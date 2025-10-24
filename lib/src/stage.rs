@@ -242,14 +242,18 @@ impl Stage {
 
     /// Start the sequencer
     pub fn sequencer_play(&mut self) {
-        // Initialize with proper timing - use a small offset to ensure proper initialization
-        self.sequencer.play_at_time(0.001);
+        self.sequencer.is_playing = true;
+        // Reset to ensure we start from a clean state
+        self.sequencer.last_step_time = -1.0; // Use negative time to ensure immediate trigger
     }
     
     /// Start the sequencer with a specific time
     pub fn sequencer_play_at_time(&mut self, time: f32) {
-        self.sequencer.play_at_time(time);
+        self.sequencer.is_playing = true;
+        // Set timing to ensure immediate trigger on first tick
+        self.sequencer.last_step_time = time - self.sequencer.step_interval - 0.001;
     }
+
 
     /// Stop the sequencer
     pub fn sequencer_stop(&mut self) {
