@@ -28,9 +28,9 @@ impl Oscillator {
         }
     }
 
-    fn advance_sample(&mut self) {
-        self.current_sample_index = (self.current_sample_index + 1.0) % self.sample_rate;
-    }
+    // fn advance_sample(&mut self) {
+    //     self.current_sample_index = (self.current_sample_index + 1.0) % self.sample_rate;
+    // }
 
     fn calculate_sine_output_from_freq(&self, freq: f32) -> f32 {
         let two_pi = 2.0 * std::f32::consts::PI;
@@ -42,54 +42,54 @@ impl Oscillator {
         self.frequency_hz * multiple > self.sample_rate / 2.0
     }
 
-    fn sine_wave(&mut self) -> f32 {
-        self.advance_sample();
-        self.calculate_sine_output_from_freq(self.frequency_hz)
-    }
+    // fn sine_wave(&mut self) -> f32 {
+    //     self.advance_sample();
+    //     self.calculate_sine_output_from_freq(self.frequency_hz)
+    // }
 
-    fn generative_waveform(&mut self, harmonic_index_increment: i32, gain_exponent: f32) -> f32 {
-        self.advance_sample();
-        let mut output = 0.0;
-        let mut i = 1;
-        while !self.is_multiple_of_freq_above_nyquist(i as f32) {
-            let gain = 1.0 / (i as f32).powf(gain_exponent);
-            output += gain * self.calculate_sine_output_from_freq(self.frequency_hz * i as f32);
-            i += harmonic_index_increment;
-        }
-        output
-    }
+    // fn generative_waveform(&mut self, harmonic_index_increment: i32, gain_exponent: f32) -> f32 {
+    //     self.advance_sample();
+    //     let mut output = 0.0;
+    //     let mut i = 1;
+    //     while !self.is_multiple_of_freq_above_nyquist(i as f32) {
+    //         let gain = 1.0 / (i as f32).powf(gain_exponent);
+    //         output += gain * self.calculate_sine_output_from_freq(self.frequency_hz * i as f32);
+    //         i += harmonic_index_increment;
+    //     }
+    //     output
+    // }
 
-    fn square_wave(&mut self) -> f32 {
-        self.generative_waveform(2, 1.0)
-    }
+    // fn square_wave(&mut self) -> f32 {
+    //     self.generative_waveform(2, 1.0)
+    // }
 
-    fn saw_wave(&mut self) -> f32 {
-        self.generative_waveform(1, 1.0)
-    }
+    // fn saw_wave(&mut self) -> f32 {
+    //     self.generative_waveform(1, 1.0)
+    // }
 
-    fn triangle_wave(&mut self) -> f32 {
-        self.generative_waveform(2, 2.0)
-    }
+    // fn triangle_wave(&mut self) -> f32 {
+    //     self.generative_waveform(2, 2.0)
+    // }
 
-    fn ring_mod_wave(&mut self) -> f32 {
-        self.advance_sample();
-        let carrier = self.calculate_sine_output_from_freq(self.frequency_hz);
-        let modulator = self.calculate_sine_output_from_freq(self.modulator_frequency_hz);
-        carrier * modulator
-    }
+    // fn ring_mod_wave(&mut self) -> f32 {
+    //     self.advance_sample();
+    //     let carrier = self.calculate_sine_output_from_freq(self.frequency_hz);
+    //     let modulator = self.calculate_sine_output_from_freq(self.modulator_frequency_hz);
+    //     carrier * modulator
+    // }
 
-    fn noise_wave(&mut self) -> f32 {
-        self.advance_sample();
+    // fn noise_wave(&mut self) -> f32 {
+    //     self.advance_sample();
         
-        // Use current sample index to generate pseudo-random noise
-        let mut hasher = DefaultHasher::new();
-        (self.current_sample_index as u64).hash(&mut hasher);
-        let hash = hasher.finish();
+    //     // Use current sample index to generate pseudo-random noise
+    //     let mut hasher = DefaultHasher::new();
+    //     (self.current_sample_index as u64).hash(&mut hasher);
+    //     let hash = hasher.finish();
         
-        // Convert hash to float in range [-1.0, 1.0]
-        let normalized = (hash as f32) / (u64::MAX as f32);
-        (normalized * 2.0) - 1.0
-    }
+    //     // Convert hash to float in range [-1.0, 1.0]
+    //     let normalized = (hash as f32) / (u64::MAX as f32);
+    //     (normalized * 2.0) - 1.0
+    // }
 
     // Time-based waveform methods that don't use advance_sample()
     fn sine_wave_time_based(&self) -> f32 {

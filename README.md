@@ -1,5 +1,11 @@
-# engine
+# libgooey
 
-Rust based audio engine which supports sound generation and processing. Intended to be embedded to power iOS and WASM based audio application 
+`libgooey` is a rust based audio engine which supports sound generation, processing modulation and beyond. It's intended to be embedded as a library in other applications wherever general sound synthesis applies
 
-https://engine-sparkling-sea-2896.fly.dev/
+### Running Examples
+
+```bash
+cargo run --example hihat
+cargo run --example kick
+cargo run --example snare
+```

@@ -22,25 +22,26 @@ impl ResonantHighpassFilter {
     pub fn process(&mut self, input: f32) -> f32 {
         // Resonant high-pass filter implementation
         // Calculate filter coefficients
-        let omega = 2.0 * std::f32::consts::PI * self.cutoff_freq / self.sample_rate;
-        let sin_omega = omega.sin();
-        let cos_omega = omega.cos();
-        let alpha = sin_omega / (2.0 * self.resonance);
+        // let omega = 2.0 * std::f32::consts::PI * self.cutoff_freq / self.sample_rate;
+        
+        // let sin_omega = omega.sin();
+        // let cos_omega = omega.cos();
+        // let alpha = sin_omega / (2.0 * self.resonance);
         
         // High-pass filter coefficients
-        let b0 = (1.0 + cos_omega) / 2.0;
-        let b1 = -(1.0 + cos_omega);
-        let b2 = (1.0 + cos_omega) / 2.0;
-        let a0 = 1.0 + alpha;
-        let a1 = -2.0 * cos_omega;
-        let a2 = 1.0 - alpha;
+        // let b0 = (1.0 + cos_omega) / 2.0;
+        // let b1 = -(1.0 + cos_omega);
+        // let b2 = (1.0 + cos_omega) / 2.0;
+        // let a0 = 1.0 + alpha;
+        // let a1 = -2.0 * cos_omega;
+        // let a2 = 1.0 - alpha;
         
         // Normalize coefficients
-        let norm_b0 = b0 / a0;
-        let norm_b1 = b1 / a0;
-        let norm_b2 = b2 / a0;
-        let norm_a1 = a1 / a0;
-        let norm_a2 = a2 / a0;
+        // let norm_b0 = b0 / a0;
+        // let norm_b1 = b1 / a0;
+        // let norm_b2 = b2 / a0;
+        // let norm_a1 = a1 / a0;
+        // let norm_a2 = a2 / a0;
         
         // Apply filter (simple one-pole approximation for efficiency)
         let alpha_simple = 1.0 - (-2.0 * std::f32::consts::PI * self.cutoff_freq / self.sample_rate).exp();

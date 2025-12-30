@@ -457,7 +457,9 @@ impl Sequencer {
         self.step_interval = 60.0 / (self.bpm * 4.0);
     }
 
-    pub fn update(&mut self, current_time: f32) {
+    // TODO
+    // remove this
+    pub fn update(&mut self, _current_time: f32) {
         // This method is called from tick() to update internal state
         // The actual triggering logic is handled in tick()
     }

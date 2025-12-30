@@ -9,6 +9,8 @@ pub mod stage;
 pub mod instruments;
 pub mod effects;
 pub mod gen;
+pub mod sequencer;
+pub mod engine;
 
 // Platform abstraction layer
 pub mod platform;
