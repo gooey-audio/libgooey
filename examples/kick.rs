@@ -5,21 +5,32 @@ Minimal code to start the audio engine and trigger kick drum hits.
 use std::io::{self, Write};
 
 // Import the platform abstraction and audio engine
-use libgooey::platform::{AudioEngine, AudioOutput, CpalOutput};
+use libgooey::engine::{Engine, EngineOutput};
+use libgooey::instruments::KickDrum;
+use std::sync::{Arc, Mutex};
 
 // CLI example for kick drum
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
-    // Create the audio engine
-    let audio_engine = AudioEngine::new(44100.0);
+    let sample_rate = 44100.0;
 
-    // Create and configure the CPAL output
-    let mut cpal_output = CpalOutput::new();
-    cpal_output.initialize(44100.0)?;
-    cpal_output.create_stream_with_stage(audio_engine.stage(), audio_engine.audio_state())?;
+    // Create the audio engine
+    let mut engine = Engine::new(sample_rate);
+
+    // Add a kick drum instrument
+    let kick = KickDrum::new(sample_rate);
+    engine.add_instrument("kick", Box::new(kick));
+
+    // Wrap in Arc<Mutex> for thread-safe access
+    let audio_engine = Arc::new(Mutex::new(engine));
+
+    // Create and configure the Engine output
+    let mut engine_output = EngineOutput::new();
+    engine_output.initialize(sample_rate)?;
+    engine_output.create_stream_with_engine(audio_engine.clone())?;
 
     // Start the audio stream
-    cpal_output.start()?;
+    engine_output.start()?;
 
     println!("=== Kick Drum Example ===");
     println!("Press SPACE to trigger kick drum, 'q' to quit");
@@ -33,8 +44,8 @@ fn main() -> anyhow::Result<()> {
         match input.trim() {
             " " | "" => {
                 println!("Triggering kick drum!");
-                let mut stage = audio_engine.stage_mut();
-                stage.trigger_kick();
+                let mut engine = audio_engine.lock().unwrap();
+                engine.trigger_instrument("kick");
             }
             "q" => {
                 println!("Quitting...");

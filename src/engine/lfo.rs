@@ -1,6 +1,61 @@
+/// Musical time divisions for BPM-synced LFO speeds
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MusicalDivision {
+    /// 4 bars (16 beats)
+    FourBars,
+    /// 2 bars (8 beats)
+    TwoBars,
+    /// 1 bar (4 beats)
+    OneBar,
+    /// Half note (2 beats)
+    Half,
+    /// Quarter note (1 beat)
+    Quarter,
+    /// Eighth note (1/2 beat)
+    Eighth,
+    /// Sixteenth note (1/4 beat)
+    Sixteenth,
+    /// Thirty-second note (1/8 beat)
+    ThirtySecond,
+}
+
+impl MusicalDivision {
+    /// Get the number of beats this division represents
+    pub fn beats(&self) -> f32 {
+        match self {
+            MusicalDivision::FourBars => 16.0,
+            MusicalDivision::TwoBars => 8.0,
+            MusicalDivision::OneBar => 4.0,
+            MusicalDivision::Half => 2.0,
+            MusicalDivision::Quarter => 1.0,
+            MusicalDivision::Eighth => 0.5,
+            MusicalDivision::Sixteenth => 0.25,
+            MusicalDivision::ThirtySecond => 0.125,
+        }
+    }
+    
+    /// Convert to frequency in Hz at the given BPM
+    pub fn to_frequency(&self, bpm: f32) -> f32 {
+        // Beats per second = BPM / 60
+        let beats_per_second = bpm / 60.0;
+        // Cycles per second = beats per second / beats per cycle
+        beats_per_second / self.beats()
+    }
+}
+
+/// LFO sync mode
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LfoSyncMode {
+    /// Free-running at a specific Hz frequency
+    Hz(f32),
+    /// Synced to BPM with a musical division
+    BpmSync(MusicalDivision),
+}
+
 /// Low Frequency Oscillator for modulation
 pub struct Lfo {
-    frequency: f32,
+    sync_mode: LfoSyncMode,
+    bpm: f32, // Current BPM (used when in BpmSync mode)
     phase: f32,
     sample_rate: f32,
     
@@ -12,12 +67,13 @@ pub struct Lfo {
 }
 
 impl Lfo {
-    /// Create a new LFO
+    /// Create a new LFO in Hz mode
     /// - frequency: LFO frequency in Hz
     /// - sample_rate: Audio sample rate
     pub fn new(frequency: f32, sample_rate: f32) -> Self {
         Self {
-            frequency,
+            sync_mode: LfoSyncMode::Hz(frequency),
+            bpm: 120.0, // Default BPM
             phase: 0.0,
             sample_rate,
             target_instrument: String::new(),
@@ -27,14 +83,49 @@ impl Lfo {
         }
     }
     
-    /// Set the frequency in Hz
-    pub fn set_frequency(&mut self, frequency: f32) {
-        self.frequency = frequency;
+    /// Create a new BPM-synced LFO
+    /// - division: Musical time division (e.g., OneBar, Sixteenth)
+    /// - bpm: Beats per minute
+    /// - sample_rate: Audio sample rate
+    pub fn new_synced(division: MusicalDivision, bpm: f32, sample_rate: f32) -> Self {
+        Self {
+            sync_mode: LfoSyncMode::BpmSync(division),
+            bpm,
+            phase: 0.0,
+            sample_rate,
+            target_instrument: String::new(),
+            target_parameter: String::new(),
+            amount: 1.0,
+            offset: 0.0,
+        }
     }
     
-    /// Get the current frequency
+    /// Set the frequency in Hz (switches to Hz mode)
+    pub fn set_frequency(&mut self, frequency: f32) {
+        self.sync_mode = LfoSyncMode::Hz(frequency);
+    }
+    
+    /// Set BPM sync mode with a musical division
+    pub fn set_sync_mode(&mut self, division: MusicalDivision) {
+        self.sync_mode = LfoSyncMode::BpmSync(division);
+    }
+    
+    /// Update the BPM (used when in BpmSync mode)
+    pub fn set_bpm(&mut self, bpm: f32) {
+        self.bpm = bpm;
+    }
+    
+    /// Get the current frequency in Hz
     pub fn frequency(&self) -> f32 {
-        self.frequency
+        match self.sync_mode {
+            LfoSyncMode::Hz(freq) => freq,
+            LfoSyncMode::BpmSync(division) => division.to_frequency(self.bpm),
+        }
+    }
+    
+    /// Get the current sync mode
+    pub fn sync_mode(&self) -> LfoSyncMode {
+        self.sync_mode
     }
     
     /// Generate one sample and advance the phase
@@ -44,7 +135,7 @@ impl Lfo {
         let value = (self.phase * 2.0 * std::f32::consts::PI).sin();
         
         // Advance phase
-        let phase_increment = self.frequency / self.sample_rate;
+        let phase_increment = self.frequency() / self.sample_rate;
         self.phase += phase_increment;
         
         // Wrap phase to 0.0-1.0

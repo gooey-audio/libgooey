@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 // Import the engine and instruments
-use libgooey::engine::{Engine, EngineOutput, Sequencer, Lfo};
+use libgooey::engine::{Engine, EngineOutput, Sequencer, Lfo, MusicalDivision};
 use libgooey::instruments::HiHat;
 
 // CLI example for sequencer
@@ -25,14 +25,18 @@ fn main() -> anyhow::Result<()> {
     let hihat = HiHat::new(sample_rate);
     engine.add_instrument("hihat", Box::new(hihat));
 
+    // Set the global BPM
+    let bpm = 120.0;
+    engine.set_bpm(bpm);
+    
     // Create a sequencer with a simple 8-step pattern (16th notes at 120 BPM)
     let pattern = vec![true, false, true, false, true, false, true, false];
-    let sequencer = Sequencer::with_pattern(120.0, sample_rate, pattern, "hihat");
+    let sequencer = Sequencer::with_pattern(bpm, sample_rate, pattern, "hihat");
     engine.add_sequencer(sequencer);
 
-    // Add an LFO to modulate the hi-hat decay time
-    // 0.5 Hz = one cycle every 2 seconds (more noticeable)
-    let lfo = Lfo::new(0.5, sample_rate);
+    // Add a BPM-synced LFO to modulate the hi-hat decay time
+    // Start with 1 bar = one cycle every 4 beats
+    let lfo = Lfo::new_synced(MusicalDivision::OneBar, bpm, sample_rate);
     let lfo_index = engine.add_lfo(lfo);
     
     // Map the LFO to the hi-hat's decay parameter
@@ -41,7 +45,7 @@ fn main() -> anyhow::Result<()> {
         .expect("Failed to map LFO to hi-hat decay");
     
     println!("✓ LFO mapped to hi-hat decay");
-    println!("  Frequency: 0.5 Hz (2 second cycle)");
+    println!("  Synced to: 1 bar (4 beats)");
     println!("  Range: 20ms to 500ms decay time");
 
     // Wrap in Arc<Mutex> for thread-safe access
@@ -58,7 +62,7 @@ fn main() -> anyhow::Result<()> {
     println!("=== Sequencer + LFO Example ===");
     println!("Press SPACE to start/stop sequencer");
     println!("Press UP/DOWN to adjust BPM");
-    println!("Press LEFT/RIGHT to adjust LFO speed");
+    println!("Press LEFT/RIGHT to cycle LFO division");
     println!("Press 'q' to quit");
     println!("");
 
@@ -88,37 +92,91 @@ fn main() -> anyhow::Result<()> {
                     }
                     KeyCode::Up => {
                         let mut engine = audio_engine.lock().unwrap();
+                        let new_bpm = (engine.bpm() + 5.0).min(200.0);
+                        engine.set_bpm(new_bpm);
+                        
+                        // Also update sequencer BPM
                         if let Some(seq) = engine.sequencer_mut(0) {
-                            let new_bpm = (seq.bpm() + 5.0).min(200.0);
                             seq.set_bpm(new_bpm);
-                            println!("\rBPM: {}  ", new_bpm);
                         }
+                        println!("\rBPM: {}  ", new_bpm);
                         io::stdout().flush().unwrap();
                     }
                     KeyCode::Down => {
                         let mut engine = audio_engine.lock().unwrap();
+                        let new_bpm = (engine.bpm() - 5.0).max(60.0);
+                        engine.set_bpm(new_bpm);
+                        
+                        // Also update sequencer BPM
                         if let Some(seq) = engine.sequencer_mut(0) {
-                            let new_bpm = (seq.bpm() - 5.0).max(60.0);
                             seq.set_bpm(new_bpm);
-                            println!("\rBPM: {}  ", new_bpm);
                         }
+                        println!("\rBPM: {}  ", new_bpm);
                         io::stdout().flush().unwrap();
                     }
                     KeyCode::Right => {
                         let mut engine = audio_engine.lock().unwrap();
                         if let Some(lfo) = engine.lfo_mut(0) {
-                            let new_freq = (lfo.frequency() + 0.05).min(2.0);
-                            lfo.set_frequency(new_freq);
-                            println!("\rLFO Frequency: {:.2} Hz  ", new_freq);
+                            use libgooey::engine::LfoSyncMode;
+                            // Cycle to next division
+                            let next_division = match lfo.sync_mode() {
+                                LfoSyncMode::BpmSync(div) => match div {
+                                    MusicalDivision::FourBars => MusicalDivision::TwoBars,
+                                    MusicalDivision::TwoBars => MusicalDivision::OneBar,
+                                    MusicalDivision::OneBar => MusicalDivision::Half,
+                                    MusicalDivision::Half => MusicalDivision::Quarter,
+                                    MusicalDivision::Quarter => MusicalDivision::Eighth,
+                                    MusicalDivision::Eighth => MusicalDivision::Sixteenth,
+                                    MusicalDivision::Sixteenth => MusicalDivision::ThirtySecond,
+                                    MusicalDivision::ThirtySecond => MusicalDivision::ThirtySecond, // Stay at fastest
+                                },
+                                LfoSyncMode::Hz(_) => MusicalDivision::OneBar, // Default to 1 bar if in Hz mode
+                            };
+                            lfo.set_sync_mode(next_division);
+                            let div_name = match next_division {
+                                MusicalDivision::FourBars => "4 bars",
+                                MusicalDivision::TwoBars => "2 bars",
+                                MusicalDivision::OneBar => "1 bar",
+                                MusicalDivision::Half => "1/2 note",
+                                MusicalDivision::Quarter => "1/4 note",
+                                MusicalDivision::Eighth => "1/8 note",
+                                MusicalDivision::Sixteenth => "1/16 note",
+                                MusicalDivision::ThirtySecond => "1/32 note",
+                            };
+                            println!("\rLFO Division: {} ({:.2} Hz)  ", div_name, lfo.frequency());
                         }
                         io::stdout().flush().unwrap();
                     }
                     KeyCode::Left => {
                         let mut engine = audio_engine.lock().unwrap();
                         if let Some(lfo) = engine.lfo_mut(0) {
-                            let new_freq = (lfo.frequency() - 0.05).max(0.05);
-                            lfo.set_frequency(new_freq);
-                            println!("\rLFO Frequency: {:.2} Hz  ", new_freq);
+                            use libgooey::engine::LfoSyncMode;
+                            // Cycle to previous division
+                            let prev_division = match lfo.sync_mode() {
+                                LfoSyncMode::BpmSync(div) => match div {
+                                    MusicalDivision::FourBars => MusicalDivision::FourBars, // Stay at slowest
+                                    MusicalDivision::TwoBars => MusicalDivision::FourBars,
+                                    MusicalDivision::OneBar => MusicalDivision::TwoBars,
+                                    MusicalDivision::Half => MusicalDivision::OneBar,
+                                    MusicalDivision::Quarter => MusicalDivision::Half,
+                                    MusicalDivision::Eighth => MusicalDivision::Quarter,
+                                    MusicalDivision::Sixteenth => MusicalDivision::Eighth,
+                                    MusicalDivision::ThirtySecond => MusicalDivision::Sixteenth,
+                                },
+                                LfoSyncMode::Hz(_) => MusicalDivision::OneBar, // Default to 1 bar if in Hz mode
+                            };
+                            lfo.set_sync_mode(prev_division);
+                            let div_name = match prev_division {
+                                MusicalDivision::FourBars => "4 bars",
+                                MusicalDivision::TwoBars => "2 bars",
+                                MusicalDivision::OneBar => "1 bar",
+                                MusicalDivision::Half => "1/2 note",
+                                MusicalDivision::Quarter => "1/4 note",
+                                MusicalDivision::Eighth => "1/8 note",
+                                MusicalDivision::Sixteenth => "1/16 note",
+                                MusicalDivision::ThirtySecond => "1/32 note",
+                            };
+                            println!("\rLFO Division: {} ({:.2} Hz)  ", div_name, lfo.frequency());
                         }
                         io::stdout().flush().unwrap();
                     }

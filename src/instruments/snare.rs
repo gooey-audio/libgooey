@@ -243,3 +243,17 @@ impl SnareDrum {
         self.pitch_start_multiplier = 1.0 + self.config.pitch_drop * 1.5;
     }
 }
+
+impl crate::engine::Instrument for SnareDrum {
+    fn trigger(&mut self, time: f32) {
+        self.trigger(time);
+    }
+
+    fn tick(&mut self, current_time: f32) -> f32 {
+        self.tick(current_time)
+    }
+
+    fn is_active(&self) -> bool {
+        self.is_active()
+    }
+}

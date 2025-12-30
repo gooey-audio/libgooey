@@ -43,7 +43,7 @@ required-features = ["native"]
 
 [[example]]
 name = "snare"
-required-features = ["native"]
+required-features = ["native", "crossterm"]
 
 [[example]]
 name = "hihat"

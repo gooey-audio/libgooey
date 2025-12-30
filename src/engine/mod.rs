@@ -10,7 +10,7 @@ pub mod sequencer;
 pub use sequencer::Sequencer;
 
 pub mod lfo;
-pub use lfo::Lfo;
+pub use lfo::{Lfo, LfoSyncMode, MusicalDivision};
 
 /// Trait that all instruments must implement
 /// Send is required because instruments are used in the audio thread
@@ -48,6 +48,7 @@ pub trait Modulatable {
 /// Minimal audio engine - the primary abstraction for audio generation
 pub struct Engine {
     sample_rate: f32,
+    bpm: f32, // Global BPM for synced LFOs and sequencers
     instruments: HashMap<String, Box<dyn Instrument>>,
     // Queue of instrument names to trigger on next tick
     trigger_queue: VecDeque<String>,
@@ -61,11 +62,26 @@ impl Engine {
     pub fn new(sample_rate: f32) -> Self {
         Self {
             sample_rate,
+            bpm: 120.0, // Default BPM
             instruments: HashMap::new(),
             trigger_queue: VecDeque::new(),
             sequencers: Vec::new(),
             lfos: Vec::new(),
         }
+    }
+    
+    /// Set the global BPM and update all synced LFOs
+    pub fn set_bpm(&mut self, bpm: f32) {
+        self.bpm = bpm;
+        // Update all LFOs with the new BPM
+        for lfo in &mut self.lfos {
+            lfo.set_bpm(bpm);
+        }
+    }
+    
+    /// Get the global BPM
+    pub fn bpm(&self) -> f32 {
+        self.bpm
     }
 
     /// Add an instrument with a unique name

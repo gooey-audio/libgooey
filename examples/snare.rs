@@ -2,51 +2,72 @@
 Minimal code to start the audio engine and trigger snare drum hits.
 */
 
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 use std::io::{self, Write};
 
 // Import the platform abstraction and audio engine
-use libgooey::platform::{AudioEngine, AudioOutput, CpalOutput};
+use libgooey::engine::{Engine, EngineOutput};
+use libgooey::instruments::SnareDrum;
+use std::sync::{Arc, Mutex};
 
 // CLI example for snare drum
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
-    // Create the audio engine
-    let audio_engine = AudioEngine::new(44100.0);
+    let sample_rate = 44100.0;
 
-    // Create and configure the CPAL output
-    let mut cpal_output = CpalOutput::new();
-    cpal_output.initialize(44100.0)?;
-    cpal_output.create_stream_with_stage(audio_engine.stage(), audio_engine.audio_state())?;
+    // Create the audio engine
+    let mut engine = Engine::new(sample_rate);
+
+    // Add a snare drum instrument
+    let snare = SnareDrum::new(sample_rate);
+    engine.add_instrument("snare", Box::new(snare));
+
+    // Wrap in Arc<Mutex> for thread-safe access
+    let audio_engine = Arc::new(Mutex::new(engine));
+
+    // Create and configure the Engine output
+    let mut engine_output = EngineOutput::new();
+    engine_output.initialize(sample_rate)?;
+    engine_output.create_stream_with_engine(audio_engine.clone())?;
 
     // Start the audio stream
-    cpal_output.start()?;
+    engine_output.start()?;
 
     println!("=== Snare Drum Example ===");
     println!("Press SPACE to trigger snare drum, 'q' to quit");
+    println!("");
+
+    // Enable raw mode for immediate key detection
+    enable_raw_mode()?;
 
     // Main input loop
-    loop {
-        let mut input = String::new();
-        io::stdout().flush().unwrap();
-        io::stdin().read_line(&mut input).unwrap();
-
-        match input.trim() {
-            " " | "" => {
-                println!("Triggering snare drum!");
-                let mut stage = audio_engine.stage_mut();
-                stage.trigger_snare();
-            }
-            "q" => {
-                println!("Quitting...");
-                break;
-            }
-            _ => {
-                println!("Press SPACE to trigger snare drum, 'q' to quit");
+    let result = loop {
+        // Poll for key events (non-blocking with timeout)
+        if event::poll(std::time::Duration::from_millis(100))? {
+            if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+                match code {
+                    KeyCode::Char(' ') => {
+                        io::stdout().flush().unwrap();
+                        let mut engine = audio_engine.lock().unwrap();
+                        engine.trigger_instrument("snare");
+                    }
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        println!("\rQuitting...           ");
+                        break Ok(());
+                    }
+                    _ => {}
+                }
             }
         }
-    }
+    };
 
-    Ok(())
+    // Restore terminal to normal mode
+    disable_raw_mode()?;
+
+    result
 }
 
 #[cfg(not(feature = "native"))]
