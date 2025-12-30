@@ -269,4 +269,70 @@ impl crate::engine::Instrument for HiHat {
     fn is_active(&self) -> bool {
         self.is_active()
     }
+
+    fn as_modulatable(&mut self) -> Option<&mut dyn crate::engine::Modulatable> {
+        Some(self)
+    }
+}
+
+// Implement modulation support for HiHat
+impl crate::engine::Modulatable for HiHat {
+    fn modulatable_parameters(&self) -> Vec<&'static str> {
+        vec!["decay", "brightness", "resonance", "frequency", "attack"]
+    }
+
+    fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
+        match parameter {
+            "decay" => {
+                // value is -1.0 to 1.0, map to decay range
+                let range = self.parameter_range("decay").unwrap();
+                self.config.decay_time = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
+                
+                // Update the amplitude envelope decay time directly (efficient!)
+                if self.config.is_open {
+                    self.amplitude_envelope.set_decay_time(self.config.decay_time * 0.4);
+                    self.amplitude_envelope.set_release_time(self.config.decay_time * 0.6);
+                } else {
+                    self.amplitude_envelope.set_decay_time(self.config.decay_time * 0.9);
+                    self.amplitude_envelope.set_release_time(self.config.decay_time * 0.1);
+                }
+                Ok(())
+            }
+            "brightness" => {
+                // Map -1.0 to 1.0 -> 0.0 to 1.0
+                self.config.brightness = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                Ok(())
+            }
+            "resonance" => {
+                self.config.resonance = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                Ok(())
+            }
+            "frequency" => {
+                let range = self.parameter_range("frequency").unwrap();
+                self.config.base_frequency = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
+                self.configure_oscillators();
+                Ok(())
+            }
+            "attack" => {
+                let range = self.parameter_range("attack").unwrap();
+                self.config.attack_time = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
+                
+                // Update envelope attack time directly
+                self.amplitude_envelope.set_attack_time(self.config.attack_time);
+                Ok(())
+            }
+            _ => Err(format!("Unknown parameter: {}", parameter))
+        }
+    }
+
+    fn parameter_range(&self, parameter: &str) -> Option<(f32, f32)> {
+        match parameter {
+            "decay" => Some((0.02, 0.5)),        // 20ms to 500ms
+            "brightness" => Some((0.0, 1.0)),
+            "resonance" => Some((0.0, 1.0)),
+            "frequency" => Some((5000.0, 15000.0)),
+            "attack" => Some((0.0001, 0.01)),    // 0.1ms to 10ms
+            _ => None
+        }
+    }
 }

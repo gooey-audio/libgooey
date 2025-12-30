@@ -58,6 +58,26 @@ impl Envelope {
         self.release_time = config.release_time;
     }
 
+    /// Set attack time directly (more efficient than set_config for modulation)
+    pub fn set_attack_time(&mut self, attack_time: f32) {
+        self.attack_time = attack_time;
+    }
+
+    /// Set decay time directly (more efficient than set_config for modulation)
+    pub fn set_decay_time(&mut self, decay_time: f32) {
+        self.decay_time = decay_time;
+    }
+
+    /// Set sustain level directly (more efficient than set_config for modulation)
+    pub fn set_sustain_level(&mut self, sustain_level: f32) {
+        self.sustain_level = sustain_level;
+    }
+
+    /// Set release time directly (more efficient than set_config for modulation)
+    pub fn set_release_time(&mut self, release_time: f32) {
+        self.release_time = release_time;
+    }
+
     pub fn trigger(&mut self, time: f32) {
         self.is_active = true;
         self.trigger_time = time;

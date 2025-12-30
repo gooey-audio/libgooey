@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 // Import the engine and instruments
-use libgooey::engine::{Engine, EngineOutput, Sequencer};
+use libgooey::engine::{Engine, EngineOutput, Sequencer, Lfo};
 use libgooey::instruments::HiHat;
 
 // CLI example for sequencer
@@ -30,6 +30,20 @@ fn main() -> anyhow::Result<()> {
     let sequencer = Sequencer::with_pattern(120.0, sample_rate, pattern, "hihat");
     engine.add_sequencer(sequencer);
 
+    // Add an LFO to modulate the hi-hat decay time
+    // 0.5 Hz = one cycle every 2 seconds (more noticeable)
+    let lfo = Lfo::new(0.5, sample_rate);
+    let lfo_index = engine.add_lfo(lfo);
+    
+    // Map the LFO to the hi-hat's decay parameter
+    // Amount of 1.0 means the LFO will use full modulation range
+    engine.map_lfo_to_parameter(lfo_index, "hihat", "decay", 1.0)
+        .expect("Failed to map LFO to hi-hat decay");
+    
+    println!("✓ LFO mapped to hi-hat decay");
+    println!("  Frequency: 0.5 Hz (2 second cycle)");
+    println!("  Range: 20ms to 500ms decay time");
+
     // Wrap in Arc<Mutex> for thread-safe access
     let audio_engine = Arc::new(Mutex::new(engine));
 
@@ -41,9 +55,10 @@ fn main() -> anyhow::Result<()> {
     // Start the audio stream
     engine_output.start()?;
 
-    println!("=== Sequencer Example ===");
+    println!("=== Sequencer + LFO Example ===");
     println!("Press SPACE to start/stop sequencer");
     println!("Press UP/DOWN to adjust BPM");
+    println!("Press LEFT/RIGHT to adjust LFO speed");
     println!("Press 'q' to quit");
     println!("");
 
@@ -86,6 +101,24 @@ fn main() -> anyhow::Result<()> {
                             let new_bpm = (seq.bpm() - 5.0).max(60.0);
                             seq.set_bpm(new_bpm);
                             println!("\rBPM: {}  ", new_bpm);
+                        }
+                        io::stdout().flush().unwrap();
+                    }
+                    KeyCode::Right => {
+                        let mut engine = audio_engine.lock().unwrap();
+                        if let Some(lfo) = engine.lfo_mut(0) {
+                            let new_freq = (lfo.frequency() + 0.05).min(2.0);
+                            lfo.set_frequency(new_freq);
+                            println!("\rLFO Frequency: {:.2} Hz  ", new_freq);
+                        }
+                        io::stdout().flush().unwrap();
+                    }
+                    KeyCode::Left => {
+                        let mut engine = audio_engine.lock().unwrap();
+                        if let Some(lfo) = engine.lfo_mut(0) {
+                            let new_freq = (lfo.frequency() - 0.05).max(0.05);
+                            lfo.set_frequency(new_freq);
+                            println!("\rLFO Frequency: {:.2} Hz  ", new_freq);
                         }
                         io::stdout().flush().unwrap();
                     }
