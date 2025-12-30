@@ -1,5 +1,5 @@
-/* CLI example demonstrating the sample-accurate sequencer with callbacks.
-This shows how to use the basic Sequencer abstraction with any trigger function.
+/* CLI example for sequencer testing.
+Demonstrates sample-accurate sequencing with the new Engine.
 */
 
 use crossterm::{
@@ -7,117 +7,105 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use std::io::{self, Write};
-
-// Import the platform abstraction and audio engine
-use libgooey::platform::{AudioEngine, AudioOutput, CpalOutput};
-use libgooey::sequencer::Sequencer;
 use std::sync::{Arc, Mutex};
+
+// Import the engine and instruments
+use libgooey::engine::{Engine, EngineOutput, Sequencer};
+use libgooey::instruments::HiHat;
 
 // CLI example for sequencer
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
-    const SAMPLE_RATE: f32 = 44100.0;
-    const INITIAL_BPM: f32 = 120.0;
-    
+    let sample_rate = 44100.0;
+
     // Create the audio engine
-    let audio_engine = AudioEngine::new(SAMPLE_RATE);
-    
-    // Create a sequencer - wrap it in Arc<Mutex<>> so we can share it with the audio callback
-    let sequencer = Arc::new(Mutex::new(Sequencer::new(INITIAL_BPM, SAMPLE_RATE)));
-    let sequencer_clone = sequencer.clone();
-    
-    // Define a simple 8-step pattern (8th notes)
-    // true means trigger on that step
-    let pattern = Arc::new([true, false, true, false, true, false, true, false]);
-    let pattern_clone = pattern.clone();
-    
-    // Create and configure the CPAL output
-    let mut cpal_output = CpalOutput::new();
-    cpal_output.initialize(SAMPLE_RATE)?;
-    
-    // Get references for the audio callback
-    let stage = audio_engine.stage();
-    let audio_state = audio_engine.audio_state();
-    
-    // We need to create a custom callback that integrates our sequencer
-    // Unfortunately, the current CpalOutput API doesn't support custom callbacks easily,
-    // so let's demonstrate the sequencer in a simpler standalone context
-    
-    // For this demo, let's just show the sequencer logic working in isolation
-    println!("=== Sequencer Demo ===");
-    println!("This demonstrates the sample-accurate sequencer logic.");
-    println!();
-    println!("Sequencer configuration:");
-    println!("  BPM: {}", INITIAL_BPM);
-    println!("  Sample Rate: {}", SAMPLE_RATE);
-    println!("  Subdivision: 8th notes");
-    println!();
-    
-    // Calculate timing information
-    let seconds_per_8th = (60.0 / INITIAL_BPM) / 2.0;
-    let samples_per_8th = seconds_per_8th * SAMPLE_RATE;
-    
-    println!("Timing calculations:");
-    println!("  Seconds per 8th note: {:.4}s", seconds_per_8th);
-    println!("  Samples per 8th note: {:.2}", samples_per_8th);
-    println!();
-    
-    // Simulate running the sequencer for a few steps
-    println!("Simulating sequencer for 8 steps:");
-    println!();
-    
-    let mut test_sequencer = Sequencer::new(INITIAL_BPM, SAMPLE_RATE);
-    test_sequencer.start();
-    
-    let mut triggered_steps = Vec::new();
-    let mut sample_count = 0u64;
-    
-    // Run for 8 steps (should be approximately 8 * samples_per_8th samples)
-    let max_samples = (samples_per_8th * 8.0) as u64 + 100; // Add some buffer
-    
-    while triggered_steps.len() < 8 && sample_count < max_samples {
-        let triggered = test_sequencer.tick(|step| {
-            let time = sample_count as f32 / SAMPLE_RATE;
-            triggered_steps.push((step, sample_count, time));
-            
-            // This is where you would call stage.trigger_hihat() or any other trigger function
-            println!("Step {}: triggered at sample {} ({:.4}s)", 
-                     step, sample_count, time);
-        });
-        
-        sample_count += 1;
-    }
-    
-    println!();
-    println!("Sequencer Statistics:");
-    println!("  Total samples processed: {}", sample_count);
-    println!("  Total steps triggered: {}", triggered_steps.len());
-    
-    if triggered_steps.len() > 1 {
-        println!("  Average samples between steps: {:.2}", 
-                 (sample_count as f32) / (triggered_steps.len() as f32));
-        println!("  Expected samples between steps: {:.2}", samples_per_8th);
-    }
-    
-    println!();
-    println!("Integration Example:");
-    println!("To integrate this into your audio callback, you would:");
-    println!("1. Create a Sequencer instance");
-    println!("2. On each audio buffer sample, call sequencer.tick() with a callback");
-    println!("3. In the callback, call stage.trigger_hihat() or other trigger methods");
-    println!();
-    println!("Example code:");
-    println!("  sequencer.tick(|step| {{");
-    println!("      if pattern[step % pattern.len()] {{");
-    println!("          stage.trigger_hihat();");
-    println!("      }}");
-    println!("  }});");
-    
-    Ok(())
+    let mut engine = Engine::new(sample_rate);
+
+    // Add a hi-hat instrument
+    let hihat = HiHat::new(sample_rate);
+    engine.add_instrument("hihat", Box::new(hihat));
+
+    // Create a sequencer with a simple 8-step pattern (16th notes at 120 BPM)
+    let pattern = vec![true, false, true, false, true, false, true, false];
+    let sequencer = Sequencer::with_pattern(120.0, sample_rate, pattern, "hihat");
+    engine.add_sequencer(sequencer);
+
+    // Wrap in Arc<Mutex> for thread-safe access
+    let audio_engine = Arc::new(Mutex::new(engine));
+
+    // Create and configure the Engine output
+    let mut engine_output = EngineOutput::new();
+    engine_output.initialize(sample_rate)?;
+    engine_output.create_stream_with_engine(audio_engine.clone())?;
+
+    // Start the audio stream
+    engine_output.start()?;
+
+    println!("=== Sequencer Example ===");
+    println!("Press SPACE to start/stop sequencer");
+    println!("Press UP/DOWN to adjust BPM");
+    println!("Press 'q' to quit");
+    println!("");
+
+    // Enable raw mode for immediate key detection
+    enable_raw_mode()?;
+
+    // Main input loop
+    let result = loop {
+        // Poll for key events (non-blocking with timeout)
+        if event::poll(std::time::Duration::from_millis(100))? {
+            if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+                match code {
+                    KeyCode::Char(' ') => {
+                        io::stdout().flush().unwrap();
+                        let mut engine = audio_engine.lock().unwrap();
+                        
+                        // Toggle the first sequencer
+                        if let Some(seq) = engine.sequencer_mut(0) {
+                            if seq.is_running() {
+                                seq.stop();
+                                println!("\rSequencer stopped          ");
+                            } else {
+                                seq.start();
+                                println!("\rSequencer started at {} BPM", seq.bpm());
+                            }
+                        }
+                    }
+                    KeyCode::Up => {
+                        let mut engine = audio_engine.lock().unwrap();
+                        if let Some(seq) = engine.sequencer_mut(0) {
+                            let new_bpm = (seq.bpm() + 5.0).min(200.0);
+                            seq.set_bpm(new_bpm);
+                            println!("\rBPM: {}  ", new_bpm);
+                        }
+                        io::stdout().flush().unwrap();
+                    }
+                    KeyCode::Down => {
+                        let mut engine = audio_engine.lock().unwrap();
+                        if let Some(seq) = engine.sequencer_mut(0) {
+                            let new_bpm = (seq.bpm() - 5.0).max(60.0);
+                            seq.set_bpm(new_bpm);
+                            println!("\rBPM: {}  ", new_bpm);
+                        }
+                        io::stdout().flush().unwrap();
+                    }
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        println!("\rQuitting...           ");
+                        break Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    };
+
+    // Restore terminal to normal mode
+    disable_raw_mode()?;
+
+    result
 }
 
 #[cfg(not(feature = "native"))]
 fn main() {
     println!("This example is only available with the 'native' feature enabled.");
 }
-

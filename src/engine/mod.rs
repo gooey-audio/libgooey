@@ -6,6 +6,9 @@ pub mod engine_output;
 #[cfg(feature = "native")]
 pub use engine_output::EngineOutput;
 
+pub mod sequencer;
+pub use sequencer::Sequencer;
+
 /// Trait that all instruments must implement
 /// Send is required because instruments are used in the audio thread
 pub trait Instrument: Send {
@@ -25,6 +28,8 @@ pub struct Engine {
     instruments: HashMap<String, Box<dyn Instrument>>,
     // Queue of instrument names to trigger on next tick
     trigger_queue: VecDeque<String>,
+    // Active sequencers
+    sequencers: Vec<Sequencer>,
 }
 
 impl Engine {
@@ -33,12 +38,33 @@ impl Engine {
             sample_rate,
             instruments: HashMap::new(),
             trigger_queue: VecDeque::new(),
+            sequencers: Vec::new(),
         }
     }
 
     /// Add an instrument with a unique name
     pub fn add_instrument(&mut self, name: impl Into<String>, instrument: Box<dyn Instrument>) {
         self.instruments.insert(name.into(), instrument);
+    }
+
+    /// Add a sequencer to the engine
+    pub fn add_sequencer(&mut self, sequencer: Sequencer) {
+        self.sequencers.push(sequencer);
+    }
+
+    /// Get a mutable reference to a sequencer by index
+    pub fn sequencer_mut(&mut self, index: usize) -> Option<&mut Sequencer> {
+        self.sequencers.get_mut(index)
+    }
+
+    /// Get a reference to a sequencer by index
+    pub fn sequencer(&self, index: usize) -> Option<&Sequencer> {
+        self.sequencers.get(index)
+    }
+
+    /// Get the number of sequencers
+    pub fn sequencer_count(&self) -> usize {
+        self.sequencers.len()
     }
 
     /// Queue an instrument to be triggered on the next audio tick
@@ -50,6 +76,16 @@ impl Engine {
     /// Generate one sample of audio at the given time
     /// This is called by the audio output on every sample
     pub fn tick(&mut self, current_time: f32) -> f32 {
+        // Process all sequencers (sample-accurate triggering)
+        for sequencer in &mut self.sequencers {
+            if let Some(instrument_name) = sequencer.tick() {
+                // Sequencer says to trigger this instrument
+                if let Some(instrument) = self.instruments.get_mut(instrument_name) {
+                    instrument.trigger(current_time);
+                }
+            }
+        }
+
         // Process trigger queue - trigger instruments with current audio time
         while let Some(name) = self.trigger_queue.pop_front() {
             if let Some(instrument) = self.instruments.get_mut(&name) {
