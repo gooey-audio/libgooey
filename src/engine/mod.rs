@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use crate::effects::{Effect, BrickWallLimiter};
 
 #[cfg(feature = "native")]
 pub mod engine_output;
@@ -56,10 +57,16 @@ pub struct Engine {
     sequencers: Vec<Sequencer>,
     // LFOs for modulation
     lfos: Vec<Lfo>,
+    // Global effects applied to the final output (distinct from per-instrument effects)
+    global_effects: Vec<Box<dyn Effect>>,
 }
 
 impl Engine {
     pub fn new(sample_rate: f32) -> Self {
+        // Initialize with a brick wall limiter as the default global effect
+        let mut global_effects: Vec<Box<dyn Effect>> = Vec::new();
+        global_effects.push(Box::new(BrickWallLimiter::new(1.0)));
+        
         Self {
             sample_rate,
             bpm: 120.0, // Default BPM
@@ -67,6 +74,7 @@ impl Engine {
             trigger_queue: VecDeque::new(),
             sequencers: Vec::new(),
             lfos: Vec::new(),
+            global_effects,
         }
     }
     
@@ -82,6 +90,22 @@ impl Engine {
     /// Get the global BPM
     pub fn bpm(&self) -> f32 {
         self.bpm
+    }
+
+    /// Add a global effect to the effects chain
+    /// Global effects are applied to the final output after all instruments are mixed
+    pub fn add_global_effect(&mut self, effect: Box<dyn Effect>) {
+        self.global_effects.push(effect);
+    }
+
+    /// Clear all global effects
+    pub fn clear_global_effects(&mut self) {
+        self.global_effects.clear();
+    }
+
+    /// Get the number of global effects
+    pub fn global_effect_count(&self) -> usize {
+        self.global_effects.len()
     }
 
     /// Add an instrument with a unique name
@@ -210,8 +234,11 @@ impl Engine {
             output += instrument.tick(current_time);
         }
 
-        // TODO
-        // later apply limiter here
+        // Apply global effects chain to the final output
+        for effect in &self.global_effects {
+            output = effect.process(output);
+        }
+
         output
     }
 
