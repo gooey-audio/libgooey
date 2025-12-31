@@ -1,9 +1,7 @@
 //! Shared audio engine logic for both native (CPAL) and WASM (web)
 
-pub mod audio_state;
 pub mod envelope;
 pub mod filters;
-pub mod stage;
 
 // New organized modules
 pub mod instruments;
@@ -11,9 +9,6 @@ pub mod effects;
 pub mod gen;
 pub mod sequencer;
 pub mod engine;
-
-// Platform abstraction layer
-pub mod platform;
 
 // WASM bindings (web)
 #[cfg(feature = "web")]

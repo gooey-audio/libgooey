@@ -50,17 +50,5 @@ name = "hihat"
 required-features = ["native", "crossterm"]
 
 [[example]]
-name = "sequencer_demo"
-required-features = ["native", "crossterm"]
-
-[[example]]
-name = "hihat_sequencer"
-required-features = ["native", "crossterm"]
-
-[[example]]
-name = "hihat_sequencer_live"
-required-features = ["native", "crossterm"]
-
-[[example]]
-name = "hihat2"
+name = "sequencer"
 required-features = ["native", "crossterm"]
