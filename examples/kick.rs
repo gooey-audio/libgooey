@@ -2,6 +2,10 @@
 Minimal code to start the audio engine and trigger kick drum hits.
 */
 
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 use std::io::{self, Write};
 
 // Import the platform abstraction and audio engine
@@ -34,30 +38,36 @@ fn main() -> anyhow::Result<()> {
 
     println!("=== Kick Drum Example ===");
     println!("Press SPACE to trigger kick drum, 'q' to quit");
+    println!("");
+
+    // Enable raw mode for immediate key detection
+    enable_raw_mode()?;
 
     // Main input loop
-    loop {
-        let mut input = String::new();
-        io::stdout().flush().unwrap();
-        io::stdin().read_line(&mut input).unwrap();
-
-        match input.trim() {
-            " " | "" => {
-                println!("Triggering kick drum!");
-                let mut engine = audio_engine.lock().unwrap();
-                engine.trigger_instrument("kick");
-            }
-            "q" => {
-                println!("Quitting...");
-                break;
-            }
-            _ => {
-                println!("Press SPACE to trigger kick drum, 'q' to quit");
+    let result = loop {
+        // Poll for key events (non-blocking with timeout)
+        if event::poll(std::time::Duration::from_millis(100))? {
+            if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+                match code {
+                    KeyCode::Char(' ') => {
+                        io::stdout().flush().unwrap();
+                        let mut engine = audio_engine.lock().unwrap();
+                        engine.trigger_instrument("kick");
+                    }
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        println!("\rQuitting...           ");
+                        break Ok(());
+                    }
+                    _ => {}
+                }
             }
         }
-    }
+    };
 
-    Ok(())
+    // Restore terminal to normal mode
+    disable_raw_mode()?;
+
+    result
 }
 
 #[cfg(not(feature = "native"))]
