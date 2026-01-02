@@ -13,6 +13,10 @@ pub use sequencer::Sequencer;
 pub mod lfo;
 pub use lfo::{Lfo, LfoSyncMode, MusicalDivision};
 
+// Export WaveformDisplay when both native and visualization features are enabled
+#[cfg(all(feature = "native", feature = "visualization"))]
+pub use crate::visualization::WaveformDisplay;
+
 /// Trait that all instruments must implement
 /// Send is required because instruments are used in the audio thread
 pub trait Instrument: Send {

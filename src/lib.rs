@@ -10,6 +10,10 @@ pub mod gen;
 pub mod sequencer;
 pub mod engine;
 
+// Visualization module (optional)
+#[cfg(feature = "visualization")]
+pub mod visualization;
+
 // WASM bindings (web)
 #[cfg(feature = "web")]
 pub mod web {

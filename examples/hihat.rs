@@ -1,5 +1,5 @@
-/* CLI example for hi-hat testing.
-Minimal code to start the audio engine and trigger hi-hat hits.
+/* CLI example for hi-hat testing with waveform visualization.
+Minimal code to start the audio engine and trigger hi-hat hits, with real-time waveform display.
 */
 
 use crossterm::{
@@ -13,7 +13,7 @@ use libgooey::engine::{Engine, EngineOutput};
 use libgooey::instruments::HiHat;
 use std::sync::{Arc, Mutex};
 
-// CLI example for hi-hat
+// Example for hi-hat with waveform visualization
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
     let sample_rate = 44100.0;
@@ -31,6 +31,11 @@ fn main() -> anyhow::Result<()> {
     // Create and configure the Engine output
     let mut engine_output = EngineOutput::new();
     engine_output.initialize(sample_rate)?;
+
+    // Enable visualization (optional - comment out to disable)
+    #[cfg(feature = "visualization")]
+    engine_output.enable_visualization(1200, 400, 2.0)?;
+
     engine_output.create_stream_with_engine(audio_engine.clone())?;
 
     // Start the audio stream
@@ -38,21 +43,31 @@ fn main() -> anyhow::Result<()> {
 
     println!("=== Hi-Hat Example ===");
     println!("Press SPACE to trigger hi-hat, 'q' to quit");
+    #[cfg(feature = "visualization")]
+    println!("Waveform visualization enabled");
     println!("");
 
     // Enable raw mode for immediate key detection
     enable_raw_mode()?;
 
-    // Main input loop
+    // Main input loop (works with or without visualization)
     let result = loop {
-        // Poll for key events (non-blocking with timeout)
-        if event::poll(std::time::Duration::from_millis(100))? {
+        // Update visualization if enabled (no-op if disabled)
+        if engine_output.update_visualization() {
+            println!("\rVisualization window closed");
+            break Ok(());
+        }
+
+        // Poll for key events (non-blocking with short timeout)
+        if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(KeyEvent { code, .. }) = event::read()? {
                 match code {
                     KeyCode::Char(' ') => {
                         io::stdout().flush().unwrap();
                         let mut engine = audio_engine.lock().unwrap();
                         engine.trigger_instrument("hihat");
+                        print!("*");
+                        io::stdout().flush().unwrap();
                     }
                     KeyCode::Char('q') | KeyCode::Esc => {
                         println!("\rQuitting...           ");
