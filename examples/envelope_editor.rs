@@ -54,75 +54,90 @@ fn main() -> anyhow::Result<()> {
     // Get initial config
     let initial_config = ADSRConfig::default();
 
-    // Create envelope editor in a separate thread
+    // Enable raw mode for immediate key detection (before creating window)
+    enable_raw_mode()?;
+
+    // Create envelope editor on the main thread (required for macOS)
     let editor_config = Arc::new(Mutex::new(initial_config));
+    let mut editor = match EnvelopeEditor::new(800, 600, initial_config) {
+        Ok(editor) => editor,
+        Err(e) => {
+            disable_raw_mode()?;
+            return Err(anyhow::anyhow!("Failed to create envelope editor: {}", e));
+        }
+    };
+
+    // Spawn a thread to handle terminal input
+    let audio_engine_clone = audio_engine.clone();
     let editor_config_clone = editor_config.clone();
+    let (input_tx, input_rx) = std::sync::mpsc::channel();
 
-    let editor_thread = thread::spawn(move || {
-        let mut editor = EnvelopeEditor::new(800, 600, *editor_config_clone.lock().unwrap())
-            .expect("Failed to create envelope editor");
+    thread::spawn(move || {
+        loop {
+            // Poll for key events (non-blocking with timeout)
+            match event::poll(std::time::Duration::from_millis(50)) {
+                Ok(true) => {
+                    if let Ok(Event::Key(KeyEvent { code, .. })) = event::read() {
+                        match code {
+                            KeyCode::Char(' ') => {
+                                // Get current envelope config
+                                let config = *editor_config_clone.lock().unwrap();
 
-        while !editor.should_close() {
-            editor.process_events();
-            editor.render();
+                                // Update the kick drum with the new envelope
+                                let mut engine = audio_engine_clone.lock().unwrap();
 
-            // Update the shared config
-            let new_config = editor.get_config();
-            *editor_config_clone.lock().unwrap() = new_config;
+                                println!("\rTriggering kick with envelope: A={:.3}s D={:.3}s S={:.2} R={:.3}s",
+                                         config.attack_time, config.decay_time, config.sustain_level, config.release_time);
 
-            // Small sleep to prevent busy waiting
-            std::thread::sleep(std::time::Duration::from_millis(16)); // ~60 FPS
+                                engine.trigger_instrument("kick");
+                                io::stdout().flush().unwrap();
+                            }
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                println!("\rQuitting...           ");
+                                let _ = input_tx.send(());
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(false) => {
+                    // Check if we should exit due to window closure
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
         }
     });
 
-    // Enable raw mode for immediate key detection
-    enable_raw_mode()?;
-
-    // Main input loop
-    let result = loop {
-        // Poll for key events (non-blocking with timeout)
-        if event::poll(std::time::Duration::from_millis(50))? {
-            if let Event::Key(KeyEvent { code, .. }) = event::read()? {
-                match code {
-                    KeyCode::Char(' ') => {
-                        io::stdout().flush().unwrap();
-
-                        // Get current envelope config from editor
-                        let config = *editor_config.lock().unwrap();
-
-                        // Update the kick drum with the new envelope
-                        let mut engine = audio_engine.lock().unwrap();
-
-                        // For kick drum, we'll update its amplitude envelope
-                        // Note: This is a simplified example. In a real scenario, you might
-                        // want to expose more envelope controls on the instruments.
-                        println!("\rTriggering kick with envelope: A={:.3}s D={:.3}s S={:.2} R={:.3}s",
-                                 config.attack_time, config.decay_time, config.sustain_level, config.release_time);
-
-                        engine.trigger_instrument("kick");
-                        io::stdout().flush().unwrap();
-                    }
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        println!("\rQuitting...           ");
-                        break Ok(());
-                    }
-                    _ => {}
-                }
-            }
+    // Main window loop
+    while !editor.should_close() {
+        // Check if input thread signaled quit
+        if input_rx.try_recv().is_ok() {
+            break;
         }
-    };
+
+        editor.process_events();
+        editor.render();
+
+        // Update the shared config
+        let new_config = editor.get_config();
+        *editor_config.lock().unwrap() = new_config;
+
+        // Small sleep to prevent busy waiting
+        std::thread::sleep(std::time::Duration::from_millis(16)); // ~60 FPS
+    }
 
     // Restore terminal to normal mode
     disable_raw_mode()?;
 
-    // Wait for editor thread to finish
-    let _ = editor_thread.join();
-
-    result
+    Ok(())
 }
 
 #[cfg(not(all(feature = "native", feature = "visualization", feature = "crossterm")))]
 fn main() {
     println!("This example requires the 'native', 'visualization', and 'crossterm' features.");
-    println!("Run with: cargo run --example envelope_editor --features native,visualization,crossterm");
+    println!(
+        "Run with: cargo run --example envelope_editor --features native,visualization,crossterm"
+    );
 }

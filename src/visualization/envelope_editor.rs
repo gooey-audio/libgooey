@@ -1,9 +1,8 @@
 /// Interactive envelope editor for debugging and experimentation
 /// This module provides a visual editor for ADSR envelopes with draggable control points
-
 use crate::envelope::ADSRConfig;
 use gl::types::*;
-use glfw::{Action, Context, Key, MouseButton, Window, WindowEvent};
+use glfw::{Action, Context, Key, MouseButton, WindowEvent};
 use std::ffi::CString;
 
 const VERTEX_SHADER: &str = r#"
@@ -32,9 +31,9 @@ pub struct EnvelopePoint {
 
 /// Interactive envelope editor with OpenGL rendering
 pub struct EnvelopeEditor {
-    window: glfw::Window,
+    window: glfw::PWindow,
     glfw: glfw::Glfw,
-    events: std::sync::mpsc::Receiver<(f64, glfw::WindowEvent)>,
+    events: glfw::GlfwReceiver<(f64, glfw::WindowEvent)>,
     shader_program: GLuint,
     vao: GLuint,
     vbo: GLuint,
@@ -58,13 +57,17 @@ pub struct EnvelopeEditor {
 impl EnvelopeEditor {
     /// Create a new envelope editor window
     pub fn new(width: u32, height: u32, initial_config: ADSRConfig) -> Result<Self, String> {
-        // Initialize GLFW
-        let mut glfw = glfw::init(glfw::FAIL_ON_ERRORS)
-            .map_err(|e| format!("Failed to initialize GLFW: {}", e))?;
+        // Initialize GLFW with logging error handler
+        let mut glfw = glfw::init(|error, description| {
+            eprintln!("GLFW Error {}: {}", error, description);
+        })
+        .map_err(|e| format!("Failed to initialize GLFW: {}", e))?;
 
         // Set OpenGL version hints
         glfw.window_hint(glfw::WindowHint::ContextVersion(3, 3));
-        glfw.window_hint(glfw::WindowHint::OpenGlProfile(glfw::OpenGlProfileHint::Core));
+        glfw.window_hint(glfw::WindowHint::OpenGlProfile(
+            glfw::OpenGlProfileHint::Core,
+        ));
 
         #[cfg(target_os = "macos")]
         glfw.window_hint(glfw::WindowHint::OpenGlForwardCompat(true));
@@ -81,8 +84,22 @@ impl EnvelopeEditor {
         window.set_framebuffer_size_polling(true);
         glfw.set_swap_interval(glfw::SwapInterval::Sync(1));
 
+        // Get actual framebuffer size (important for Retina displays)
+        let (fb_width, fb_height) = window.get_framebuffer_size();
+        let actual_width = fb_width as u32;
+        let actual_height = fb_height as u32;
+        eprintln!(
+            "Window size: {}x{}, Framebuffer size: {}x{}",
+            width, height, actual_width, actual_height
+        );
+
         // Load OpenGL function pointers
         gl::load_with(|symbol| window.get_proc_address(symbol) as *const _);
+
+        // Set viewport to actual framebuffer size
+        unsafe {
+            gl::Viewport(0, 0, fb_width, fb_height);
+        }
 
         // Create shader program
         let shader_program = unsafe {
@@ -100,8 +117,16 @@ impl EnvelopeEditor {
                 let mut len = 0;
                 gl::GetProgramiv(program, gl::INFO_LOG_LENGTH, &mut len);
                 let mut buffer = vec![0u8; len as usize];
-                gl::GetProgramInfoLog(program, len, std::ptr::null_mut(), buffer.as_mut_ptr() as *mut GLchar);
-                return Err(format!("Shader linking failed: {}", String::from_utf8_lossy(&buffer)));
+                gl::GetProgramInfoLog(
+                    program,
+                    len,
+                    std::ptr::null_mut(),
+                    buffer.as_mut_ptr() as *mut GLchar,
+                );
+                return Err(format!(
+                    "Shader linking failed: {}",
+                    String::from_utf8_lossy(&buffer)
+                ));
             }
 
             gl::DeleteShader(vertex_shader);
@@ -117,7 +142,14 @@ impl EnvelopeEditor {
             gl::GenBuffers(1, &mut vbo);
             gl::BindVertexArray(vao);
             gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
-            gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, 2 * std::mem::size_of::<f32>() as GLsizei, std::ptr::null());
+            gl::VertexAttribPointer(
+                0,
+                2,
+                gl::FLOAT,
+                gl::FALSE,
+                2 * std::mem::size_of::<f32>() as GLsizei,
+                std::ptr::null(),
+            );
             gl::EnableVertexAttribArray(0);
         }
 
@@ -135,7 +167,10 @@ impl EnvelopeEditor {
             amplitude: initial_config.sustain_level,
         };
         let release_point = EnvelopePoint {
-            time: initial_config.attack_time + initial_config.decay_time + 0.5 + initial_config.release_time,
+            time: initial_config.attack_time
+                + initial_config.decay_time
+                + 0.5
+                + initial_config.release_time,
             amplitude: 0.0,
         };
 
@@ -152,8 +187,8 @@ impl EnvelopeEditor {
             release_point,
             dragging_point: None,
             mouse_pos: (0.0, 0.0),
-            width,
-            height,
+            width: actual_width,
+            height: actual_height,
             margin: 0.1,
         })
     }
@@ -172,8 +207,16 @@ impl EnvelopeEditor {
             let mut len = 0;
             gl::GetShaderiv(shader, gl::INFO_LOG_LENGTH, &mut len);
             let mut buffer = vec![0u8; len as usize];
-            gl::GetShaderInfoLog(shader, len, std::ptr::null_mut(), buffer.as_mut_ptr() as *mut GLchar);
-            return Err(format!("Shader compilation failed: {}", String::from_utf8_lossy(&buffer)));
+            gl::GetShaderInfoLog(
+                shader,
+                len,
+                std::ptr::null_mut(),
+                buffer.as_mut_ptr() as *mut GLchar,
+            );
+            return Err(format!(
+                "Shader compilation failed: {}",
+                String::from_utf8_lossy(&buffer)
+            ));
         }
 
         Ok(shader)
@@ -182,15 +225,19 @@ impl EnvelopeEditor {
     /// Process window events
     pub fn process_events(&mut self) {
         self.glfw.poll_events();
-        for (_, event) in glfw::flush_messages(&self.events) {
+        let events: Vec<_> = glfw::flush_messages(&self.events).collect();
+        for (_, event) in events {
             match event {
                 WindowEvent::Key(Key::Escape, _, Action::Press, _) => {
                     self.window.set_should_close(true);
                 }
                 WindowEvent::MouseButton(MouseButton::Button1, Action::Press, _) => {
+                    eprintln!("Mouse press at {:?}", self.mouse_pos);
                     self.handle_mouse_press();
+                    eprintln!("Dragging point: {:?}", self.dragging_point);
                 }
                 WindowEvent::MouseButton(MouseButton::Button1, Action::Release, _) => {
+                    eprintln!("Mouse release");
                     self.dragging_point = None;
                 }
                 WindowEvent::CursorPos(x, y) => {
@@ -214,7 +261,9 @@ impl EnvelopeEditor {
     /// Handle mouse press to start dragging a control point
     fn handle_mouse_press(&mut self) {
         let (mx, my) = self.screen_to_normalized(self.mouse_pos.0, self.mouse_pos.1);
-        let threshold = 0.05;
+        let threshold = 0.15; // Increased from 0.05 to make points easier to click
+
+        eprintln!("Mouse normalized: ({}, {})", mx, my);
 
         // Check each control point
         let points = [
@@ -227,11 +276,17 @@ impl EnvelopeEditor {
         for (point, idx) in points.iter() {
             let (px, py) = self.point_to_normalized(point.time, point.amplitude);
             let dist = ((mx - px).powi(2) + (my - py).powi(2)).sqrt();
+            eprintln!(
+                "  Point {}: ({}, {}) time={} amp={} dist={}",
+                idx, px, py, point.time, point.amplitude, dist
+            );
             if dist < threshold {
                 self.dragging_point = Some(*idx);
+                eprintln!("  -> Selected point {}", idx);
                 return;
             }
         }
+        eprintln!("  -> No point selected");
     }
 
     /// Handle mouse drag to move control points
@@ -248,13 +303,17 @@ impl EnvelopeEditor {
                 }
                 1 => {
                     // Decay point - adjust both time and sustain level
-                    self.decay_point.time = time.max(self.attack_point.time + 0.001).min(self.sustain_point.time - 0.001);
+                    self.decay_point.time = time
+                        .max(self.attack_point.time + 0.001)
+                        .min(self.sustain_point.time - 0.001);
                     self.decay_point.amplitude = amplitude.clamp(0.0, 1.0);
                     self.sustain_point.amplitude = self.decay_point.amplitude;
                 }
                 2 => {
                     // Sustain point - horizontal movement (duration)
-                    self.sustain_point.time = time.max(self.decay_point.time + 0.001).min(self.release_point.time - 0.001);
+                    self.sustain_point.time = time
+                        .max(self.decay_point.time + 0.001)
+                        .min(self.release_point.time - 0.001);
                 }
                 3 => {
                     // Release point - only horizontal movement
@@ -314,11 +373,17 @@ impl EnvelopeEditor {
     fn draw_envelope_curve(&self) {
         let mut vertices = Vec::new();
 
+        // Start at origin (0, 0)
+        let (x0, y0) = self.point_to_normalized(0.0, 0.0);
+        vertices.push(x0);
+        vertices.push(y0);
+
         // Generate curve points
+        let max_time = self.release_point.time * 1.2;
         let steps = 200;
-        for i in 0..=steps {
+        for i in 1..=steps {
             let progress = i as f32 / steps as f32;
-            let time = progress * self.release_point.time * 1.2;
+            let time = progress * max_time;
             let amplitude = self.get_amplitude_at_time(time);
             let (x, y) = self.point_to_normalized(time, amplitude);
             vertices.push(x);
@@ -327,7 +392,8 @@ impl EnvelopeEditor {
 
         unsafe {
             // Set color for envelope curve
-            let color_loc = gl::GetUniformLocation(self.shader_program, b"color\0".as_ptr() as *const i8);
+            let color_loc =
+                gl::GetUniformLocation(self.shader_program, b"color\0".as_ptr() as *const i8);
             gl::Uniform3f(color_loc, 0.3, 0.8, 0.4);
 
             gl::BindBuffer(gl::ARRAY_BUFFER, self.vbo);
@@ -349,14 +415,16 @@ impl EnvelopeEditor {
             time / self.attack_point.time
         } else if time < self.decay_point.time {
             // Decay phase
-            let decay_progress = (time - self.attack_point.time) / (self.decay_point.time - self.attack_point.time);
+            let decay_progress =
+                (time - self.attack_point.time) / (self.decay_point.time - self.attack_point.time);
             1.0 - (1.0 - self.decay_point.amplitude) * decay_progress
         } else if time < self.sustain_point.time {
             // Sustain phase
             self.sustain_point.amplitude
         } else if time < self.release_point.time {
             // Release phase
-            let release_progress = (time - self.sustain_point.time) / (self.release_point.time - self.sustain_point.time);
+            let release_progress = (time - self.sustain_point.time)
+                / (self.release_point.time - self.sustain_point.time);
             self.sustain_point.amplitude * (1.0 - release_progress)
         } else {
             0.0
@@ -375,7 +443,7 @@ impl EnvelopeEditor {
         for (i, point) in points.iter().enumerate() {
             let (x, y) = self.point_to_normalized(point.time, point.amplitude);
             let is_dragging = self.dragging_point == Some(i);
-            self.draw_circle(x, y, 0.02, is_dragging);
+            self.draw_circle(x, y, 0.04, is_dragging); // Increased from 0.02 to make points more visible
         }
     }
 
@@ -391,7 +459,8 @@ impl EnvelopeEditor {
         }
 
         unsafe {
-            let color_loc = gl::GetUniformLocation(self.shader_program, b"color\0".as_ptr() as *const i8);
+            let color_loc =
+                gl::GetUniformLocation(self.shader_program, b"color\0".as_ptr() as *const i8);
             if highlighted {
                 gl::Uniform3f(color_loc, 1.0, 0.8, 0.2);
             } else {
@@ -432,7 +501,8 @@ impl EnvelopeEditor {
         }
 
         unsafe {
-            let color_loc = gl::GetUniformLocation(self.shader_program, b"color\0".as_ptr() as *const i8);
+            let color_loc =
+                gl::GetUniformLocation(self.shader_program, b"color\0".as_ptr() as *const i8);
             gl::Uniform3f(color_loc, 0.2, 0.2, 0.25);
 
             gl::BindBuffer(gl::ARRAY_BUFFER, self.vbo);
@@ -473,7 +543,8 @@ impl EnvelopeEditor {
         self.sustain_point.time = config.attack_time + config.decay_time + 0.5;
         self.sustain_point.amplitude = config.sustain_level;
 
-        self.release_point.time = config.attack_time + config.decay_time + 0.5 + config.release_time;
+        self.release_point.time =
+            config.attack_time + config.decay_time + 0.5 + config.release_time;
         self.release_point.amplitude = 0.0;
     }
 }

@@ -30,6 +30,16 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglfw3-dev libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
@@ -42,6 +52,14 @@ jobs:
 
           # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
           # prompt: 'Update the pull request description to include a summary of changes.'
+
+          # System instruction: Always test compilation when working with code changes
+          system_prompt: |
+            When working with Rust code changes, ALWAYS verify compilation before completing your work:
+            1. Run `cargo build --all-features` to test basic compilation
+            2. Run `cargo build --examples --all-features` to test examples compilation
+            3. If compilation fails, fix the errors before considering your work complete
+            4. Report compilation status in your response
 
           # Optional: Add claude_args to customize behavior and configuration
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md

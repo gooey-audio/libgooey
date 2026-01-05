@@ -31,6 +31,16 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglfw3-dev libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@v1
@@ -40,7 +50,13 @@ jobs:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
 
+            IMPORTANT: Before reviewing, you MUST test that the project compiles successfully:
+            1. Run `cargo build --all-features` to verify compilation
+            2. If there are examples in the examples/ directory, test them with `cargo build --examples --all-features`
+            3. If compilation fails, document the errors and suggest fixes
+
             Please review this pull request and provide feedback on:
+            - Compilation status (MUST CHECK FIRST)
             - Code quality and best practices
             - Potential bugs or issues
             - Performance considerations
