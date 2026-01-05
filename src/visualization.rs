@@ -8,7 +8,13 @@ use std::collections::VecDeque;
 pub mod waveform_display;
 
 #[cfg(feature = "visualization")]
+pub mod envelope_editor;
+
+#[cfg(feature = "visualization")]
 pub use waveform_display::{DisplayEvent, WaveformDisplay};
+
+#[cfg(feature = "visualization")]
+pub use envelope_editor::{EnvelopeEditor, EnvelopePoint};
 
 /// Thread-safe circular buffer for storing audio samples
 #[cfg(feature = "visualization")]

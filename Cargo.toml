@@ -55,3 +55,7 @@ required-features = ["native", "crossterm"]
 [[example]]
 name = "sequencer"
 required-features = ["native", "crossterm"]
+
+[[example]]
+name = "envelope_editor"
+required-features = ["native", "visualization", "crossterm"]
