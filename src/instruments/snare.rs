@@ -256,4 +256,75 @@ impl crate::engine::Instrument for SnareDrum {
     fn is_active(&self) -> bool {
         self.is_active()
     }
+
+    fn as_modulatable(&mut self) -> Option<&mut dyn crate::engine::Modulatable> {
+        Some(self)
+    }
+}
+
+// Implement modulation support for SnareDrum
+impl crate::engine::Modulatable for SnareDrum {
+    fn modulatable_parameters(&self) -> Vec<&'static str> {
+        vec![
+            "frequency",
+            "tonal",
+            "noise",
+            "crack",
+            "decay",
+            "pitch_drop",
+        ]
+    }
+
+    fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
+        match parameter {
+            "frequency" => {
+                // value is -1.0 to 1.0, map to frequency range
+                let range = self.parameter_range("frequency").unwrap();
+                self.config.snare_frequency = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
+                self.base_frequency = self.config.snare_frequency;
+                self.configure_oscillators();
+                Ok(())
+            }
+            "tonal" => {
+                // Map -1.0 to 1.0 -> 0.0 to 1.0
+                self.config.tonal_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                self.configure_oscillators();
+                Ok(())
+            }
+            "noise" => {
+                self.config.noise_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                self.configure_oscillators();
+                Ok(())
+            }
+            "crack" => {
+                self.config.crack_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                self.configure_oscillators();
+                Ok(())
+            }
+            "decay" => {
+                let range = self.parameter_range("decay").unwrap();
+                self.config.decay_time = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
+                self.configure_oscillators();
+                Ok(())
+            }
+            "pitch_drop" => {
+                self.config.pitch_drop = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                self.pitch_start_multiplier = 1.0 + self.config.pitch_drop * 1.5;
+                Ok(())
+            }
+            _ => Err(format!("Unknown parameter: {}", parameter)),
+        }
+    }
+
+    fn parameter_range(&self, parameter: &str) -> Option<(f32, f32)> {
+        match parameter {
+            "frequency" => Some((150.0, 400.0)), // 150Hz to 400Hz for snare
+            "tonal" => Some((0.0, 1.0)),
+            "noise" => Some((0.0, 1.0)),
+            "crack" => Some((0.0, 1.0)),
+            "decay" => Some((0.05, 0.8)), // 50ms to 800ms
+            "pitch_drop" => Some((0.0, 1.0)),
+            _ => None,
+        }
+    }
 }

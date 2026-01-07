@@ -217,3 +217,75 @@ impl TomDrum {
         self.pitch_start_multiplier = 1.0 + self.config.pitch_drop * 1.0;
     }
 }
+
+impl crate::engine::Instrument for TomDrum {
+    fn trigger(&mut self, time: f32) {
+        self.trigger(time);
+    }
+
+    fn tick(&mut self, current_time: f32) -> f32 {
+        self.tick(current_time)
+    }
+
+    fn is_active(&self) -> bool {
+        self.is_active()
+    }
+
+    fn as_modulatable(&mut self) -> Option<&mut dyn crate::engine::Modulatable> {
+        Some(self)
+    }
+}
+
+// Implement modulation support for TomDrum
+impl crate::engine::Modulatable for TomDrum {
+    fn modulatable_parameters(&self) -> Vec<&'static str> {
+        vec!["frequency", "tonal", "punch", "decay", "pitch_drop"]
+    }
+
+    fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
+        match parameter {
+            "frequency" => {
+                // value is -1.0 to 1.0, map to frequency range
+                let range = self.parameter_range("frequency").unwrap();
+                self.config.tom_frequency = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
+                self.base_frequency = self.config.tom_frequency;
+                self.configure_oscillators();
+                Ok(())
+            }
+            "tonal" => {
+                // Map -1.0 to 1.0 -> 0.0 to 1.0
+                self.config.tonal_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                self.configure_oscillators();
+                Ok(())
+            }
+            "punch" => {
+                self.config.punch_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                self.configure_oscillators();
+                Ok(())
+            }
+            "decay" => {
+                let range = self.parameter_range("decay").unwrap();
+                self.config.decay_time = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
+                self.configure_oscillators();
+                Ok(())
+            }
+            "pitch_drop" => {
+                self.config.pitch_drop = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                self.pitch_start_multiplier = 1.0 + self.config.pitch_drop * 1.0;
+                Ok(())
+            }
+            _ => Err(format!("Unknown parameter: {}", parameter)),
+        }
+    }
+
+    fn parameter_range(&self, parameter: &str) -> Option<(f32, f32)> {
+        match parameter {
+            "frequency" => Some((80.0, 300.0)), // 80Hz to 300Hz for toms
+            "tonal" => Some((0.0, 1.0)),
+            "punch" => Some((0.0, 1.0)),
+            "decay" => Some((0.1, 1.5)), // 100ms to 1.5s
+            "pitch_drop" => Some((0.0, 1.0)),
+            _ => None,
+        }
+    }
+}

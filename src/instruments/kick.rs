@@ -281,4 +281,68 @@ impl crate::engine::Instrument for KickDrum {
     fn is_active(&self) -> bool {
         self.is_active()
     }
+
+    fn as_modulatable(&mut self) -> Option<&mut dyn crate::engine::Modulatable> {
+        Some(self)
+    }
+}
+
+// Implement modulation support for KickDrum
+impl crate::engine::Modulatable for KickDrum {
+    fn modulatable_parameters(&self) -> Vec<&'static str> {
+        vec!["frequency", "punch", "sub", "click", "decay", "pitch_drop"]
+    }
+
+    fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
+        match parameter {
+            "frequency" => {
+                // value is -1.0 to 1.0, map to frequency range
+                let range = self.parameter_range("frequency").unwrap();
+                self.config.kick_frequency = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
+                self.base_frequency = self.config.kick_frequency;
+                self.configure_oscillators();
+                Ok(())
+            }
+            "punch" => {
+                // Map -1.0 to 1.0 -> 0.0 to 1.0
+                self.config.punch_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                self.configure_oscillators();
+                Ok(())
+            }
+            "sub" => {
+                self.config.sub_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                self.configure_oscillators();
+                Ok(())
+            }
+            "click" => {
+                self.config.click_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                self.configure_oscillators();
+                Ok(())
+            }
+            "decay" => {
+                let range = self.parameter_range("decay").unwrap();
+                self.config.decay_time = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
+                self.configure_oscillators();
+                Ok(())
+            }
+            "pitch_drop" => {
+                self.config.pitch_drop = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                self.pitch_start_multiplier = 1.0 + self.config.pitch_drop * 2.0;
+                Ok(())
+            }
+            _ => Err(format!("Unknown parameter: {}", parameter)),
+        }
+    }
+
+    fn parameter_range(&self, parameter: &str) -> Option<(f32, f32)> {
+        match parameter {
+            "frequency" => Some((30.0, 150.0)), // 30Hz to 150Hz for kick
+            "punch" => Some((0.0, 1.0)),
+            "sub" => Some((0.0, 1.0)),
+            "click" => Some((0.0, 1.0)),
+            "decay" => Some((0.05, 1.5)), // 50ms to 1.5s
+            "pitch_drop" => Some((0.0, 1.0)),
+            _ => None,
+        }
+    }
 }

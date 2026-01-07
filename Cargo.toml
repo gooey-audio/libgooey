@@ -55,3 +55,7 @@ required-features = ["native", "crossterm"]
 [[example]]
 name = "sequencer"
 required-features = ["native", "crossterm"]
+
+[[example]]
+name = "lfo_test"
+required-features = ["native", "crossterm"]
