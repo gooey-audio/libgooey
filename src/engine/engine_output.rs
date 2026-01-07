@@ -82,7 +82,7 @@ impl EngineOutput {
         self.audio_buffer = Some(audio_buffer.clone());
 
         // Create the waveform display (must be on main thread for macOS)
-        let display = WaveformDisplay::new(audio_buffer, width, height)
+        let display = WaveformDisplay::new(audio_buffer, width, height, self.sample_rate)
             .map_err(|e| anyhow::anyhow!("Failed to create waveform display: {}", e))?;
 
         self.display = Some(display);

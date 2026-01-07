@@ -62,9 +62,17 @@ fn main() -> anyhow::Result<()> {
     // Wrap in Arc<Mutex> for thread-safe access
     let audio_engine = Arc::new(Mutex::new(engine));
 
+    // Enable raw mode for immediate key detection (MUST be before GLFW window creation)
+    enable_raw_mode()?;
+
     // Create and configure the Engine output
     let mut engine_output = EngineOutput::new();
     engine_output.initialize(sample_rate)?;
+
+    // Enable visualization (optional - comment out to disable)
+    #[cfg(feature = "visualization")]
+    engine_output.enable_visualization(1200, 600, 2.0)?;
+
     engine_output.create_stream_with_engine(audio_engine.clone())?;
 
     // Start the audio stream
@@ -77,15 +85,22 @@ fn main() -> anyhow::Result<()> {
     println!("Press W/S to adjust filter cutoff frequency");
     println!("Press A/D to adjust filter resonance");
     println!("Press 'q' to quit");
+    #[cfg(feature = "visualization")]
+    println!("\nVisualization window shows:");
+    #[cfg(feature = "visualization")]
+    println!("  Top: Waveform | Bottom: Spectrogram (0-10kHz)");
     println!("");
-
-    // Enable raw mode for immediate key detection
-    enable_raw_mode()?;
 
     // Main input loop
     let result = loop {
-        // Poll for key events (non-blocking with timeout)
-        if event::poll(std::time::Duration::from_millis(100))? {
+        // Update visualization if enabled (no-op if disabled)
+        if engine_output.update_visualization() {
+            println!("\rVisualization window closed");
+            break Ok(());
+        }
+
+        // Poll for key events (non-blocking with short timeout for smooth visualization)
+        if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(KeyEvent { code, .. }) = event::read()? {
                 match code {
                     KeyCode::Char(' ') => {

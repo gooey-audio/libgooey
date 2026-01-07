@@ -28,6 +28,9 @@ fn main() -> anyhow::Result<()> {
     // Wrap in Arc<Mutex> for thread-safe access
     let audio_engine = Arc::new(Mutex::new(engine));
 
+    // Enable raw mode for immediate key detection (MUST be before GLFW window creation)
+    enable_raw_mode()?;
+
     // Create and configure the Engine output
     let mut engine_output = EngineOutput::new();
     engine_output.initialize(sample_rate)?;
@@ -46,9 +49,6 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "visualization")]
     println!("Waveform visualization enabled");
     println!("");
-
-    // Enable raw mode for immediate key detection
-    enable_raw_mode()?;
 
     // Main input loop (works with or without visualization)
     let result = loop {

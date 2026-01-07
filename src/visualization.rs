@@ -8,7 +8,13 @@ use std::collections::VecDeque;
 pub mod waveform_display;
 
 #[cfg(feature = "visualization")]
+pub mod spectrogram;
+
+#[cfg(feature = "visualization")]
 pub use waveform_display::{DisplayEvent, WaveformDisplay};
+
+#[cfg(feature = "visualization")]
+pub use spectrogram::SpectrogramAnalyzer;
 
 /// Thread-safe circular buffer for storing audio samples
 #[cfg(feature = "visualization")]

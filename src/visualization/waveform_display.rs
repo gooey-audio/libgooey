@@ -1,4 +1,4 @@
-use super::AudioBuffer;
+use super::{AudioBuffer, SpectrogramAnalyzer};
 use glfw::{Action, Context, GlfwReceiver, Key, WindowEvent};
 use std::ffi::CString;
 
@@ -20,11 +20,18 @@ pub struct WaveformDisplay {
     shader_program: u32,
     vao: u32,
     vbo: u32,
+    spectrogram: SpectrogramAnalyzer,
+    sample_rate: f32,
 }
 
 impl WaveformDisplay {
     /// Create a new waveform display window
-    pub fn new(audio_buffer: AudioBuffer, width: u32, height: u32) -> Result<Self, String> {
+    pub fn new(
+        audio_buffer: AudioBuffer,
+        width: u32,
+        height: u32,
+        sample_rate: f32,
+    ) -> Result<Self, String> {
         // Initialize GLFW
         let mut glfw = glfw::init(glfw::fail_on_errors)
             .map_err(|e| format!("Failed to initialize GLFW: {:?}", e))?;
@@ -58,6 +65,9 @@ impl WaveformDisplay {
         let shader_program = unsafe { create_shader_program()? };
         let (vao, vbo) = unsafe { create_buffers()? };
 
+        // Create spectrogram analyzer (512-point FFT, 200 history frames)
+        let spectrogram = SpectrogramAnalyzer::new(512, sample_rate, 200);
+
         Ok(Self {
             glfw,
             window,
@@ -68,6 +78,8 @@ impl WaveformDisplay {
             shader_program,
             vao,
             vbo,
+            spectrogram,
+            sample_rate,
         })
     }
 
@@ -111,11 +123,11 @@ impl WaveformDisplay {
         display_events
     }
 
-    /// Render the waveform
-    fn render(&self) {
+    /// Render the waveform and spectrogram
+    fn render(&mut self) {
         unsafe {
             // Clear the screen
-            gl::ClearColor(0.1, 0.1, 0.15, 1.0);
+            gl::ClearColor(0.05, 0.05, 0.1, 1.0);
             gl::Clear(gl::COLOR_BUFFER_BIT);
 
             // Use our shader program
@@ -126,6 +138,22 @@ impl WaveformDisplay {
             if samples.is_empty() {
                 return;
             }
+
+            // Analyze samples for spectrogram
+            self.spectrogram.analyze(&samples);
+
+            // Get color uniform location
+            let color_location =
+                gl::GetUniformLocation(self.shader_program, b"color\0".as_ptr() as *const i8);
+
+            // ====== TOP PANEL: WAVEFORM ======
+            // Set viewport for top half
+            gl::Viewport(
+                0,
+                (self.height / 2) as i32,
+                self.width as i32,
+                (self.height / 2) as i32,
+            );
 
             // Convert samples to vertices (normalized coordinates)
             let mut vertices: Vec<f32> = Vec::with_capacity(samples.len() * 2);
@@ -149,6 +177,7 @@ impl WaveformDisplay {
             );
 
             // Draw the waveform as a line strip
+            gl::Uniform3f(color_location, 0.2, 1.0, 0.5);
             gl::LineWidth(2.0);
             gl::DrawArrays(gl::LINE_STRIP, 0, (vertices.len() / 2) as i32);
 
@@ -160,18 +189,69 @@ impl WaveformDisplay {
                 center_line.as_ptr() as *const _,
                 gl::DYNAMIC_DRAW,
             );
-            gl::LineWidth(1.0);
-
-            // Set a different color for the center line
-            let color_location =
-                gl::GetUniformLocation(self.shader_program, b"color\0".as_ptr() as *const i8);
             gl::Uniform3f(color_location, 0.3, 0.3, 0.4);
+            gl::LineWidth(1.0);
             gl::DrawArrays(gl::LINES, 0, 2);
 
-            // Reset color to white for waveform
-            gl::Uniform3f(color_location, 0.2, 1.0, 0.5);
+            // ====== BOTTOM PANEL: SPECTROGRAM ======
+            // Set viewport for bottom half
+            gl::Viewport(0, 0, self.width as i32, (self.height / 2) as i32);
 
+            // Draw spectrogram as rectangles
+            self.render_spectrogram(color_location);
+
+            // Reset viewport
+            gl::Viewport(0, 0, self.width as i32, self.height as i32);
             gl::BindVertexArray(0);
+        }
+    }
+
+    /// Render the spectrogram
+    unsafe fn render_spectrogram(&self, color_location: i32) {
+        let history = self.spectrogram.get_history();
+        if history.is_empty() {
+            return;
+        }
+
+        let num_time_steps = history.len();
+        let num_freq_bins = self.spectrogram.num_bins();
+
+        // Draw each time step as a vertical strip
+        for (time_idx, spectrum) in history.iter().enumerate() {
+            let x_start = (time_idx as f32 / num_time_steps as f32) * 2.0 - 1.0;
+            let x_end = ((time_idx + 1) as f32 / num_time_steps as f32) * 2.0 - 1.0;
+
+            // Draw frequency bins (only show up to 10 kHz for visibility)
+            let max_freq_idx = (10000.0 / (self.sample_rate / 2.0) * num_freq_bins as f32) as usize;
+            let display_bins = max_freq_idx.min(num_freq_bins);
+
+            for freq_idx in 0..display_bins {
+                let y_start = (freq_idx as f32 / display_bins as f32) * 2.0 - 1.0;
+                let y_end = ((freq_idx + 1) as f32 / display_bins as f32) * 2.0 - 1.0;
+
+                // Get magnitude in dB and normalize to 0-1 range (assuming -80 dB to 0 dB)
+                let mag_db = spectrum[freq_idx];
+                let normalized = ((mag_db + 80.0) / 80.0).clamp(0.0, 1.0);
+
+                // Map to color (blue-green-yellow-red heat map)
+                let (r, g, b) = magnitude_to_color(normalized);
+                gl::Uniform3f(color_location, r, g, b);
+
+                // Draw rectangle for this frequency bin at this time
+                let quad: [f32; 8] = [
+                    x_start, y_start, x_end, y_start, x_end, y_end, x_start, y_end,
+                ];
+
+                gl::BindBuffer(gl::ARRAY_BUFFER, self.vbo);
+                gl::BufferData(
+                    gl::ARRAY_BUFFER,
+                    (quad.len() * std::mem::size_of::<f32>()) as isize,
+                    quad.as_ptr() as *const _,
+                    gl::DYNAMIC_DRAW,
+                );
+
+                gl::DrawArrays(gl::TRIANGLE_FAN, 0, 4);
+            }
         }
     }
 
@@ -340,4 +420,28 @@ unsafe fn check_program_link_errors(program: u32) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Convert magnitude (0.0 to 1.0) to heat map color (RGB)
+/// 0.0 = dark blue (silent)
+/// 0.5 = green/yellow (moderate)
+/// 1.0 = red (loud)
+fn magnitude_to_color(magnitude: f32) -> (f32, f32, f32) {
+    if magnitude < 0.25 {
+        // Dark blue to blue
+        let t = magnitude / 0.25;
+        (0.0, 0.0, 0.2 + t * 0.6)
+    } else if magnitude < 0.5 {
+        // Blue to cyan
+        let t = (magnitude - 0.25) / 0.25;
+        (0.0, t * 0.8, 0.8)
+    } else if magnitude < 0.75 {
+        // Cyan to yellow
+        let t = (magnitude - 0.5) / 0.25;
+        (t, 0.8, 0.8 * (1.0 - t))
+    } else {
+        // Yellow to red
+        let t = (magnitude - 0.75) / 0.25;
+        (1.0, 0.8 * (1.0 - t), 0.0)
+    }
 }
