@@ -117,6 +117,16 @@ impl Engine {
         self.instruments.insert(name.into(), instrument);
     }
 
+    /// Get a mutable reference to an instrument by name
+    pub fn instrument_mut(&mut self, name: &str) -> Option<&mut Box<dyn Instrument>> {
+        self.instruments.get_mut(name)
+    }
+
+    /// Get a reference to an instrument by name
+    pub fn instrument(&self, name: &str) -> Option<&Box<dyn Instrument>> {
+        self.instruments.get(name)
+    }
+
     /// Add a sequencer to the engine
     pub fn add_sequencer(&mut self, sequencer: Sequencer) {
         self.sequencers.push(sequencer);

@@ -1,18 +1,22 @@
 [package]
-name = "libgooey"
+name = "gooey"
 version = "0.1.0"
 edition = "2021"
 autoexamples = false
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = ["native"]
 native = ["cpal"]
+ios = []  # iOS target - no native audio output, just the engine
 web = ["wasm-bindgen", "js-sys", "web-sys"]
 crossterm = ["dep:crossterm"]
 visualization = ["glfw", "gl", "rustfft"]
+
+[build-dependencies]
+cbindgen = "0.26"
 
 [dependencies]
 cpal = { version = "0.15", optional = true }

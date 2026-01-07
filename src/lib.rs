@@ -6,6 +6,7 @@ pub mod filters;
 // New organized modules
 pub mod effects;
 pub mod engine;
+pub mod ffi;
 pub mod gen;
 pub mod instruments;
 pub mod sequencer;
