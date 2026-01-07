@@ -1,7 +1,7 @@
 #[derive(Clone, Copy, Debug)]
 pub struct ADSRConfig {
     pub attack_time: f32,   // seconds
-    pub decay_time: f32,    // seconds  
+    pub decay_time: f32,    // seconds
     pub sustain_level: f32, // 0.0 to 1.0
     pub release_time: f32,  // seconds
 }
@@ -10,7 +10,7 @@ impl ADSRConfig {
     pub fn new(attack: f32, decay: f32, sustain: f32, release: f32) -> Self {
         Self {
             attack_time: attack.max(0.001), // Minimum attack to avoid artifacts
-            decay_time: decay.max(0.001),   // Minimum decay 
+            decay_time: decay.max(0.001),   // Minimum decay
             sustain_level: sustain.clamp(0.0, 1.0),
             release_time: release.max(0.001), // Minimum release
         }
@@ -28,7 +28,7 @@ pub struct Envelope {
     pub release_time: f32,  // seconds
     pub current_time: f32,  // current time in the envelope
     pub is_active: bool,
-    pub trigger_time: f32,  // when the envelope was triggered
+    pub trigger_time: f32,               // when the envelope was triggered
     pub release_time_start: Option<f32>, // when release was triggered
 }
 
@@ -116,7 +116,7 @@ impl Envelope {
                     // Released during sustain
                     self.sustain_level
                 };
-                
+
                 // Apply release envelope
                 let release_progress = release_elapsed / self.release_time;
                 release_amplitude * (1.0 - release_progress)
@@ -145,4 +145,4 @@ impl Envelope {
             }
         }
     }
-} 
+}

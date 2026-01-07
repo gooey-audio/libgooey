@@ -4,12 +4,12 @@ use crate::gen::waveform::Waveform;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TomConfig {
-    pub tom_frequency: f32,  // Base frequency (80-300Hz typical for toms)
-    pub tonal_amount: f32,   // Tonal component presence (0.0-1.0)
-    pub punch_amount: f32,   // Attack/punch component presence (0.0-1.0)
-    pub decay_time: f32,     // Overall decay length in seconds
-    pub pitch_drop: f32,     // Frequency sweep amount (0.0-1.0)
-    pub volume: f32,         // Overall volume (0.0-1.0)
+    pub tom_frequency: f32, // Base frequency (80-300Hz typical for toms)
+    pub tonal_amount: f32,  // Tonal component presence (0.0-1.0)
+    pub punch_amount: f32,  // Attack/punch component presence (0.0-1.0)
+    pub decay_time: f32,    // Overall decay length in seconds
+    pub pitch_drop: f32,    // Frequency sweep amount (0.0-1.0)
+    pub volume: f32,        // Overall volume (0.0-1.0)
 }
 
 impl TomConfig {
@@ -57,8 +57,8 @@ pub struct TomDrum {
     pub config: TomConfig,
 
     // Two oscillators for tom character
-    pub tonal_oscillator: Oscillator,  // Main tonal component (sine/triangle)
-    pub punch_oscillator: Oscillator,  // Attack/punch component
+    pub tonal_oscillator: Oscillator, // Main tonal component (sine/triangle)
+    pub punch_oscillator: Oscillator, // Attack/punch component
 
     // Pitch envelope for frequency sweeping
     pub pitch_envelope: Envelope,
@@ -99,10 +99,10 @@ impl TomDrum {
         self.tonal_oscillator
             .set_volume(config.tonal_amount * config.volume);
         self.tonal_oscillator.set_adsr(ADSRConfig::new(
-            0.001,                    // Very fast attack
-            config.decay_time * 0.9,  // Main decay
-            0.0,                      // No sustain - drums should decay to silence
-            config.decay_time * 0.3,  // Medium release
+            0.001,                   // Very fast attack
+            config.decay_time * 0.9, // Main decay
+            0.0,                     // No sustain - drums should decay to silence
+            config.decay_time * 0.3, // Medium release
         ));
 
         // Punch oscillator: Triangle wave for attack character
@@ -111,18 +111,18 @@ impl TomDrum {
         self.punch_oscillator
             .set_volume(config.punch_amount * config.volume * 0.6);
         self.punch_oscillator.set_adsr(ADSRConfig::new(
-            0.001,                    // Very fast attack
-            config.decay_time * 0.3,  // Short decay for punch
-            0.0,                      // No sustain for punch
-            config.decay_time * 0.1,  // Quick release
+            0.001,                   // Very fast attack
+            config.decay_time * 0.3, // Short decay for punch
+            0.0,                     // No sustain for punch
+            config.decay_time * 0.1, // Quick release
         ));
 
         // Pitch envelope: Fast attack, medium decay for frequency sweeping
         self.pitch_envelope.set_config(ADSRConfig::new(
-            0.001,                    // Instant attack
-            config.decay_time * 0.4,  // Medium pitch drop
-            0.0,                      // Drop to base frequency
-            config.decay_time * 0.2,  // Medium release
+            0.001,                   // Instant attack
+            config.decay_time * 0.4, // Medium pitch drop
+            0.0,                     // Drop to base frequency
+            config.decay_time * 0.2, // Medium release
         ));
     }
 
@@ -165,7 +165,8 @@ impl TomDrum {
         self.tonal_oscillator.frequency_hz = self.base_frequency * frequency_multiplier;
 
         // Punch oscillator gets a more subtle pitch modulation
-        self.punch_oscillator.frequency_hz = self.base_frequency * 3.0 * (1.0 + (frequency_multiplier - 1.0) * 0.5);
+        self.punch_oscillator.frequency_hz =
+            self.base_frequency * 3.0 * (1.0 + (frequency_multiplier - 1.0) * 0.5);
 
         // Sum oscillator outputs
         let tonal_output = self.tonal_oscillator.tick(current_time);
@@ -174,9 +175,7 @@ impl TomDrum {
         let total_output = tonal_output + punch_output;
 
         // Check if tom is still active
-        if !self.tonal_oscillator.envelope.is_active
-            && !self.punch_oscillator.envelope.is_active
-        {
+        if !self.tonal_oscillator.envelope.is_active && !self.punch_oscillator.envelope.is_active {
             self.is_active = false;
         }
 

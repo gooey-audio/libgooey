@@ -16,8 +16,8 @@ impl FMSnapSynthesizer {
     pub fn new(sample_rate: f32) -> Self {
         Self {
             sample_rate,
-            attack_time: 0.001,  // 1ms attack
-            decay_time: 0.008,   // 8ms decay  
+            attack_time: 0.001, // 1ms attack
+            decay_time: 0.008,  // 8ms decay
             carrier_freq: 50.0,
             modulator_freq: 500.0,
             modulation_index: 2.0,
@@ -39,7 +39,7 @@ impl FMSnapSynthesizer {
         }
 
         let t = current_time - self.trigger_time;
-        
+
         // Check if we're past the envelope duration
         if t > self.attack_time + self.decay_time {
             self.is_active = false;
@@ -58,18 +58,18 @@ impl FMSnapSynthesizer {
         let dt = 1.0 / self.sample_rate;
         let mod_signal = (2.0 * PI * self.modulator_freq * t).sin();
         let instantaneous_freq = self.carrier_freq + self.modulation_index * mod_signal * env;
-        
+
         // Update phase
         self.phase += 2.0 * PI * instantaneous_freq * dt;
-        
+
         // Wrap phase to prevent overflow
         if self.phase > 2.0 * PI {
             self.phase -= 2.0 * PI;
         }
-        
+
         // Generate output
         let output = self.phase.sin() * env;
-        
+
         output
     }
 
@@ -77,7 +77,14 @@ impl FMSnapSynthesizer {
         self.is_active
     }
 
-    pub fn set_params(&mut self, attack_time: f32, decay_time: f32, carrier_freq: f32, modulator_freq: f32, modulation_index: f32) {
+    pub fn set_params(
+        &mut self,
+        attack_time: f32,
+        decay_time: f32,
+        carrier_freq: f32,
+        modulator_freq: f32,
+        modulation_index: f32,
+    ) {
         self.attack_time = attack_time;
         self.decay_time = decay_time;
         self.carrier_freq = carrier_freq;

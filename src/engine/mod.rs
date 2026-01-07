@@ -1,5 +1,5 @@
+use crate::effects::{BrickWallLimiter, Effect};
 use std::collections::{HashMap, VecDeque};
-use crate::effects::{Effect, BrickWallLimiter};
 
 #[cfg(feature = "native")]
 pub mod engine_output;
@@ -22,13 +22,13 @@ pub use crate::visualization::WaveformDisplay;
 pub trait Instrument: Send {
     /// Trigger the instrument at a specific time
     fn trigger(&mut self, time: f32);
-    
+
     /// Generate one sample of audio at the current time
     fn tick(&mut self, current_time: f32) -> f32;
-    
+
     /// Check if the instrument is currently active
     fn is_active(&self) -> bool;
-    
+
     /// Try to cast to Modulatable trait object
     /// Override this if the instrument supports modulation
     fn as_modulatable(&mut self) -> Option<&mut dyn Modulatable> {
@@ -40,12 +40,12 @@ pub trait Instrument: Send {
 pub trait Modulatable {
     /// Get list of parameter names that can be modulated
     fn modulatable_parameters(&self) -> Vec<&'static str>;
-    
+
     /// Apply a modulation value to a parameter
     /// value is typically -1.0 to 1.0
     /// Returns Ok(()) if parameter exists and was applied, Err otherwise
     fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String>;
-    
+
     /// Get the range for a parameter (min, max)
     fn parameter_range(&self, parameter: &str) -> Option<(f32, f32)>;
 }
@@ -70,7 +70,7 @@ impl Engine {
         // Initialize with a brick wall limiter as the default global effect
         let mut global_effects: Vec<Box<dyn Effect>> = Vec::new();
         global_effects.push(Box::new(BrickWallLimiter::new(1.0)));
-        
+
         Self {
             sample_rate,
             bpm: 120.0, // Default BPM
@@ -81,7 +81,7 @@ impl Engine {
             global_effects,
         }
     }
-    
+
     /// Set the global BPM and update all synced LFOs
     pub fn set_bpm(&mut self, bpm: f32) {
         self.bpm = bpm;
@@ -90,7 +90,7 @@ impl Engine {
             lfo.set_bpm(bpm);
         }
     }
-    
+
     /// Get the global BPM
     pub fn bpm(&self) -> f32 {
         self.bpm
@@ -163,21 +163,28 @@ impl Engine {
         amount: f32,
     ) -> Result<(), String> {
         // Validate instrument exists
-        let instrument = self.instruments.get_mut(instrument_name)
+        let instrument = self
+            .instruments
+            .get_mut(instrument_name)
             .ok_or_else(|| format!("Instrument '{}' not found", instrument_name))?;
-        
+
         // Validate parameter is modulatable
         if let Some(modulatable) = instrument.as_modulatable() {
             if !modulatable.modulatable_parameters().contains(&parameter) {
                 return Err(format!(
                     "Parameter '{}' is not modulatable on instrument '{}'. Available: {:?}",
-                    parameter, instrument_name, modulatable.modulatable_parameters()
+                    parameter,
+                    instrument_name,
+                    modulatable.modulatable_parameters()
                 ));
             }
         } else {
-            return Err(format!("Instrument '{}' does not support modulation", instrument_name));
+            return Err(format!(
+                "Instrument '{}' does not support modulation",
+                instrument_name
+            ));
         }
-        
+
         // Set up the mapping
         if let Some(lfo) = self.lfos.get_mut(lfo_index) {
             lfo.target_instrument = instrument_name.to_string();
@@ -201,7 +208,7 @@ impl Engine {
         // Process LFOs and apply modulation
         for lfo in &mut self.lfos {
             let lfo_value = lfo.tick();
-            
+
             // Apply modulation if this LFO has a target
             if !lfo.target_instrument.is_empty() && !lfo.target_parameter.is_empty() {
                 if let Some(instrument) = self.instruments.get_mut(&lfo.target_instrument) {

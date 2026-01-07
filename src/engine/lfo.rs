@@ -33,7 +33,7 @@ impl MusicalDivision {
             MusicalDivision::ThirtySecond => 0.125,
         }
     }
-    
+
     /// Convert to frequency in Hz at the given BPM
     pub fn to_frequency(&self, bpm: f32) -> f32 {
         // Beats per second = BPM / 60
@@ -58,7 +58,7 @@ pub struct Lfo {
     bpm: f32, // Current BPM (used when in BpmSync mode)
     phase: f32,
     sample_rate: f32,
-    
+
     // Routing
     pub target_instrument: String,
     pub target_parameter: String,
@@ -82,7 +82,7 @@ impl Lfo {
             offset: 0.0,
         }
     }
-    
+
     /// Create a new BPM-synced LFO
     /// - division: Musical time division (e.g., OneBar, Sixteenth)
     /// - bpm: Beats per minute
@@ -99,22 +99,22 @@ impl Lfo {
             offset: 0.0,
         }
     }
-    
+
     /// Set the frequency in Hz (switches to Hz mode)
     pub fn set_frequency(&mut self, frequency: f32) {
         self.sync_mode = LfoSyncMode::Hz(frequency);
     }
-    
+
     /// Set BPM sync mode with a musical division
     pub fn set_sync_mode(&mut self, division: MusicalDivision) {
         self.sync_mode = LfoSyncMode::BpmSync(division);
     }
-    
+
     /// Update the BPM (used when in BpmSync mode)
     pub fn set_bpm(&mut self, bpm: f32) {
         self.bpm = bpm;
     }
-    
+
     /// Get the current frequency in Hz
     pub fn frequency(&self) -> f32 {
         match self.sync_mode {
@@ -122,39 +122,38 @@ impl Lfo {
             LfoSyncMode::BpmSync(division) => division.to_frequency(self.bpm),
         }
     }
-    
+
     /// Get the current sync mode
     pub fn sync_mode(&self) -> LfoSyncMode {
         self.sync_mode
     }
-    
+
     /// Generate one sample and advance the phase
     /// Returns a value from -1.0 to 1.0 (sine wave)
     pub fn tick(&mut self) -> f32 {
         // Calculate sine wave
         let value = (self.phase * 2.0 * std::f32::consts::PI).sin();
-        
+
         // Advance phase
         let phase_increment = self.frequency() / self.sample_rate;
         self.phase += phase_increment;
-        
+
         // Wrap phase to 0.0-1.0
         if self.phase >= 1.0 {
             self.phase -= 1.0;
         }
-        
+
         // Apply offset and amount
         self.offset + (value * self.amount)
     }
-    
+
     /// Reset the phase to 0
     pub fn reset(&mut self) {
         self.phase = 0.0;
     }
-    
+
     /// Get the current phase (0.0 to 1.0)
     pub fn phase(&self) -> f32 {
         self.phase
     }
 }
-

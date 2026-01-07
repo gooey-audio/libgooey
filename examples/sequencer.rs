@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 // Import the engine and instruments
-use libgooey::engine::{Engine, EngineOutput, Sequencer, Lfo, MusicalDivision};
+use libgooey::engine::{Engine, EngineOutput, Lfo, MusicalDivision, Sequencer};
 use libgooey::instruments::HiHat;
 
 // CLI example for sequencer
@@ -28,7 +28,7 @@ fn main() -> anyhow::Result<()> {
     // Set the global BPM
     let bpm = 120.0;
     engine.set_bpm(bpm);
-    
+
     // Create a sequencer with a simple 8-step pattern (16th notes at 120 BPM)
     let pattern = vec![true, false, true, false, true, false, true, false];
     let sequencer = Sequencer::with_pattern(bpm, sample_rate, pattern, "hihat");
@@ -38,12 +38,13 @@ fn main() -> anyhow::Result<()> {
     // Start with 1 bar = one cycle every 4 beats
     let lfo = Lfo::new_synced(MusicalDivision::OneBar, bpm, sample_rate);
     let lfo_index = engine.add_lfo(lfo);
-    
+
     // Map the LFO to the hi-hat's decay parameter
     // Amount of 1.0 means the LFO will use full modulation range
-    engine.map_lfo_to_parameter(lfo_index, "hihat", "decay", 1.0)
+    engine
+        .map_lfo_to_parameter(lfo_index, "hihat", "decay", 1.0)
         .expect("Failed to map LFO to hi-hat decay");
-    
+
     println!("✓ LFO mapped to hi-hat decay");
     println!("  Synced to: 1 bar (4 beats)");
     println!("  Range: 20ms to 500ms decay time");
@@ -78,7 +79,7 @@ fn main() -> anyhow::Result<()> {
                     KeyCode::Char(' ') => {
                         io::stdout().flush().unwrap();
                         let mut engine = audio_engine.lock().unwrap();
-                        
+
                         // Toggle the first sequencer
                         if let Some(seq) = engine.sequencer_mut(0) {
                             if seq.is_running() {
@@ -94,7 +95,7 @@ fn main() -> anyhow::Result<()> {
                         let mut engine = audio_engine.lock().unwrap();
                         let new_bpm = (engine.bpm() + 5.0).min(200.0);
                         engine.set_bpm(new_bpm);
-                        
+
                         // Also update sequencer BPM
                         if let Some(seq) = engine.sequencer_mut(0) {
                             seq.set_bpm(new_bpm);
@@ -106,7 +107,7 @@ fn main() -> anyhow::Result<()> {
                         let mut engine = audio_engine.lock().unwrap();
                         let new_bpm = (engine.bpm() - 5.0).max(60.0);
                         engine.set_bpm(new_bpm);
-                        
+
                         // Also update sequencer BPM
                         if let Some(seq) = engine.sequencer_mut(0) {
                             seq.set_bpm(new_bpm);

@@ -60,9 +60,9 @@ pub struct SnareDrum {
     pub config: SnareConfig,
 
     // Three oscillators for different components
-    pub tonal_oscillator: Oscillator,  // Tonal component (triangle/sine)
-    pub noise_oscillator: Oscillator,  // Main noise component
-    pub crack_oscillator: Oscillator,  // High-frequency crack
+    pub tonal_oscillator: Oscillator, // Tonal component (triangle/sine)
+    pub noise_oscillator: Oscillator, // Main noise component
+    pub crack_oscillator: Oscillator, // High-frequency crack
 
     // Pitch envelope for frequency sweeping
     pub pitch_envelope: Envelope,
@@ -128,10 +128,10 @@ impl SnareDrum {
         self.crack_oscillator
             .set_volume(config.crack_amount * config.volume * 0.4);
         self.crack_oscillator.set_adsr(ADSRConfig::new(
-            0.001,                    // Very fast attack
-            config.decay_time * 0.2,  // Very short decay for crack
-            0.0,                      // No sustain
-            config.decay_time * 0.1,  // Very short release
+            0.001,                   // Very fast attack
+            config.decay_time * 0.2, // Very short decay for crack
+            0.0,                     // No sustain
+            config.decay_time * 0.1, // Very short release
         ));
 
         // Pitch envelope: Fast attack, quick decay for frequency sweeping

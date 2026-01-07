@@ -4,13 +4,13 @@ use crate::gen::waveform::Waveform;
 
 #[derive(Clone, Copy, Debug)]
 pub struct HiHatConfig {
-    pub base_frequency: f32,     // Base frequency for filtering (6000-12000Hz typical)
-    pub resonance: f32,          // Filter resonance (0.0-1.0)
-    pub brightness: f32,         // High-frequency content (0.0-1.0)
-    pub decay_time: f32,         // Decay length in seconds
-    pub attack_time: f32,        // Attack time in seconds
-    pub volume: f32,             // Overall volume (0.0-1.0)
-    pub is_open: bool,           // true for open, false for closed
+    pub base_frequency: f32, // Base frequency for filtering (6000-12000Hz typical)
+    pub resonance: f32,      // Filter resonance (0.0-1.0)
+    pub brightness: f32,     // High-frequency content (0.0-1.0)
+    pub decay_time: f32,     // Decay length in seconds
+    pub attack_time: f32,    // Attack time in seconds
+    pub volume: f32,         // Overall volume (0.0-1.0)
+    pub is_open: bool,       // true for open, false for closed
 }
 
 impl HiHatConfig {
@@ -110,22 +110,22 @@ impl HiHat {
         self.noise_oscillator.waveform = Waveform::Noise;
         self.noise_oscillator.frequency_hz = config.base_frequency;
         self.noise_oscillator.set_volume(config.volume);
-        
+
         // Configure envelope based on open/closed type
         if config.is_open {
             // Open hi-hat: longer decay, more sustain
             self.noise_oscillator.set_adsr(ADSRConfig::new(
-                config.attack_time,     // Quick attack
+                config.attack_time,      // Quick attack
                 config.decay_time * 0.3, // Medium decay
-                0.3,                    // Some sustain for open sound
+                0.3,                     // Some sustain for open sound
                 config.decay_time * 0.7, // Longer release
             ));
         } else {
             // Closed hi-hat: very short decay, no sustain
             self.noise_oscillator.set_adsr(ADSRConfig::new(
-                config.attack_time,     // Quick attack
+                config.attack_time,      // Quick attack
                 config.decay_time * 0.8, // Most of the decay
-                0.0,                    // No sustain for closed sound
+                0.0,                     // No sustain for closed sound
                 config.decay_time * 0.2, // Short release
             ));
         }
@@ -133,29 +133,30 @@ impl HiHat {
         // Brightness oscillator for high-frequency emphasis
         self.brightness_oscillator.waveform = Waveform::Noise;
         self.brightness_oscillator.frequency_hz = config.base_frequency * 2.0;
-        self.brightness_oscillator.set_volume(config.brightness * config.volume * 0.5);
-        
+        self.brightness_oscillator
+            .set_volume(config.brightness * config.volume * 0.5);
+
         // Brightness has a shorter envelope for transient emphasis
         self.brightness_oscillator.set_adsr(ADSRConfig::new(
-            config.attack_time,     // Quick attack
+            config.attack_time,      // Quick attack
             config.decay_time * 0.3, // Shorter decay for brightness
-            0.0,                    // No sustain
+            0.0,                     // No sustain
             config.decay_time * 0.1, // Very short release
         ));
 
         // Amplitude envelope for overall shaping
         if config.is_open {
             self.amplitude_envelope.set_config(ADSRConfig::new(
-                config.attack_time,     // Quick attack
+                config.attack_time,      // Quick attack
                 config.decay_time * 0.4, // Medium decay
-                0.2,                    // Low sustain
+                0.2,                     // Low sustain
                 config.decay_time * 0.6, // Longer release for open sound
             ));
         } else {
             self.amplitude_envelope.set_config(ADSRConfig::new(
-                config.attack_time,     // Quick attack
+                config.attack_time,      // Quick attack
                 config.decay_time * 0.9, // Most of the decay
-                0.0,                    // No sustain for closed sound
+                0.0,                     // No sustain for closed sound
                 config.decay_time * 0.1, // Very short release
             ));
         }
@@ -287,14 +288,18 @@ impl crate::engine::Modulatable for HiHat {
                 // value is -1.0 to 1.0, map to decay range
                 let range = self.parameter_range("decay").unwrap();
                 self.config.decay_time = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
-                
+
                 // Update the amplitude envelope decay time directly (efficient!)
                 if self.config.is_open {
-                    self.amplitude_envelope.set_decay_time(self.config.decay_time * 0.4);
-                    self.amplitude_envelope.set_release_time(self.config.decay_time * 0.6);
+                    self.amplitude_envelope
+                        .set_decay_time(self.config.decay_time * 0.4);
+                    self.amplitude_envelope
+                        .set_release_time(self.config.decay_time * 0.6);
                 } else {
-                    self.amplitude_envelope.set_decay_time(self.config.decay_time * 0.9);
-                    self.amplitude_envelope.set_release_time(self.config.decay_time * 0.1);
+                    self.amplitude_envelope
+                        .set_decay_time(self.config.decay_time * 0.9);
+                    self.amplitude_envelope
+                        .set_release_time(self.config.decay_time * 0.1);
                 }
                 Ok(())
             }
@@ -316,23 +321,24 @@ impl crate::engine::Modulatable for HiHat {
             "attack" => {
                 let range = self.parameter_range("attack").unwrap();
                 self.config.attack_time = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
-                
+
                 // Update envelope attack time directly
-                self.amplitude_envelope.set_attack_time(self.config.attack_time);
+                self.amplitude_envelope
+                    .set_attack_time(self.config.attack_time);
                 Ok(())
             }
-            _ => Err(format!("Unknown parameter: {}", parameter))
+            _ => Err(format!("Unknown parameter: {}", parameter)),
         }
     }
 
     fn parameter_range(&self, parameter: &str) -> Option<(f32, f32)> {
         match parameter {
-            "decay" => Some((0.02, 0.5)),        // 20ms to 500ms
+            "decay" => Some((0.02, 0.5)), // 20ms to 500ms
             "brightness" => Some((0.0, 1.0)),
             "resonance" => Some((0.0, 1.0)),
             "frequency" => Some((5000.0, 15000.0)),
-            "attack" => Some((0.0001, 0.01)),    // 0.1ms to 10ms
-            _ => None
+            "attack" => Some((0.0001, 0.01)), // 0.1ms to 10ms
+            _ => None,
         }
     }
 }

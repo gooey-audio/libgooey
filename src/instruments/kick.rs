@@ -1,8 +1,8 @@
 use crate::envelope::{ADSRConfig, Envelope};
 use crate::filters::ResonantHighpassFilter;
-use crate::instruments::fm_snap::FMSnapSynthesizer;
 use crate::gen::oscillator::Oscillator;
 use crate::gen::waveform::Waveform;
+use crate::instruments::fm_snap::FMSnapSynthesizer;
 
 #[derive(Clone, Copy, Debug)]
 pub struct KickConfig {
@@ -211,7 +211,10 @@ impl KickDrum {
         // Add FM snap for beater sound
         let fm_snap_output = self.fm_snap.tick(current_time);
 
-        let total_output = sub_output + punch_output + filtered_click_output + (fm_snap_output * self.config.volume);
+        let total_output = sub_output
+            + punch_output
+            + filtered_click_output
+            + (fm_snap_output * self.config.volume);
 
         // Check if kick is still active
         if !self.sub_oscillator.envelope.is_active
