@@ -10,6 +10,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 // Import the engine and instruments
+use libgooey::effects::LowpassFilterEffect;
 use libgooey::engine::{Engine, EngineOutput, Lfo, MusicalDivision, Sequencer};
 use libgooey::instruments::HiHat;
 
@@ -49,6 +50,15 @@ fn main() -> anyhow::Result<()> {
     println!("  Synced to: 1 bar (4 beats)");
     println!("  Range: 20ms to 500ms decay time");
 
+    // Add a lowpass filter effect to the engine
+    let filter = LowpassFilterEffect::new(sample_rate, 2000.0, 0.3);
+    let filter_control = filter.get_control();
+    engine.add_global_effect(Box::new(filter));
+
+    println!("✓ Lowpass filter added to output");
+    println!("  Initial cutoff: 2000 Hz");
+    println!("  Resonance: 0.3");
+
     // Wrap in Arc<Mutex> for thread-safe access
     let audio_engine = Arc::new(Mutex::new(engine));
 
@@ -60,10 +70,12 @@ fn main() -> anyhow::Result<()> {
     // Start the audio stream
     engine_output.start()?;
 
-    println!("=== Sequencer + LFO Example ===");
+    println!("=== Sequencer + LFO + Filter Example ===");
     println!("Press SPACE to start/stop sequencer");
     println!("Press UP/DOWN to adjust BPM");
     println!("Press LEFT/RIGHT to cycle LFO division");
+    println!("Press W/S to adjust filter cutoff frequency");
+    println!("Press A/D to adjust filter resonance");
     println!("Press 'q' to quit");
     println!("");
 
@@ -181,7 +193,35 @@ fn main() -> anyhow::Result<()> {
                         }
                         io::stdout().flush().unwrap();
                     }
-                    KeyCode::Char('q') | KeyCode::Esc => {
+                    KeyCode::Char('w') | KeyCode::Char('W') => {
+                        let current = filter_control.get_cutoff_freq();
+                        let new_cutoff = (current + 200.0).min(20000.0);
+                        filter_control.set_cutoff_freq(new_cutoff);
+                        println!("\rFilter Cutoff: {:.0} Hz  ", new_cutoff);
+                        io::stdout().flush().unwrap();
+                    }
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        let current = filter_control.get_cutoff_freq();
+                        let new_cutoff = (current - 200.0).max(100.0);
+                        filter_control.set_cutoff_freq(new_cutoff);
+                        println!("\rFilter Cutoff: {:.0} Hz  ", new_cutoff);
+                        io::stdout().flush().unwrap();
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        let current = filter_control.get_resonance();
+                        let new_resonance = (current - 0.05).max(0.0);
+                        filter_control.set_resonance(new_resonance);
+                        println!("\rFilter Resonance: {:.2}  ", new_resonance);
+                        io::stdout().flush().unwrap();
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        let current = filter_control.get_resonance();
+                        let new_resonance = (current + 0.05).min(0.95);
+                        filter_control.set_resonance(new_resonance);
+                        println!("\rFilter Resonance: {:.2}  ", new_resonance);
+                        io::stdout().flush().unwrap();
+                    }
+                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                         println!("\rQuitting...           ");
                         break Ok(());
                     }

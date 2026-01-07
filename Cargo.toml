@@ -53,6 +53,10 @@ name = "hihat"
 required-features = ["native", "crossterm"]
 
 [[example]]
+name = "tom"
+required-features = ["native", "crossterm"]
+
+[[example]]
 name = "sequencer"
 required-features = ["native", "crossterm"]
 
