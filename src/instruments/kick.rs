@@ -3,7 +3,10 @@ use crate::filters::ResonantHighpassFilter;
 use crate::gen::oscillator::Oscillator;
 use crate::gen::waveform::Waveform;
 use crate::instruments::fm_snap::FMSnapSynthesizer;
+use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
+/// Static configuration for kick drum presets
+/// Used to initialize a KickDrum with specific parameter values
 #[derive(Clone, Copy, Debug)]
 pub struct KickConfig {
     pub kick_frequency: f32, // Base frequency (40-80Hz typical)
@@ -53,9 +56,74 @@ impl KickConfig {
     }
 }
 
+/// Smoothed parameters for real-time control of the kick drum
+/// These use one-pole smoothing to prevent clicks/pops during parameter changes
+pub struct KickParams {
+    pub frequency: SmoothedParam,   // Base frequency (20-200 Hz)
+    pub punch: SmoothedParam,       // Mid-frequency presence (0-1)
+    pub sub: SmoothedParam,         // Sub-bass presence (0-1)
+    pub click: SmoothedParam,       // High-frequency click (0-1)
+    pub decay: SmoothedParam,       // Decay time in seconds (0.01-5.0)
+    pub pitch_drop: SmoothedParam,  // Pitch envelope amount (0-1)
+    pub volume: SmoothedParam,      // Overall volume (0-1)
+}
+
+impl KickParams {
+    /// Create new smoothed parameters from a config
+    pub fn from_config(config: &KickConfig, sample_rate: f32) -> Self {
+        Self {
+            frequency: SmoothedParam::new(config.kick_frequency, 20.0, 200.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            punch: SmoothedParam::new(config.punch_amount, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            sub: SmoothedParam::new(config.sub_amount, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            click: SmoothedParam::new(config.click_amount, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            decay: SmoothedParam::new(config.decay_time, 0.01, 5.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            pitch_drop: SmoothedParam::new(config.pitch_drop, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            volume: SmoothedParam::new(config.volume, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+        }
+    }
+
+    /// Tick all smoothers and return whether any are still smoothing
+    #[inline]
+    pub fn tick(&mut self) -> bool {
+        self.frequency.tick();
+        self.punch.tick();
+        self.sub.tick();
+        self.click.tick();
+        self.decay.tick();
+        self.pitch_drop.tick();
+        self.volume.tick();
+        
+        // Return true if any smoother is still active
+        !self.is_settled()
+    }
+
+    /// Check if all parameters have settled
+    pub fn is_settled(&self) -> bool {
+        self.frequency.is_settled() && self.punch.is_settled() && 
+        self.sub.is_settled() && self.click.is_settled() &&
+        self.decay.is_settled() && self.pitch_drop.is_settled() &&
+        self.volume.is_settled()
+    }
+
+    /// Get a snapshot of current values as a KickConfig (for reading back)
+    pub fn to_config(&self) -> KickConfig {
+        KickConfig {
+            kick_frequency: self.frequency.get(),
+            punch_amount: self.punch.get(),
+            sub_amount: self.sub.get(),
+            click_amount: self.click.get(),
+            decay_time: self.decay.get(),
+            pitch_drop: self.pitch_drop.get(),
+            volume: self.volume.get(),
+        }
+    }
+}
+
 pub struct KickDrum {
     pub sample_rate: f32,
-    pub config: KickConfig,
+    
+    /// Smoothed parameters for click-free real-time control
+    pub params: KickParams,
 
     // Three oscillators for different frequency ranges
     pub sub_oscillator: Oscillator,   // Sub-bass (fundamental)
@@ -64,8 +132,7 @@ pub struct KickDrum {
 
     // Pitch envelope for frequency sweeping
     pub pitch_envelope: Envelope,
-    pub base_frequency: f32,
-    pub pitch_start_multiplier: f32,
+    pitch_start_multiplier: f32,
 
     // High-pass filter for click oscillator
     pub click_filter: ResonantHighpassFilter,
@@ -83,14 +150,14 @@ impl KickDrum {
     }
 
     pub fn with_config(sample_rate: f32, config: KickConfig) -> Self {
+        let params = KickParams::from_config(&config, sample_rate);
         let mut kick = Self {
             sample_rate,
-            config,
+            params,
             sub_oscillator: Oscillator::new(sample_rate, config.kick_frequency),
             punch_oscillator: Oscillator::new(sample_rate, config.kick_frequency * 2.5),
             click_oscillator: Oscillator::new(sample_rate, config.kick_frequency * 40.0),
             pitch_envelope: Envelope::new(),
-            base_frequency: config.kick_frequency,
             pitch_start_multiplier: 1.0 + config.pitch_drop * 2.0, // Start 1-3x higher
             click_filter: ResonantHighpassFilter::new(sample_rate, 8000.0, 4.0),
             fm_snap: FMSnapSynthesizer::new(sample_rate),
@@ -101,63 +168,89 @@ impl KickDrum {
         kick
     }
 
+    /// Configure oscillators from current smoothed parameter values
+    /// Called once at initialization and when decay changes significantly
     fn configure_oscillators(&mut self) {
-        let config = self.config;
+        let decay = self.params.decay.get();
 
-        // Sub oscillator: Deep sine wave with synchronized timing
+        // Sub oscillator: Deep sine wave
         self.sub_oscillator.waveform = Waveform::Sine;
-        self.sub_oscillator.frequency_hz = config.kick_frequency;
-        self.sub_oscillator
-            .set_volume(config.sub_amount * config.volume);
         self.sub_oscillator.set_adsr(ADSRConfig::new(
-            0.001,                   // Very fast attack
-            config.decay_time,       // Synchronized decay time
-            0.0,                     // No sustain
-            config.decay_time * 0.2, // Synchronized release
+            0.001,            // Very fast attack
+            decay,            // Synchronized decay time
+            0.0,              // No sustain
+            decay * 0.2,      // Synchronized release
         ));
 
-        // Punch oscillator: Sine or triangle for mid-range impact
+        // Punch oscillator: Triangle for mid-range impact
         self.punch_oscillator.waveform = Waveform::Triangle;
-        self.punch_oscillator.frequency_hz = config.kick_frequency * 2.5;
-        self.punch_oscillator
-            .set_volume(config.punch_amount * config.volume * 0.7);
         self.punch_oscillator.set_adsr(ADSRConfig::new(
-            0.001,                   // Very fast attack
-            config.decay_time,       // Synchronized decay time
-            0.0,                     // No sustain
-            config.decay_time * 0.2, // Synchronized release
+            0.001,            // Very fast attack
+            decay,            // Synchronized decay time
+            0.0,              // No sustain
+            decay * 0.2,      // Synchronized release
         ));
 
         // Click oscillator: High-frequency filtered noise transient
         self.click_oscillator.waveform = Waveform::Noise;
-        self.click_oscillator.frequency_hz = config.kick_frequency * 40.0;
-        self.click_oscillator
-            .set_volume(config.click_amount * config.volume * 0.3);
         self.click_oscillator.set_adsr(ADSRConfig::new(
-            0.001,                    // Very fast attack
-            config.decay_time * 0.2,  // Much shorter decay time for click
-            0.0,                      // No sustain
-            config.decay_time * 0.02, // Extremely short release for click
+            0.001,             // Very fast attack
+            decay * 0.2,       // Much shorter decay for click
+            0.0,               // No sustain
+            decay * 0.02,      // Extremely short release
         ));
 
         // Pitch envelope: Fast attack, synchronized decay for frequency sweeping
         self.pitch_envelope.set_config(ADSRConfig::new(
-            0.001,                   // Instant attack
-            config.decay_time,       // Synchronized decay time
-            0.0,                     // Drop to base frequency
-            config.decay_time * 0.2, // Synchronized release
+            0.001,            // Instant attack
+            decay,            // Synchronized decay time
+            0.0,              // Drop to base frequency
+            decay * 0.2,      // Synchronized release
         ));
     }
 
+    /// Apply current smoothed parameters to oscillators (called per-sample)
+    #[inline]
+    fn apply_params(&mut self) {
+        let punch = self.params.punch.get();
+        let sub = self.params.sub.get();
+        let click = self.params.click.get();
+        let pitch_drop = self.params.pitch_drop.get();
+        let volume = self.params.volume.get();
+
+        // Update pitch start multiplier
+        self.pitch_start_multiplier = 1.0 + pitch_drop * 2.0;
+
+        // Update oscillator volumes (these can change smoothly)
+        self.sub_oscillator.set_volume(sub * volume);
+        self.punch_oscillator.set_volume(punch * volume * 0.7);
+        self.click_oscillator.set_volume(click * volume * 0.3);
+    }
+
     pub fn set_config(&mut self, config: KickConfig) {
-        self.config = config;
-        self.base_frequency = config.kick_frequency;
-        self.pitch_start_multiplier = 1.0 + config.pitch_drop * 2.0;
+        // Set all parameter targets (will smooth to new values)
+        self.params.frequency.set_target(config.kick_frequency);
+        self.params.punch.set_target(config.punch_amount);
+        self.params.sub.set_target(config.sub_amount);
+        self.params.click.set_target(config.click_amount);
+        self.params.decay.set_target(config.decay_time);
+        self.params.pitch_drop.set_target(config.pitch_drop);
+        self.params.volume.set_target(config.volume);
+        
+        // Reconfigure envelopes for new decay time
         self.configure_oscillators();
+    }
+    
+    /// Get current config snapshot (reads current smoothed values)
+    pub fn config(&self) -> KickConfig {
+        self.params.to_config()
     }
 
     pub fn trigger(&mut self, time: f32) {
         self.is_active = true;
+
+        // Reconfigure envelopes with current decay value before triggering
+        self.configure_oscillators();
 
         // Trigger all oscillators
         self.sub_oscillator.trigger(time);
@@ -184,21 +277,29 @@ impl KickDrum {
     }
 
     pub fn tick(&mut self, current_time: f32) -> f32 {
+        // Always tick smoothers (even when not active, to settle values)
+        self.params.tick();
+        
         if !self.is_active {
             return 0.0;
         }
+
+        // Apply smoothed parameters to oscillators
+        self.apply_params();
+        
+        let base_frequency = self.params.frequency.get();
 
         // Calculate pitch modulation
         let pitch_envelope_value = self.pitch_envelope.get_amplitude(current_time);
         let frequency_multiplier = 1.0 + (self.pitch_start_multiplier - 1.0) * pitch_envelope_value;
 
         // Apply pitch envelope to oscillators
-        self.sub_oscillator.frequency_hz = self.base_frequency * frequency_multiplier;
-        self.punch_oscillator.frequency_hz = self.base_frequency * 2.5 * frequency_multiplier;
+        self.sub_oscillator.frequency_hz = base_frequency * frequency_multiplier;
+        self.punch_oscillator.frequency_hz = base_frequency * 2.5 * frequency_multiplier;
 
         // Click oscillator gets less pitch modulation to maintain transient character
         let click_pitch_mod = 1.0 + (frequency_multiplier - 1.0) * 0.3;
-        self.click_oscillator.frequency_hz = self.base_frequency * 40.0 * click_pitch_mod;
+        self.click_oscillator.frequency_hz = base_frequency * 40.0 * click_pitch_mod;
 
         // Sum all oscillator outputs
         let sub_output = self.sub_oscillator.tick(current_time);
@@ -214,7 +315,7 @@ impl KickDrum {
         let total_output = sub_output
             + punch_output
             + filtered_click_output
-            + (fm_snap_output * self.config.volume);
+            + (fm_snap_output * self.params.volume.get());
 
         // Check if kick is still active
         if !self.sub_oscillator.envelope.is_active
@@ -232,40 +333,39 @@ impl KickDrum {
         self.is_active
     }
 
+    /// Set volume (smoothed)
     pub fn set_volume(&mut self, volume: f32) {
-        self.config.volume = volume.clamp(0.0, 1.0);
-        self.configure_oscillators();
+        self.params.volume.set_target(volume);
     }
 
+    /// Set base frequency (smoothed)
     pub fn set_frequency(&mut self, frequency: f32) {
-        self.config.kick_frequency = frequency.max(20.0).min(200.0);
-        self.base_frequency = self.config.kick_frequency;
-        self.configure_oscillators();
+        self.params.frequency.set_target(frequency);
     }
 
+    /// Set decay time (smoothed, takes effect on next trigger)
     pub fn set_decay(&mut self, decay_time: f32) {
-        self.config.decay_time = decay_time.max(0.01).min(5.0);
-        self.configure_oscillators();
+        self.params.decay.set_target(decay_time);
     }
 
+    /// Set punch amount (smoothed)
     pub fn set_punch(&mut self, punch_amount: f32) {
-        self.config.punch_amount = punch_amount.clamp(0.0, 1.0);
-        self.configure_oscillators();
+        self.params.punch.set_target(punch_amount);
     }
 
+    /// Set sub amount (smoothed)
     pub fn set_sub(&mut self, sub_amount: f32) {
-        self.config.sub_amount = sub_amount.clamp(0.0, 1.0);
-        self.configure_oscillators();
+        self.params.sub.set_target(sub_amount);
     }
 
+    /// Set click amount (smoothed)
     pub fn set_click(&mut self, click_amount: f32) {
-        self.config.click_amount = click_amount.clamp(0.0, 1.0);
-        self.configure_oscillators();
+        self.params.click.set_target(click_amount);
     }
 
+    /// Set pitch drop amount (smoothed)
     pub fn set_pitch_drop(&mut self, pitch_drop: f32) {
-        self.config.pitch_drop = pitch_drop.clamp(0.0, 1.0);
-        self.pitch_start_multiplier = 1.0 + self.config.pitch_drop * 2.0;
+        self.params.pitch_drop.set_target(pitch_drop);
     }
 }
 
@@ -290,44 +390,38 @@ impl crate::engine::Instrument for KickDrum {
 // Implement modulation support for KickDrum
 impl crate::engine::Modulatable for KickDrum {
     fn modulatable_parameters(&self) -> Vec<&'static str> {
-        vec!["frequency", "punch", "sub", "click", "decay", "pitch_drop"]
+        vec!["frequency", "punch", "sub", "click", "decay", "pitch_drop", "volume"]
     }
 
     fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
+        // value is -1.0 to 1.0 (bipolar), set_bipolar maps this to the param range
         match parameter {
             "frequency" => {
-                // value is -1.0 to 1.0, map to frequency range
-                let range = self.parameter_range("frequency").unwrap();
-                self.config.kick_frequency = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
-                self.base_frequency = self.config.kick_frequency;
-                self.configure_oscillators();
+                self.params.frequency.set_bipolar(value);
                 Ok(())
             }
             "punch" => {
-                // Map -1.0 to 1.0 -> 0.0 to 1.0
-                self.config.punch_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                self.configure_oscillators();
+                self.params.punch.set_bipolar(value);
                 Ok(())
             }
             "sub" => {
-                self.config.sub_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                self.configure_oscillators();
+                self.params.sub.set_bipolar(value);
                 Ok(())
             }
             "click" => {
-                self.config.click_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                self.configure_oscillators();
+                self.params.click.set_bipolar(value);
                 Ok(())
             }
             "decay" => {
-                let range = self.parameter_range("decay").unwrap();
-                self.config.decay_time = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
-                self.configure_oscillators();
+                self.params.decay.set_bipolar(value);
                 Ok(())
             }
             "pitch_drop" => {
-                self.config.pitch_drop = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                self.pitch_start_multiplier = 1.0 + self.config.pitch_drop * 2.0;
+                self.params.pitch_drop.set_bipolar(value);
+                Ok(())
+            }
+            "volume" => {
+                self.params.volume.set_bipolar(value);
                 Ok(())
             }
             _ => Err(format!("Unknown parameter: {}", parameter)),
@@ -336,12 +430,13 @@ impl crate::engine::Modulatable for KickDrum {
 
     fn parameter_range(&self, parameter: &str) -> Option<(f32, f32)> {
         match parameter {
-            "frequency" => Some((30.0, 150.0)), // 30Hz to 150Hz for kick
-            "punch" => Some((0.0, 1.0)),
-            "sub" => Some((0.0, 1.0)),
-            "click" => Some((0.0, 1.0)),
-            "decay" => Some((0.05, 1.5)), // 50ms to 1.5s
-            "pitch_drop" => Some((0.0, 1.0)),
+            "frequency" => Some(self.params.frequency.range()),
+            "punch" => Some(self.params.punch.range()),
+            "sub" => Some(self.params.sub.range()),
+            "click" => Some(self.params.click.range()),
+            "decay" => Some(self.params.decay.range()),
+            "pitch_drop" => Some(self.params.pitch_drop.range()),
+            "volume" => Some(self.params.volume.range()),
             _ => None,
         }
     }

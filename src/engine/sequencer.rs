@@ -11,6 +11,10 @@ pub struct Sequencer {
     // Pattern and current position
     pattern: Vec<bool>,
     current_step: usize,
+    
+    // The step that is currently being played (for UI display)
+    // This is the step that most recently triggered, not the next one
+    playhead_step: usize,
 
     // Instrument to trigger
     instrument_name: String,
@@ -44,6 +48,7 @@ impl Sequencer {
             samples_per_step,
             pattern,
             current_step: 0,
+            playhead_step: 0,
             instrument_name: instrument_name.into(),
             is_running: false,
         }
@@ -66,6 +71,7 @@ impl Sequencer {
             samples_per_step,
             pattern,
             current_step: 0,
+            playhead_step: 0,
             instrument_name: instrument_name.into(),
             is_running: false,
         }
@@ -96,6 +102,7 @@ impl Sequencer {
         self.sample_count = 0;
         self.next_trigger_sample = 0;
         self.current_step = 0;
+        self.playhead_step = 0;
     }
 
     /// Set the BPM and recalculate timing
@@ -125,8 +132,14 @@ impl Sequencer {
         }
     }
 
-    /// Get the current step
+    /// Get the current playhead step (the step currently being played)
+    /// This is suitable for UI display
     pub fn current_step(&self) -> usize {
+        self.playhead_step
+    }
+    
+    /// Get the next step that will be triggered (internal use)
+    pub fn next_step(&self) -> usize {
         self.current_step
     }
 
@@ -152,12 +165,15 @@ impl Sequencer {
 
         // Check if we've reached the next trigger point
         if self.sample_count >= self.next_trigger_sample {
+            // Update playhead to show the step that's about to play
+            self.playhead_step = self.current_step;
+            
             // Check if this step should trigger
             if self.pattern[self.current_step] {
                 should_trigger = Some(self.instrument_name.as_str());
             }
 
-            // Advance to the next step
+            // Advance to the next step (internal tracking)
             self.current_step = (self.current_step + 1) % self.pattern.len();
 
             // Calculate the next trigger sample (accumulate fractional samples for accuracy)
@@ -172,5 +188,50 @@ impl Sequencer {
     /// Get BPM
     pub fn bpm(&self) -> f32 {
         self.bpm
+    }
+
+    /// Get the current sample count
+    pub fn sample_count(&self) -> u64 {
+        self.sample_count
+    }
+
+    /// Get the sample number when the current step started
+    /// This can be used to calculate how far into the current step we are
+    pub fn current_step_start_sample(&self) -> u64 {
+        // The current step started at the previous trigger point
+        // which is next_trigger_sample - samples_per_step
+        if self.next_trigger_sample as f32 > self.samples_per_step {
+            (self.next_trigger_sample as f32 - self.samples_per_step) as u64
+        } else {
+            0
+        }
+    }
+
+    /// Get samples per step (useful for UI timing calculations)
+    pub fn samples_per_step(&self) -> f32 {
+        self.samples_per_step
+    }
+
+    /// Get the step that will be playing after a given number of samples
+    /// This is useful for UI display to compensate for audio latency
+    /// 
+    /// lookahead_samples: How many samples ahead to look (e.g., audio buffer size)
+    pub fn step_at_lookahead(&self, lookahead_samples: u64) -> usize {
+        if !self.is_running || self.pattern.is_empty() {
+            return self.playhead_step;
+        }
+
+        let future_sample = self.sample_count + lookahead_samples;
+        
+        // Calculate how many steps ahead this puts us
+        if future_sample >= self.next_trigger_sample {
+            // We've crossed into future steps
+            let samples_past_next = future_sample - self.next_trigger_sample;
+            let additional_steps = (samples_past_next as f32 / self.samples_per_step) as usize;
+            (self.current_step + additional_steps) % self.pattern.len()
+        } else {
+            // Still on the current playhead step
+            self.playhead_step
+        }
     }
 }

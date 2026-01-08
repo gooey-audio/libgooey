@@ -10,6 +10,7 @@ pub mod ffi;
 pub mod gen;
 pub mod instruments;
 pub mod sequencer;
+pub mod utils;
 
 // Visualization module (optional)
 #[cfg(feature = "visualization")]

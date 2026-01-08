@@ -13,6 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// 
 /// This struct provides a simplified C-compatible interface for iOS integration.
 /// It manages a kick drum instrument and a 16-step sequencer with sample-accurate timing.
+/// 
+/// Parameter smoothing is handled internally by the KickDrum instrument,
+/// so all parameter changes are automatically smoothed to prevent clicks/pops.
 pub struct GooeyEngine {
     kick: KickDrum,
     sequencer: Sequencer,
@@ -61,7 +64,7 @@ impl GooeyEngine {
                 self.kick.trigger(self.current_time);
             }
             
-            // Generate audio from kick
+            // Generate audio from kick (smoothing happens inside kick.tick())
             let raw_output = self.kick.tick(self.current_time);
             
             // Apply limiter
@@ -175,6 +178,8 @@ pub unsafe extern "C" fn gooey_engine_trigger_kick(engine: *mut GooeyEngine) {
 
 /// Set a kick drum parameter
 ///
+/// All parameters are automatically smoothed to prevent clicks/pops.
+///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
 /// * `param` - Parameter index (see KICK_PARAM_* constants)
@@ -203,6 +208,7 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
 
     let engine = &mut *engine;
     
+    // KickDrum's setters now handle smoothing internally
     match param {
         KICK_PARAM_FREQUENCY => engine.kick.set_frequency(value),
         KICK_PARAM_PUNCH => engine.kick.set_punch(value),
@@ -311,6 +317,37 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_current_step(engine: *mut Go
     let engine = &*engine;
     if engine.sequencer.is_running() {
         engine.sequencer.current_step() as i32
+    } else {
+        -1
+    }
+}
+
+/// Get the sequencer step that will be playing after a lookahead period
+/// 
+/// This compensates for audio buffer latency by looking ahead.
+/// Use this for UI display to sync visuals with audio output.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine  
+/// * `lookahead_samples` - Number of samples to look ahead (typically audio buffer size)
+///
+/// # Returns
+/// The step index that will be playing after the lookahead, or -1 if not running
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_get_step_with_lookahead(
+    engine: *mut GooeyEngine,
+    lookahead_samples: u32,
+) -> i32 {
+    if engine.is_null() {
+        return -1;
+    }
+
+    let engine = &*engine;
+    if engine.sequencer.is_running() {
+        engine.sequencer.step_at_lookahead(lookahead_samples as u64) as i32
     } else {
         -1
     }

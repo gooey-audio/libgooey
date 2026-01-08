@@ -1,7 +1,7 @@
 // Integration tests for basic Engine functionality
 
-use libgooey::engine::{Engine, Sequencer};
-use libgooey::instruments::{HiHat, KickDrum, SnareDrum};
+use gooey::engine::{Engine, Sequencer};
+use gooey::instruments::{HiHat, KickDrum, SnareDrum};
 
 #[test]
 fn test_engine_creation() {

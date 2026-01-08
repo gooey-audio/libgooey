@@ -1,8 +1,8 @@
 // Integration tests for LFO modulation on all instruments
 // Based on the lfo_verify example code
 
-use libgooey::engine::{Engine, Lfo, MusicalDivision};
-use libgooey::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
+use gooey::engine::{Engine, Lfo, MusicalDivision};
+use gooey::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
 
 #[test]
 fn test_kick_drum_modulation() {
