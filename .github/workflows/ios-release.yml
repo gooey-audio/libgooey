@@ -1,0 +1,221 @@
+name: iOS Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name for release (e.g., v0.1.0)'
+        required: true
+        type: string
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ios-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ios-
+
+      - name: Build iOS libraries
+        run: |
+          chmod +x scripts/build-ios.sh
+          ./scripts/build-ios.sh
+
+      - name: Verify build outputs
+        run: |
+          echo "Checking for build artifacts..."
+          
+          if [ ! -f "target/aarch64-apple-ios/release/libgooey.a" ]; then
+            echo "ERROR: Device library not found!"
+            exit 1
+          fi
+          
+          if [ ! -f "target/aarch64-apple-ios-sim/release/libgooey.a" ]; then
+            echo "ERROR: Simulator library not found!"
+            exit 1
+          fi
+          
+          if [ ! -f "include/gooey.h" ]; then
+            echo "ERROR: Header file not found!"
+            exit 1
+          fi
+          
+          echo "✓ All build artifacts present"
+          echo ""
+          echo "File sizes:"
+          ls -lh target/aarch64-apple-ios/release/libgooey.a
+          ls -lh target/aarch64-apple-ios-sim/release/libgooey.a
+          ls -lh include/gooey.h
+
+      - name: Create release package
+        run: |
+          # Determine the tag/version
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          
+          echo "Creating release package for version: $VERSION"
+          
+          # Create directory structure
+          mkdir -p release/device
+          mkdir -p release/simulator
+          mkdir -p release/include
+          
+          # Copy binaries
+          cp target/aarch64-apple-ios/release/libgooey.a release/device/
+          cp target/aarch64-apple-ios-sim/release/libgooey.a release/simulator/
+          
+          # Copy header
+          cp include/gooey.h release/include/
+          
+          # Create README for the release package
+          cat > release/README.md << 'EOF'
+          # libgooey iOS Build
+          
+          This package contains pre-built static libraries for iOS.
+          
+          ## Contents
+          
+          - `device/libgooey.a` - Static library for iOS devices (aarch64-apple-ios)
+          - `simulator/libgooey.a` - Static library for iOS Simulator (aarch64-apple-ios-sim)
+          - `include/gooey.h` - C header file with FFI bindings
+          
+          ## Integration
+          
+          ### Xcode Configuration
+          
+          1. **Add libraries to your project:**
+             - Copy `device/libgooey.a` and `simulator/libgooey.a` to your project
+             - Add both libraries to your target's "Link Binary With Libraries" build phase
+          
+          2. **Configure Library Search Paths:**
+             - Add the paths containing libgooey.a to "Library Search Paths"
+             - Use conditional paths for device vs simulator if needed
+          
+          3. **Configure Header Search Paths:**
+             - Add the `include/` directory to "Header Search Paths"
+          
+          4. **Add to Bridging Header (for Swift projects):**
+             ```c
+             #include "gooey.h"
+             ```
+          
+          ## Version
+          
+          Built from libgooey ${VERSION}
+          
+          ## Build Environment
+          
+          - macOS runner (GitHub Actions)
+          - Rust stable toolchain
+          - Targets: aarch64-apple-ios, aarch64-apple-ios-sim
+          
+          ## Usage Example
+          
+          ```swift
+          // Initialize engine
+          let sampleRate: Float = 44100.0
+          let engine = gooey_engine_new(sampleRate)
+          
+          // Trigger kick drum
+          gooey_engine_trigger_kick(engine)
+          
+          // Set parameters
+          gooey_engine_set_kick_param(engine, KICK_PARAM_FREQUENCY, 60.0)
+          
+          // Render audio
+          var buffer = [Float](repeating: 0, count: 512)
+          gooey_engine_render(engine, &buffer, 512)
+          
+          // Clean up
+          gooey_engine_free(engine)
+          ```
+          
+          ## Support
+          
+          For issues, see: https://github.com/your-org/libgooey
+          EOF
+          
+          # Replace version placeholder
+          sed -i '' "s/\${VERSION}/$VERSION/g" release/README.md
+          
+          # Create tarball
+          cd release
+          tar -czf ../libgooey-ios-${VERSION}.tar.gz .
+          cd ..
+          
+          echo "✓ Created: libgooey-ios-${VERSION}.tar.gz"
+          ls -lh libgooey-ios-${VERSION}.tar.gz
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: libgooey iOS ${{ github.event.inputs.tag || github.ref_name }}
+          body: |
+            # libgooey iOS Release ${{ github.event.inputs.tag || github.ref_name }}
+            
+            Pre-built static libraries for iOS development.
+            
+            ## 📦 What's Included
+            
+            - ✅ iOS Device library (aarch64-apple-ios)
+            - ✅ iOS Simulator library (aarch64-apple-ios-sim)
+            - ✅ C header file with FFI bindings
+            - ✅ Integration documentation
+            
+            ## 🔽 Download
+            
+            Download `libgooey-ios-${{ github.event.inputs.tag || github.ref_name }}.tar.gz` below and extract it to your iOS project.
+            
+            ## 🚀 Quick Start
+            
+            ```bash
+            # Download and extract
+            curl -L -o libgooey-ios.tar.gz \
+              https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.tag || github.ref_name }}/libgooey-ios-${{ github.event.inputs.tag || github.ref_name }}.tar.gz
+            tar -xzf libgooey-ios.tar.gz -C YourProject/Libraries/
+            ```
+            
+            See `README.md` in the archive for Xcode integration instructions.
+            
+            ## 📝 Build Info
+            
+            - **Rust Toolchain**: stable
+            - **Targets**: aarch64-apple-ios, aarch64-apple-ios-sim
+            - **Build Date**: ${{ github.event.repository.updated_at }}
+            - **Commit**: ${{ github.sha }}
+          files: |
+            libgooey-ios-${{ github.event.inputs.tag || github.ref_name }}.tar.gz
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts for verification
+        uses: actions/upload-artifact@v4
+        with:
+          name: libgooey-ios-${{ github.event.inputs.tag || github.ref_name }}
+          path: libgooey-ios-${{ github.event.inputs.tag || github.ref_name }}.tar.gz
+          retention-days: 30
