@@ -3,7 +3,7 @@
 //! This module exposes the audio engine to C/Swift via C-compatible functions.
 //! Designed for integration with iOS (and other platforms in the future).
 
-use crate::effects::{BrickWallLimiter, Effect};
+use crate::effects::{BrickWallLimiter, Effect, LowpassFilterControl, LowpassFilterEffect};
 use crate::engine::Sequencer;
 use crate::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
 use std::slice;
@@ -30,7 +30,10 @@ pub struct GooeyEngine {
     hihat_sequencer: Sequencer,
     tom_sequencer: Sequencer,
 
-    // Effects
+    // Global effects (applied in order: lowpass filter -> limiter)
+    lowpass_filter: LowpassFilterEffect,
+    lowpass_filter_control: LowpassFilterControl,
+    lowpass_filter_enabled: bool,
     limiter: BrickWallLimiter,
 
     // Engine state
@@ -62,6 +65,11 @@ impl GooeyEngine {
         let hihat_sequencer = Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "hihat");
         let tom_sequencer = Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "tom");
 
+        // Create lowpass filter with default settings (fully open, no resonance)
+        // Default cutoff at 20kHz means filter is effectively bypassed when enabled
+        let lowpass_filter = LowpassFilterEffect::new(sample_rate, 20000.0, 0.0);
+        let lowpass_filter_control = lowpass_filter.get_control();
+
         Self {
             kick,
             snare,
@@ -71,6 +79,9 @@ impl GooeyEngine {
             snare_sequencer,
             hihat_sequencer,
             tom_sequencer,
+            lowpass_filter,
+            lowpass_filter_control,
+            lowpass_filter_enabled: false, // Disabled by default
             limiter: BrickWallLimiter::new(1.0),
             sample_rate,
             bpm,
@@ -122,18 +133,42 @@ impl GooeyEngine {
             }
 
             // Generate and mix audio from all instruments
-            let output = self.kick.tick(self.current_time)
+            let mut output = self.kick.tick(self.current_time)
                 + self.snare.tick(self.current_time)
                 + self.hihat.tick(self.current_time)
                 + self.tom.tick(self.current_time);
 
-            // Apply limiter to prevent clipping
+            // Apply global effects chain
+            // 1. Lowpass filter (if enabled)
+            if self.lowpass_filter_enabled {
+                output = self.lowpass_filter.process(output);
+            }
+
+            // 2. Limiter (always on - protects output from clipping)
             *sample = self.limiter.process(output);
 
             self.current_time += sample_period;
         }
     }
 }
+
+// =============================================================================
+// Global effect IDs (must match Swift GlobalEffect enum)
+// =============================================================================
+
+/// Global effect: Lowpass filter
+pub const EFFECT_LOWPASS_FILTER: u32 = 0;
+/// Total number of global effects
+pub const EFFECT_COUNT: u32 = 1;
+
+// =============================================================================
+// Lowpass filter parameter indices (must match Swift FilterParam enum)
+// =============================================================================
+
+/// Filter parameter: cutoff frequency (20-20000 Hz)
+pub const FILTER_PARAM_CUTOFF: u32 = 0;
+/// Filter parameter: resonance (0.0-0.95)
+pub const FILTER_PARAM_RESONANCE: u32 = 1;
 
 // =============================================================================
 // Kick drum parameter indices (must match Swift KickParam enum)
@@ -320,6 +355,146 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
         KICK_PARAM_PITCH_DROP => engine.kick.set_pitch_drop(value),
         KICK_PARAM_VOLUME => engine.kick.set_volume(value),
         _ => {} // Unknown parameter, ignore
+    }
+}
+
+// =============================================================================
+// Global effects control
+// =============================================================================
+
+/// Set a parameter on a global effect
+///
+/// This provides a generic interface for controlling any global effect's parameters.
+/// Use effect ID constants (EFFECT_LOWPASS_FILTER, etc.) and corresponding parameter
+/// constants (FILTER_PARAM_CUTOFF, FILTER_PARAM_RESONANCE, etc.).
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `effect` - Effect ID (see EFFECT_* constants)
+/// * `param` - Parameter ID (depends on effect type, see *_PARAM_* constants)
+/// * `value` - Parameter value (range depends on parameter)
+///
+/// # Effect and Parameter Reference
+/// - EFFECT_LOWPASS_FILTER (0):
+///   - FILTER_PARAM_CUTOFF (0): 20-20000 Hz
+///   - FILTER_PARAM_RESONANCE (1): 0.0-0.95
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
+    engine: *mut GooeyEngine,
+    effect: u32,
+    param: u32,
+    value: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+
+    match effect {
+        EFFECT_LOWPASS_FILTER => match param {
+            FILTER_PARAM_CUTOFF => engine.lowpass_filter_control.set_cutoff_freq(value),
+            FILTER_PARAM_RESONANCE => engine.lowpass_filter_control.set_resonance(value),
+            _ => {} // Unknown parameter, ignore
+        },
+        _ => {} // Unknown effect, ignore
+    }
+}
+
+/// Get a parameter value from a global effect
+///
+/// This provides a generic interface for reading any global effect's parameters.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `effect` - Effect ID (see EFFECT_* constants)
+/// * `param` - Parameter ID (depends on effect type)
+///
+/// # Returns
+/// The current parameter value, or -1.0 if the effect or parameter is invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
+    engine: *mut GooeyEngine,
+    effect: u32,
+    param: u32,
+) -> f32 {
+    if engine.is_null() {
+        return -1.0;
+    }
+
+    let engine = &*engine;
+
+    match effect {
+        EFFECT_LOWPASS_FILTER => match param {
+            FILTER_PARAM_CUTOFF => engine.lowpass_filter_control.get_cutoff_freq(),
+            FILTER_PARAM_RESONANCE => engine.lowpass_filter_control.get_resonance(),
+            _ => -1.0, // Unknown parameter
+        },
+        _ => -1.0, // Unknown effect
+    }
+}
+
+/// Enable or disable a global effect
+///
+/// When disabled, the effect is bypassed and does not process audio.
+/// This is useful for A/B comparison or saving CPU when an effect is not needed.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `effect` - Effect ID (see EFFECT_* constants)
+/// * `enabled` - Whether the effect should be active
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_global_effect_enabled(
+    engine: *mut GooeyEngine,
+    effect: u32,
+    enabled: bool,
+) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+
+    match effect {
+        EFFECT_LOWPASS_FILTER => engine.lowpass_filter_enabled = enabled,
+        _ => {} // Unknown effect, ignore
+    }
+}
+
+/// Check if a global effect is enabled
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `effect` - Effect ID (see EFFECT_* constants)
+///
+/// # Returns
+/// `true` if the effect is enabled, `false` if disabled or if the effect ID is invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_global_effect_enabled(
+    engine: *mut GooeyEngine,
+    effect: u32,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+
+    let engine = &*engine;
+
+    match effect {
+        EFFECT_LOWPASS_FILTER => engine.lowpass_filter_enabled,
+        _ => false, // Unknown effect
     }
 }
 
@@ -650,4 +825,10 @@ pub extern "C" fn gooey_engine_sequencer_step_count() -> u32 {
 #[no_mangle]
 pub extern "C" fn gooey_engine_instrument_count() -> u32 {
     INSTRUMENT_COUNT
+}
+
+/// Get the number of available global effects
+#[no_mangle]
+pub extern "C" fn gooey_engine_global_effect_count() -> u32 {
+    EFFECT_COUNT
 }
