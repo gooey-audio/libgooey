@@ -4,7 +4,8 @@
 
 ## Features
 
-- Kick drum synthesizer with comprehensive parameter control
+- Kick, Snare, Hihat and Tom drum synthesizer with comprehensive parameter control
+- Parameter smoothing
 - 16-step sequencer with sample-accurate timing
 - C FFI for integration with Swift/iOS and other languages
 - Cross-platform support (native, iOS, WASM)
