@@ -59,26 +59,68 @@ impl KickConfig {
 /// Smoothed parameters for real-time control of the kick drum
 /// These use one-pole smoothing to prevent clicks/pops during parameter changes
 pub struct KickParams {
-    pub frequency: SmoothedParam,   // Base frequency (20-200 Hz)
-    pub punch: SmoothedParam,       // Mid-frequency presence (0-1)
-    pub sub: SmoothedParam,         // Sub-bass presence (0-1)
-    pub click: SmoothedParam,       // High-frequency click (0-1)
-    pub decay: SmoothedParam,       // Decay time in seconds (0.01-5.0)
-    pub pitch_drop: SmoothedParam,  // Pitch envelope amount (0-1)
-    pub volume: SmoothedParam,      // Overall volume (0-1)
+    pub frequency: SmoothedParam,  // Base frequency (20-200 Hz)
+    pub punch: SmoothedParam,      // Mid-frequency presence (0-1)
+    pub sub: SmoothedParam,        // Sub-bass presence (0-1)
+    pub click: SmoothedParam,      // High-frequency click (0-1)
+    pub decay: SmoothedParam,      // Decay time in seconds (0.01-5.0)
+    pub pitch_drop: SmoothedParam, // Pitch envelope amount (0-1)
+    pub volume: SmoothedParam,     // Overall volume (0-1)
 }
 
 impl KickParams {
     /// Create new smoothed parameters from a config
     pub fn from_config(config: &KickConfig, sample_rate: f32) -> Self {
         Self {
-            frequency: SmoothedParam::new(config.kick_frequency, 20.0, 200.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
-            punch: SmoothedParam::new(config.punch_amount, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
-            sub: SmoothedParam::new(config.sub_amount, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
-            click: SmoothedParam::new(config.click_amount, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
-            decay: SmoothedParam::new(config.decay_time, 0.01, 5.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
-            pitch_drop: SmoothedParam::new(config.pitch_drop, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
-            volume: SmoothedParam::new(config.volume, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            frequency: SmoothedParam::new(
+                config.kick_frequency,
+                20.0,
+                200.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            punch: SmoothedParam::new(
+                config.punch_amount,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            sub: SmoothedParam::new(
+                config.sub_amount,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            click: SmoothedParam::new(
+                config.click_amount,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            decay: SmoothedParam::new(
+                config.decay_time,
+                0.01,
+                5.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            pitch_drop: SmoothedParam::new(
+                config.pitch_drop,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            volume: SmoothedParam::new(
+                config.volume,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
         }
     }
 
@@ -92,17 +134,20 @@ impl KickParams {
         self.decay.tick();
         self.pitch_drop.tick();
         self.volume.tick();
-        
+
         // Return true if any smoother is still active
         !self.is_settled()
     }
 
     /// Check if all parameters have settled
     pub fn is_settled(&self) -> bool {
-        self.frequency.is_settled() && self.punch.is_settled() && 
-        self.sub.is_settled() && self.click.is_settled() &&
-        self.decay.is_settled() && self.pitch_drop.is_settled() &&
-        self.volume.is_settled()
+        self.frequency.is_settled()
+            && self.punch.is_settled()
+            && self.sub.is_settled()
+            && self.click.is_settled()
+            && self.decay.is_settled()
+            && self.pitch_drop.is_settled()
+            && self.volume.is_settled()
     }
 
     /// Get a snapshot of current values as a KickConfig (for reading back)
@@ -121,7 +166,7 @@ impl KickParams {
 
 pub struct KickDrum {
     pub sample_rate: f32,
-    
+
     /// Smoothed parameters for click-free real-time control
     pub params: KickParams,
 
@@ -176,36 +221,36 @@ impl KickDrum {
         // Sub oscillator: Deep sine wave
         self.sub_oscillator.waveform = Waveform::Sine;
         self.sub_oscillator.set_adsr(ADSRConfig::new(
-            0.001,            // Very fast attack
-            decay,            // Synchronized decay time
-            0.0,              // No sustain
-            decay * 0.2,      // Synchronized release
+            0.001,       // Very fast attack
+            decay,       // Synchronized decay time
+            0.0,         // No sustain
+            decay * 0.2, // Synchronized release
         ));
 
         // Punch oscillator: Triangle for mid-range impact
         self.punch_oscillator.waveform = Waveform::Triangle;
         self.punch_oscillator.set_adsr(ADSRConfig::new(
-            0.001,            // Very fast attack
-            decay,            // Synchronized decay time
-            0.0,              // No sustain
-            decay * 0.2,      // Synchronized release
+            0.001,       // Very fast attack
+            decay,       // Synchronized decay time
+            0.0,         // No sustain
+            decay * 0.2, // Synchronized release
         ));
 
         // Click oscillator: High-frequency filtered noise transient
         self.click_oscillator.waveform = Waveform::Noise;
         self.click_oscillator.set_adsr(ADSRConfig::new(
-            0.001,             // Very fast attack
-            decay * 0.2,       // Much shorter decay for click
-            0.0,               // No sustain
-            decay * 0.02,      // Extremely short release
+            0.001,        // Very fast attack
+            decay * 0.2,  // Much shorter decay for click
+            0.0,          // No sustain
+            decay * 0.02, // Extremely short release
         ));
 
         // Pitch envelope: Fast attack, synchronized decay for frequency sweeping
         self.pitch_envelope.set_config(ADSRConfig::new(
-            0.001,            // Instant attack
-            decay,            // Synchronized decay time
-            0.0,              // Drop to base frequency
-            decay * 0.2,      // Synchronized release
+            0.001,       // Instant attack
+            decay,       // Synchronized decay time
+            0.0,         // Drop to base frequency
+            decay * 0.2, // Synchronized release
         ));
     }
 
@@ -236,11 +281,11 @@ impl KickDrum {
         self.params.decay.set_target(config.decay_time);
         self.params.pitch_drop.set_target(config.pitch_drop);
         self.params.volume.set_target(config.volume);
-        
+
         // Reconfigure envelopes for new decay time
         self.configure_oscillators();
     }
-    
+
     /// Get current config snapshot (reads current smoothed values)
     pub fn config(&self) -> KickConfig {
         self.params.to_config()
@@ -279,14 +324,14 @@ impl KickDrum {
     pub fn tick(&mut self, current_time: f32) -> f32 {
         // Always tick smoothers (even when not active, to settle values)
         self.params.tick();
-        
+
         if !self.is_active {
             return 0.0;
         }
 
         // Apply smoothed parameters to oscillators
         self.apply_params();
-        
+
         let base_frequency = self.params.frequency.get();
 
         // Calculate pitch modulation
@@ -390,7 +435,15 @@ impl crate::engine::Instrument for KickDrum {
 // Implement modulation support for KickDrum
 impl crate::engine::Modulatable for KickDrum {
     fn modulatable_parameters(&self) -> Vec<&'static str> {
-        vec!["frequency", "punch", "sub", "click", "decay", "pitch_drop", "volume"]
+        vec![
+            "frequency",
+            "punch",
+            "sub",
+            "click",
+            "decay",
+            "pitch_drop",
+            "volume",
+        ]
     }
 
     fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {

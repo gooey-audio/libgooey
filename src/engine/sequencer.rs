@@ -11,7 +11,7 @@ pub struct Sequencer {
     // Pattern and current position
     pattern: Vec<bool>,
     current_step: usize,
-    
+
     // The step that is currently being played (for UI display)
     // This is the step that most recently triggered, not the next one
     playhead_step: usize,
@@ -137,7 +137,7 @@ impl Sequencer {
     pub fn current_step(&self) -> usize {
         self.playhead_step
     }
-    
+
     /// Get the next step that will be triggered (internal use)
     pub fn next_step(&self) -> usize {
         self.current_step
@@ -167,7 +167,7 @@ impl Sequencer {
         if self.sample_count >= self.next_trigger_sample {
             // Update playhead to show the step that's about to play
             self.playhead_step = self.current_step;
-            
+
             // Check if this step should trigger
             if self.pattern[self.current_step] {
                 should_trigger = Some(self.instrument_name.as_str());
@@ -214,7 +214,7 @@ impl Sequencer {
 
     /// Get the step that will be playing after a given number of samples
     /// This is useful for UI display to compensate for audio latency
-    /// 
+    ///
     /// lookahead_samples: How many samples ahead to look (e.g., audio buffer size)
     pub fn step_at_lookahead(&self, lookahead_samples: u64) -> usize {
         if !self.is_running || self.pattern.is_empty() {
@@ -222,7 +222,7 @@ impl Sequencer {
         }
 
         let future_sample = self.sample_count + lookahead_samples;
-        
+
         // Calculate how many steps ahead this puts us
         if future_sample >= self.next_trigger_sample {
             // We've crossed into future steps

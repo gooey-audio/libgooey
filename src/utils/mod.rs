@@ -2,4 +2,4 @@
 
 pub mod smoother;
 
-pub use smoother::{SmoothedParam, ParamSmoother, DEFAULT_SMOOTH_TIME_MS};
+pub use smoother::{ParamSmoother, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};

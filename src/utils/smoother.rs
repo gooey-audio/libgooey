@@ -7,7 +7,7 @@
 pub const DEFAULT_SMOOTH_TIME_MS: f32 = 15.0;
 
 /// A smoothed parameter with range constraints
-/// 
+///
 /// This is the primary type for modulatable instrument parameters.
 /// It combines smoothing with min/max range constraints.
 #[derive(Clone, Debug)]
@@ -28,14 +28,20 @@ pub struct SmoothedParam {
 
 impl SmoothedParam {
     /// Create a new smoothed parameter with range
-    /// 
+    ///
     /// # Arguments
     /// * `initial_value` - Starting value (will be clamped to range)
     /// * `min` - Minimum allowed value
     /// * `max` - Maximum allowed value
     /// * `sample_rate` - Audio sample rate in Hz
     /// * `smooth_time_ms` - Smoothing time in milliseconds (5-50ms typical)
-    pub fn new(initial_value: f32, min: f32, max: f32, sample_rate: f32, smooth_time_ms: f32) -> Self {
+    pub fn new(
+        initial_value: f32,
+        min: f32,
+        max: f32,
+        sample_rate: f32,
+        smooth_time_ms: f32,
+    ) -> Self {
         let coeff = Self::calculate_coeff(sample_rate, smooth_time_ms);
         let clamped = initial_value.clamp(min, max);
         Self {
@@ -50,7 +56,13 @@ impl SmoothedParam {
 
     /// Create a 0-1 normalized parameter
     pub fn new_normalized(initial_value: f32, sample_rate: f32) -> Self {
-        Self::new(initial_value.clamp(0.0, 1.0), 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS)
+        Self::new(
+            initial_value.clamp(0.0, 1.0),
+            0.0,
+            1.0,
+            sample_rate,
+            DEFAULT_SMOOTH_TIME_MS,
+        )
     }
 
     /// Calculate the smoothing coefficient from sample rate and time
@@ -152,9 +164,15 @@ pub type ParamSmoother = SmoothedParam;
 impl ParamSmoother {
     /// Legacy constructor (creates unbounded smoother)
     pub fn new_legacy(initial_value: f32, sample_rate: f32, smooth_time_ms: f32) -> Self {
-        Self::new(initial_value, f32::MIN, f32::MAX, sample_rate, smooth_time_ms)
+        Self::new(
+            initial_value,
+            f32::MIN,
+            f32::MAX,
+            sample_rate,
+            smooth_time_ms,
+        )
     }
-    
+
     /// Get current value (legacy name)
     pub fn current(&self) -> f32 {
         self.get()
@@ -175,14 +193,18 @@ mod tests {
     fn test_smoother_reaches_target() {
         let mut smoother = SmoothedParam::new(0.0, 0.0, 1.0, 44100.0, 10.0);
         smoother.set_target(1.0);
-        
+
         // Run for 100ms worth of samples (10x the time constant, should definitely settle)
         // One-pole filter reaches 99.995% of target after 10 time constants
         for _ in 0..(44100 / 10) {
             smoother.tick();
         }
-        
-        assert!((smoother.get() - 1.0).abs() < 0.001, "Expected ~1.0, got {}", smoother.get());
+
+        assert!(
+            (smoother.get() - 1.0).abs() < 0.001,
+            "Expected ~1.0, got {}",
+            smoother.get()
+        );
         assert!(smoother.is_settled());
     }
 
@@ -190,7 +212,7 @@ mod tests {
     fn test_immediate_set() {
         let mut smoother = SmoothedParam::new(0.0, 0.0, 1.0, 44100.0, 10.0);
         smoother.set_immediate(1.0);
-        
+
         assert_eq!(smoother.get(), 1.0);
         assert!(smoother.is_settled());
     }
@@ -198,11 +220,11 @@ mod tests {
     #[test]
     fn test_range_clamping() {
         let mut smoother = SmoothedParam::new(50.0, 20.0, 200.0, 44100.0, 10.0);
-        
+
         // Test clamping above max
         smoother.set_target(300.0);
         assert_eq!(smoother.target(), 200.0);
-        
+
         // Test clamping below min
         smoother.set_target(10.0);
         assert_eq!(smoother.target(), 20.0);
@@ -211,13 +233,13 @@ mod tests {
     #[test]
     fn test_normalized_set() {
         let mut smoother = SmoothedParam::new(50.0, 0.0, 100.0, 44100.0, 10.0);
-        
+
         smoother.set_normalized(0.5);
         assert_eq!(smoother.target(), 50.0);
-        
+
         smoother.set_normalized(0.0);
         assert_eq!(smoother.target(), 0.0);
-        
+
         smoother.set_normalized(1.0);
         assert_eq!(smoother.target(), 100.0);
     }
@@ -225,14 +247,14 @@ mod tests {
     #[test]
     fn test_bipolar_set() {
         let mut smoother = SmoothedParam::new(50.0, 0.0, 100.0, 44100.0, 10.0);
-        
-        smoother.set_bipolar(0.0);  // Center
+
+        smoother.set_bipolar(0.0); // Center
         assert_eq!(smoother.target(), 50.0);
-        
+
         smoother.set_bipolar(-1.0); // Min
         assert_eq!(smoother.target(), 0.0);
-        
-        smoother.set_bipolar(1.0);  // Max
+
+        smoother.set_bipolar(1.0); // Max
         assert_eq!(smoother.target(), 100.0);
     }
 }
