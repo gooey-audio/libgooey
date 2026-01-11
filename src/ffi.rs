@@ -3,7 +3,7 @@
 //! This module exposes the audio engine to C/Swift via C-compatible functions.
 //! Designed for integration with iOS (and other platforms in the future).
 
-use crate::effects::{BrickWallLimiter, Effect, LowpassFilterControl, LowpassFilterEffect};
+use crate::effects::{BrickWallLimiter, Effect, LowpassFilterEffect};
 use crate::engine::Sequencer;
 use crate::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
 use std::slice;
@@ -32,7 +32,6 @@ pub struct GooeyEngine {
 
     // Global effects (applied in order: lowpass filter -> limiter)
     lowpass_filter: LowpassFilterEffect,
-    lowpass_filter_control: LowpassFilterControl,
     lowpass_filter_enabled: bool,
     limiter: BrickWallLimiter,
 
@@ -68,7 +67,6 @@ impl GooeyEngine {
         // Create lowpass filter with default settings (fully open, no resonance)
         // Default cutoff at 20kHz means filter is effectively bypassed when enabled
         let lowpass_filter = LowpassFilterEffect::new(sample_rate, 20000.0, 0.0);
-        let lowpass_filter_control = lowpass_filter.get_control();
 
         Self {
             kick,
@@ -80,7 +78,6 @@ impl GooeyEngine {
             hihat_sequencer,
             tom_sequencer,
             lowpass_filter,
-            lowpass_filter_control,
             lowpass_filter_enabled: false, // Disabled by default
             limiter: BrickWallLimiter::new(1.0),
             sample_rate,
@@ -396,8 +393,8 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
 
     match effect {
         EFFECT_LOWPASS_FILTER => match param {
-            FILTER_PARAM_CUTOFF => engine.lowpass_filter_control.set_cutoff_freq(value),
-            FILTER_PARAM_RESONANCE => engine.lowpass_filter_control.set_resonance(value),
+            FILTER_PARAM_CUTOFF => engine.lowpass_filter.set_cutoff_freq(value),
+            FILTER_PARAM_RESONANCE => engine.lowpass_filter.set_resonance(value),
             _ => {} // Unknown parameter, ignore
         },
         _ => {} // Unknown effect, ignore
@@ -432,8 +429,8 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
 
     match effect {
         EFFECT_LOWPASS_FILTER => match param {
-            FILTER_PARAM_CUTOFF => engine.lowpass_filter_control.get_cutoff_freq(),
-            FILTER_PARAM_RESONANCE => engine.lowpass_filter_control.get_resonance(),
+            FILTER_PARAM_CUTOFF => engine.lowpass_filter.get_cutoff_freq(),
+            FILTER_PARAM_RESONANCE => engine.lowpass_filter.get_resonance(),
             _ => -1.0, // Unknown parameter
         },
         _ => -1.0, // Unknown effect
