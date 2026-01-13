@@ -20,11 +20,6 @@ use gooey::instruments::HiHat;
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
-        .format(|buf, record| {
-            let target = record.target();
-            let short_target = target.rsplit("::").next().unwrap_or(target);
-            writeln!(buf, "[{:5}] {:15.15} {}", record.level(), short_target, record.args())
-        })
         .init();
     let sample_rate = 44100.0;
 
