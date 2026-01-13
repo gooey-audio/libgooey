@@ -5,6 +5,7 @@ edition = "2021"
 autoexamples = false
 
 [lib]
+name = "libgooey"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
@@ -14,6 +15,7 @@ ios = []  # iOS target - no native audio output, just the engine
 web = ["wasm-bindgen", "js-sys", "web-sys"]
 crossterm = ["dep:crossterm"]
 visualization = ["glfw", "gl", "rustfft"]
+midi = ["midir"]  # MIDI input support for examples
 
 [build-dependencies]
 cbindgen = "0.26"
@@ -26,6 +28,7 @@ crossterm = { version = "0.27", optional = true }
 glfw = { version = "0.58", optional = true }
 gl = { version = "0.14", optional = true }
 rustfft = { version = "6.2", optional = true }
+midir = { version = "0.10", optional = true }
 
 [dependencies.wasm-bindgen]
 version = "0.2"
@@ -68,3 +71,7 @@ required-features = ["native", "crossterm"]
 [[example]]
 name = "lfo_test"
 required-features = ["native", "crossterm"]
+
+[[example]]
+name = "midi_kick"
+required-features = ["native", "midi"]
