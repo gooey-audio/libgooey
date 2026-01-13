@@ -14,7 +14,7 @@ use libgooey::instruments::KickDrum;
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "midi")]
-mod midi_input;
+mod common;
 
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
@@ -49,13 +49,14 @@ fn main() -> anyhow::Result<()> {
     // Try to initialize MIDI input (optional, fails gracefully)
     #[cfg(feature = "midi")]
     let midi = {
-        println!("Available MIDI ports: {:?}", midi_input::MidiHandler::list_ports());
-        match midi_input::MidiHandler::new() {
+        use common::midi::{drum_notes, MidiHandler};
+        println!("Available MIDI ports: {:?}", MidiHandler::list_ports());
+        match MidiHandler::new() {
             Ok(handler) => {
                 println!(
                     "MIDI connected! Hit drum pad (note {} or {}) to trigger.",
-                    midi_input::drum_notes::KICK,
-                    midi_input::drum_notes::KICK_ALT
+                    drum_notes::KICK,
+                    drum_notes::KICK_ALT
                 );
                 Some(handler)
             }
@@ -84,12 +85,11 @@ fn main() -> anyhow::Result<()> {
         // Poll for MIDI events (if available)
         #[cfg(feature = "midi")]
         if let Some(ref midi_handler) = midi {
+            use common::midi::{drum_notes, velocity_to_float, MidiDrumEvent};
             for event in midi_handler.poll_all() {
-                if let midi_input::MidiDrumEvent::NoteOn { note, velocity } = event {
-                    if note == midi_input::drum_notes::KICK
-                        || note == midi_input::drum_notes::KICK_ALT
-                    {
-                        let velocity_float = midi_input::velocity_to_float(velocity);
+                if let MidiDrumEvent::NoteOn { note, velocity } = event {
+                    if note == drum_notes::KICK || note == drum_notes::KICK_ALT {
+                        let velocity_float = velocity_to_float(velocity);
                         let mut engine = audio_engine.lock().unwrap();
                         engine.trigger_instrument("kick");
                         print!("* (vel: {:.0}%) ", velocity_float * 100.0);
