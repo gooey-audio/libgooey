@@ -195,6 +195,11 @@ pub struct KickDrum {
     /// How much velocity affects decay time (0.0-1.0)
     /// Higher values = more velocity sensitivity (shorter decay at high velocity)
     velocity_to_decay: f32,
+
+    /// How much velocity affects pitch envelope decay (0.0-1.0)
+    /// Higher velocity = faster pitch decay (sharper, more aggressive pitch drop)
+    /// Lower velocity = slower pitch decay (gentler, more subtle pitch sweep)
+    velocity_to_pitch: f32,
 }
 
 impl KickDrum {
@@ -223,6 +228,11 @@ impl KickDrum {
             // Velocity scaling: 0.5 means velocity can reduce decay by up to 50%
             // (higher velocity = shorter, tighter decay)
             velocity_to_decay: 0.5,
+
+            // Pitch velocity scaling: 0.7 gives strong pitch response to velocity
+            // Higher velocity = sharper/faster pitch drop
+            // Lower velocity = gentler/slower pitch sweep
+            velocity_to_pitch: 0.7,
         };
 
         kick.configure_oscillators();
@@ -282,10 +292,15 @@ impl KickDrum {
         // Update pitch start multiplier
         self.pitch_start_multiplier = 1.0 + pitch_drop * 2.0;
 
+        // Light velocity scaling for click: range [0.6, 1.0]
+        // Higher velocity = more click, lower velocity = less click
+        let click_vel_scale = 0.6 + 0.4 * self.current_velocity;
+
         // Update oscillator volumes (these can change smoothly)
         self.sub_oscillator.set_volume(sub * volume);
         self.punch_oscillator.set_volume(punch * volume * 0.7);
-        self.click_oscillator.set_volume(click * volume * 0.3);
+        // Click reduced from 0.3 to 0.15, with velocity scaling
+        self.click_oscillator.set_volume(click * volume * 0.15 * click_vel_scale);
     }
 
     pub fn set_config(&mut self, config: KickConfig) {
@@ -331,16 +346,25 @@ impl KickDrum {
         // Scale factor: 1.0 at vel=0, down to 0.5 at vel=1 (50% reduction)
         let decay_scale = 1.0 - (self.velocity_to_decay * vel_squared);
 
+        // --- Pitch envelope scaling ---
+        // Higher velocity = faster/sharper pitch decay (more aggressive pitch drop)
+        // Lower velocity = slower pitch decay (gentler, more subtle sweep)
+        // Use a more aggressive scaling for pitch to make high velocity hits snappy
+        let pitch_decay_scale = 1.0 - (self.velocity_to_pitch * vel_squared);
+
         // Get base parameters
         let base_decay = self.params.decay.get() * decay_scale;
+        let pitch_decay = self.params.decay.get() * pitch_decay_scale;
         let base_freq = self.params.frequency.get();
 
-        // Configure pitch envelope
+        // Configure pitch envelope with velocity-scaled decay
+        // High velocity = short pitch decay (sharp, punchy attack)
+        // Low velocity = long pitch decay (smooth, subtle pitch sweep)
         self.pitch_envelope.set_config(ADSRConfig::new(
             0.001,
-            base_decay,
+            pitch_decay,
             0.0,
-            base_decay * 0.2,
+            pitch_decay * 0.2,
         ));
 
         // Configure amplitude envelopes with velocity-scaled decay
