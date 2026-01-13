@@ -71,7 +71,3 @@ required-features = ["native", "crossterm"]
 [[example]]
 name = "lfo_test"
 required-features = ["native", "crossterm"]
-
-[[example]]
-name = "midi_kick"
-required-features = ["native", "midi"]

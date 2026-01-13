@@ -1,5 +1,6 @@
 /* CLI example for kick drum testing.
 Minimal code to start the audio engine and trigger kick drum hits.
+Supports both keyboard (SPACE) and MIDI input (if available).
 */
 
 use crossterm::{
@@ -8,12 +9,13 @@ use crossterm::{
 };
 use std::io::{self, Write};
 
-// Import the platform abstraction and audio engine
 use libgooey::engine::{Engine, EngineOutput};
 use libgooey::instruments::KickDrum;
 use std::sync::{Arc, Mutex};
 
-// CLI example for kick drum
+#[cfg(feature = "midi")]
+mod midi_input;
+
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
     let sample_rate = 44100.0;
@@ -43,9 +45,30 @@ fn main() -> anyhow::Result<()> {
 
     println!("=== Kick Drum Example ===");
     println!("Press SPACE to trigger kick drum, 'q' to quit");
+
+    // Try to initialize MIDI input (optional, fails gracefully)
+    #[cfg(feature = "midi")]
+    let midi = {
+        println!("Available MIDI ports: {:?}", midi_input::MidiHandler::list_ports());
+        match midi_input::MidiHandler::new() {
+            Ok(handler) => {
+                println!(
+                    "MIDI connected! Hit drum pad (note {} or {}) to trigger.",
+                    midi_input::drum_notes::KICK,
+                    midi_input::drum_notes::KICK_ALT
+                );
+                Some(handler)
+            }
+            Err(e) => {
+                println!("No MIDI device found: {} (using keyboard only)", e);
+                None
+            }
+        }
+    };
+
     #[cfg(feature = "visualization")]
     println!("Waveform visualization enabled");
-    println!("");
+    println!();
 
     // Enable raw mode for immediate key detection
     enable_raw_mode()?;
@@ -58,8 +81,26 @@ fn main() -> anyhow::Result<()> {
             break Ok(());
         }
 
+        // Poll for MIDI events (if available)
+        #[cfg(feature = "midi")]
+        if let Some(ref midi_handler) = midi {
+            for event in midi_handler.poll_all() {
+                if let midi_input::MidiDrumEvent::NoteOn { note, velocity } = event {
+                    if note == midi_input::drum_notes::KICK
+                        || note == midi_input::drum_notes::KICK_ALT
+                    {
+                        let velocity_float = midi_input::velocity_to_float(velocity);
+                        let mut engine = audio_engine.lock().unwrap();
+                        engine.trigger_instrument("kick");
+                        print!("* (vel: {:.0}%) ", velocity_float * 100.0);
+                        io::stdout().flush().unwrap();
+                    }
+                }
+            }
+        }
+
         // Poll for key events (non-blocking with short timeout)
-        if event::poll(std::time::Duration::from_millis(16))? {
+        if event::poll(std::time::Duration::from_millis(1))? {
             if let Event::Key(KeyEvent { code, .. }) = event::read()? {
                 match code {
                     KeyCode::Char(' ') => {

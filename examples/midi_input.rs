@@ -9,7 +9,8 @@ use std::sync::mpsc::{channel, Receiver};
 pub enum MidiDrumEvent {
     /// Note on with note number and velocity (0-127)
     NoteOn { note: u8, velocity: u8 },
-    /// Note off
+    /// Note off (note field kept for future use with choked hi-hats)
+    #[allow(dead_code)]
     NoteOff { note: u8 },
 }
 
