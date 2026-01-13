@@ -71,6 +71,27 @@ pub struct HiHat {
     pub amplitude_envelope: Envelope,
 
     pub is_active: bool,
+
+    // Velocity-responsive state
+    /// Current trigger velocity (0.0-1.0), set on trigger
+    current_velocity: f32,
+
+    // Velocity scaling configuration
+    // Note: Hi-hat velocity relationships are OPPOSITE to kick drum!
+    // On real cymbals, harder hits = more resonance = longer decay
+
+    /// How much velocity affects decay time (0.0-1.0)
+    /// Higher velocity = LONGER decay (more cymbal ring)
+    /// This is opposite to kick drum behavior
+    velocity_to_decay: f32,
+
+    /// How much velocity affects brightness (0.0-1.0)
+    /// Higher velocity = brighter sound (more high-frequency content)
+    velocity_to_brightness: f32,
+
+    /// How much velocity affects resonance (0.0-1.0)
+    /// Higher velocity = more resonant shimmer
+    velocity_to_resonance: f32,
 }
 
 impl HiHat {
@@ -97,6 +118,17 @@ impl HiHat {
             brightness_oscillator: Oscillator::new(sample_rate, config.base_frequency * 2.0),
             amplitude_envelope: Envelope::new(),
             is_active: false,
+
+            // Initialize velocity state
+            current_velocity: 1.0,
+
+            // Velocity scaling for natural cymbal behavior:
+            // - Decay increases with velocity (0.5 = 50-100% range)
+            velocity_to_decay: 0.5,
+            // - Brightness increases strongly with velocity (0.6 = 40-100% range)
+            velocity_to_brightness: 0.6,
+            // - Resonance increases subtly with velocity (0.3 = 70-100% range)
+            velocity_to_resonance: 0.3,
         };
 
         hihat.configure_oscillators();
@@ -167,8 +199,85 @@ impl HiHat {
         self.configure_oscillators();
     }
 
+    /// Trigger at default velocity (convenience method)
     pub fn trigger(&mut self, time: f32) {
+        self.trigger_with_velocity(time, 0.5);
+    }
+
+    /// Trigger with velocity (0.0-1.0)
+    ///
+    /// Velocity affects hi-hat characteristics naturally:
+    /// - Higher velocity = LONGER decay (more cymbal ring/resonance)
+    /// - Higher velocity = brighter sound (more high-frequency content)
+    /// - Higher velocity = more resonant shimmer
+    ///
+    /// Note: This is OPPOSITE to kick drum behavior! Real cymbals
+    /// ring longer when struck harder because more energy excites
+    /// more resonant modes.
+    pub fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+        self.current_velocity = velocity.clamp(0.0, 1.0);
         self.is_active = true;
+
+        let vel = self.current_velocity;
+
+        // Quadratic curve for natural acoustic-like response
+        let vel_squared = vel * vel;
+
+        // --- Decay time scaling (OPPOSITE to kick!) ---
+        // Higher velocity = LONGER decay (more cymbal ring)
+        // Scale: 0.5 at vel=0 up to 1.0 at vel=1
+        // This gives soft hits 50% of the decay, hard hits full decay
+        let decay_scale = (1.0 - self.velocity_to_decay) + (self.velocity_to_decay * vel_squared);
+
+        // Get velocity-scaled decay time
+        let config = self.config;
+        let scaled_decay = config.decay_time * decay_scale;
+
+        // Configure noise oscillator envelope with velocity-scaled decay
+        if config.is_open {
+            // Open hi-hat: longer decay, some sustain
+            self.noise_oscillator.set_adsr(ADSRConfig::new(
+                config.attack_time,
+                scaled_decay * 0.3,
+                0.3,
+                scaled_decay * 0.7,
+            ));
+        } else {
+            // Closed hi-hat: shorter decay, no sustain
+            self.noise_oscillator.set_adsr(ADSRConfig::new(
+                config.attack_time,
+                scaled_decay * 0.8,
+                0.0,
+                scaled_decay * 0.2,
+            ));
+        }
+
+        // Configure brightness oscillator with velocity-scaled (shorter) decay
+        // Brightness always has a faster decay to emphasize the transient
+        let brightness_decay = scaled_decay * 0.3;
+        self.brightness_oscillator.set_adsr(ADSRConfig::new(
+            config.attack_time,
+            brightness_decay,
+            0.0,
+            brightness_decay * 0.3,
+        ));
+
+        // Configure amplitude envelope with velocity-scaled decay
+        if config.is_open {
+            self.amplitude_envelope.set_config(ADSRConfig::new(
+                config.attack_time,
+                scaled_decay * 0.4,
+                0.2,
+                scaled_decay * 0.6,
+            ));
+        } else {
+            self.amplitude_envelope.set_config(ADSRConfig::new(
+                config.attack_time,
+                scaled_decay * 0.9,
+                0.0,
+                scaled_decay * 0.1,
+            ));
+        }
 
         // Trigger all oscillators
         self.noise_oscillator.trigger(time);
@@ -191,20 +300,38 @@ impl HiHat {
             return 0.0;
         }
 
+        let vel = self.current_velocity;
+        let vel_squared = vel * vel;
+
+        // --- Velocity-responsive brightness scaling ---
+        // Higher velocity = more brightness contribution
+        // Scale: (1 - velocity_to_brightness) at vel=0 up to 1.0 at vel=1
+        let brightness_scale =
+            (1.0 - self.velocity_to_brightness) + (self.velocity_to_brightness * vel_squared);
+
         // Get outputs from oscillators
         let noise_output = self.noise_oscillator.tick(current_time);
-        let brightness_output = self.brightness_oscillator.tick(current_time);
+        let brightness_output = self.brightness_oscillator.tick(current_time) * brightness_scale;
 
         // Combine oscillator outputs
         let combined_output = noise_output + brightness_output;
 
         // Apply amplitude envelope
         let amplitude = self.amplitude_envelope.get_amplitude(current_time);
-        let final_output = combined_output * amplitude;
+        let enveloped_output = combined_output * amplitude;
 
-        // Apply simple resonance simulation by emphasizing certain frequencies
-        let resonance_factor = 1.0 + self.config.resonance * 0.5;
-        let resonant_output = final_output * resonance_factor;
+        // --- Velocity-responsive resonance scaling ---
+        // Higher velocity = more resonant shimmer
+        // Base resonance + velocity-scaled additional resonance
+        let resonance_scale =
+            (1.0 - self.velocity_to_resonance) + (self.velocity_to_resonance * vel_squared);
+        let effective_resonance = self.config.resonance * resonance_scale;
+        let resonance_factor = 1.0 + effective_resonance * 0.5;
+        let resonant_output = enveloped_output * resonance_factor;
+
+        // --- Velocity amplitude scaling (sqrt for perceptual loudness) ---
+        let velocity_amplitude = vel.sqrt();
+        let final_output = resonant_output * velocity_amplitude;
 
         // Check if hi-hat is still active
         if !self.noise_oscillator.envelope.is_active
@@ -214,7 +341,7 @@ impl HiHat {
             self.is_active = false;
         }
 
-        resonant_output
+        final_output
     }
 
     pub fn is_active(&self) -> bool {
@@ -259,9 +386,8 @@ impl HiHat {
 
 // Implement the Instrument trait for engine compatibility
 impl crate::engine::Instrument for HiHat {
-    fn trigger_with_velocity(&mut self, time: f32, _velocity: f32) {
-        // Velocity not yet implemented for hihat
-        HiHat::trigger(self, time);
+    fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+        HiHat::trigger_with_velocity(self, time, velocity);
     }
 
     fn tick(&mut self, current_time: f32) -> f32 {
