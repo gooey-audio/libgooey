@@ -7,7 +7,6 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use log::info;
-use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 // Import the engine and instruments
@@ -119,7 +118,6 @@ fn main() -> anyhow::Result<()> {
             if let Event::Key(KeyEvent { code, .. }) = event::read()? {
                 match code {
                     KeyCode::Char(' ') => {
-                        io::stdout().flush().unwrap();
                         let mut engine = audio_engine.lock().unwrap();
 
                         // Toggle the first sequencer

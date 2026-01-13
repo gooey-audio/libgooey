@@ -7,7 +7,6 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use log::info;
-use std::io::{self, Write};
 
 // Import the platform abstraction and audio engine
 use gooey::engine::{Engine, EngineOutput};
@@ -78,11 +77,9 @@ fn main() -> anyhow::Result<()> {
             if let Event::Key(KeyEvent { code, .. }) = event::read()? {
                 match code {
                     KeyCode::Char(' ') => {
-                        io::stdout().flush().unwrap();
                         let mut engine = audio_engine.lock().unwrap();
                         engine.trigger_instrument("tom");
-                        print!("*");
-                        io::stdout().flush().unwrap();
+                        info!("Triggered tom");
                     }
                     KeyCode::Char('q') | KeyCode::Esc => {
                         info!("Quitting...");

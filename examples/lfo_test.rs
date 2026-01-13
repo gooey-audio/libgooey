@@ -7,7 +7,6 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use log::info;
-use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 // Import the engine and instruments
@@ -132,26 +131,22 @@ fn main() -> anyhow::Result<()> {
                     KeyCode::Char('k') | KeyCode::Char('K') => {
                         let mut engine = audio_engine.lock().unwrap();
                         engine.trigger_instrument("kick");
-                        print!("K");
-                        io::stdout().flush().unwrap();
+                        info!("Triggered kick");
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => {
                         let mut engine = audio_engine.lock().unwrap();
                         engine.trigger_instrument("snare");
-                        print!("S");
-                        io::stdout().flush().unwrap();
+                        info!("Triggered snare");
                     }
                     KeyCode::Char('h') | KeyCode::Char('H') => {
                         let mut engine = audio_engine.lock().unwrap();
                         engine.trigger_instrument("hihat");
-                        print!("H");
-                        io::stdout().flush().unwrap();
+                        info!("Triggered hihat");
                     }
                     KeyCode::Char('t') | KeyCode::Char('T') => {
                         let mut engine = audio_engine.lock().unwrap();
                         engine.trigger_instrument("tom");
-                        print!("T");
-                        io::stdout().flush().unwrap();
+                        info!("Triggered tom");
                     }
                     KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                         info!("Quitting...");
