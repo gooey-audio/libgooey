@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 // Import the engine and instruments
 use libgooey::effects::LowpassFilterEffect;
-use libgooey::engine::{Engine, EngineOutput, Lfo, MusicalDivision, Sequencer};
+use libgooey::engine::{Engine, EngineOutput, Lfo, MusicalDivision, Sequencer, SequencerStep};
 use libgooey::instruments::HiHat;
 
 // CLI example for sequencer
@@ -30,10 +30,23 @@ fn main() -> anyhow::Result<()> {
     let bpm = 120.0;
     engine.set_bpm(bpm);
 
-    // Create a sequencer with a simple 8-step pattern (16th notes at 120 BPM)
-    let pattern = vec![true, false, true, false, true, false, true, false];
-    let sequencer = Sequencer::with_pattern(bpm, sample_rate, pattern, "hihat");
+    // Create a sequencer with varying velocities to demonstrate velocity response
+    // Pattern: soft -> medium -> hard -> full (repeating)
+    // This lets you hear the velocity differences without a MIDI controller
+    let pattern = vec![
+        SequencerStep::with_velocity(true, 0.2),  // Soft - short decay, less bright
+        SequencerStep::with_velocity(false, 0.0), // Rest
+        SequencerStep::with_velocity(true, 0.5),  // Medium
+        SequencerStep::with_velocity(false, 0.0), // Rest
+        SequencerStep::with_velocity(true, 0.8),  // Hard - longer decay, brighter
+        SequencerStep::with_velocity(false, 0.0), // Rest
+        SequencerStep::with_velocity(true, 1.0),  // Full - maximum decay & brightness
+        SequencerStep::with_velocity(false, 0.0), // Rest
+    ];
+    let sequencer = Sequencer::with_velocity_pattern(bpm, sample_rate, pattern, "hihat");
     engine.add_sequencer(sequencer);
+
+    println!("Pattern velocities: 0.2 (soft) -> 0.5 (med) -> 0.8 (hard) -> 1.0 (full)");
 
     // Add a BPM-synced LFO to modulate the hi-hat decay time
     // Start with 1 bar = one cycle every 4 beats
