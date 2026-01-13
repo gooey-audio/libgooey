@@ -11,25 +11,13 @@ use log::info;
 // Import the platform abstraction and audio engine
 use gooey::engine::{Engine, EngineOutput};
 use gooey::instruments::KickDrum;
+use gooey::utils::init_logger;
 use std::sync::{Arc, Mutex};
 
 // CLI example for kick drum
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .format(|buf, record| {
-            use std::io::Write;
-            writeln!(
-                buf,
-                "\r[{} {:5} {}] {}",
-                buf.timestamp(),
-                record.level(),
-                record.module_path().unwrap_or("unknown"),
-                record.args()
-            )
-        })
-        .init();
+    init_logger();
     let sample_rate = 44100.0;
 
     // Create the audio engine
