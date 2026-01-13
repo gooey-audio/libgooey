@@ -309,7 +309,7 @@ impl KickDrum {
 
     /// Trigger at full velocity (convenience method)
     pub fn trigger(&mut self, time: f32) {
-        self.trigger_with_velocity(time, 1.0);
+        self.trigger_with_velocity(time, 0.5);
     }
 
     /// Trigger with velocity (0.0-1.0)

@@ -215,10 +215,10 @@ impl Engine {
         }
     }
 
-    /// Queue an instrument to be triggered on the next audio tick at full velocity
+    /// Queue an instrument to be triggered on the next audio tick at half velocity
     /// This is thread-safe to call from the main thread
     pub fn trigger_instrument(&mut self, name: &str) {
-        self.trigger_queue.push_back((name.to_string(), 1.0));
+        self.trigger_queue.push_back((name.to_string(), 0.5));
     }
 
     /// Queue an instrument to be triggered on the next audio tick with specified velocity
