@@ -1,4 +1,46 @@
-/// A sample-accurate step sequencer
+/// Represents a single sequencer step with enabled state and velocity
+#[derive(Clone, Copy, Debug)]
+pub struct SequencerStep {
+    /// Whether this step triggers the instrument
+    pub enabled: bool,
+    /// Velocity for this step (0.0-1.0, defaults to 1.0)
+    pub velocity: f32,
+}
+
+impl Default for SequencerStep {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            velocity: 1.0,
+        }
+    }
+}
+
+impl SequencerStep {
+    /// Create a new step with the given enabled state and full velocity
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            velocity: 1.0,
+        }
+    }
+
+    /// Create a new step with the given enabled state and velocity
+    pub fn with_velocity(enabled: bool, velocity: f32) -> Self {
+        Self {
+            enabled,
+            velocity: velocity.clamp(0.0, 1.0),
+        }
+    }
+}
+
+impl From<bool> for SequencerStep {
+    fn from(enabled: bool) -> Self {
+        Self::new(enabled)
+    }
+}
+
+/// A sample-accurate step sequencer with per-step velocity
 pub struct Sequencer {
     bpm: f32,
     sample_rate: f32,
@@ -8,8 +50,8 @@ pub struct Sequencer {
     next_trigger_sample: u64,
     samples_per_step: f32,
 
-    // Pattern and current position
-    pattern: Vec<bool>,
+    // Pattern and current position (now with velocity per step)
+    pattern: Vec<SequencerStep>,
     current_step: usize,
 
     // The step that is currently being played (for UI display)
@@ -37,8 +79,8 @@ impl Sequencer {
     ) -> Self {
         let samples_per_step = Self::calculate_samples_per_step(bpm, sample_rate);
 
-        // Initialize with all steps enabled
-        let pattern = vec![true; beat_count];
+        // Initialize with all steps enabled at full velocity
+        let pattern = vec![SequencerStep::default(); beat_count];
 
         Self {
             bpm,
@@ -54,11 +96,37 @@ impl Sequencer {
         }
     }
 
-    /// Create a sequencer with a custom pattern
+    /// Create a sequencer with a custom pattern (bool array for backwards compatibility)
     pub fn with_pattern(
         bpm: f32,
         sample_rate: f32,
         pattern: Vec<bool>,
+        instrument_name: impl Into<String>,
+    ) -> Self {
+        let samples_per_step = Self::calculate_samples_per_step(bpm, sample_rate);
+
+        // Convert bool pattern to SequencerStep with full velocity
+        let pattern: Vec<SequencerStep> = pattern.into_iter().map(SequencerStep::from).collect();
+
+        Self {
+            bpm,
+            sample_rate,
+            sample_count: 0,
+            next_trigger_sample: 0,
+            samples_per_step,
+            pattern,
+            current_step: 0,
+            playhead_step: 0,
+            instrument_name: instrument_name.into(),
+            is_running: false,
+        }
+    }
+
+    /// Create a sequencer with a custom pattern including velocities
+    pub fn with_velocity_pattern(
+        bpm: f32,
+        sample_rate: f32,
+        pattern: Vec<SequencerStep>,
         instrument_name: impl Into<String>,
     ) -> Self {
         let samples_per_step = Self::calculate_samples_per_step(bpm, sample_rate);
@@ -111,20 +179,48 @@ impl Sequencer {
         self.samples_per_step = Self::calculate_samples_per_step(bpm, self.sample_rate);
     }
 
-    /// Set a step in the pattern
+    /// Set a step's enabled state in the pattern (maintains current velocity)
     pub fn set_step(&mut self, step: usize, enabled: bool) {
         if step < self.pattern.len() {
-            self.pattern[step] = enabled;
+            self.pattern[step].enabled = enabled;
         }
     }
 
-    /// Get the pattern
-    pub fn pattern(&self) -> &[bool] {
+    /// Set a step's velocity (0.0-1.0)
+    pub fn set_step_velocity(&mut self, step: usize, velocity: f32) {
+        if step < self.pattern.len() {
+            self.pattern[step].velocity = velocity.clamp(0.0, 1.0);
+        }
+    }
+
+    /// Set both enabled state and velocity for a step
+    pub fn set_step_with_velocity(&mut self, step: usize, enabled: bool, velocity: f32) {
+        if step < self.pattern.len() {
+            self.pattern[step] = SequencerStep::with_velocity(enabled, velocity);
+        }
+    }
+
+    /// Get the pattern with velocity information
+    pub fn pattern_steps(&self) -> &[SequencerStep] {
         &self.pattern
     }
 
-    /// Set the entire pattern
+    /// Get the pattern as enabled booleans (for backwards compatibility)
+    pub fn pattern(&self) -> Vec<bool> {
+        self.pattern.iter().map(|s| s.enabled).collect()
+    }
+
+    /// Set the entire pattern from bool array (sets all velocities to 1.0)
     pub fn set_pattern(&mut self, pattern: Vec<bool>) {
+        self.pattern = pattern.into_iter().map(SequencerStep::from).collect();
+        // Reset to beginning if current step is beyond new pattern length
+        if self.current_step >= self.pattern.len() {
+            self.current_step = 0;
+        }
+    }
+
+    /// Set the entire pattern with velocity information
+    pub fn set_pattern_with_velocity(&mut self, pattern: Vec<SequencerStep>) {
         self.pattern = pattern;
         // Reset to beginning if current step is beyond new pattern length
         if self.current_step >= self.pattern.len() {
@@ -153,9 +249,9 @@ impl Sequencer {
         &self.instrument_name
     }
 
-    /// Process one sample and return the instrument name if it should be triggered
-    /// Returns Some(instrument_name) if a trigger should happen, None otherwise
-    pub fn tick(&mut self) -> Option<&str> {
+    /// Process one sample and return trigger info if applicable
+    /// Returns Some((instrument_name, velocity)) if a trigger should happen, None otherwise
+    pub fn tick(&mut self) -> Option<(&str, f32)> {
         if !self.is_running || self.pattern.is_empty() {
             self.sample_count += 1;
             return None;
@@ -169,8 +265,9 @@ impl Sequencer {
             self.playhead_step = self.current_step;
 
             // Check if this step should trigger
-            if self.pattern[self.current_step] {
-                should_trigger = Some(self.instrument_name.as_str());
+            let step = &self.pattern[self.current_step];
+            if step.enabled {
+                should_trigger = Some((self.instrument_name.as_str(), step.velocity));
             }
 
             // Advance to the next step (internal tracking)

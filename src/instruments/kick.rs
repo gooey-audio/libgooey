@@ -186,6 +186,15 @@ pub struct KickDrum {
     pub fm_snap: FMSnapSynthesizer,
 
     pub is_active: bool,
+
+    // Velocity-responsive state
+    /// Current trigger velocity (0.0-1.0), set on trigger
+    current_velocity: f32,
+
+    // Velocity scaling configuration
+    /// How much velocity affects decay time (0.0-1.0)
+    /// Higher values = more velocity sensitivity (shorter decay at high velocity)
+    velocity_to_decay: f32,
 }
 
 impl KickDrum {
@@ -207,6 +216,13 @@ impl KickDrum {
             click_filter: ResonantHighpassFilter::new(sample_rate, 8000.0, 4.0),
             fm_snap: FMSnapSynthesizer::new(sample_rate),
             is_active: false,
+
+            // Initialize velocity state
+            current_velocity: 1.0,
+
+            // Velocity scaling: 0.5 means velocity can reduce decay by up to 50%
+            // (higher velocity = shorter, tighter decay)
+            velocity_to_decay: 0.5,
         };
 
         kick.configure_oscillators();
@@ -291,11 +307,66 @@ impl KickDrum {
         self.params.to_config()
     }
 
+    /// Trigger at full velocity (convenience method)
     pub fn trigger(&mut self, time: f32) {
+        self.trigger_with_velocity(time, 0.5);
+    }
+
+    /// Trigger with velocity (0.0-1.0)
+    ///
+    /// Velocity affects the amplitude envelope decay time:
+    /// - Higher velocity = shorter decay (tighter, punchier sound)
+    /// - Lower velocity = longer decay (deeper, more sustained sound)
+    pub fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+        self.current_velocity = velocity.clamp(0.0, 1.0);
         self.is_active = true;
 
-        // Reconfigure envelopes with current decay value before triggering
-        self.configure_oscillators();
+        let vel = self.current_velocity;
+
+        // Quadratic curve for natural acoustic-like response
+        let vel_squared = vel * vel;
+
+        // --- Decay time scaling ---
+        // Higher velocity = shorter decay (tighter, punchier sound)
+        // Scale factor: 1.0 at vel=0, down to 0.5 at vel=1 (50% reduction)
+        let decay_scale = 1.0 - (self.velocity_to_decay * vel_squared);
+
+        // Get base parameters
+        let base_decay = self.params.decay.get() * decay_scale;
+        let base_freq = self.params.frequency.get();
+
+        // Configure pitch envelope
+        self.pitch_envelope.set_config(ADSRConfig::new(
+            0.001,
+            base_decay,
+            0.0,
+            base_decay * 0.2,
+        ));
+
+        // Configure amplitude envelopes with velocity-scaled decay
+        self.sub_oscillator.set_adsr(ADSRConfig::new(
+            0.001,
+            base_decay,
+            0.0,
+            base_decay * 0.2,
+        ));
+        self.punch_oscillator.set_adsr(ADSRConfig::new(
+            0.001,
+            base_decay,
+            0.0,
+            base_decay * 0.2,
+        ));
+        self.click_oscillator.set_adsr(ADSRConfig::new(
+            0.001,
+            base_decay * 0.2,  // Click always shorter
+            0.0,
+            base_decay * 0.02,
+        ));
+
+        // Update base frequencies
+        self.sub_oscillator.frequency_hz = base_freq;
+        self.punch_oscillator.frequency_hz = base_freq * 2.5;
+        self.click_oscillator.frequency_hz = base_freq * 40.0;
 
         // Trigger all oscillators
         self.sub_oscillator.trigger(time);
@@ -362,6 +433,10 @@ impl KickDrum {
             + filtered_click_output
             + (fm_snap_output * self.params.volume.get());
 
+        // Apply velocity amplitude scaling (sqrt for perceptually linear loudness)
+        let velocity_amplitude = self.current_velocity.sqrt();
+        let final_output = total_output * velocity_amplitude;
+
         // Check if kick is still active
         if !self.sub_oscillator.envelope.is_active
             && !self.punch_oscillator.envelope.is_active
@@ -371,7 +446,7 @@ impl KickDrum {
             self.is_active = false;
         }
 
-        total_output
+        final_output
     }
 
     pub fn is_active(&self) -> bool {
@@ -415,8 +490,8 @@ impl KickDrum {
 }
 
 impl crate::engine::Instrument for KickDrum {
-    fn trigger(&mut self, time: f32) {
-        self.trigger(time);
+    fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+        KickDrum::trigger_with_velocity(self, time, velocity);
     }
 
     fn tick(&mut self, current_time: f32) -> f32 {

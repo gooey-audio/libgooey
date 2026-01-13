@@ -4,10 +4,10 @@
 //! Designed for integration with iOS (and other platforms in the future).
 
 use crate::effects::{BrickWallLimiter, Effect, LowpassFilterEffect};
-use crate::engine::Sequencer;
+use crate::engine::{Instrument, Sequencer};
 use crate::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
 use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Opaque wrapper around the audio engine for FFI
 ///
@@ -40,11 +40,15 @@ pub struct GooeyEngine {
     bpm: f32,
     current_time: f32,
 
-    // Per-instrument manual trigger flags
+    // Per-instrument manual trigger flags and velocities
     kick_trigger_pending: AtomicBool,
+    kick_trigger_velocity: AtomicU32, // f32 bits stored atomically
     snare_trigger_pending: AtomicBool,
+    snare_trigger_velocity: AtomicU32,
     hihat_trigger_pending: AtomicBool,
+    hihat_trigger_velocity: AtomicU32,
     tom_trigger_pending: AtomicBool,
+    tom_trigger_velocity: AtomicU32,
 }
 
 impl GooeyEngine {
@@ -84,25 +88,33 @@ impl GooeyEngine {
             bpm,
             current_time: 0.0,
             kick_trigger_pending: AtomicBool::new(false),
+            kick_trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
             snare_trigger_pending: AtomicBool::new(false),
+            snare_trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
             hihat_trigger_pending: AtomicBool::new(false),
+            hihat_trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
             tom_trigger_pending: AtomicBool::new(false),
+            tom_trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
         }
     }
 
     fn render(&mut self, buffer: &mut [f32]) {
-        // Check for pending manual triggers (all instruments)
+        // Check for pending manual triggers with velocity (all instruments)
         if self.kick_trigger_pending.swap(false, Ordering::Acquire) {
-            self.kick.trigger(self.current_time);
+            let velocity = f32::from_bits(self.kick_trigger_velocity.load(Ordering::Acquire));
+            self.kick.trigger_with_velocity(self.current_time, velocity);
         }
         if self.snare_trigger_pending.swap(false, Ordering::Acquire) {
-            self.snare.trigger(self.current_time);
+            let velocity = f32::from_bits(self.snare_trigger_velocity.load(Ordering::Acquire));
+            self.snare.trigger_with_velocity(self.current_time, velocity);
         }
         if self.hihat_trigger_pending.swap(false, Ordering::Acquire) {
-            self.hihat.trigger(self.current_time);
+            let velocity = f32::from_bits(self.hihat_trigger_velocity.load(Ordering::Acquire));
+            self.hihat.trigger_with_velocity(self.current_time, velocity);
         }
         if self.tom_trigger_pending.swap(false, Ordering::Acquire) {
-            self.tom.trigger(self.current_time);
+            let velocity = f32::from_bits(self.tom_trigger_velocity.load(Ordering::Acquire));
+            self.tom.trigger_with_velocity(self.current_time, velocity);
         }
 
         let sample_period = 1.0 / self.sample_rate;
@@ -110,23 +122,24 @@ impl GooeyEngine {
         for sample in buffer.iter_mut() {
             // Tick ALL sequencers first to ensure sample-accurate synchronization
             // (if two instruments trigger on the same step, they fire at exactly the same sample)
-            let kick_trigger = self.kick_sequencer.tick().is_some();
-            let snare_trigger = self.snare_sequencer.tick().is_some();
-            let hihat_trigger = self.hihat_sequencer.tick().is_some();
-            let tom_trigger = self.tom_sequencer.tick().is_some();
+            // Returns Option<(&str, f32)> with instrument name and velocity
+            let kick_trigger = self.kick_sequencer.tick();
+            let snare_trigger = self.snare_sequencer.tick();
+            let hihat_trigger = self.hihat_sequencer.tick();
+            let tom_trigger = self.tom_sequencer.tick();
 
-            // Apply triggers after all sequencers have been ticked
-            if kick_trigger {
-                self.kick.trigger(self.current_time);
+            // Apply triggers with velocity after all sequencers have been ticked
+            if let Some((_, velocity)) = kick_trigger {
+                self.kick.trigger_with_velocity(self.current_time, velocity);
             }
-            if snare_trigger {
-                self.snare.trigger(self.current_time);
+            if let Some((_, velocity)) = snare_trigger {
+                self.snare.trigger_with_velocity(self.current_time, velocity);
             }
-            if hihat_trigger {
-                self.hihat.trigger(self.current_time);
+            if let Some((_, velocity)) = hihat_trigger {
+                self.hihat.trigger_with_velocity(self.current_time, velocity);
             }
-            if tom_trigger {
-                self.tom.trigger(self.current_time);
+            if let Some((_, velocity)) = tom_trigger {
+                self.tom.trigger_with_velocity(self.current_time, velocity);
             }
 
             // Generate and mix audio from all instruments
@@ -269,10 +282,53 @@ pub unsafe extern "C" fn gooey_engine_render(
 // Instrument triggering
 // =============================================================================
 
-/// Trigger any instrument manually by ID
+/// Trigger any instrument manually by ID with velocity
+///
+/// Use this for manual triggering with velocity sensitivity (e.g., velocity-sensitive pads, MIDI input).
+/// The trigger will be processed on the next call to `gooey_engine_render`.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+/// * `velocity` - Velocity from 0.0 (softest) to 1.0 (hardest)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_trigger_instrument_with_velocity(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    velocity: f32,
+) {
+    if let Some(engine) = engine.as_ref() {
+        let vel_clamped = velocity.clamp(0.0, 1.0);
+        match instrument {
+            INSTRUMENT_KICK => {
+                engine.kick_trigger_velocity.store(vel_clamped.to_bits(), Ordering::Release);
+                engine.kick_trigger_pending.store(true, Ordering::Release);
+            }
+            INSTRUMENT_SNARE => {
+                engine.snare_trigger_velocity.store(vel_clamped.to_bits(), Ordering::Release);
+                engine.snare_trigger_pending.store(true, Ordering::Release);
+            }
+            INSTRUMENT_HIHAT => {
+                engine.hihat_trigger_velocity.store(vel_clamped.to_bits(), Ordering::Release);
+                engine.hihat_trigger_pending.store(true, Ordering::Release);
+            }
+            INSTRUMENT_TOM => {
+                engine.tom_trigger_velocity.store(vel_clamped.to_bits(), Ordering::Release);
+                engine.tom_trigger_pending.store(true, Ordering::Release);
+            }
+            _ => {} // Unknown instrument, ignore
+        }
+    }
+}
+
+/// Trigger any instrument manually by ID at full velocity
 ///
 /// Use this for manual triggering outside of the sequencer (e.g., user tap).
 /// The trigger will be processed on the next call to `gooey_engine_render`.
+/// For velocity-sensitive triggering, use `gooey_engine_trigger_instrument_with_velocity`.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -285,15 +341,7 @@ pub unsafe extern "C" fn gooey_engine_trigger_instrument(
     engine: *mut GooeyEngine,
     instrument: u32,
 ) {
-    if let Some(engine) = engine.as_ref() {
-        match instrument {
-            INSTRUMENT_KICK => engine.kick_trigger_pending.store(true, Ordering::Release),
-            INSTRUMENT_SNARE => engine.snare_trigger_pending.store(true, Ordering::Release),
-            INSTRUMENT_HIHAT => engine.hihat_trigger_pending.store(true, Ordering::Release),
-            INSTRUMENT_TOM => engine.tom_trigger_pending.store(true, Ordering::Release),
-            _ => {} // Unknown instrument, ignore
-        }
-    }
+    gooey_engine_trigger_instrument_with_velocity(engine, instrument, 1.0);
 }
 
 /// Trigger the kick drum manually (legacy function, prefer `gooey_engine_trigger_instrument`)
@@ -707,6 +755,62 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step(
     let engine = &mut *engine;
     if let Some(sequencer) = engine.sequencer_for_instrument(instrument) {
         sequencer.set_step(step as usize, enabled);
+    }
+}
+
+/// Set the velocity for a specific step in an instrument's sequencer
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+/// * `step` - Step index (0-15 for a 16-step sequencer)
+/// * `velocity` - Velocity from 0.0 to 1.0
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_set_step_velocity(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+    velocity: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+    if let Some(sequencer) = engine.sequencer_for_instrument(instrument) {
+        sequencer.set_step_velocity(step as usize, velocity);
+    }
+}
+
+/// Set both enabled state and velocity for a sequencer step
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+/// * `step` - Step index (0-15 for a 16-step sequencer)
+/// * `enabled` - Whether the step should trigger
+/// * `velocity` - Velocity from 0.0 to 1.0
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_set_step_with_velocity(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+    enabled: bool,
+    velocity: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+    if let Some(sequencer) = engine.sequencer_for_instrument(instrument) {
+        sequencer.set_step_with_velocity(step as usize, enabled, velocity);
     }
 }
 

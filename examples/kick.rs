@@ -136,8 +136,11 @@ fn main() -> anyhow::Result<()> {
             while let Ok((note, velocity)) = midi_handler.receiver.try_recv() {
                 if note == KICK_NOTE || note == KICK_NOTE_ALT {
                     let mut engine = audio_engine.lock().unwrap();
-                    engine.trigger_instrument("kick");
-                    print!("* (vel: {:.0}%) ", (velocity as f32 / 127.0) * 100.0);
+                    // Convert MIDI velocity (0-127) to normalized (0.0-1.0)
+                    let vel_normalized = velocity as f32 / 127.0;
+                    // Queue trigger with velocity - Engine will apply correct time in tick()
+                    engine.trigger_instrument_with_velocity("kick", vel_normalized);
+                    print!("* (vel: {:.0}%) ", vel_normalized * 100.0);
                     io::stdout().flush().unwrap();
                 }
             }

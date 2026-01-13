@@ -8,7 +8,7 @@ pub mod engine_output;
 pub use engine_output::EngineOutput;
 
 pub mod sequencer;
-pub use sequencer::Sequencer;
+pub use sequencer::{Sequencer, SequencerStep};
 
 pub mod lfo;
 pub use lfo::{Lfo, LfoSyncMode, MusicalDivision};
@@ -20,8 +20,17 @@ pub use crate::visualization::WaveformDisplay;
 /// Trait that all instruments must implement
 /// Send is required because instruments are used in the audio thread
 pub trait Instrument: Send {
-    /// Trigger the instrument at a specific time
-    fn trigger(&mut self, time: f32);
+    /// Trigger the instrument at a specific time with velocity
+    ///
+    /// # Arguments
+    /// * `time` - The current audio time in seconds
+    /// * `velocity` - Trigger velocity from 0.0 (softest) to 1.0 (hardest)
+    fn trigger_with_velocity(&mut self, time: f32, velocity: f32);
+
+    /// Trigger the instrument at full velocity (convenience method)
+    fn trigger(&mut self, time: f32) {
+        self.trigger_with_velocity(time, 1.0);
+    }
 
     /// Generate one sample of audio at the current time
     fn tick(&mut self, current_time: f32) -> f32;
@@ -55,8 +64,8 @@ pub struct Engine {
     sample_rate: f32,
     bpm: f32, // Global BPM for synced LFOs and sequencers
     instruments: HashMap<String, Box<dyn Instrument>>,
-    // Queue of instrument names to trigger on next tick
-    trigger_queue: VecDeque<String>,
+    // Queue of (instrument_name, velocity) to trigger on next tick
+    trigger_queue: VecDeque<(String, f32)>,
     // Active sequencers
     sequencers: Vec<Sequencer>,
     // LFOs for modulation
@@ -206,10 +215,16 @@ impl Engine {
         }
     }
 
-    /// Queue an instrument to be triggered on the next audio tick
+    /// Queue an instrument to be triggered on the next audio tick at half velocity
     /// This is thread-safe to call from the main thread
     pub fn trigger_instrument(&mut self, name: &str) {
-        self.trigger_queue.push_back(name.to_string());
+        self.trigger_queue.push_back((name.to_string(), 0.5));
+    }
+
+    /// Queue an instrument to be triggered on the next audio tick with specified velocity
+    /// This is thread-safe to call from the main thread
+    pub fn trigger_instrument_with_velocity(&mut self, name: &str, velocity: f32) {
+        self.trigger_queue.push_back((name.to_string(), velocity.clamp(0.0, 1.0)));
     }
 
     /// Generate one sample of audio at the given time
@@ -229,20 +244,20 @@ impl Engine {
             }
         }
 
-        // Process all sequencers (sample-accurate triggering)
+        // Process all sequencers (sample-accurate triggering with velocity)
         for sequencer in &mut self.sequencers {
-            if let Some(instrument_name) = sequencer.tick() {
-                // Sequencer says to trigger this instrument
+            if let Some((instrument_name, velocity)) = sequencer.tick() {
+                // Sequencer says to trigger this instrument with velocity
                 if let Some(instrument) = self.instruments.get_mut(instrument_name) {
-                    instrument.trigger(current_time);
+                    instrument.trigger_with_velocity(current_time, velocity);
                 }
             }
         }
 
-        // Process trigger queue - trigger instruments with current audio time
-        while let Some(name) = self.trigger_queue.pop_front() {
+        // Process trigger queue - trigger instruments with current audio time and velocity
+        while let Some((name, velocity)) = self.trigger_queue.pop_front() {
             if let Some(instrument) = self.instruments.get_mut(&name) {
-                instrument.trigger(current_time);
+                instrument.trigger_with_velocity(current_time, velocity);
             } else {
                 eprintln!("Warning: Instrument '{}' not found", name);
             }
