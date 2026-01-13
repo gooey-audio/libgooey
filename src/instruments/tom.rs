@@ -219,8 +219,9 @@ impl TomDrum {
 }
 
 impl crate::engine::Instrument for TomDrum {
-    fn trigger(&mut self, time: f32) {
-        self.trigger(time);
+    fn trigger_with_velocity(&mut self, time: f32, _velocity: f32) {
+        // Velocity not yet implemented for tom
+        TomDrum::trigger(self, time);
     }
 
     fn tick(&mut self, current_time: f32) -> f32 {

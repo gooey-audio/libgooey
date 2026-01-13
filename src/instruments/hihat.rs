@@ -259,8 +259,9 @@ impl HiHat {
 
 // Implement the Instrument trait for engine compatibility
 impl crate::engine::Instrument for HiHat {
-    fn trigger(&mut self, time: f32) {
-        self.trigger(time);
+    fn trigger_with_velocity(&mut self, time: f32, _velocity: f32) {
+        // Velocity not yet implemented for hihat
+        HiHat::trigger(self, time);
     }
 
     fn tick(&mut self, current_time: f32) -> f32 {
