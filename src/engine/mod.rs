@@ -224,7 +224,8 @@ impl Engine {
     /// Queue an instrument to be triggered on the next audio tick with specified velocity
     /// This is thread-safe to call from the main thread
     pub fn trigger_instrument_with_velocity(&mut self, name: &str, velocity: f32) {
-        self.trigger_queue.push_back((name.to_string(), velocity.clamp(0.0, 1.0)));
+        self.trigger_queue
+            .push_back((name.to_string(), velocity.clamp(0.0, 1.0)));
     }
 
     /// Generate one sample of audio at the given time

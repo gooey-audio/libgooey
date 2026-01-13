@@ -79,7 +79,6 @@ pub struct HiHat {
     // Velocity scaling configuration
     // Note: Hi-hat velocity relationships are OPPOSITE to kick drum!
     // On real cymbals, harder hits = more resonance = longer decay
-
     /// How much velocity affects decay time (0.0-1.0)
     /// Higher velocity = LONGER decay (more cymbal ring)
     /// This is opposite to kick drum behavior

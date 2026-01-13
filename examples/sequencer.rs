@@ -34,13 +34,13 @@ fn main() -> anyhow::Result<()> {
     // Pattern: soft -> medium -> hard -> full (repeating)
     // This lets you hear the velocity differences without a MIDI controller
     let pattern = vec![
-        SequencerStep::with_velocity(true, 0.2),  // Soft - short decay, less bright
+        SequencerStep::with_velocity(true, 0.2), // Soft - short decay, less bright
         SequencerStep::with_velocity(false, 0.0), // Rest
-        SequencerStep::with_velocity(true, 0.5),  // Medium
+        SequencerStep::with_velocity(true, 0.5), // Medium
         SequencerStep::with_velocity(false, 0.0), // Rest
-        SequencerStep::with_velocity(true, 0.8),  // Hard - longer decay, brighter
+        SequencerStep::with_velocity(true, 0.8), // Hard - longer decay, brighter
         SequencerStep::with_velocity(false, 0.0), // Rest
-        SequencerStep::with_velocity(true, 1.0),  // Full - maximum decay & brightness
+        SequencerStep::with_velocity(true, 1.0), // Full - maximum decay & brightness
         SequencerStep::with_velocity(false, 0.0), // Rest
     ];
     let sequencer = Sequencer::with_velocity_pattern(bpm, sample_rate, pattern, "hihat");
