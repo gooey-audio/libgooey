@@ -4,6 +4,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, FromSample, Sample, SizedSample, Stream, StreamConfig,
 };
+use log::{debug, error, info};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -87,7 +88,7 @@ impl EngineOutput {
 
         self.display = Some(display);
 
-        println!("Waveform visualization enabled");
+        info!("Waveform visualization enabled");
 
         Ok(())
     }
@@ -205,10 +206,10 @@ impl EngineOutput {
             .default_output_device()
             .ok_or_else(|| anyhow::anyhow!("Default output device is not available"))?;
 
-        println!("Output device: {}", device.name()?);
+        info!("Output device: {}", device.name()?);
 
         let config = device.default_output_config()?;
-        println!("Default output config: {:?}", config);
+        debug!("Default output config: {:?}", config);
 
         self.sample_rate = config.sample_rate().0 as f32;
         self.device = Some(device);
@@ -232,7 +233,7 @@ impl EngineOutput {
         let num_channels = config.channels as usize;
         let sample_rate = config.sample_rate.0 as f64;
 
-        let err_fn = |err| eprintln!("Error building output sound stream: {}", err);
+        let err_fn = |err| error!("Error building output sound stream: {}", err);
 
         let stream = device.build_output_stream(
             config,
@@ -268,7 +269,7 @@ impl EngineOutput {
         let num_channels = config.channels as usize;
         let sample_rate = config.sample_rate.0 as f64;
 
-        let err_fn = |err| eprintln!("Error building output sound stream: {}", err);
+        let err_fn = |err| error!("Error building output sound stream: {}", err);
 
         let stream = device.build_output_stream(
             config,
@@ -382,7 +383,7 @@ impl EngineOutput {
             stream.play()?;
             self.is_active = true;
             self.start_time = Some(Instant::now());
-            println!("Audio stream started at sample rate: {}", self.sample_rate);
+            info!("Audio stream started at sample rate: {}", self.sample_rate);
         } else {
             return Err(anyhow::anyhow!(
                 "Stream not created. Call create_stream_with_engine first."
@@ -397,7 +398,7 @@ impl EngineOutput {
         if let Some(stream) = &self.stream {
             stream.pause()?;
             self.is_active = false;
-            println!("Audio stream stopped");
+            info!("Audio stream stopped");
         }
 
         Ok(())

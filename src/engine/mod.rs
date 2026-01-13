@@ -1,4 +1,5 @@
 use crate::effects::{BrickWallLimiter, Effect};
+use log::warn;
 use std::collections::{HashMap, VecDeque};
 
 #[cfg(feature = "native")]
@@ -244,7 +245,7 @@ impl Engine {
             if let Some(instrument) = self.instruments.get_mut(&name) {
                 instrument.trigger(current_time);
             } else {
-                eprintln!("Warning: Instrument '{}' not found", name);
+                warn!("Instrument '{}' not found", name);
             }
         }
 

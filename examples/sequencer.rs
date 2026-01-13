@@ -6,17 +6,19 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use log::info;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 // Import the engine and instruments
-use libgooey::effects::LowpassFilterEffect;
-use libgooey::engine::{Engine, EngineOutput, Lfo, MusicalDivision, Sequencer};
-use libgooey::instruments::HiHat;
+use gooey::effects::LowpassFilterEffect;
+use gooey::engine::{Engine, EngineOutput, Lfo, MusicalDivision, Sequencer};
+use gooey::instruments::HiHat;
 
 // CLI example for sequencer
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
+    env_logger::init();
     let sample_rate = 44100.0;
 
     // Create the audio engine
@@ -46,18 +48,18 @@ fn main() -> anyhow::Result<()> {
         .map_lfo_to_parameter(lfo_index, "hihat", "decay", 1.0)
         .expect("Failed to map LFO to hi-hat decay");
 
-    println!("✓ LFO mapped to hi-hat decay");
-    println!("  Synced to: 1 bar (4 beats)");
-    println!("  Range: 20ms to 500ms decay time");
+    info!("LFO mapped to hi-hat decay");
+    info!("  Synced to: 1 bar (4 beats)");
+    info!("  Range: 20ms to 500ms decay time");
 
     // Add a lowpass filter effect to the engine
     let filter = LowpassFilterEffect::new(sample_rate, 2000.0, 0.3);
     let filter_control = filter.get_control();
     engine.add_global_effect(Box::new(filter));
 
-    println!("✓ Lowpass filter added to output");
-    println!("  Initial cutoff: 2000 Hz");
-    println!("  Resonance: 0.3");
+    info!("Lowpass filter added to output");
+    info!("  Initial cutoff: 2000 Hz");
+    info!("  Resonance: 0.3");
 
     // Wrap in Arc<Mutex> for thread-safe access
     let audio_engine = Arc::new(Mutex::new(engine));
@@ -78,24 +80,24 @@ fn main() -> anyhow::Result<()> {
     // Start the audio stream
     engine_output.start()?;
 
-    println!("=== Sequencer + LFO + Filter Example ===");
-    println!("Press SPACE to start/stop sequencer");
-    println!("Press UP/DOWN to adjust BPM");
-    println!("Press LEFT/RIGHT to cycle LFO division");
-    println!("Press W/S to adjust filter cutoff frequency");
-    println!("Press A/D to adjust filter resonance");
-    println!("Press 'q' to quit");
+    info!("=== Sequencer + LFO + Filter Example ===");
+    info!("Press SPACE to start/stop sequencer");
+    info!("Press UP/DOWN to adjust BPM");
+    info!("Press LEFT/RIGHT to cycle LFO division");
+    info!("Press W/S to adjust filter cutoff frequency");
+    info!("Press A/D to adjust filter resonance");
+    info!("Press 'q' to quit");
     #[cfg(feature = "visualization")]
-    println!("\nVisualization window shows:");
+    info!("Visualization window shows:");
     #[cfg(feature = "visualization")]
-    println!("  Top: Waveform | Bottom: Spectrogram (0-10kHz)");
-    println!("");
+    info!("  Top: Waveform | Bottom: Spectrogram (0-10kHz)");
+    info!("");
 
     // Main input loop
     let result = loop {
         // Update visualization if enabled (no-op if disabled)
         if engine_output.update_visualization() {
-            println!("\rVisualization window closed");
+            info!("Visualization window closed");
             break Ok(());
         }
 
@@ -111,10 +113,10 @@ fn main() -> anyhow::Result<()> {
                         if let Some(seq) = engine.sequencer_mut(0) {
                             if seq.is_running() {
                                 seq.stop();
-                                println!("\rSequencer stopped          ");
+                                info!("Sequencer stopped");
                             } else {
                                 seq.start();
-                                println!("\rSequencer started at {} BPM", seq.bpm());
+                                info!("Sequencer started at {} BPM", seq.bpm());
                             }
                         }
                     }
@@ -127,8 +129,7 @@ fn main() -> anyhow::Result<()> {
                         if let Some(seq) = engine.sequencer_mut(0) {
                             seq.set_bpm(new_bpm);
                         }
-                        println!("\rBPM: {}  ", new_bpm);
-                        io::stdout().flush().unwrap();
+                        info!("BPM: {}", new_bpm);
                     }
                     KeyCode::Down => {
                         let mut engine = audio_engine.lock().unwrap();
@@ -139,13 +140,12 @@ fn main() -> anyhow::Result<()> {
                         if let Some(seq) = engine.sequencer_mut(0) {
                             seq.set_bpm(new_bpm);
                         }
-                        println!("\rBPM: {}  ", new_bpm);
-                        io::stdout().flush().unwrap();
+                        info!("BPM: {}", new_bpm);
                     }
                     KeyCode::Right => {
                         let mut engine = audio_engine.lock().unwrap();
                         if let Some(lfo) = engine.lfo_mut(0) {
-                            use libgooey::engine::LfoSyncMode;
+                            use gooey::engine::LfoSyncMode;
                             // Cycle to next division
                             let next_division = match lfo.sync_mode() {
                                 LfoSyncMode::BpmSync(div) => match div {
@@ -171,14 +171,13 @@ fn main() -> anyhow::Result<()> {
                                 MusicalDivision::Sixteenth => "1/16 note",
                                 MusicalDivision::ThirtySecond => "1/32 note",
                             };
-                            println!("\rLFO Division: {} ({:.2} Hz)  ", div_name, lfo.frequency());
+                            info!("LFO Division: {} ({:.2} Hz)", div_name, lfo.frequency());
                         }
-                        io::stdout().flush().unwrap();
                     }
                     KeyCode::Left => {
                         let mut engine = audio_engine.lock().unwrap();
                         if let Some(lfo) = engine.lfo_mut(0) {
-                            use libgooey::engine::LfoSyncMode;
+                            use gooey::engine::LfoSyncMode;
                             // Cycle to previous division
                             let prev_division = match lfo.sync_mode() {
                                 LfoSyncMode::BpmSync(div) => match div {
@@ -204,40 +203,35 @@ fn main() -> anyhow::Result<()> {
                                 MusicalDivision::Sixteenth => "1/16 note",
                                 MusicalDivision::ThirtySecond => "1/32 note",
                             };
-                            println!("\rLFO Division: {} ({:.2} Hz)  ", div_name, lfo.frequency());
+                            info!("LFO Division: {} ({:.2} Hz)", div_name, lfo.frequency());
                         }
-                        io::stdout().flush().unwrap();
                     }
                     KeyCode::Char('w') | KeyCode::Char('W') => {
                         let current = filter_control.get_cutoff_freq();
                         let new_cutoff = (current + 200.0).min(20000.0);
                         filter_control.set_cutoff_freq(new_cutoff);
-                        println!("\rFilter Cutoff: {:.0} Hz  ", new_cutoff);
-                        io::stdout().flush().unwrap();
+                        info!("Filter Cutoff: {:.0} Hz", new_cutoff);
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => {
                         let current = filter_control.get_cutoff_freq();
                         let new_cutoff = (current - 200.0).max(100.0);
                         filter_control.set_cutoff_freq(new_cutoff);
-                        println!("\rFilter Cutoff: {:.0} Hz  ", new_cutoff);
-                        io::stdout().flush().unwrap();
+                        info!("Filter Cutoff: {:.0} Hz", new_cutoff);
                     }
                     KeyCode::Char('a') | KeyCode::Char('A') => {
                         let current = filter_control.get_resonance();
                         let new_resonance = (current - 0.05).max(0.0);
                         filter_control.set_resonance(new_resonance);
-                        println!("\rFilter Resonance: {:.2}  ", new_resonance);
-                        io::stdout().flush().unwrap();
+                        info!("Filter Resonance: {:.2}", new_resonance);
                     }
                     KeyCode::Char('d') | KeyCode::Char('D') => {
                         let current = filter_control.get_resonance();
                         let new_resonance = (current + 0.05).min(0.95);
                         filter_control.set_resonance(new_resonance);
-                        println!("\rFilter Resonance: {:.2}  ", new_resonance);
-                        io::stdout().flush().unwrap();
+                        info!("Filter Resonance: {:.2}", new_resonance);
                     }
                     KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                        println!("\rQuitting...           ");
+                        info!("Quitting...");
                         break Ok(());
                     }
                     _ => {}

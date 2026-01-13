@@ -6,16 +6,18 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use log::info;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 // Import the engine and instruments
-use libgooey::engine::{Engine, EngineOutput, Lfo, MusicalDivision};
-use libgooey::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
+use gooey::engine::{Engine, EngineOutput, Lfo, MusicalDivision};
+use gooey::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
 
 // CLI example for LFO testing
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
+    env_logger::init();
     let sample_rate = 44100.0;
 
     // Create the audio engine
@@ -65,12 +67,12 @@ fn main() -> anyhow::Result<()> {
         .map_lfo_to_parameter(tom_lfo_idx, "tom", "frequency", 1.0)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    println!("✓ All instruments and LFOs configured");
-    println!("  Kick: pitch_drop modulated by 1-bar LFO");
-    println!("  Snare: tonal modulated by 2-bar LFO");
-    println!("  HiHat: decay modulated by half-note LFO");
-    println!("  Tom: frequency modulated by quarter-note LFO");
-    println!();
+    info!("All instruments and LFOs configured");
+    info!("  Kick: pitch_drop modulated by 1-bar LFO");
+    info!("  Snare: tonal modulated by 2-bar LFO");
+    info!("  HiHat: decay modulated by half-note LFO");
+    info!("  Tom: frequency modulated by quarter-note LFO");
+    info!("");
 
     // Wrap in Arc<Mutex> for thread-safe access
     let audio_engine = Arc::new(Mutex::new(engine));
@@ -88,16 +90,16 @@ fn main() -> anyhow::Result<()> {
     // Start the audio stream
     engine_output.start()?;
 
-    println!("=== LFO Modulation Test ===");
-    println!("Press keys to trigger instruments:");
-    println!("  K = Kick (pitch_drop modulated)");
-    println!("  S = Snare (tonal modulated)");
-    println!("  H = HiHat (decay modulated)");
-    println!("  T = Tom (frequency modulated)");
-    println!("  Q = Quit");
+    info!("=== LFO Modulation Test ===");
+    info!("Press keys to trigger instruments:");
+    info!("  K = Kick (pitch_drop modulated)");
+    info!("  S = Snare (tonal modulated)");
+    info!("  H = HiHat (decay modulated)");
+    info!("  T = Tom (frequency modulated)");
+    info!("  Q = Quit");
     #[cfg(feature = "visualization")]
-    println!("\nWaveform visualization enabled");
-    println!();
+    info!("Waveform visualization enabled");
+    info!("");
 
     // Enable raw mode for immediate key detection
     enable_raw_mode()?;
@@ -106,7 +108,7 @@ fn main() -> anyhow::Result<()> {
     let result = loop {
         // Update visualization if enabled (no-op if disabled)
         if engine_output.update_visualization() {
-            println!("\rVisualization window closed");
+            info!("Visualization window closed");
             break Ok(());
         }
 
@@ -139,7 +141,7 @@ fn main() -> anyhow::Result<()> {
                         io::stdout().flush().unwrap();
                     }
                     KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                        println!("\rQuitting...           ");
+                        info!("Quitting...");
                         break Ok(());
                     }
                     _ => {}

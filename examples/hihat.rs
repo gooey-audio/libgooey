@@ -6,16 +6,18 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use log::info;
 use std::io::{self, Write};
 
 // Import the platform abstraction and audio engine
-use libgooey::engine::{Engine, EngineOutput};
-use libgooey::instruments::HiHat;
+use gooey::engine::{Engine, EngineOutput};
+use gooey::instruments::HiHat;
 use std::sync::{Arc, Mutex};
 
 // Example for hi-hat with waveform visualization
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
+    env_logger::init();
     let sample_rate = 44100.0;
 
     // Create the audio engine
@@ -44,17 +46,17 @@ fn main() -> anyhow::Result<()> {
     // Start the audio stream
     engine_output.start()?;
 
-    println!("=== Hi-Hat Example ===");
-    println!("Press SPACE to trigger hi-hat, 'q' to quit");
+    info!("=== Hi-Hat Example ===");
+    info!("Press SPACE to trigger hi-hat, 'q' to quit");
     #[cfg(feature = "visualization")]
-    println!("Waveform visualization enabled");
-    println!("");
+    info!("Waveform visualization enabled");
+    info!("");
 
     // Main input loop (works with or without visualization)
     let result = loop {
         // Update visualization if enabled (no-op if disabled)
         if engine_output.update_visualization() {
-            println!("\rVisualization window closed");
+            info!("Visualization window closed");
             break Ok(());
         }
 
@@ -70,7 +72,7 @@ fn main() -> anyhow::Result<()> {
                         io::stdout().flush().unwrap();
                     }
                     KeyCode::Char('q') | KeyCode::Esc => {
-                        println!("\rQuitting...           ");
+                        info!("Quitting...");
                         break Ok(());
                     }
                     _ => {}
