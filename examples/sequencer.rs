@@ -20,6 +20,17 @@ use gooey::instruments::HiHat;
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
+        .format(|buf, record| {
+            use std::io::Write;
+            writeln!(
+                buf,
+                "\r[{} {:5} {}] {}",
+                buf.timestamp(),
+                record.level(),
+                record.module_path().unwrap_or("unknown"),
+                record.args()
+            )
+        })
         .init();
     let sample_rate = 44100.0;
 
