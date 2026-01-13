@@ -17,7 +17,10 @@ use gooey::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
 // CLI example for LFO testing
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .format(|buf, record| writeln!(buf, "[{:5}] {}", record.level(), record.args()))
+        .init();
     let sample_rate = 44100.0;
 
     // Create the audio engine
