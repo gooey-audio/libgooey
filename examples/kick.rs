@@ -14,7 +14,60 @@ use libgooey::instruments::KickDrum;
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "midi")]
-mod midi_input;
+use midir::{MidiInput, MidiInputConnection};
+#[cfg(feature = "midi")]
+use std::sync::mpsc::{channel, Receiver};
+
+// GM drum note numbers for kick
+#[cfg(feature = "midi")]
+const KICK_NOTE: u8 = 36;
+#[cfg(feature = "midi")]
+const KICK_NOTE_ALT: u8 = 35;
+
+#[cfg(feature = "midi")]
+struct MidiHandler {
+    _connection: MidiInputConnection<()>,
+    receiver: Receiver<(u8, u8)>, // (note, velocity)
+}
+
+#[cfg(feature = "midi")]
+impl MidiHandler {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let midi_in = MidiInput::new("libgooey-kick")?;
+        let ports = midi_in.ports();
+        if ports.is_empty() {
+            return Err("No MIDI input devices found".into());
+        }
+
+        let port = &ports[0];
+        let port_name = midi_in.port_name(port)?;
+        println!("Connecting to MIDI: {}", port_name);
+
+        let (tx, rx) = channel();
+        let connection = midi_in.connect(
+            port,
+            "kick-midi",
+            move |_, msg, _| {
+                // Note On with velocity > 0
+                if msg.len() >= 3 && (msg[0] & 0xF0) == 0x90 && msg[2] > 0 {
+                    let _ = tx.send((msg[1], msg[2]));
+                }
+            },
+            (),
+        )?;
+
+        Ok(Self {
+            _connection: connection,
+            receiver: rx,
+        })
+    }
+
+    fn list_ports() -> Vec<String> {
+        MidiInput::new("list")
+            .map(|m| m.ports().iter().filter_map(|p| m.port_name(p).ok()).collect())
+            .unwrap_or_default()
+    }
+}
 
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
@@ -49,18 +102,14 @@ fn main() -> anyhow::Result<()> {
     // Try to initialize MIDI input (optional, fails gracefully)
     #[cfg(feature = "midi")]
     let midi = {
-        println!("Available MIDI ports: {:?}", midi_input::MidiHandler::list_ports());
-        match midi_input::MidiHandler::new() {
+        println!("Available MIDI ports: {:?}", MidiHandler::list_ports());
+        match MidiHandler::new() {
             Ok(handler) => {
-                println!(
-                    "MIDI connected! Hit drum pad (note {} or {}) to trigger.",
-                    midi_input::drum_notes::KICK,
-                    midi_input::drum_notes::KICK_ALT
-                );
+                println!("MIDI connected! Hit drum pad (note {} or {}).", KICK_NOTE, KICK_NOTE_ALT);
                 Some(handler)
             }
             Err(e) => {
-                println!("No MIDI device found: {} (using keyboard only)", e);
+                println!("No MIDI device: {} (keyboard only)", e);
                 None
             }
         }
@@ -84,17 +133,12 @@ fn main() -> anyhow::Result<()> {
         // Poll for MIDI events (if available)
         #[cfg(feature = "midi")]
         if let Some(ref midi_handler) = midi {
-            for event in midi_handler.poll_all() {
-                if let midi_input::MidiDrumEvent::NoteOn { note, velocity } = event {
-                    if note == midi_input::drum_notes::KICK
-                        || note == midi_input::drum_notes::KICK_ALT
-                    {
-                        let velocity_float = midi_input::velocity_to_float(velocity);
-                        let mut engine = audio_engine.lock().unwrap();
-                        engine.trigger_instrument("kick");
-                        print!("* (vel: {:.0}%) ", velocity_float * 100.0);
-                        io::stdout().flush().unwrap();
-                    }
+            while let Ok((note, velocity)) = midi_handler.receiver.try_recv() {
+                if note == KICK_NOTE || note == KICK_NOTE_ALT {
+                    let mut engine = audio_engine.lock().unwrap();
+                    engine.trigger_instrument("kick");
+                    print!("* (vel: {:.0}%) ", (velocity as f32 / 127.0) * 100.0);
+                    io::stdout().flush().unwrap();
                 }
             }
         }
