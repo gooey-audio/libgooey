@@ -38,6 +38,7 @@ pub struct GooeyEngine {
     // Engine state
     sample_rate: f32,
     bpm: f32,
+    swing: f32,
     current_time: f32,
 
     // Per-instrument manual trigger flags
@@ -82,6 +83,7 @@ impl GooeyEngine {
             limiter: BrickWallLimiter::new(1.0),
             sample_rate,
             bpm,
+            swing: 0.5, // Default: neutral/no swing
             current_time: 0.0,
             kick_trigger_pending: AtomicBool::new(false),
             snare_trigger_pending: AtomicBool::new(false),
@@ -521,6 +523,54 @@ pub unsafe extern "C" fn gooey_engine_set_bpm(engine: *mut GooeyEngine, bpm: f32
     engine.snare_sequencer.set_bpm(bpm);
     engine.hihat_sequencer.set_bpm(bpm);
     engine.tom_sequencer.set_bpm(bpm);
+}
+
+/// Set the global swing amount for all sequencers
+///
+/// Swing delays off-beat steps (odd-numbered steps: 1, 3, 5, etc.) to create
+/// a groovy feel. Common in drum machines like MPC, TR-808, etc.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `swing` - Swing amount (0.0-1.0, where 0.5 = no swing)
+///   - 0.5 = neutral/straight timing
+///   - 0.67 = typical "medium" swing (MPC-style 67%)
+///   - 0.75 = heavy swing
+///   - 1.0 = maximum swing (full step delay)
+///   - Values below 0.5 create "reverse swing" (off-beats early)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_swing(engine: *mut GooeyEngine, swing: f32) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+    let clamped = swing.clamp(0.0, 1.0);
+    engine.swing = clamped;
+    engine.kick_sequencer.set_swing(clamped);
+    engine.snare_sequencer.set_swing(clamped);
+    engine.hihat_sequencer.set_swing(clamped);
+    engine.tom_sequencer.set_swing(clamped);
+}
+
+/// Get the current global swing amount
+///
+/// # Returns
+/// The current swing amount (0.0-1.0), or 0.5 (neutral) if engine is invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_swing(engine: *mut GooeyEngine) -> f32 {
+    if engine.is_null() {
+        return 0.5;
+    }
+
+    let engine = &*engine;
+    engine.swing
 }
 
 // =============================================================================
