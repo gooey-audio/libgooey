@@ -1,3 +1,5 @@
+use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
+
 /// A sample-accurate step sequencer
 pub struct Sequencer {
     bpm: f32,
@@ -21,6 +23,9 @@ pub struct Sequencer {
 
     // Whether the sequencer is running
     is_running: bool,
+
+    // Swing timing (0.0-1.0, where 0.5 = neutral/no swing)
+    swing: SmoothedParam,
 }
 
 impl Sequencer {
@@ -51,6 +56,7 @@ impl Sequencer {
             playhead_step: 0,
             instrument_name: instrument_name.into(),
             is_running: false,
+            swing: SmoothedParam::new(0.5, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
         }
     }
 
@@ -74,6 +80,7 @@ impl Sequencer {
             playhead_step: 0,
             instrument_name: instrument_name.into(),
             is_running: false,
+            swing: SmoothedParam::new(0.5, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
         }
     }
 
@@ -153,6 +160,29 @@ impl Sequencer {
         &self.instrument_name
     }
 
+    /// Set the swing amount (0.0-1.0, where 0.5 = no swing)
+    ///
+    /// Swing delays off-beat steps (odd-numbered: 1, 3, 5...) to create a groovy feel.
+    /// - 0.5 = neutral/straight timing
+    /// - 0.67 = typical "medium" swing (MPC-style 67%)
+    /// - 1.0 = maximum swing (full step delay)
+    /// - Values below 0.5 create "reverse swing" (off-beats early)
+    pub fn set_swing(&mut self, swing: f32) {
+        self.swing.set_target(swing.clamp(0.0, 1.0));
+    }
+
+    /// Get the current swing amount
+    pub fn swing(&self) -> f32 {
+        self.swing.get()
+    }
+
+    /// Check if a step index is a "swing step" (off-beat)
+    /// In 16th note grid: steps 1, 3, 5, 7, 9, 11, 13, 15 are off-beats
+    #[inline]
+    fn is_swing_step(&self, step: usize) -> bool {
+        step % 2 == 1
+    }
+
     /// Process one sample and return the instrument name if it should be triggered
     /// Returns Some(instrument_name) if a trigger should happen, None otherwise
     pub fn tick(&mut self) -> Option<&str> {
@@ -160,6 +190,9 @@ impl Sequencer {
             self.sample_count += 1;
             return None;
         }
+
+        // Tick the swing smoother for smooth parameter changes
+        self.swing.tick();
 
         let mut should_trigger = None;
 
@@ -176,9 +209,20 @@ impl Sequencer {
             // Advance to the next step (internal tracking)
             self.current_step = (self.current_step + 1) % self.pattern.len();
 
+            // Calculate swing offset for the next step
+            // Swing delays off-beat steps (odd-numbered) by a percentage of the step length
+            let swing_offset = if self.is_swing_step(self.current_step) {
+                // Map 0.0-1.0 to -1.0 to +1.0, then multiply by step length
+                (self.swing.get() - 0.5) * 2.0 * self.samples_per_step
+            } else {
+                0.0
+            };
+
             // Calculate the next trigger sample (accumulate fractional samples for accuracy)
-            self.next_trigger_sample =
-                (self.next_trigger_sample as f32 + self.samples_per_step).round() as u64;
+            self.next_trigger_sample = (self.next_trigger_sample as f32
+                + self.samples_per_step
+                + swing_offset)
+                .round() as u64;
         }
 
         self.sample_count += 1;
@@ -233,5 +277,125 @@ impl Sequencer {
             // Still on the current playhead step
             self.playhead_step
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_swing_default_neutral() {
+        let seq = Sequencer::new(120.0, 44100.0, 16, "test");
+        assert!(
+            (seq.swing() - 0.5).abs() < 0.001,
+            "Default swing should be 0.5 (neutral)"
+        );
+    }
+
+    #[test]
+    fn test_swing_set_and_get() {
+        let mut seq = Sequencer::new(120.0, 44100.0, 16, "test");
+
+        seq.set_swing(0.67);
+        // Tick to let smoother settle
+        for _ in 0..4410 {
+            seq.swing.tick();
+        }
+        assert!(
+            (seq.swing() - 0.67).abs() < 0.01,
+            "Swing should be ~0.67 after settling"
+        );
+    }
+
+    #[test]
+    fn test_swing_clamping() {
+        let mut seq = Sequencer::new(120.0, 44100.0, 16, "test");
+
+        // Test clamping above max
+        seq.set_swing(1.5);
+        for _ in 0..4410 {
+            seq.swing.tick();
+        }
+        assert!(
+            (seq.swing() - 1.0).abs() < 0.01,
+            "Swing should be clamped to 1.0"
+        );
+
+        // Test clamping below min
+        seq.set_swing(-0.5);
+        for _ in 0..4410 {
+            seq.swing.tick();
+        }
+        assert!(
+            (seq.swing() - 0.0).abs() < 0.01,
+            "Swing should be clamped to 0.0"
+        );
+    }
+
+    #[test]
+    fn test_is_swing_step() {
+        let seq = Sequencer::new(120.0, 44100.0, 16, "test");
+
+        // Even steps (on-beat) should not be swing steps
+        assert!(!seq.is_swing_step(0), "Step 0 should not be a swing step");
+        assert!(!seq.is_swing_step(2), "Step 2 should not be a swing step");
+        assert!(!seq.is_swing_step(4), "Step 4 should not be a swing step");
+        assert!(!seq.is_swing_step(14), "Step 14 should not be a swing step");
+
+        // Odd steps (off-beat) should be swing steps
+        assert!(seq.is_swing_step(1), "Step 1 should be a swing step");
+        assert!(seq.is_swing_step(3), "Step 3 should be a swing step");
+        assert!(seq.is_swing_step(5), "Step 5 should be a swing step");
+        assert!(seq.is_swing_step(15), "Step 15 should be a swing step");
+    }
+
+    #[test]
+    fn test_swing_timing_affects_triggers() {
+        // Create two sequencers with the same pattern
+        let mut seq_straight = Sequencer::with_pattern(120.0, 44100.0, vec![true; 4], "test");
+        let mut seq_swing = Sequencer::with_pattern(120.0, 44100.0, vec![true; 4], "test");
+
+        // Set swing on one - use immediate to avoid needing to settle
+        seq_swing.swing.set_immediate(0.75);
+
+        seq_straight.start();
+        seq_swing.start();
+
+        // Run and record first few trigger times (only need first 2 to test)
+        let mut triggers_straight: Vec<u64> = Vec::new();
+        let mut triggers_swing: Vec<u64> = Vec::new();
+
+        for _ in 0..50000 {
+            if seq_straight.tick().is_some() {
+                triggers_straight.push(seq_straight.sample_count());
+            }
+            if seq_swing.tick().is_some() {
+                triggers_swing.push(seq_swing.sample_count());
+            }
+
+            // Only need first few triggers
+            if triggers_straight.len() >= 4 && triggers_swing.len() >= 4 {
+                break;
+            }
+        }
+
+        // Should have at least 2 triggers each
+        assert!(
+            triggers_straight.len() >= 2 && triggers_swing.len() >= 2,
+            "Both sequencers should have at least 2 triggers"
+        );
+
+        // With swing, step 1 should be delayed relative to straight
+        let straight_gap = triggers_straight[1] - triggers_straight[0];
+        let swing_gap = triggers_swing[1] - triggers_swing[0];
+
+        // Swing should make the gap to step 1 longer
+        assert!(
+            swing_gap > straight_gap,
+            "Swung step 1 should be delayed (gap {} vs {})",
+            swing_gap,
+            straight_gap
+        );
     }
 }
