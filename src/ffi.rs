@@ -207,7 +207,7 @@ pub const KICK_PARAM_VOLUME: u32 = 6;
 // Hi-hat parameter indices (must match Swift HiHatParam enum)
 // =============================================================================
 
-/// Hi-hat parameter: base frequency (4000-16000 Hz)
+/// Hi-hat parameter: filter cutoff frequency (4000-16000 Hz) - tames harshness
 pub const HIHAT_PARAM_FREQUENCY: u32 = 0;
 /// Hi-hat parameter: brightness/high-frequency emphasis (0-1)
 pub const HIHAT_PARAM_BRIGHTNESS: u32 = 1;
@@ -442,9 +442,9 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
 /// * `value` - Parameter value (range depends on parameter)
 ///
 /// # Parameter indices and ranges
-/// - 0 (FREQUENCY): 4000-16000 Hz
-/// - 1 (BRIGHTNESS): 0-1
-/// - 2 (RESONANCE): 0-1
+/// - 0 (FREQUENCY): 4000-16000 Hz - filter cutoff, lower values tame harshness
+/// - 1 (BRIGHTNESS): 0-1 - high-frequency emphasis
+/// - 2 (RESONANCE): 0-1 - filter resonance boost
 /// - 3 (DECAY): 0.01-3.0 seconds
 /// - 4 (ATTACK): 0.001-0.1 seconds
 /// - 5 (VOLUME): 0-1

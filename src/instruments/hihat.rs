@@ -63,9 +63,9 @@ impl HiHatConfig {
 /// Smoothed parameters for real-time control of the hi-hat
 /// These use one-pole smoothing to prevent clicks/pops during parameter changes
 pub struct HiHatParams {
-    pub frequency: SmoothedParam,  // Base frequency (4000-16000 Hz)
+    pub frequency: SmoothedParam,  // Output filter cutoff (4000-16000 Hz) - tames harshness
     pub brightness: SmoothedParam, // High-frequency emphasis (0-1)
-    pub resonance: SmoothedParam,  // Filter resonance (0-1)
+    pub resonance: SmoothedParam,  // Filter resonance boost (0-1)
     pub decay: SmoothedParam,      // Decay time in seconds (0.01-3.0)
     pub attack: SmoothedParam,     // Attack time in seconds (0.001-0.1)
     pub volume: SmoothedParam,     // Overall volume (0-1)
@@ -174,6 +174,9 @@ pub struct HiHat {
     // Amplitude envelope
     pub amplitude_envelope: Envelope,
 
+    // Output lowpass filter state (one-pole, tames harshness)
+    filter_state: f32,
+
     pub is_active: bool,
 }
 
@@ -202,6 +205,7 @@ impl HiHat {
             noise_oscillator: Oscillator::new(sample_rate, config.base_frequency),
             brightness_oscillator: Oscillator::new(sample_rate, config.base_frequency * 2.0),
             amplitude_envelope: Envelope::new(),
+            filter_state: 0.0,
             is_active: false,
         };
 
@@ -217,15 +221,13 @@ impl HiHat {
     /// Configure oscillators from current smoothed parameter values
     /// Called once at initialization and when decay changes significantly
     fn configure_oscillators(&mut self) {
-        let frequency = self.params.frequency.get();
         let brightness = self.params.brightness.get();
         let decay = self.params.decay.get();
         let attack = self.params.attack.get();
         let volume = self.params.volume.get();
 
-        // Main noise oscillator
+        // Main noise oscillator (frequency doesn't affect noise, just a placeholder)
         self.noise_oscillator.waveform = Waveform::Noise;
-        self.noise_oscillator.frequency_hz = frequency;
         self.noise_oscillator.set_volume(volume);
 
         // Configure envelope based on open/closed type
@@ -249,7 +251,6 @@ impl HiHat {
 
         // Brightness oscillator for high-frequency emphasis
         self.brightness_oscillator.waveform = Waveform::Noise;
-        self.brightness_oscillator.frequency_hz = frequency * 2.0;
         self.brightness_oscillator.set_volume(brightness * volume * 0.5);
 
         // Brightness has a shorter envelope for transient emphasis
@@ -281,15 +282,12 @@ impl HiHat {
     /// Apply current smoothed parameters to oscillators (called per-sample)
     #[inline]
     fn apply_params(&mut self) {
-        let frequency = self.params.frequency.get();
         let brightness = self.params.brightness.get();
         let volume = self.params.volume.get();
 
-        // Update oscillator frequencies and volumes (these can change smoothly)
-        self.noise_oscillator.frequency_hz = frequency;
+        // Update oscillator volumes (these can change smoothly)
+        // Note: frequency parameter now controls the output lowpass filter cutoff
         self.noise_oscillator.set_volume(volume);
-
-        self.brightness_oscillator.frequency_hz = frequency * 2.0;
         self.brightness_oscillator.set_volume(brightness * volume * 0.5);
     }
 
@@ -352,6 +350,24 @@ impl HiHat {
         let resonance_factor = 1.0 + self.params.resonance.get() * 0.5;
         let resonant_output = final_output * resonance_factor;
 
+        // Apply lowpass filter to tame harshness (one-pole filter)
+        // The frequency parameter controls the cutoff
+        let cutoff = self.params.frequency.get();
+        let normalized_freq = cutoff / self.sample_rate;
+        // One-pole coefficient: g = 1 - e^(-2*pi*fc/fs)
+        let g = 1.0 - (-2.0 * std::f32::consts::PI * normalized_freq).exp();
+        let g = g.clamp(0.0, 1.0);
+
+        // Apply filter: y[n] = y[n-1] + g * (x[n] - y[n-1])
+        self.filter_state += g * (resonant_output - self.filter_state);
+
+        // Flush denormals to zero
+        if self.filter_state.abs() < 1e-15 {
+            self.filter_state = 0.0;
+        }
+
+        let filtered_output = self.filter_state;
+
         // Check if hi-hat is still active
         if !self.noise_oscillator.envelope.is_active
             && !self.brightness_oscillator.envelope.is_active
@@ -360,7 +376,7 @@ impl HiHat {
             self.is_active = false;
         }
 
-        resonant_output
+        filtered_output
     }
 
     pub fn is_active(&self) -> bool {
@@ -372,7 +388,7 @@ impl HiHat {
         self.params.volume.set_target(volume);
     }
 
-    /// Set base frequency (smoothed)
+    /// Set filter cutoff frequency (smoothed) - lower values tame harshness
     pub fn set_frequency(&mut self, frequency: f32) {
         self.params.frequency.set_target(frequency);
     }
