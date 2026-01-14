@@ -24,8 +24,8 @@ jobs:
 
       - name: Build native library
         run: |
-          # Use the same Rust version as Dockerfile
-          docker run --rm -v $(pwd):/app -w /app/lib rust:1.87 cargo build --release
+          # Use the same Rust version as Dockerfile, with ALSA headers for cpal
+          docker run --rm -v $(pwd):/app -w /app rust:1.87 bash -c "apt-get update && apt-get install -y libasound2-dev && cargo build --release"
 
       - name: Create release directory structure
         run: |
@@ -33,17 +33,15 @@ jobs:
           mkdir -p release/wasm
           mkdir -p release/native
           mkdir -p release/headers
-          
+
           # Copy WASM files
           cp -r wasm-output/* release/wasm/
-          
+
           # Copy native library
-          cp lib/target/release/libgooey_audio_engine.* release/native/ 2>/dev/null || true
-          
-          # Generate and copy headers
-          cd lib
-          cargo doc --no-deps
-          cp -r target/doc release/docs
+          cp target/release/libgooey.* release/native/ 2>/dev/null || true
+
+          # Copy C header
+          cp include/gooey.h release/headers/ 2>/dev/null || true
 
       - name: Create release archive
         run: |
@@ -70,15 +68,15 @@ jobs:
             ### Native
             - `native/` - Native library build for desktop applications
             - Static library for linking into native applications
-            
-            ### Documentation
-            - `docs/` - Generated API documentation
+
+            ### Headers
+            - `headers/` - C header files for FFI integration
             
             ## Usage
             
             ### Web Integration
             ```javascript
-            import init, { WasmOscillator } from './wasm/gooey_audio_engine.js';
+            import init, { WasmOscillator } from './wasm/gooey.js';
             await init();
             
             const oscillator = new WasmOscillator(44100, 440);
