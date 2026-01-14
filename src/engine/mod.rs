@@ -1,4 +1,5 @@
 use crate::effects::{BrickWallLimiter, Effect};
+use crate::utils::SmoothedParam;
 use std::collections::{HashMap, VecDeque};
 
 #[cfg(feature = "native")]
@@ -72,6 +73,8 @@ pub struct Engine {
     lfos: Vec<Lfo>,
     // Global effects applied to the final output (distinct from per-instrument effects)
     global_effects: Vec<Box<dyn Effect>>,
+    // Master gain applied to the summed output before effects
+    master_gain: SmoothedParam,
 }
 
 impl Engine {
@@ -88,6 +91,8 @@ impl Engine {
             sequencers: Vec::new(),
             lfos: Vec::new(),
             global_effects,
+            // Default of 0.25 provides headroom for mixing multiple instruments
+            master_gain: SmoothedParam::new(0.25, 0.0, 2.0, sample_rate, 30.0),
         }
     }
 
@@ -119,6 +124,22 @@ impl Engine {
     /// Get the number of global effects
     pub fn global_effect_count(&self) -> usize {
         self.global_effects.len()
+    }
+
+    /// Set the master gain level (smoothed to prevent clicks)
+    ///
+    /// # Arguments
+    /// * `gain` - Gain level from 0.0 (silence) to 2.0 (+6dB). Default is 0.7.
+    ///
+    /// The default of 0.7 provides ~3dB headroom for mixing multiple instruments
+    /// without clipping on professional audio interfaces.
+    pub fn set_master_gain(&mut self, gain: f32) {
+        self.master_gain.set_target(gain);
+    }
+
+    /// Get the current master gain target value
+    pub fn master_gain(&self) -> f32 {
+        self.master_gain.target()
     }
 
     /// Add an instrument with a unique name
@@ -224,7 +245,8 @@ impl Engine {
     /// Queue an instrument to be triggered on the next audio tick with specified velocity
     /// This is thread-safe to call from the main thread
     pub fn trigger_instrument_with_velocity(&mut self, name: &str, velocity: f32) {
-        self.trigger_queue.push_back((name.to_string(), velocity.clamp(0.0, 1.0)));
+        self.trigger_queue
+            .push_back((name.to_string(), velocity.clamp(0.0, 1.0)));
     }
 
     /// Generate one sample of audio at the given time
@@ -269,6 +291,9 @@ impl Engine {
         for instrument in self.instruments.values_mut() {
             output += instrument.tick(current_time);
         }
+
+        // Apply master gain before effects
+        output *= self.master_gain.tick();
 
         // Apply global effects chain to the final output
         for effect in &self.global_effects {
