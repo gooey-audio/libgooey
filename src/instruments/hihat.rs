@@ -63,12 +63,12 @@ impl HiHatConfig {
 /// Smoothed parameters for real-time control of the hi-hat
 /// These use one-pole smoothing to prevent clicks/pops during parameter changes
 pub struct HiHatParams {
-    pub frequency: SmoothedParam, // Output filter cutoff (4000-16000 Hz) - tames harshness
+    pub frequency: SmoothedParam,  // Output filter cutoff (4000-16000 Hz) - tames harshness
     pub brightness: SmoothedParam, // High-frequency emphasis (0-1)
-    pub resonance: SmoothedParam, // Filter resonance boost (0-1)
-    pub decay: SmoothedParam,     // Decay time in seconds (0.01-3.0)
-    pub attack: SmoothedParam,    // Attack time in seconds (0.001-0.1)
-    pub volume: SmoothedParam,    // Overall volume (0-1)
+    pub resonance: SmoothedParam,  // Filter resonance boost (0-1)
+    pub decay: SmoothedParam,      // Decay time in seconds (0.01-3.0)
+    pub attack: SmoothedParam,     // Attack time in seconds (0.001-0.1)
+    pub volume: SmoothedParam,     // Overall volume (0-1)
 }
 
 impl HiHatParams {
@@ -234,48 +234,47 @@ impl HiHat {
         if self.is_open {
             // Open hi-hat: longer decay, more sustain
             self.noise_oscillator.set_adsr(ADSRConfig::new(
-                attack,      // Quick attack
-                decay * 0.3, // Medium decay
-                0.3,         // Some sustain for open sound
-                decay * 0.7, // Longer release
+                attack,       // Quick attack
+                decay * 0.3,  // Medium decay
+                0.3,          // Some sustain for open sound
+                decay * 0.7,  // Longer release
             ));
         } else {
             // Closed hi-hat: very short decay, no sustain
             self.noise_oscillator.set_adsr(ADSRConfig::new(
-                attack,      // Quick attack
-                decay * 0.8, // Most of the decay
-                0.0,         // No sustain for closed sound
-                decay * 0.2, // Short release
+                attack,       // Quick attack
+                decay * 0.8,  // Most of the decay
+                0.0,          // No sustain for closed sound
+                decay * 0.2,  // Short release
             ));
         }
 
         // Brightness oscillator for high-frequency emphasis
         self.brightness_oscillator.waveform = Waveform::Noise;
-        self.brightness_oscillator
-            .set_volume(brightness * volume * 0.5);
+        self.brightness_oscillator.set_volume(brightness * volume * 0.5);
 
         // Brightness has a shorter envelope for transient emphasis
         self.brightness_oscillator.set_adsr(ADSRConfig::new(
-            attack,      // Quick attack
-            decay * 0.3, // Shorter decay for brightness
-            0.0,         // No sustain
-            decay * 0.1, // Very short release
+            attack,       // Quick attack
+            decay * 0.3,  // Shorter decay for brightness
+            0.0,          // No sustain
+            decay * 0.1,  // Very short release
         ));
 
         // Amplitude envelope for overall shaping
         if self.is_open {
             self.amplitude_envelope.set_config(ADSRConfig::new(
-                attack,      // Quick attack
-                decay * 0.4, // Medium decay
-                0.2,         // Low sustain
-                decay * 0.6, // Longer release for open sound
+                attack,       // Quick attack
+                decay * 0.4,  // Medium decay
+                0.2,          // Low sustain
+                decay * 0.6,  // Longer release for open sound
             ));
         } else {
             self.amplitude_envelope.set_config(ADSRConfig::new(
-                attack,      // Quick attack
-                decay * 0.9, // Most of the decay
-                0.0,         // No sustain for closed sound
-                decay * 0.1, // Very short release
+                attack,       // Quick attack
+                decay * 0.9,  // Most of the decay
+                0.0,          // No sustain for closed sound
+                decay * 0.1,  // Very short release
             ));
         }
     }
@@ -289,8 +288,7 @@ impl HiHat {
         // Update oscillator volumes (these can change smoothly)
         // Note: frequency parameter now controls the output lowpass filter cutoff
         self.noise_oscillator.set_volume(volume);
-        self.brightness_oscillator
-            .set_volume(brightness * volume * 0.5);
+        self.brightness_oscillator.set_volume(brightness * volume * 0.5);
     }
 
     pub fn set_config(&mut self, config: HiHatConfig) {
