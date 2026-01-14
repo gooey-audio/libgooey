@@ -300,7 +300,8 @@ impl KickDrum {
         self.sub_oscillator.set_volume(sub * volume);
         self.punch_oscillator.set_volume(punch * volume * 0.7);
         // Click reduced from 0.3 to 0.15, with velocity scaling
-        self.click_oscillator.set_volume(click * volume * 0.15 * click_vel_scale);
+        self.click_oscillator
+            .set_volume(click * volume * 0.15 * click_vel_scale);
     }
 
     pub fn set_config(&mut self, config: KickConfig) {
@@ -360,29 +361,17 @@ impl KickDrum {
         // Configure pitch envelope with velocity-scaled decay
         // High velocity = short pitch decay (sharp, punchy attack)
         // Low velocity = long pitch decay (smooth, subtle pitch sweep)
-        self.pitch_envelope.set_config(ADSRConfig::new(
-            0.001,
-            pitch_decay,
-            0.0,
-            pitch_decay * 0.2,
-        ));
+        self.pitch_envelope
+            .set_config(ADSRConfig::new(0.001, pitch_decay, 0.0, pitch_decay * 0.2));
 
         // Configure amplitude envelopes with velocity-scaled decay
-        self.sub_oscillator.set_adsr(ADSRConfig::new(
-            0.001,
-            base_decay,
-            0.0,
-            base_decay * 0.2,
-        ));
-        self.punch_oscillator.set_adsr(ADSRConfig::new(
-            0.001,
-            base_decay,
-            0.0,
-            base_decay * 0.2,
-        ));
+        self.sub_oscillator
+            .set_adsr(ADSRConfig::new(0.001, base_decay, 0.0, base_decay * 0.2));
+        self.punch_oscillator
+            .set_adsr(ADSRConfig::new(0.001, base_decay, 0.0, base_decay * 0.2));
         self.click_oscillator.set_adsr(ADSRConfig::new(
             0.001,
-            base_decay * 0.2,  // Click always shorter
+            base_decay * 0.2, // Click always shorter
             0.0,
             base_decay * 0.02,
         ));

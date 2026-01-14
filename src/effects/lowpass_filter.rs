@@ -146,12 +146,12 @@ impl Effect for LowpassFilterEffect {
         let max_cutoff = self.sample_rate * 0.40;
         let safe_cutoff = cutoff.min(max_cutoff);
 
-        // Calculate filter coefficient 
+        // Calculate filter coefficient
         // Using a simple but stable one-pole coefficient: g = 1 - e^(-2*pi*fc/fs)
         // This is more stable than the sin() or tan() formulations at high frequencies
         let normalized_freq = safe_cutoff / self.sample_rate;
         let g = 1.0 - (-2.0 * std::f32::consts::PI * normalized_freq).exp();
-        
+
         // Clamp g to ensure stability (must be well under 1.0)
         let g = g.clamp(0.0, 0.90);
 
@@ -324,7 +324,10 @@ mod tests {
 
             // Process a sample
             let output = filter.process(1.0);
-            assert!(output.is_finite(), "Filter should remain stable during parameter changes");
+            assert!(
+                output.is_finite(),
+                "Filter should remain stable during parameter changes"
+            );
         }
     }
 
@@ -338,7 +341,7 @@ mod tests {
             // Use a mix of signals to test stability
             let input = (i as f32 * 0.1).sin() * 0.5;
             let output = filter.process(input);
-            
+
             assert!(
                 output.is_finite(),
                 "Filter output should be finite at high frequencies"

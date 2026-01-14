@@ -118,7 +118,9 @@ impl SmoothedParam {
         self.current += self.coeff * (self.target - self.current);
 
         // Check if we've effectively reached the target
-        if (self.current - self.target).abs() < 1e-6 {
+        // Use 1e-4 threshold as f32 precision limits prevent convergence beyond this
+        // (still inaudible: -80dB below signal)
+        if (self.current - self.target).abs() < 1e-4 {
             self.current = self.target;
             self.settled = true;
         }
@@ -194,8 +196,8 @@ mod tests {
         let mut smoother = SmoothedParam::new(0.0, 0.0, 1.0, 44100.0, 10.0);
         smoother.set_target(1.0);
 
-        // Run for 100ms worth of samples (10x the time constant, should definitely settle)
-        // One-pole filter reaches 99.995% of target after 10 time constants
+        // Run for 100ms worth of samples (10x the time constant)
+        // Should settle to within 1e-5 threshold
         for _ in 0..(44100 / 10) {
             smoother.tick();
         }

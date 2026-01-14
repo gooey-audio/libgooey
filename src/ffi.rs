@@ -106,11 +106,13 @@ impl GooeyEngine {
         }
         if self.snare_trigger_pending.swap(false, Ordering::Acquire) {
             let velocity = f32::from_bits(self.snare_trigger_velocity.load(Ordering::Acquire));
-            self.snare.trigger_with_velocity(self.current_time, velocity);
+            self.snare
+                .trigger_with_velocity(self.current_time, velocity);
         }
         if self.hihat_trigger_pending.swap(false, Ordering::Acquire) {
             let velocity = f32::from_bits(self.hihat_trigger_velocity.load(Ordering::Acquire));
-            self.hihat.trigger_with_velocity(self.current_time, velocity);
+            self.hihat
+                .trigger_with_velocity(self.current_time, velocity);
         }
         if self.tom_trigger_pending.swap(false, Ordering::Acquire) {
             let velocity = f32::from_bits(self.tom_trigger_velocity.load(Ordering::Acquire));
@@ -133,10 +135,12 @@ impl GooeyEngine {
                 self.kick.trigger_with_velocity(self.current_time, velocity);
             }
             if let Some((_, velocity)) = snare_trigger {
-                self.snare.trigger_with_velocity(self.current_time, velocity);
+                self.snare
+                    .trigger_with_velocity(self.current_time, velocity);
             }
             if let Some((_, velocity)) = hihat_trigger {
-                self.hihat.trigger_with_velocity(self.current_time, velocity);
+                self.hihat
+                    .trigger_with_velocity(self.current_time, velocity);
             }
             if let Some((_, velocity)) = tom_trigger {
                 self.tom.trigger_with_velocity(self.current_time, velocity);
@@ -304,19 +308,27 @@ pub unsafe extern "C" fn gooey_engine_trigger_instrument_with_velocity(
         let vel_clamped = velocity.clamp(0.0, 1.0);
         match instrument {
             INSTRUMENT_KICK => {
-                engine.kick_trigger_velocity.store(vel_clamped.to_bits(), Ordering::Release);
+                engine
+                    .kick_trigger_velocity
+                    .store(vel_clamped.to_bits(), Ordering::Release);
                 engine.kick_trigger_pending.store(true, Ordering::Release);
             }
             INSTRUMENT_SNARE => {
-                engine.snare_trigger_velocity.store(vel_clamped.to_bits(), Ordering::Release);
+                engine
+                    .snare_trigger_velocity
+                    .store(vel_clamped.to_bits(), Ordering::Release);
                 engine.snare_trigger_pending.store(true, Ordering::Release);
             }
             INSTRUMENT_HIHAT => {
-                engine.hihat_trigger_velocity.store(vel_clamped.to_bits(), Ordering::Release);
+                engine
+                    .hihat_trigger_velocity
+                    .store(vel_clamped.to_bits(), Ordering::Release);
                 engine.hihat_trigger_pending.store(true, Ordering::Release);
             }
             INSTRUMENT_TOM => {
-                engine.tom_trigger_velocity.store(vel_clamped.to_bits(), Ordering::Release);
+                engine
+                    .tom_trigger_velocity
+                    .store(vel_clamped.to_bits(), Ordering::Release);
                 engine.tom_trigger_pending.store(true, Ordering::Release);
             }
             _ => {} // Unknown instrument, ignore
