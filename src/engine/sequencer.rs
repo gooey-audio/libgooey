@@ -200,6 +200,16 @@ impl Sequencer {
         }
     }
 
+    /// Get a step's enabled state
+    pub fn get_step_enabled(&self, step: usize) -> bool {
+        self.pattern.get(step).map(|s| s.enabled).unwrap_or(false)
+    }
+
+    /// Get a step's velocity (0.0-1.0)
+    pub fn get_step_velocity(&self, step: usize) -> f32 {
+        self.pattern.get(step).map(|s| s.velocity).unwrap_or(0.0)
+    }
+
     /// Get the pattern with velocity information
     pub fn pattern_steps(&self) -> &[SequencerStep] {
         &self.pattern

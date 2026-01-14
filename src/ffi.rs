@@ -838,7 +838,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step(
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
 #[no_mangle]
-pub unsafe extern "C" fn gooey_engine_sequencer_set_step_velocity(
+pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_velocity(
     engine: *mut GooeyEngine,
     instrument: u32,
     step: u32,
@@ -866,7 +866,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_step_velocity(
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
 #[no_mangle]
-pub unsafe extern "C" fn gooey_engine_sequencer_set_step_with_velocity(
+pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_with_velocity(
     engine: *mut GooeyEngine,
     instrument: u32,
     step: u32,
@@ -973,6 +973,64 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_with_lookahe
         }
     }
     -1
+}
+
+/// Get the velocity for a specific step in an instrument's sequencer
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+/// * `step` - Step index (0-15 for a 16-step sequencer)
+///
+/// # Returns
+/// The velocity (0.0-1.0), or 0.0 if invalid engine/instrument/step
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_velocity(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+) -> f32 {
+    if engine.is_null() {
+        return 0.0;
+    }
+
+    let engine = &*engine;
+    if let Some(sequencer) = engine.sequencer_for_instrument_ref(instrument) {
+        return sequencer.get_step_velocity(step as usize);
+    }
+    0.0
+}
+
+/// Get the enabled state for a specific step in an instrument's sequencer
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+/// * `step` - Step index (0-15 for a 16-step sequencer)
+///
+/// # Returns
+/// Whether the step is enabled (true/false), or false if invalid engine/instrument/step
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_enabled(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+
+    let engine = &*engine;
+    if let Some(sequencer) = engine.sequencer_for_instrument_ref(instrument) {
+        return sequencer.get_step_enabled(step as usize);
+    }
+    false
 }
 
 // =============================================================================
