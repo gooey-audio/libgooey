@@ -204,6 +204,23 @@ pub const KICK_PARAM_PITCH_DROP: u32 = 5;
 pub const KICK_PARAM_VOLUME: u32 = 6;
 
 // =============================================================================
+// Hi-hat parameter indices (must match Swift HiHatParam enum)
+// =============================================================================
+
+/// Hi-hat parameter: base frequency (4000-16000 Hz)
+pub const HIHAT_PARAM_FREQUENCY: u32 = 0;
+/// Hi-hat parameter: brightness/high-frequency emphasis (0-1)
+pub const HIHAT_PARAM_BRIGHTNESS: u32 = 1;
+/// Hi-hat parameter: filter resonance (0-1)
+pub const HIHAT_PARAM_RESONANCE: u32 = 2;
+/// Hi-hat parameter: decay time (0.01-3.0 seconds)
+pub const HIHAT_PARAM_DECAY: u32 = 3;
+/// Hi-hat parameter: attack time (0.001-0.1 seconds)
+pub const HIHAT_PARAM_ATTACK: u32 = 4;
+/// Hi-hat parameter: overall volume (0-1)
+pub const HIHAT_PARAM_VOLUME: u32 = 5;
+
+// =============================================================================
 // Instrument IDs (must match Swift/C enum if used)
 // =============================================================================
 
@@ -411,6 +428,49 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
         KICK_PARAM_DECAY => engine.kick.set_decay(value),
         KICK_PARAM_PITCH_DROP => engine.kick.set_pitch_drop(value),
         KICK_PARAM_VOLUME => engine.kick.set_volume(value),
+        _ => {} // Unknown parameter, ignore
+    }
+}
+
+/// Set a hi-hat parameter
+///
+/// All parameters are automatically smoothed to prevent clicks/pops.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `param` - Parameter index (see HIHAT_PARAM_* constants)
+/// * `value` - Parameter value (range depends on parameter)
+///
+/// # Parameter indices and ranges
+/// - 0 (FREQUENCY): 4000-16000 Hz
+/// - 1 (BRIGHTNESS): 0-1
+/// - 2 (RESONANCE): 0-1
+/// - 3 (DECAY): 0.01-3.0 seconds
+/// - 4 (ATTACK): 0.001-0.1 seconds
+/// - 5 (VOLUME): 0-1
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_hihat_param(
+    engine: *mut GooeyEngine,
+    param: u32,
+    value: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+
+    // HiHat's setters now handle smoothing internally
+    match param {
+        HIHAT_PARAM_FREQUENCY => engine.hihat.set_frequency(value),
+        HIHAT_PARAM_BRIGHTNESS => engine.hihat.set_brightness(value),
+        HIHAT_PARAM_RESONANCE => engine.hihat.set_resonance(value),
+        HIHAT_PARAM_DECAY => engine.hihat.set_decay(value),
+        HIHAT_PARAM_ATTACK => engine.hihat.set_attack(value),
+        HIHAT_PARAM_VOLUME => engine.hihat.set_volume(value),
         _ => {} // Unknown parameter, ignore
     }
 }
@@ -926,6 +986,12 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_with_lookahe
 #[no_mangle]
 pub extern "C" fn gooey_engine_kick_param_count() -> u32 {
     7
+}
+
+/// Get the number of hi-hat parameters
+#[no_mangle]
+pub extern "C" fn gooey_engine_hihat_param_count() -> u32 {
+    6
 }
 
 /// Get the number of sequencer steps
