@@ -64,7 +64,12 @@ impl MidiHandler {
 
     fn list_ports() -> Vec<String> {
         MidiInput::new("list")
-            .map(|m| m.ports().iter().filter_map(|p| m.port_name(p).ok()).collect())
+            .map(|m| {
+                m.ports()
+                    .iter()
+                    .filter_map(|p| m.port_name(p).ok())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }
@@ -105,7 +110,10 @@ fn main() -> anyhow::Result<()> {
         println!("Available MIDI ports: {:?}", MidiHandler::list_ports());
         match MidiHandler::new() {
             Ok(handler) => {
-                println!("MIDI connected! Hit drum pad (note {} or {}).", KICK_NOTE, KICK_NOTE_ALT);
+                println!(
+                    "MIDI connected! Hit drum pad (note {} or {}).",
+                    KICK_NOTE, KICK_NOTE_ALT
+                );
                 Some(handler)
             }
             Err(e) => {
