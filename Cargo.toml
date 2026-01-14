@@ -5,7 +5,7 @@ edition = "2021"
 autoexamples = false
 
 [lib]
-name = "libgooey"
+name = "gooey"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
