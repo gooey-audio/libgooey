@@ -91,8 +91,8 @@ impl Engine {
             sequencers: Vec::new(),
             lfos: Vec::new(),
             global_effects,
-            // Default 0.7 provides ~3dB headroom for mixing multiple instruments
-            master_gain: SmoothedParam::new(0.7, 0.0, 2.0, sample_rate, 30.0),
+            // Default of 0.25 provides headroom for mixing multiple instruments
+            master_gain: SmoothedParam::new(0.25, 0.0, 2.0, sample_rate, 30.0),
         }
     }
 
@@ -245,7 +245,8 @@ impl Engine {
     /// Queue an instrument to be triggered on the next audio tick with specified velocity
     /// This is thread-safe to call from the main thread
     pub fn trigger_instrument_with_velocity(&mut self, name: &str, velocity: f32) {
-        self.trigger_queue.push_back((name.to_string(), velocity.clamp(0.0, 1.0)));
+        self.trigger_queue
+            .push_back((name.to_string(), velocity.clamp(0.0, 1.0)));
     }
 
     /// Generate one sample of audio at the given time
