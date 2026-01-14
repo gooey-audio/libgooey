@@ -5,10 +5,11 @@ use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 #[derive(Clone, Copy, Debug)]
 pub struct HiHatConfig {
-    pub base_frequency: f32, // Base frequency for filtering (2000-18000Hz)
+    pub base_frequency: f32, // Base frequency for filtering (6000-12000Hz typical)
     pub resonance: f32,      // Filter resonance (0.0-1.0)
-    pub brightness: f32,     // High-frequency content (0.0-1.0) - also boosts filter cutoff
-    pub decay_time: f32,     // Decay length in seconds (0.005-2.0)
+    pub brightness: f32,     // High-frequency content (0.0-1.0)
+    pub decay_time: f32,     // Decay length in seconds
+    pub attack_time: f32,    // Attack time in seconds
     pub volume: f32,         // Overall volume (0.0-1.0)
     pub is_open: bool,       // true for open, false for closed
 }
@@ -19,52 +20,55 @@ impl HiHatConfig {
         resonance: f32,
         brightness: f32,
         decay_time: f32,
+        attack_time: f32,
         volume: f32,
         is_open: bool,
     ) -> Self {
         Self {
-            base_frequency: base_frequency.clamp(2000.0, 18000.0), // Wide filter range
+            base_frequency: base_frequency.max(4000.0).min(16000.0), // Reasonable hi-hat range
             resonance: resonance.clamp(0.0, 1.0),
             brightness: brightness.clamp(0.0, 1.0),
-            decay_time: decay_time.clamp(0.005, 2.0), // Ultra-tight to open
+            decay_time: decay_time.max(0.01).min(3.0), // Reasonable decay range
+            attack_time: attack_time.max(0.001).min(0.1), // Quick attack for hi-hats
             volume: volume.clamp(0.0, 1.0),
             is_open,
         }
     }
 
     pub fn closed_default() -> Self {
-        Self::new(8000.0, 0.7, 0.5, 0.08, 0.8, false)
+        Self::new(8000.0, 0.7, 0.6, 0.1, 0.001, 0.8, false)
     }
 
     pub fn open_default() -> Self {
-        Self::new(10000.0, 0.5, 0.7, 0.6, 0.7, true)
+        Self::new(8000.0, 0.5, 0.8, 0.8, 0.001, 0.7, true)
     }
 
     pub fn closed_tight() -> Self {
-        Self::new(6000.0, 0.8, 0.3, 0.015, 0.9, false)
+        Self::new(10000.0, 0.8, 0.5, 0.05, 0.001, 0.9, false)
     }
 
     pub fn open_bright() -> Self {
-        Self::new(14000.0, 0.4, 1.0, 1.2, 0.8, true)
+        Self::new(12000.0, 0.4, 1.0, 1.2, 0.001, 0.8, true)
     }
 
     pub fn closed_dark() -> Self {
-        Self::new(4000.0, 0.6, 0.2, 0.1, 0.7, false)
+        Self::new(6000.0, 0.6, 0.3, 0.15, 0.002, 0.7, false)
     }
 
     pub fn open_long() -> Self {
-        Self::new(8000.0, 0.3, 0.6, 1.8, 0.6, true)
+        Self::new(7000.0, 0.3, 0.7, 2.0, 0.001, 0.6, true)
     }
 }
 
 /// Smoothed parameters for real-time control of the hi-hat
 /// These use one-pole smoothing to prevent clicks/pops during parameter changes
 pub struct HiHatParams {
-    pub frequency: SmoothedParam,  // Output filter cutoff (2000-18000 Hz)
-    pub brightness: SmoothedParam, // High-frequency emphasis (0-1) - also boosts filter cutoff
-    pub resonance: SmoothedParam,  // Filter resonance boost (0-1)
-    pub decay: SmoothedParam,      // Decay time in seconds (0.005-2.0)
-    pub volume: SmoothedParam,     // Overall volume (0-1)
+    pub frequency: SmoothedParam, // Output filter cutoff (4000-16000 Hz) - tames harshness
+    pub brightness: SmoothedParam, // High-frequency emphasis (0-1)
+    pub resonance: SmoothedParam, // Filter resonance boost (0-1)
+    pub decay: SmoothedParam,     // Decay time in seconds (0.01-3.0)
+    pub attack: SmoothedParam,    // Attack time in seconds (0.001-0.1)
+    pub volume: SmoothedParam,    // Overall volume (0-1)
 }
 
 impl HiHatParams {
@@ -73,8 +77,8 @@ impl HiHatParams {
         Self {
             frequency: SmoothedParam::new(
                 config.base_frequency,
-                2000.0,
-                18000.0,
+                4000.0,
+                16000.0,
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
@@ -94,8 +98,15 @@ impl HiHatParams {
             ),
             decay: SmoothedParam::new(
                 config.decay_time,
-                0.005,
-                2.0,
+                0.01,
+                3.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            attack: SmoothedParam::new(
+                config.attack_time,
+                0.001,
+                0.1,
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
@@ -116,6 +127,7 @@ impl HiHatParams {
         self.brightness.tick();
         self.resonance.tick();
         self.decay.tick();
+        self.attack.tick();
         self.volume.tick();
 
         // Return true if any smoother is still active
@@ -128,6 +140,7 @@ impl HiHatParams {
             && self.brightness.is_settled()
             && self.resonance.is_settled()
             && self.decay.is_settled()
+            && self.attack.is_settled()
             && self.volume.is_settled()
     }
 
@@ -138,6 +151,7 @@ impl HiHatParams {
             resonance: self.resonance.get(),
             brightness: self.brightness.get(),
             decay_time: self.decay.get(),
+            attack_time: self.attack.get(),
             volume: self.volume.get(),
             is_open,
         }
@@ -209,10 +223,8 @@ impl HiHat {
     fn configure_oscillators(&mut self) {
         let brightness = self.params.brightness.get();
         let decay = self.params.decay.get();
+        let attack = self.params.attack.get();
         let volume = self.params.volume.get();
-
-        // Fixed fast attack for hi-hats (always percussive)
-        const ATTACK: f32 = 0.001;
 
         // Main noise oscillator (frequency doesn't affect noise, just a placeholder)
         self.noise_oscillator.waveform = Waveform::Noise;
@@ -220,50 +232,50 @@ impl HiHat {
 
         // Configure envelope based on open/closed type
         if self.is_open {
-            // Open hi-hat: longer decay with sustain for that "wash" sound
+            // Open hi-hat: longer decay, more sustain
             self.noise_oscillator.set_adsr(ADSRConfig::new(
-                ATTACK,       // Instant attack
-                decay * 0.2,  // Quick initial decay
-                0.4,          // Sustain for open wash
-                decay * 0.8,  // Long release
+                attack,      // Quick attack
+                decay * 0.3, // Medium decay
+                0.3,         // Some sustain for open sound
+                decay * 0.7, // Longer release
             ));
         } else {
-            // Closed hi-hat: very short, punchy envelope
+            // Closed hi-hat: very short decay, no sustain
             self.noise_oscillator.set_adsr(ADSRConfig::new(
-                ATTACK,       // Instant attack
-                decay,        // Full decay time
-                0.0,          // No sustain for tight closed sound
-                decay * 0.1,  // Very short release
+                attack,      // Quick attack
+                decay * 0.8, // Most of the decay
+                0.0,         // No sustain for closed sound
+                decay * 0.2, // Short release
             ));
         }
 
-        // Brightness oscillator for high-frequency transient emphasis
+        // Brightness oscillator for high-frequency emphasis
         self.brightness_oscillator.waveform = Waveform::Noise;
-        // Significantly increase brightness oscillator contribution
-        self.brightness_oscillator.set_volume(brightness * volume * 0.8);
+        self.brightness_oscillator
+            .set_volume(brightness * volume * 0.5);
 
-        // Brightness has a shorter envelope for transient "sizzle"
+        // Brightness has a shorter envelope for transient emphasis
         self.brightness_oscillator.set_adsr(ADSRConfig::new(
-            ATTACK,       // Instant attack
-            decay * 0.2,  // Shorter decay for brightness
-            0.0,          // No sustain
-            decay * 0.05, // Very short release
+            attack,      // Quick attack
+            decay * 0.3, // Shorter decay for brightness
+            0.0,         // No sustain
+            decay * 0.1, // Very short release
         ));
 
         // Amplitude envelope for overall shaping
         if self.is_open {
             self.amplitude_envelope.set_config(ADSRConfig::new(
-                ATTACK,       // Instant attack
-                decay * 0.3,  // Medium decay
-                0.3,          // Sustain for open sound
-                decay * 0.7,  // Longer release for open sound
+                attack,      // Quick attack
+                decay * 0.4, // Medium decay
+                0.2,         // Low sustain
+                decay * 0.6, // Longer release for open sound
             ));
         } else {
             self.amplitude_envelope.set_config(ADSRConfig::new(
-                ATTACK,       // Instant attack
-                decay,        // Full decay time
-                0.0,          // No sustain for closed sound
-                decay * 0.05, // Very short release
+                attack,      // Quick attack
+                decay * 0.9, // Most of the decay
+                0.0,         // No sustain for closed sound
+                decay * 0.1, // Very short release
             ));
         }
     }
@@ -277,7 +289,8 @@ impl HiHat {
         // Update oscillator volumes (these can change smoothly)
         // Note: frequency parameter now controls the output lowpass filter cutoff
         self.noise_oscillator.set_volume(volume);
-        self.brightness_oscillator.set_volume(brightness * volume * 0.5);
+        self.brightness_oscillator
+            .set_volume(brightness * volume * 0.5);
     }
 
     pub fn set_config(&mut self, config: HiHatConfig) {
@@ -286,6 +299,7 @@ impl HiHat {
         self.params.brightness.set_target(config.brightness);
         self.params.resonance.set_target(config.resonance);
         self.params.decay.set_target(config.decay_time);
+        self.params.attack.set_target(config.attack_time);
         self.params.volume.set_target(config.volume);
         self.is_open = config.is_open;
 
@@ -335,15 +349,12 @@ impl HiHat {
         let final_output = combined_output * amplitude;
 
         // Apply simple resonance simulation by emphasizing certain frequencies
-        let resonance_factor = 1.0 + self.params.resonance.get() * 0.8;
+        let resonance_factor = 1.0 + self.params.resonance.get() * 0.5;
         let resonant_output = final_output * resonance_factor;
 
         // Apply lowpass filter to tame harshness (one-pole filter)
-        // Base cutoff from frequency parameter, significantly boosted by brightness
-        let base_cutoff = self.params.frequency.get();
-        let brightness = self.params.brightness.get();
-        // Brightness adds up to 8kHz to the cutoff (major impact on tone)
-        let cutoff = (base_cutoff + brightness * 8000.0).min(self.sample_rate * 0.49);
+        // The frequency parameter controls the cutoff
+        let cutoff = self.params.frequency.get();
         let normalized_freq = cutoff / self.sample_rate;
         // One-pole coefficient: g = 1 - e^(-2*pi*fc/fs)
         let g = 1.0 - (-2.0 * std::f32::consts::PI * normalized_freq).exp();
@@ -399,6 +410,11 @@ impl HiHat {
         self.params.resonance.set_target(resonance);
     }
 
+    /// Set attack time (smoothed, takes effect on next trigger)
+    pub fn set_attack(&mut self, attack_time: f32) {
+        self.params.attack.set_target(attack_time);
+    }
+
     /// Set open/closed mode (reconfigures envelopes)
     pub fn set_open(&mut self, is_open: bool) {
         self.is_open = is_open;
@@ -429,7 +445,14 @@ impl crate::engine::Instrument for HiHat {
 // Implement modulation support for HiHat
 impl crate::engine::Modulatable for HiHat {
     fn modulatable_parameters(&self) -> Vec<&'static str> {
-        vec!["frequency", "brightness", "resonance", "decay", "volume"]
+        vec![
+            "frequency",
+            "brightness",
+            "resonance",
+            "decay",
+            "attack",
+            "volume",
+        ]
     }
 
     fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
@@ -451,6 +474,10 @@ impl crate::engine::Modulatable for HiHat {
                 self.params.decay.set_bipolar(value);
                 Ok(())
             }
+            "attack" => {
+                self.params.attack.set_bipolar(value);
+                Ok(())
+            }
             "volume" => {
                 self.params.volume.set_bipolar(value);
                 Ok(())
@@ -465,6 +492,7 @@ impl crate::engine::Modulatable for HiHat {
             "brightness" => Some(self.params.brightness.range()),
             "resonance" => Some(self.params.resonance.range()),
             "decay" => Some(self.params.decay.range()),
+            "attack" => Some(self.params.attack.range()),
             "volume" => Some(self.params.volume.range()),
             _ => None,
         }

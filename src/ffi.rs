@@ -3,7 +3,7 @@
 //! This module exposes the audio engine to C/Swift via C-compatible functions.
 //! Designed for integration with iOS (and other platforms in the future).
 
-use crate::effects::{BrickWallLimiter, Effect, LowpassFilterEffect};
+use crate::effects::{BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect};
 use crate::engine::{Instrument, Sequencer};
 use crate::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
 use std::slice;
@@ -30,7 +30,9 @@ pub struct GooeyEngine {
     hihat_sequencer: Sequencer,
     tom_sequencer: Sequencer,
 
-    // Global effects (applied in order: lowpass filter -> limiter)
+    // Global effects (applied in order: delay -> lowpass filter -> limiter)
+    delay: DelayEffect,
+    delay_enabled: bool,
     lowpass_filter: LowpassFilterEffect,
     lowpass_filter_enabled: bool,
     limiter: BrickWallLimiter,
@@ -68,6 +70,9 @@ impl GooeyEngine {
         let hihat_sequencer = Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "hihat");
         let tom_sequencer = Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "tom");
 
+        // Create delay with default settings (0.25s delay, no feedback, no mix)
+        let delay = DelayEffect::new(sample_rate, 0.25, 0.0, 0.0);
+
         // Create lowpass filter with default settings (fully open, no resonance)
         // Default cutoff at 20kHz means filter is effectively bypassed when enabled
         let lowpass_filter = LowpassFilterEffect::new(sample_rate, 20000.0, 0.0);
@@ -81,6 +86,8 @@ impl GooeyEngine {
             snare_sequencer,
             hihat_sequencer,
             tom_sequencer,
+            delay,
+            delay_enabled: false, // Disabled by default
             lowpass_filter,
             lowpass_filter_enabled: false, // Disabled by default
             limiter: BrickWallLimiter::new(1.0),
@@ -153,12 +160,17 @@ impl GooeyEngine {
                 + self.tom.tick(self.current_time);
 
             // Apply global effects chain
-            // 1. Lowpass filter (if enabled)
+            // 1. Delay (if enabled)
+            if self.delay_enabled {
+                output = self.delay.process(output);
+            }
+
+            // 2. Lowpass filter (if enabled)
             if self.lowpass_filter_enabled {
                 output = self.lowpass_filter.process(output);
             }
 
-            // 2. Limiter (always on - protects output from clipping)
+            // 3. Limiter (always on - protects output from clipping)
             *sample = self.limiter.process(output);
 
             self.current_time += sample_period;
@@ -172,8 +184,10 @@ impl GooeyEngine {
 
 /// Global effect: Lowpass filter
 pub const EFFECT_LOWPASS_FILTER: u32 = 0;
+/// Global effect: Delay
+pub const EFFECT_DELAY: u32 = 1;
 /// Total number of global effects
-pub const EFFECT_COUNT: u32 = 1;
+pub const EFFECT_COUNT: u32 = 2;
 
 // =============================================================================
 // Lowpass filter parameter indices (must match Swift FilterParam enum)
@@ -183,6 +197,17 @@ pub const EFFECT_COUNT: u32 = 1;
 pub const FILTER_PARAM_CUTOFF: u32 = 0;
 /// Filter parameter: resonance (0.0-0.95)
 pub const FILTER_PARAM_RESONANCE: u32 = 1;
+
+// =============================================================================
+// Delay parameter indices (must match Swift DelayParam enum)
+// =============================================================================
+
+/// Delay parameter: time in seconds (0.0-5.0)
+pub const DELAY_PARAM_TIME: u32 = 0;
+/// Delay parameter: feedback amount (0.0-0.95)
+pub const DELAY_PARAM_FEEDBACK: u32 = 1;
+/// Delay parameter: wet/dry mix (0.0-1.0)
+pub const DELAY_PARAM_MIX: u32 = 2;
 
 // =============================================================================
 // Kick drum parameter indices (must match Swift KickParam enum)
@@ -492,6 +517,10 @@ pub unsafe extern "C" fn gooey_engine_set_hihat_param(
 /// - EFFECT_LOWPASS_FILTER (0):
 ///   - FILTER_PARAM_CUTOFF (0): 20-20000 Hz
 ///   - FILTER_PARAM_RESONANCE (1): 0.0-0.95
+/// - EFFECT_DELAY (1):
+///   - DELAY_PARAM_TIME (0): 0.0-5.0 seconds
+///   - DELAY_PARAM_FEEDBACK (1): 0.0-0.95
+///   - DELAY_PARAM_MIX (2): 0.0-1.0
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -512,6 +541,12 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
         EFFECT_LOWPASS_FILTER => match param {
             FILTER_PARAM_CUTOFF => engine.lowpass_filter.set_cutoff_freq(value),
             FILTER_PARAM_RESONANCE => engine.lowpass_filter.set_resonance(value),
+            _ => {} // Unknown parameter, ignore
+        },
+        EFFECT_DELAY => match param {
+            DELAY_PARAM_TIME => engine.delay.set_time(value),
+            DELAY_PARAM_FEEDBACK => engine.delay.set_feedback(value),
+            DELAY_PARAM_MIX => engine.delay.set_mix(value),
             _ => {} // Unknown parameter, ignore
         },
         _ => {} // Unknown effect, ignore
@@ -550,6 +585,12 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
             FILTER_PARAM_RESONANCE => engine.lowpass_filter.get_resonance(),
             _ => -1.0, // Unknown parameter
         },
+        EFFECT_DELAY => match param {
+            DELAY_PARAM_TIME => engine.delay.get_time(),
+            DELAY_PARAM_FEEDBACK => engine.delay.get_feedback(),
+            DELAY_PARAM_MIX => engine.delay.get_mix(),
+            _ => -1.0, // Unknown parameter
+        },
         _ => -1.0, // Unknown effect
     }
 }
@@ -580,6 +621,7 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_enabled(
 
     match effect {
         EFFECT_LOWPASS_FILTER => engine.lowpass_filter_enabled = enabled,
+        EFFECT_DELAY => engine.delay_enabled = enabled,
         _ => {} // Unknown effect, ignore
     }
 }
@@ -608,6 +650,7 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_enabled(
 
     match effect {
         EFFECT_LOWPASS_FILTER => engine.lowpass_filter_enabled,
+        EFFECT_DELAY => engine.delay_enabled,
         _ => false, // Unknown effect
     }
 }
