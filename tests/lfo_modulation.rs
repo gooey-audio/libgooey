@@ -72,7 +72,7 @@ fn test_hihat_modulation() {
     let lfo_idx = engine.add_lfo(lfo);
 
     // Test all HiHat parameters
-    let params = ["decay", "brightness", "resonance", "frequency", "attack"];
+    let params = ["decay", "brightness", "resonance", "frequency", "volume"];
     for param in params {
         let result = engine.map_lfo_to_parameter(lfo_idx, "hihat", param, 1.0);
         assert!(

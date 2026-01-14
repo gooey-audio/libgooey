@@ -207,18 +207,16 @@ pub const KICK_PARAM_VOLUME: u32 = 6;
 // Hi-hat parameter indices (must match Swift HiHatParam enum)
 // =============================================================================
 
-/// Hi-hat parameter: filter cutoff frequency (4000-16000 Hz) - tames harshness
+/// Hi-hat parameter: filter cutoff frequency (2000-18000 Hz)
 pub const HIHAT_PARAM_FREQUENCY: u32 = 0;
-/// Hi-hat parameter: brightness/high-frequency emphasis (0-1)
+/// Hi-hat parameter: brightness/high-frequency emphasis (0-1) - also boosts filter cutoff
 pub const HIHAT_PARAM_BRIGHTNESS: u32 = 1;
 /// Hi-hat parameter: filter resonance (0-1)
 pub const HIHAT_PARAM_RESONANCE: u32 = 2;
-/// Hi-hat parameter: decay time (0.01-3.0 seconds)
+/// Hi-hat parameter: decay time (0.005-2.0 seconds) - ultra-tight to open
 pub const HIHAT_PARAM_DECAY: u32 = 3;
-/// Hi-hat parameter: attack time (0.001-0.1 seconds)
-pub const HIHAT_PARAM_ATTACK: u32 = 4;
 /// Hi-hat parameter: overall volume (0-1)
-pub const HIHAT_PARAM_VOLUME: u32 = 5;
+pub const HIHAT_PARAM_VOLUME: u32 = 4;
 
 // =============================================================================
 // Instrument IDs (must match Swift/C enum if used)
@@ -469,7 +467,6 @@ pub unsafe extern "C" fn gooey_engine_set_hihat_param(
         HIHAT_PARAM_BRIGHTNESS => engine.hihat.set_brightness(value),
         HIHAT_PARAM_RESONANCE => engine.hihat.set_resonance(value),
         HIHAT_PARAM_DECAY => engine.hihat.set_decay(value),
-        HIHAT_PARAM_ATTACK => engine.hihat.set_attack(value),
         HIHAT_PARAM_VOLUME => engine.hihat.set_volume(value),
         _ => {} // Unknown parameter, ignore
     }
@@ -991,7 +988,7 @@ pub extern "C" fn gooey_engine_kick_param_count() -> u32 {
 /// Get the number of hi-hat parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_hihat_param_count() -> u32 {
-    6
+    5
 }
 
 /// Get the number of sequencer steps
