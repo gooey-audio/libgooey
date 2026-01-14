@@ -3,8 +3,7 @@
 .gitignore
 
 # Rust
-lib/target/
-lib/Cargo.lock
+target/
 
 # Node.js
 debug-ui/node_modules/
