@@ -1,6 +1,7 @@
 use crate::envelope::{ADSRConfig, Envelope};
 use crate::gen::oscillator::Oscillator;
 use crate::gen::waveform::Waveform;
+use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SnareConfig {
@@ -55,9 +56,75 @@ impl SnareConfig {
     }
 }
 
+/// Smoothed parameters for real-time control of the snare drum
+/// These use one-pole smoothing to prevent clicks/pops during parameter changes
+pub struct SnareParams {
+    pub frequency: SmoothedParam,   // Base frequency (100-600 Hz)
+    pub decay: SmoothedParam,       // Decay time in seconds (0.01-2.0)
+    pub brightness: SmoothedParam,  // Snap/crack tone amount (0-1)
+    pub volume: SmoothedParam,      // Overall volume (0-1)
+}
+
+impl SnareParams {
+    /// Create new smoothed parameters from a config
+    pub fn from_config(config: &SnareConfig, sample_rate: f32) -> Self {
+        Self {
+            frequency: SmoothedParam::new(
+                config.snare_frequency,
+                100.0,
+                600.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            decay: SmoothedParam::new(
+                config.decay_time,
+                0.01,
+                2.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            brightness: SmoothedParam::new(
+                config.crack_amount,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            volume: SmoothedParam::new(
+                config.volume,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+        }
+    }
+
+    /// Tick all smoothers and return whether any are still smoothing
+    #[inline]
+    pub fn tick(&mut self) -> bool {
+        self.frequency.tick();
+        self.decay.tick();
+        self.brightness.tick();
+        self.volume.tick();
+        !self.is_settled()
+    }
+
+    /// Check if all parameters have settled
+    pub fn is_settled(&self) -> bool {
+        self.frequency.is_settled()
+            && self.decay.is_settled()
+            && self.brightness.is_settled()
+            && self.volume.is_settled()
+    }
+}
+
 pub struct SnareDrum {
     pub sample_rate: f32,
     pub config: SnareConfig,
+
+    /// Smoothed parameters for click-free real-time control
+    pub params: SnareParams,
 
     // Three oscillators for different components
     pub tonal_oscillator: Oscillator, // Tonal component (triangle/sine)
@@ -79,9 +146,11 @@ impl SnareDrum {
     }
 
     pub fn with_config(sample_rate: f32, config: SnareConfig) -> Self {
+        let params = SnareParams::from_config(&config, sample_rate);
         let mut snare = Self {
             sample_rate,
             config,
+            params,
             tonal_oscillator: Oscillator::new(sample_rate, config.snare_frequency),
             noise_oscillator: Oscillator::new(sample_rate, config.snare_frequency * 8.0),
             crack_oscillator: Oscillator::new(sample_rate, config.snare_frequency * 25.0),
@@ -172,16 +241,25 @@ impl SnareDrum {
     }
 
     pub fn tick(&mut self, current_time: f32) -> f32 {
+        // Always tick smoothers (even when not active, to settle values)
+        self.params.tick();
+
         if !self.is_active {
             return 0.0;
         }
+
+        // Apply smoothed parameters to oscillators
+        self.apply_params();
+
+        // Use smoothed frequency for pitch calculations
+        let base_frequency = self.params.frequency.get();
 
         // Calculate pitch modulation
         let pitch_envelope_value = self.pitch_envelope.get_amplitude(current_time);
         let frequency_multiplier = 1.0 + (self.pitch_start_multiplier - 1.0) * pitch_envelope_value;
 
         // Apply pitch envelope to tonal oscillator only
-        self.tonal_oscillator.frequency_hz = self.base_frequency * frequency_multiplier;
+        self.tonal_oscillator.frequency_hz = base_frequency * frequency_multiplier;
 
         // Noise components don't get pitch modulation to maintain their character
 
@@ -207,20 +285,42 @@ impl SnareDrum {
         self.is_active
     }
 
+    /// Apply current smoothed parameters to oscillators (called per-sample)
+    #[inline]
+    fn apply_params(&mut self) {
+        let volume = self.params.volume.get();
+        let brightness = self.params.brightness.get();
+
+        // Update oscillator volumes with smoothed values
+        self.tonal_oscillator
+            .set_volume(self.config.tonal_amount * volume);
+        self.noise_oscillator
+            .set_volume(self.config.noise_amount * volume * 0.8);
+        self.crack_oscillator
+            .set_volume(brightness * volume * 0.4);
+    }
+
+    /// Set volume (smoothed)
     pub fn set_volume(&mut self, volume: f32) {
-        self.config.volume = volume.clamp(0.0, 1.0);
-        self.configure_oscillators();
+        self.params.volume.set_target(volume);
     }
 
+    /// Set base frequency (smoothed)
     pub fn set_frequency(&mut self, frequency: f32) {
-        self.config.snare_frequency = frequency.max(100.0).min(600.0);
-        self.base_frequency = self.config.snare_frequency;
-        self.configure_oscillators();
+        self.params.frequency.set_target(frequency);
     }
 
+    /// Set decay time (smoothed)
     pub fn set_decay(&mut self, decay_time: f32) {
+        self.params.decay.set_target(decay_time);
+        // Also update config for envelope reconfiguration on next trigger
         self.config.decay_time = decay_time.max(0.01).min(2.0);
         self.configure_oscillators();
+    }
+
+    /// Set brightness/snap amount (smoothed)
+    pub fn set_brightness(&mut self, brightness: f32) {
+        self.params.brightness.set_target(brightness);
     }
 
     pub fn set_tonal(&mut self, tonal_amount: f32) {
@@ -233,9 +333,9 @@ impl SnareDrum {
         self.configure_oscillators();
     }
 
+    /// Set crack amount (alias for set_brightness)
     pub fn set_crack(&mut self, crack_amount: f32) {
-        self.config.crack_amount = crack_amount.clamp(0.0, 1.0);
-        self.configure_oscillators();
+        self.set_brightness(crack_amount);
     }
 
     pub fn set_pitch_drop(&mut self, pitch_drop: f32) {
@@ -268,10 +368,12 @@ impl crate::engine::Modulatable for SnareDrum {
     fn modulatable_parameters(&self) -> Vec<&'static str> {
         vec![
             "frequency",
+            "decay",
+            "brightness",
+            "crack", // Alias for brightness (backward compatibility)
+            "volume",
             "tonal",
             "noise",
-            "crack",
-            "decay",
             "pitch_drop",
         ]
     }
@@ -279,11 +381,19 @@ impl crate::engine::Modulatable for SnareDrum {
     fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
         match parameter {
             "frequency" => {
-                // value is -1.0 to 1.0, map to frequency range
-                let range = self.parameter_range("frequency").unwrap();
-                self.config.snare_frequency = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
-                self.base_frequency = self.config.snare_frequency;
-                self.configure_oscillators();
+                self.params.frequency.set_bipolar(value);
+                Ok(())
+            }
+            "decay" => {
+                self.params.decay.set_bipolar(value);
+                Ok(())
+            }
+            "brightness" | "crack" => {
+                self.params.brightness.set_bipolar(value);
+                Ok(())
+            }
+            "volume" => {
+                self.params.volume.set_bipolar(value);
                 Ok(())
             }
             "tonal" => {
@@ -294,17 +404,6 @@ impl crate::engine::Modulatable for SnareDrum {
             }
             "noise" => {
                 self.config.noise_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                self.configure_oscillators();
-                Ok(())
-            }
-            "crack" => {
-                self.config.crack_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                self.configure_oscillators();
-                Ok(())
-            }
-            "decay" => {
-                let range = self.parameter_range("decay").unwrap();
-                self.config.decay_time = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
                 self.configure_oscillators();
                 Ok(())
             }
@@ -319,11 +418,12 @@ impl crate::engine::Modulatable for SnareDrum {
 
     fn parameter_range(&self, parameter: &str) -> Option<(f32, f32)> {
         match parameter {
-            "frequency" => Some((150.0, 400.0)), // 150Hz to 400Hz for snare
+            "frequency" => Some(self.params.frequency.range()),
+            "decay" => Some(self.params.decay.range()),
+            "brightness" | "crack" => Some(self.params.brightness.range()),
+            "volume" => Some(self.params.volume.range()),
             "tonal" => Some((0.0, 1.0)),
             "noise" => Some((0.0, 1.0)),
-            "crack" => Some((0.0, 1.0)),
-            "decay" => Some((0.05, 0.8)), // 50ms to 800ms
             "pitch_drop" => Some((0.0, 1.0)),
             _ => None,
         }
