@@ -9,12 +9,13 @@ use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 /// Used to initialize a KickDrum with specific parameter values
 #[derive(Clone, Copy, Debug)]
 pub struct KickConfig {
-    pub kick_frequency: f32, // Base frequency (40-80Hz typical)
+    pub kick_frequency: f32, // Base frequency (30-80Hz typical)
     pub punch_amount: f32,   // Mid-frequency presence (0.0-1.0)
     pub sub_amount: f32,     // Sub-bass presence (0.0-1.0)
     pub click_amount: f32,   // High-frequency click (0.0-1.0)
+    pub snap_amount: f32,    // FM snap transient/zap (0.0-1.0)
     pub decay_time: f32,     // Overall decay length in seconds
-    pub pitch_drop: f32,     // Frequency sweep amount (0.0-1.0)
+    pub pitch_envelope: f32,     // Frequency sweep amount (0.0-1.0)
     pub volume: f32,         // Overall volume (0.0-1.0)
 }
 
@@ -24,47 +25,54 @@ impl KickConfig {
         punch_amount: f32,
         sub_amount: f32,
         click_amount: f32,
+        snap_amount: f32,
         decay_time: f32,
-        pitch_drop: f32,
+        pitch_envelope: f32,
         volume: f32,
     ) -> Self {
         Self {
-            kick_frequency: kick_frequency.max(20.0).min(200.0), // Reasonable kick range
+            kick_frequency: kick_frequency.max(30.0).min(80.0), // Typical kick drum frequency range
             punch_amount: punch_amount.clamp(0.0, 1.0),
             sub_amount: sub_amount.clamp(0.0, 1.0),
             click_amount: click_amount.clamp(0.0, 1.0),
+            snap_amount: snap_amount.clamp(0.0, 1.0),
             decay_time: decay_time.max(0.01).min(5.0), // Reasonable decay range
-            pitch_drop: pitch_drop.clamp(0.0, 1.0),
+            pitch_envelope: pitch_envelope.clamp(0.0, 1.0),
             volume: volume.clamp(0.0, 1.0),
         }
     }
 
     pub fn default() -> Self {
-        Self::new(30.0, 0.80, 0.80, 0.20, 0.28, 0.20, 0.80)
+        // snap_amount defaults to 0.3 for subtle attack transient
+        Self::new(30.0, 0.80, 0.80, 0.20, 0.3, 0.28, 0.20, 0.80)
     }
 
     pub fn punchy() -> Self {
-        Self::new(60.0, 0.9, 0.6, 0.4, 0.6, 0.7, 0.85)
+        // punchy preset gets more snap for aggressive attack
+        Self::new(60.0, 0.9, 0.6, 0.4, 0.6, 0.6, 0.7, 0.85)
     }
 
     pub fn deep() -> Self {
-        Self::new(45.0, 0.5, 1.0, 0.2, 1.2, 0.5, 0.9)
+        // deep preset has less snap for smoother attack
+        Self::new(45.0, 0.5, 1.0, 0.2, 0.2, 1.2, 0.5, 0.9)
     }
 
     pub fn tight() -> Self {
-        Self::new(70.0, 0.8, 0.7, 0.5, 0.4, 0.8, 0.8)
+        // tight preset has moderate snap
+        Self::new(70.0, 0.8, 0.7, 0.5, 0.5, 0.4, 0.8, 0.8)
     }
 }
 
 /// Smoothed parameters for real-time control of the kick drum
 /// These use one-pole smoothing to prevent clicks/pops during parameter changes
 pub struct KickParams {
-    pub frequency: SmoothedParam,  // Base frequency (20-200 Hz)
+    pub frequency: SmoothedParam,  // Base frequency (30-80 Hz)
     pub punch: SmoothedParam,      // Mid-frequency presence (0-1)
     pub sub: SmoothedParam,        // Sub-bass presence (0-1)
     pub click: SmoothedParam,      // High-frequency click (0-1)
+    pub snap: SmoothedParam,       // FM snap transient/zap (0-1)
     pub decay: SmoothedParam,      // Decay time in seconds (0.01-5.0)
-    pub pitch_drop: SmoothedParam, // Pitch envelope amount (0-1)
+    pub pitch_envelope: SmoothedParam, // Pitch envelope amount (0-1)
     pub volume: SmoothedParam,     // Overall volume (0-1)
 }
 
@@ -74,8 +82,8 @@ impl KickParams {
         Self {
             frequency: SmoothedParam::new(
                 config.kick_frequency,
-                20.0,
-                200.0,
+                30.0,
+                80.0,
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
@@ -100,6 +108,13 @@ impl KickParams {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
+            snap: SmoothedParam::new(
+                config.snap_amount,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
             decay: SmoothedParam::new(
                 config.decay_time,
                 0.01,
@@ -107,8 +122,8 @@ impl KickParams {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
-            pitch_drop: SmoothedParam::new(
-                config.pitch_drop,
+            pitch_envelope: SmoothedParam::new(
+                config.pitch_envelope,
                 0.0,
                 1.0,
                 sample_rate,
@@ -131,8 +146,9 @@ impl KickParams {
         self.punch.tick();
         self.sub.tick();
         self.click.tick();
+        self.snap.tick();
         self.decay.tick();
-        self.pitch_drop.tick();
+        self.pitch_envelope.tick();
         self.volume.tick();
 
         // Return true if any smoother is still active
@@ -145,8 +161,9 @@ impl KickParams {
             && self.punch.is_settled()
             && self.sub.is_settled()
             && self.click.is_settled()
+            && self.snap.is_settled()
             && self.decay.is_settled()
-            && self.pitch_drop.is_settled()
+            && self.pitch_envelope.is_settled()
             && self.volume.is_settled()
     }
 
@@ -157,8 +174,9 @@ impl KickParams {
             punch_amount: self.punch.get(),
             sub_amount: self.sub.get(),
             click_amount: self.click.get(),
+            snap_amount: self.snap.get(),
             decay_time: self.decay.get(),
-            pitch_drop: self.pitch_drop.get(),
+            pitch_envelope: self.pitch_envelope.get(),
             volume: self.volume.get(),
         }
     }
@@ -217,7 +235,7 @@ impl KickDrum {
             punch_oscillator: Oscillator::new(sample_rate, config.kick_frequency * 2.5),
             click_oscillator: Oscillator::new(sample_rate, config.kick_frequency * 40.0),
             pitch_envelope: Envelope::new(),
-            pitch_start_multiplier: 1.0 + config.pitch_drop * 2.0, // Start 1-3x higher
+            pitch_start_multiplier: 1.0 + config.pitch_envelope * 2.0, // Start 1-3x higher
             click_filter: ResonantHighpassFilter::new(sample_rate, 8000.0, 4.0),
             fm_snap: FMSnapSynthesizer::new(sample_rate),
             is_active: false,
@@ -271,12 +289,14 @@ impl KickDrum {
             decay * 0.02, // Extremely short release
         ));
 
-        // Pitch envelope: Fast attack, synchronized decay for frequency sweeping
+        // Pitch envelope: Fast attack, shorter decay to settle before amplitude
+        // Pitch envelope uses 60% of amplitude decay to prevent "phantom pitch" artifacts
+        let pitch_decay = decay * 0.6;
         self.pitch_envelope.set_config(ADSRConfig::new(
-            0.001,       // Instant attack
-            decay,       // Synchronized decay time
-            0.0,         // Drop to base frequency
-            decay * 0.2, // Synchronized release
+            0.001,        // Instant attack
+            pitch_decay,  // Shorter than amplitude decay
+            0.0,          // Drop to base frequency
+            pitch_decay * 0.1, // Very short release
         ));
     }
 
@@ -286,11 +306,11 @@ impl KickDrum {
         let punch = self.params.punch.get();
         let sub = self.params.sub.get();
         let click = self.params.click.get();
-        let pitch_drop = self.params.pitch_drop.get();
+        let pitch_envelope = self.params.pitch_envelope.get();
         let volume = self.params.volume.get();
 
         // Update pitch start multiplier
-        self.pitch_start_multiplier = 1.0 + pitch_drop * 2.0;
+        self.pitch_start_multiplier = 1.0 + pitch_envelope * 2.0;
 
         // Light velocity scaling for click: range [0.6, 1.0]
         // Higher velocity = more click, lower velocity = less click
@@ -310,8 +330,9 @@ impl KickDrum {
         self.params.punch.set_target(config.punch_amount);
         self.params.sub.set_target(config.sub_amount);
         self.params.click.set_target(config.click_amount);
+        self.params.snap.set_target(config.snap_amount);
         self.params.decay.set_target(config.decay_time);
-        self.params.pitch_drop.set_target(config.pitch_drop);
+        self.params.pitch_envelope.set_target(config.pitch_envelope);
         self.params.volume.set_target(config.volume);
 
         // Reconfigure envelopes for new decay time
@@ -355,14 +376,17 @@ impl KickDrum {
 
         // Get base parameters
         let base_decay = self.params.decay.get() * decay_scale;
-        let pitch_decay = self.params.decay.get() * pitch_decay_scale;
+        // Pitch decay must be at most 60% of amplitude decay to ensure pitch settles
+        // before sound ends (fixes "phantom pitch" at end of decay)
+        let pitch_decay = (self.params.decay.get() * pitch_decay_scale).min(base_decay * 0.6);
         let base_freq = self.params.frequency.get();
 
         // Configure pitch envelope with velocity-scaled decay
         // High velocity = short pitch decay (sharp, punchy attack)
         // Low velocity = long pitch decay (smooth, subtle pitch sweep)
+        // Pitch envelope always completes before amplitude to prevent pitch artifacts
         self.pitch_envelope
-            .set_config(ADSRConfig::new(0.001, pitch_decay, 0.0, pitch_decay * 0.2));
+            .set_config(ADSRConfig::new(0.001, pitch_decay, 0.0, pitch_decay * 0.1));
 
         // Configure amplitude envelopes with velocity-scaled decay
         self.sub_oscillator
@@ -438,13 +462,14 @@ impl KickDrum {
         // Apply resonant high-pass filtering to click for more realistic sound
         let filtered_click_output = self.click_filter.process(raw_click_output);
 
-        // Add FM snap for beater sound
+        // Add FM snap for beater sound (controlled by snap_amount parameter)
         let fm_snap_output = self.fm_snap.tick(current_time);
+        let snap = self.params.snap.get();
 
         let total_output = sub_output
             + punch_output
             + filtered_click_output
-            + (fm_snap_output * self.params.volume.get());
+            + (fm_snap_output * snap * self.params.volume.get());
 
         // Apply velocity amplitude scaling (sqrt for perceptually linear loudness)
         let velocity_amplitude = self.current_velocity.sqrt();
@@ -496,9 +521,14 @@ impl KickDrum {
         self.params.click.set_target(click_amount);
     }
 
+    /// Set snap amount (smoothed) - controls FM snap transient/zap
+    pub fn set_snap(&mut self, snap_amount: f32) {
+        self.params.snap.set_target(snap_amount);
+    }
+
     /// Set pitch drop amount (smoothed)
-    pub fn set_pitch_drop(&mut self, pitch_drop: f32) {
-        self.params.pitch_drop.set_target(pitch_drop);
+    pub fn set_pitch_envelope(&mut self, pitch_envelope: f32) {
+        self.params.pitch_envelope.set_target(pitch_envelope);
     }
 }
 
@@ -528,8 +558,9 @@ impl crate::engine::Modulatable for KickDrum {
             "punch",
             "sub",
             "click",
+            "snap",
             "decay",
-            "pitch_drop",
+            "pitch_envelope",
             "volume",
         ]
     }
@@ -553,12 +584,16 @@ impl crate::engine::Modulatable for KickDrum {
                 self.params.click.set_bipolar(value);
                 Ok(())
             }
+            "snap" => {
+                self.params.snap.set_bipolar(value);
+                Ok(())
+            }
             "decay" => {
                 self.params.decay.set_bipolar(value);
                 Ok(())
             }
-            "pitch_drop" => {
-                self.params.pitch_drop.set_bipolar(value);
+            "pitch_envelope" => {
+                self.params.pitch_envelope.set_bipolar(value);
                 Ok(())
             }
             "volume" => {
@@ -575,8 +610,9 @@ impl crate::engine::Modulatable for KickDrum {
             "punch" => Some(self.params.punch.range()),
             "sub" => Some(self.params.sub.range()),
             "click" => Some(self.params.click.range()),
+            "snap" => Some(self.params.snap.range()),
             "decay" => Some(self.params.decay.range()),
-            "pitch_drop" => Some(self.params.pitch_drop.range()),
+            "pitch_envelope" => Some(self.params.pitch_envelope.range()),
             "volume" => Some(self.params.volume.range()),
             _ => None,
         }
