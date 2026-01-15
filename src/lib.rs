@@ -150,8 +150,13 @@ pub mod web {
         }
 
         #[wasm_bindgen]
-        pub fn set_pitch_drop(&mut self, pitch_drop: f32) {
-            self.kick_drum.set_pitch_drop(pitch_drop);
+        pub fn set_snap(&mut self, snap_amount: f32) {
+            self.kick_drum.set_snap(snap_amount);
+        }
+
+        #[wasm_bindgen]
+        pub fn set_pitch_envelope(&mut self, pitch_envelope: f32) {
+            self.kick_drum.set_pitch_envelope(pitch_envelope);
         }
 
         #[wasm_bindgen]
@@ -161,8 +166,9 @@ pub mod web {
             punch_amount: f32,
             sub_amount: f32,
             click_amount: f32,
+            snap_amount: f32,
             decay_time: f32,
-            pitch_drop: f32,
+            pitch_envelope: f32,
             volume: f32,
         ) {
             let config = KickConfig::new(
@@ -170,8 +176,9 @@ pub mod web {
                 punch_amount,
                 sub_amount,
                 click_amount,
+                snap_amount,
                 decay_time,
-                pitch_drop,
+                pitch_envelope,
                 volume,
             );
             self.kick_drum.set_config(config);
