@@ -160,67 +160,79 @@ impl SnareDrum {
             is_active: false,
         };
 
-        snare.configure_oscillators();
+        snare.setup_waveforms();
         snare
     }
 
-    fn configure_oscillators(&mut self) {
-        let config = self.config;
-
-        // Tonal oscillator: Triangle wave for body
+    /// Set up oscillator waveforms (called once at construction)
+    fn setup_waveforms(&mut self) {
         self.tonal_oscillator.waveform = Waveform::Triangle;
-        self.tonal_oscillator.frequency_hz = config.snare_frequency;
-        self.tonal_oscillator
-            .set_volume(config.tonal_amount * config.volume);
-        self.tonal_oscillator.set_adsr(ADSRConfig::new(
-            0.001,                   // Very fast attack
-            config.decay_time * 0.8, // Main decay
-            0.0,                     // No sustain - drums should decay to silence
-            config.decay_time * 0.4, // Medium release
-        ));
-
-        // Noise oscillator: Main snare noise character
         self.noise_oscillator.waveform = Waveform::Noise;
-        self.noise_oscillator.frequency_hz = config.snare_frequency * 8.0;
-        self.noise_oscillator
-            .set_volume(config.noise_amount * config.volume * 0.8);
-        self.noise_oscillator.set_adsr(ADSRConfig::new(
-            0.001,                   // Very fast attack
-            config.decay_time * 0.6, // Shorter decay for noise
-            0.0,                     // No sustain - drums should decay to silence
-            config.decay_time * 0.3, // Quick release
-        ));
-
-        // Crack oscillator: High-frequency transient
         self.crack_oscillator.waveform = Waveform::Noise;
-        self.crack_oscillator.frequency_hz = config.snare_frequency * 25.0;
-        self.crack_oscillator
-            .set_volume(config.crack_amount * config.volume * 0.4);
-        self.crack_oscillator.set_adsr(ADSRConfig::new(
-            0.001,                   // Very fast attack
-            config.decay_time * 0.2, // Very short decay for crack
-            0.0,                     // No sustain
-            config.decay_time * 0.1, // Very short release
-        ));
-
-        // Pitch envelope: Fast attack, quick decay for frequency sweeping
-        self.pitch_envelope.set_config(ADSRConfig::new(
-            0.001,                   // Instant attack
-            config.decay_time * 0.3, // Quick pitch drop
-            0.0,                     // Drop to base frequency
-            config.decay_time * 0.1, // Quick release
-        ));
     }
 
     pub fn set_config(&mut self, config: SnareConfig) {
         self.config = config;
         self.base_frequency = config.snare_frequency;
         self.pitch_start_multiplier = 1.0 + config.pitch_drop * 1.5;
-        self.configure_oscillators();
+        // Update smoothed params to match new config
+        self.params.frequency.set_target(config.snare_frequency);
+        self.params.decay.set_target(config.decay_time);
+        self.params.brightness.set_target(config.crack_amount);
+        self.params.volume.set_target(config.volume);
     }
 
+    /// Trigger the snare drum
+    ///
+    /// Configures envelopes using current smoothed parameter values,
+    /// then triggers all oscillators. This matches the kick pattern
+    /// and prepares for future velocity support.
     pub fn trigger(&mut self, time: f32) {
         self.is_active = true;
+
+        // Get current smoothed parameter values
+        let base_freq = self.params.frequency.get();
+        let decay = self.params.decay.get();
+        let volume = self.params.volume.get();
+        let brightness = self.params.brightness.get();
+
+        // Configure pitch envelope
+        self.pitch_envelope.set_config(ADSRConfig::new(
+            0.001,         // Instant attack
+            decay * 0.3,   // Quick pitch drop
+            0.0,           // Drop to base frequency
+            decay * 0.1,   // Quick release
+        ));
+
+        // Configure tonal oscillator envelope
+        self.tonal_oscillator.frequency_hz = base_freq;
+        self.tonal_oscillator.set_volume(self.config.tonal_amount * volume);
+        self.tonal_oscillator.set_adsr(ADSRConfig::new(
+            0.001,         // Very fast attack
+            decay * 0.8,   // Main decay
+            0.0,           // No sustain
+            decay * 0.4,   // Medium release
+        ));
+
+        // Configure noise oscillator envelope
+        self.noise_oscillator.frequency_hz = base_freq * 8.0;
+        self.noise_oscillator.set_volume(self.config.noise_amount * volume * 0.8);
+        self.noise_oscillator.set_adsr(ADSRConfig::new(
+            0.001,         // Very fast attack
+            decay * 0.6,   // Shorter decay for noise
+            0.0,           // No sustain
+            decay * 0.3,   // Quick release
+        ));
+
+        // Configure crack oscillator envelope
+        self.crack_oscillator.frequency_hz = base_freq * 25.0;
+        self.crack_oscillator.set_volume(brightness * volume * 0.4);
+        self.crack_oscillator.set_adsr(ADSRConfig::new(
+            0.001,         // Very fast attack
+            decay * 0.2,   // Very short decay for crack
+            0.0,           // No sustain
+            decay * 0.1,   // Very short release
+        ));
 
         // Trigger all oscillators
         self.tonal_oscillator.trigger(time);
@@ -242,14 +254,17 @@ impl SnareDrum {
 
     pub fn tick(&mut self, current_time: f32) -> f32 {
         // Always tick smoothers (even when not active, to settle values)
-        self.params.tick();
+        // Returns true if any params are still changing
+        let params_changing = self.params.tick();
 
         if !self.is_active {
             return 0.0;
         }
 
-        // Apply smoothed parameters to oscillators
-        self.apply_params();
+        // Only apply params when they're actively changing (optimization)
+        if params_changing {
+            self.apply_params();
+        }
 
         // Use smoothed frequency for pitch calculations
         let base_frequency = self.params.frequency.get();
@@ -311,11 +326,9 @@ impl SnareDrum {
     }
 
     /// Set decay time (smoothed)
+    /// Envelope will be reconfigured on next trigger
     pub fn set_decay(&mut self, decay_time: f32) {
         self.params.decay.set_target(decay_time);
-        // Also update config for envelope reconfiguration on next trigger
-        self.config.decay_time = decay_time.max(0.01).min(2.0);
-        self.configure_oscillators();
     }
 
     /// Set brightness/snap amount (smoothed)
@@ -325,12 +338,10 @@ impl SnareDrum {
 
     pub fn set_tonal(&mut self, tonal_amount: f32) {
         self.config.tonal_amount = tonal_amount.clamp(0.0, 1.0);
-        self.configure_oscillators();
     }
 
     pub fn set_noise(&mut self, noise_amount: f32) {
         self.config.noise_amount = noise_amount.clamp(0.0, 1.0);
-        self.configure_oscillators();
     }
 
     /// Set crack amount (alias for set_brightness)
@@ -399,12 +410,10 @@ impl crate::engine::Modulatable for SnareDrum {
             "tonal" => {
                 // Map -1.0 to 1.0 -> 0.0 to 1.0
                 self.config.tonal_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                self.configure_oscillators();
                 Ok(())
             }
             "noise" => {
                 self.config.noise_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                self.configure_oscillators();
                 Ok(())
             }
             "pitch_drop" => {
