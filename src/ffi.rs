@@ -246,6 +246,19 @@ pub const HIHAT_PARAM_DECAY: u32 = 3;
 pub const HIHAT_PARAM_VOLUME: u32 = 4;
 
 // =============================================================================
+// Snare drum parameter indices (must match Swift SnareParam enum)
+// =============================================================================
+
+/// Snare parameter: base frequency (100-600 Hz)
+pub const SNARE_PARAM_FREQUENCY: u32 = 0;
+/// Snare parameter: decay time (0.01-2.0 seconds)
+pub const SNARE_PARAM_DECAY: u32 = 1;
+/// Snare parameter: brightness/snap amount (0-1)
+pub const SNARE_PARAM_BRIGHTNESS: u32 = 2;
+/// Snare parameter: overall volume (0-1)
+pub const SNARE_PARAM_VOLUME: u32 = 3;
+
+// =============================================================================
 // Instrument IDs (must match Swift/C enum if used)
 // =============================================================================
 
@@ -497,6 +510,45 @@ pub unsafe extern "C" fn gooey_engine_set_hihat_param(
         HIHAT_PARAM_RESONANCE => engine.hihat.set_resonance(value),
         HIHAT_PARAM_DECAY => engine.hihat.set_decay(value),
         HIHAT_PARAM_VOLUME => engine.hihat.set_volume(value),
+        _ => {} // Unknown parameter, ignore
+    }
+}
+
+/// Set a snare drum parameter
+///
+/// All parameters are automatically smoothed to prevent clicks/pops.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `param` - Parameter index (see SNARE_PARAM_* constants)
+/// * `value` - Parameter value (range depends on parameter)
+///
+/// # Parameter indices and ranges
+/// - 0 (FREQUENCY): 100-600 Hz - base pitch
+/// - 1 (DECAY): 0.01-2.0 seconds - shortness/length
+/// - 2 (BRIGHTNESS): 0-1 - snap/crack tone amount
+/// - 3 (VOLUME): 0-1 - output level
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_snare_param(
+    engine: *mut GooeyEngine,
+    param: u32,
+    value: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+
+    // SnareDrum's setters now handle smoothing internally
+    match param {
+        SNARE_PARAM_FREQUENCY => engine.snare.set_frequency(value),
+        SNARE_PARAM_DECAY => engine.snare.set_decay(value),
+        SNARE_PARAM_BRIGHTNESS => engine.snare.set_brightness(value),
+        SNARE_PARAM_VOLUME => engine.snare.set_volume(value),
         _ => {} // Unknown parameter, ignore
     }
 }
