@@ -205,7 +205,7 @@ impl HiHat {
     }
 
     /// Configure oscillators from current smoothed parameter values
-    /// Called once at initialization and when decay changes significantly
+    /// Called at initialization; trigger() handles per-hit envelope config
     fn configure_oscillators(&mut self) {
         let brightness = self.params.brightness.get();
         let decay = self.params.decay.get();
@@ -296,11 +296,57 @@ impl HiHat {
     pub fn trigger(&mut self, time: f32) {
         self.is_active = true;
 
-        // Trigger all oscillators
+        // Read current parameters for envelope configuration
+        let decay = self.params.decay.get();
+        let brightness = self.params.brightness.get();
+        let volume = self.params.volume.get();
+        const ATTACK: f32 = 0.001;
+
+        // Configure and trigger noise oscillator envelope based on open/closed
+        if self.is_open {
+            self.noise_oscillator.set_adsr(ADSRConfig::new(
+                ATTACK,
+                decay * 0.2,
+                0.4,
+                decay * 0.8,
+            ));
+        } else {
+            self.noise_oscillator.set_adsr(ADSRConfig::new(
+                ATTACK,
+                decay,
+                0.0,
+                decay * 0.1,
+            ));
+        }
+        self.noise_oscillator.set_volume(volume);
         self.noise_oscillator.trigger(time);
+
+        // Configure and trigger brightness oscillator (shorter envelope for transient sizzle)
+        self.brightness_oscillator.set_adsr(ADSRConfig::new(
+            ATTACK,
+            decay * 0.2,
+            0.0,
+            decay * 0.05,
+        ));
+        self.brightness_oscillator.set_volume(brightness * volume * 0.8);
         self.brightness_oscillator.trigger(time);
 
-        // Trigger amplitude envelope
+        // Configure and trigger amplitude envelope
+        if self.is_open {
+            self.amplitude_envelope.set_config(ADSRConfig::new(
+                ATTACK,
+                decay * 0.3,
+                0.3,
+                decay * 0.7,
+            ));
+        } else {
+            self.amplitude_envelope.set_config(ADSRConfig::new(
+                ATTACK,
+                decay,
+                0.0,
+                decay * 0.05,
+            ));
+        }
         self.amplitude_envelope.trigger(time);
     }
 
@@ -386,11 +432,9 @@ impl HiHat {
         self.params.frequency.set_target(frequency);
     }
 
-    /// Set decay time (smoothed, reconfigures envelopes immediately)
+    /// Set decay time (smoothed, takes effect on next trigger)
     pub fn set_decay(&mut self, decay_time: f32) {
         self.params.decay.set_target(decay_time);
-        // Must reconfigure envelopes for decay to take effect
-        self.configure_oscillators();
     }
 
     /// Set brightness (smoothed)
