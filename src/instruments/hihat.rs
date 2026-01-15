@@ -23,7 +23,7 @@ impl HiHatConfig {
         is_open: bool,
     ) -> Self {
         Self {
-            base_frequency: base_frequency.clamp(2000.0, 18000.0), // Wide filter range
+            base_frequency: base_frequency.clamp(200.0, 20000.0), // Extreme filter range for dramatic pitch control
             resonance: resonance.clamp(0.0, 1.0),
             brightness: brightness.clamp(0.0, 1.0),
             decay_time: decay_time.clamp(0.005, 2.0), // Ultra-tight to open
@@ -73,8 +73,8 @@ impl HiHatParams {
         Self {
             frequency: SmoothedParam::new(
                 config.base_frequency,
-                2000.0,
-                18000.0,
+                200.0,
+                20000.0,
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
@@ -342,8 +342,8 @@ impl HiHat {
         // Base cutoff from frequency parameter, significantly boosted by brightness
         let base_cutoff = self.params.frequency.get();
         let brightness = self.params.brightness.get();
-        // Brightness adds up to 8kHz to the cutoff (major impact on tone)
-        let cutoff = (base_cutoff + brightness * 8000.0).min(self.sample_rate * 0.49);
+        // Brightness adds up to 16kHz to the cutoff (dramatic impact on tone)
+        let cutoff = (base_cutoff + brightness * 16000.0).min(self.sample_rate * 0.49);
         let normalized_freq = cutoff / self.sample_rate;
         // One-pole coefficient: g = 1 - e^(-2*pi*fc/fs)
         let g = 1.0 - (-2.0 * std::f32::consts::PI * normalized_freq).exp();
@@ -357,7 +357,9 @@ impl HiHat {
             self.filter_state = 0.0;
         }
 
-        let filtered_output = self.filter_state;
+        // Apply final volume control for direct, audible effect
+        let volume = self.params.volume.get();
+        let final_output = self.filter_state * volume;
 
         // Check if hi-hat is still active
         if !self.noise_oscillator.envelope.is_active
@@ -367,7 +369,7 @@ impl HiHat {
             self.is_active = false;
         }
 
-        filtered_output
+        final_output
     }
 
     pub fn is_active(&self) -> bool {
@@ -384,9 +386,11 @@ impl HiHat {
         self.params.frequency.set_target(frequency);
     }
 
-    /// Set decay time (smoothed, takes effect on next trigger)
+    /// Set decay time (smoothed, reconfigures envelopes immediately)
     pub fn set_decay(&mut self, decay_time: f32) {
         self.params.decay.set_target(decay_time);
+        // Must reconfigure envelopes for decay to take effect
+        self.configure_oscillators();
     }
 
     /// Set brightness (smoothed)
