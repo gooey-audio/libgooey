@@ -5,7 +5,7 @@ use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 #[derive(Clone, Copy, Debug)]
 pub struct HiHatConfig {
-    pub base_frequency: f32, // Base frequency for filtering (2000-18000Hz)
+    pub base_frequency: f32, // Base frequency for filtering (200-20000Hz)
     pub resonance: f32,      // Filter resonance (0.0-1.0)
     pub brightness: f32,     // High-frequency content (0.0-1.0) - also boosts filter cutoff
     pub decay_time: f32,     // Decay length in seconds (0.005-2.0)
@@ -23,7 +23,7 @@ impl HiHatConfig {
         is_open: bool,
     ) -> Self {
         Self {
-            base_frequency: base_frequency.clamp(2000.0, 18000.0), // Wide filter range
+            base_frequency: base_frequency.clamp(200.0, 20000.0), // Extreme filter range for dramatic pitch control
             resonance: resonance.clamp(0.0, 1.0),
             brightness: brightness.clamp(0.0, 1.0),
             decay_time: decay_time.clamp(0.005, 2.0), // Ultra-tight to open
@@ -60,7 +60,7 @@ impl HiHatConfig {
 /// Smoothed parameters for real-time control of the hi-hat
 /// These use one-pole smoothing to prevent clicks/pops during parameter changes
 pub struct HiHatParams {
-    pub frequency: SmoothedParam,  // Output filter cutoff (2000-18000 Hz)
+    pub frequency: SmoothedParam,  // Output filter cutoff (200-20000 Hz)
     pub brightness: SmoothedParam, // High-frequency emphasis (0-1) - also boosts filter cutoff
     pub resonance: SmoothedParam,  // Filter resonance boost (0-1)
     pub decay: SmoothedParam,      // Decay time in seconds (0.005-2.0)
@@ -73,8 +73,8 @@ impl HiHatParams {
         Self {
             frequency: SmoothedParam::new(
                 config.base_frequency,
-                2000.0,
-                18000.0,
+                200.0,
+                20000.0,
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
@@ -205,18 +205,18 @@ impl HiHat {
     }
 
     /// Configure oscillators from current smoothed parameter values
-    /// Called once at initialization and when decay changes significantly
+    /// Called at initialization; trigger() handles per-hit envelope config
+    /// Note: Volume is applied only at final output stage, not here
     fn configure_oscillators(&mut self) {
         let brightness = self.params.brightness.get();
         let decay = self.params.decay.get();
-        let volume = self.params.volume.get();
 
         // Fixed fast attack for hi-hats (always percussive)
         const ATTACK: f32 = 0.001;
 
         // Main noise oscillator (frequency doesn't affect noise, just a placeholder)
         self.noise_oscillator.waveform = Waveform::Noise;
-        self.noise_oscillator.set_volume(volume);
+        self.noise_oscillator.set_volume(1.0); // Full level; volume applied at output
 
         // Configure envelope based on open/closed type
         if self.is_open {
@@ -239,8 +239,8 @@ impl HiHat {
 
         // Brightness oscillator for high-frequency transient emphasis
         self.brightness_oscillator.waveform = Waveform::Noise;
-        // Significantly increase brightness oscillator contribution
-        self.brightness_oscillator.set_volume(brightness * volume * 0.8);
+        // Relative level based on brightness param; volume applied at output
+        self.brightness_oscillator.set_volume(brightness * 0.8);
 
         // Brightness has a shorter envelope for transient "sizzle"
         self.brightness_oscillator.set_adsr(ADSRConfig::new(
@@ -269,15 +269,15 @@ impl HiHat {
     }
 
     /// Apply current smoothed parameters to oscillators (called per-sample)
+    /// Note: Volume is applied only at final output stage, not here
     #[inline]
     fn apply_params(&mut self) {
         let brightness = self.params.brightness.get();
-        let volume = self.params.volume.get();
 
-        // Update oscillator volumes (these can change smoothly)
-        // Note: frequency parameter now controls the output lowpass filter cutoff
-        self.noise_oscillator.set_volume(volume);
-        self.brightness_oscillator.set_volume(brightness * volume * 0.5);
+        // Update brightness oscillator level (can change smoothly)
+        // Note: frequency parameter controls the output lowpass filter cutoff
+        // Note: volume is applied at final output, not here
+        self.brightness_oscillator.set_volume(brightness * 0.5);
     }
 
     pub fn set_config(&mut self, config: HiHatConfig) {
@@ -296,11 +296,57 @@ impl HiHat {
     pub fn trigger(&mut self, time: f32) {
         self.is_active = true;
 
-        // Trigger all oscillators
+        // Read current parameters for envelope configuration
+        // Note: volume is applied at final output, not here
+        let decay = self.params.decay.get();
+        let brightness = self.params.brightness.get();
+        const ATTACK: f32 = 0.001;
+
+        // Configure and trigger noise oscillator envelope based on open/closed
+        if self.is_open {
+            self.noise_oscillator.set_adsr(ADSRConfig::new(
+                ATTACK,
+                decay * 0.2,
+                0.4,
+                decay * 0.8,
+            ));
+        } else {
+            self.noise_oscillator.set_adsr(ADSRConfig::new(
+                ATTACK,
+                decay,
+                0.0,
+                decay * 0.1,
+            ));
+        }
+        self.noise_oscillator.set_volume(1.0); // Full level; volume applied at output
         self.noise_oscillator.trigger(time);
+
+        // Configure and trigger brightness oscillator (shorter envelope for transient sizzle)
+        self.brightness_oscillator.set_adsr(ADSRConfig::new(
+            ATTACK,
+            decay * 0.2,
+            0.0,
+            decay * 0.05,
+        ));
+        self.brightness_oscillator.set_volume(brightness * 0.8); // Relative level; volume applied at output
         self.brightness_oscillator.trigger(time);
 
-        // Trigger amplitude envelope
+        // Configure and trigger amplitude envelope
+        if self.is_open {
+            self.amplitude_envelope.set_config(ADSRConfig::new(
+                ATTACK,
+                decay * 0.3,
+                0.3,
+                decay * 0.7,
+            ));
+        } else {
+            self.amplitude_envelope.set_config(ADSRConfig::new(
+                ATTACK,
+                decay,
+                0.0,
+                decay * 0.05,
+            ));
+        }
         self.amplitude_envelope.trigger(time);
     }
 
@@ -342,8 +388,8 @@ impl HiHat {
         // Base cutoff from frequency parameter, significantly boosted by brightness
         let base_cutoff = self.params.frequency.get();
         let brightness = self.params.brightness.get();
-        // Brightness adds up to 8kHz to the cutoff (major impact on tone)
-        let cutoff = (base_cutoff + brightness * 8000.0).min(self.sample_rate * 0.49);
+        // Brightness adds up to 12kHz to the cutoff (dramatic impact on tone)
+        let cutoff = (base_cutoff + brightness * 12000.0).min(self.sample_rate * 0.45);
         let normalized_freq = cutoff / self.sample_rate;
         // One-pole coefficient: g = 1 - e^(-2*pi*fc/fs)
         let g = 1.0 - (-2.0 * std::f32::consts::PI * normalized_freq).exp();
@@ -357,7 +403,9 @@ impl HiHat {
             self.filter_state = 0.0;
         }
 
-        let filtered_output = self.filter_state;
+        // Apply final volume control for direct, audible effect
+        let volume = self.params.volume.get();
+        let final_output = self.filter_state * volume;
 
         // Check if hi-hat is still active
         if !self.noise_oscillator.envelope.is_active
@@ -367,7 +415,7 @@ impl HiHat {
             self.is_active = false;
         }
 
-        filtered_output
+        final_output
     }
 
     pub fn is_active(&self) -> bool {
