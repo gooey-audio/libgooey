@@ -1493,12 +1493,15 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_timing(
     }
 }
 
-/// Set the modulation amount for an LFO
+/// Set the global modulation amount for an LFO
+///
+/// This scales the LFO's sine wave amplitude before it's distributed to routes.
+/// Final modulation = (offset + sine * amount) * route_depth
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
 /// * `lfo_index` - LFO index (0-7)
-/// * `amount` - Modulation amount (0.0 to 1.0, typically)
+/// * `amount` - Global amplitude scale (0.0 to 1.0, default 1.0)
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -1515,14 +1518,14 @@ pub unsafe extern "C" fn gooey_engine_set_lfo_amount(
     engine.lfos[lfo_index as usize].amount = amount;
 }
 
-/// Get the modulation amount for an LFO
+/// Get the global modulation amount for an LFO
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
 /// * `lfo_index` - LFO index (0-7)
 ///
 /// # Returns
-/// The current modulation amount, or 0.0 if invalid
+/// The current global amplitude scale, or 0.0 if invalid
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -1538,12 +1541,17 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_amount(
     engine.lfos[lfo_index as usize].amount
 }
 
-/// Set the center offset for an LFO
+/// Set the center offset (DC bias) for an LFO
+///
+/// This adds a constant value to the LFO output before distribution to routes.
+/// Final modulation = (offset + sine * amount) * route_depth
+///
+/// Use offset to bias the modulation (e.g., offset=0.5 with amount=0.5 gives 0.0-1.0 range)
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
 /// * `lfo_index` - LFO index (0-7)
-/// * `offset` - Center offset (-1.0 to 1.0, typically 0.0 for centered)
+/// * `offset` - DC bias (-1.0 to 1.0, default 0.0 for centered bipolar modulation)
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -1560,14 +1568,14 @@ pub unsafe extern "C" fn gooey_engine_set_lfo_offset(
     engine.lfos[lfo_index as usize].offset = offset;
 }
 
-/// Get the center offset for an LFO
+/// Get the center offset (DC bias) for an LFO
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
 /// * `lfo_index` - LFO index (0-7)
 ///
 /// # Returns
-/// The current center offset, or 0.0 if invalid
+/// The current DC bias, or 0.0 if invalid
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -1586,14 +1594,14 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_offset(
 /// Add a route from an LFO to an instrument parameter
 ///
 /// Each LFO can have multiple routes to different parameters.
-/// The route's depth controls how much the LFO affects that particular target.
+/// Final modulation applied to target = (offset + sine * amount) * depth
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
 /// * `lfo_index` - LFO index (0-7)
 /// * `instrument` - Target instrument (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
 /// * `param` - Target parameter index (KICK_PARAM_FREQUENCY, etc.)
-/// * `depth` - Route depth (0.0 to 1.0) - how strongly this route is modulated
+/// * `depth` - Per-route depth (0.0 to 1.0) - scales the LFO output for this target
 ///
 /// # Returns
 /// A route ID that can be used to remove this specific route, or LFO_INVALID on error

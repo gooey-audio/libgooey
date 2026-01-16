@@ -165,7 +165,8 @@ impl Lfo {
     }
 
     /// Generate one sample and advance the phase
-    /// Returns a value from -1.0 to 1.0 (sine wave)
+    /// Returns: offset + (sine_value * amount)
+    /// With default settings (amount=1.0, offset=0.0), this returns -1.0 to 1.0
     pub fn tick(&mut self) -> f32 {
         // Calculate sine wave
         let value = (self.phase * 2.0 * std::f32::consts::PI).sin();
