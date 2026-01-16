@@ -3,7 +3,7 @@
 //! This module exposes the audio engine to C/Swift via C-compatible functions.
 //! Designed for integration with iOS (and other platforms in the future).
 
-use crate::effects::{BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect};
+use crate::effects::{BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect, TubeSaturation};
 use crate::engine::{Instrument, Sequencer};
 use crate::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
 use std::slice;
@@ -30,11 +30,13 @@ pub struct GooeyEngine {
     hihat_sequencer: Sequencer,
     tom_sequencer: Sequencer,
 
-    // Global effects (applied in order: delay -> lowpass filter -> limiter)
+    // Global effects (applied in order: delay -> lowpass filter -> saturation -> limiter)
     delay: DelayEffect,
     delay_enabled: bool,
     lowpass_filter: LowpassFilterEffect,
     lowpass_filter_enabled: bool,
+    saturation: TubeSaturation,
+    saturation_enabled: bool,
     limiter: BrickWallLimiter,
 
     // Engine state
@@ -77,6 +79,10 @@ impl GooeyEngine {
         // Default cutoff at 20kHz means filter is effectively bypassed when enabled
         let lowpass_filter = LowpassFilterEffect::new(sample_rate, 20000.0, 0.0);
 
+        // Create saturation with default light warmth settings
+        // drive: 0.3, warmth: 0.4, mix: 0.5 for subtle analog warmth
+        let saturation = TubeSaturation::new(sample_rate, 0.3, 0.4, 0.5);
+
         Self {
             kick,
             snare,
@@ -90,6 +96,8 @@ impl GooeyEngine {
             delay_enabled: false, // Disabled by default
             lowpass_filter,
             lowpass_filter_enabled: false, // Disabled by default
+            saturation,
+            saturation_enabled: true, // Enabled by default for light warmth
             limiter: BrickWallLimiter::new(1.0),
             sample_rate,
             bpm,
@@ -170,7 +178,12 @@ impl GooeyEngine {
                 output = self.lowpass_filter.process(output);
             }
 
-            // 3. Limiter (always on - protects output from clipping)
+            // 3. Saturation (if enabled)
+            if self.saturation_enabled {
+                output = self.saturation.process(output);
+            }
+
+            // 4. Limiter (always on - protects output from clipping)
             *sample = self.limiter.process(output);
 
             self.current_time += sample_period;
@@ -186,8 +199,10 @@ impl GooeyEngine {
 pub const EFFECT_LOWPASS_FILTER: u32 = 0;
 /// Global effect: Delay
 pub const EFFECT_DELAY: u32 = 1;
+/// Global effect: Saturation
+pub const EFFECT_SATURATION: u32 = 2;
 /// Total number of global effects
-pub const EFFECT_COUNT: u32 = 2;
+pub const EFFECT_COUNT: u32 = 3;
 
 // =============================================================================
 // Lowpass filter parameter indices (must match Swift FilterParam enum)
@@ -208,6 +223,17 @@ pub const DELAY_PARAM_TIME: u32 = 0;
 pub const DELAY_PARAM_FEEDBACK: u32 = 1;
 /// Delay parameter: wet/dry mix (0.0-1.0)
 pub const DELAY_PARAM_MIX: u32 = 2;
+
+// =============================================================================
+// Saturation parameter indices (must match Swift SaturationParam enum)
+// =============================================================================
+
+/// Saturation parameter: drive amount (0.0-1.0)
+pub const SATURATION_PARAM_DRIVE: u32 = 0;
+/// Saturation parameter: warmth/even harmonics (0.0-1.0)
+pub const SATURATION_PARAM_WARMTH: u32 = 1;
+/// Saturation parameter: wet/dry mix (0.0-1.0)
+pub const SATURATION_PARAM_MIX: u32 = 2;
 
 // =============================================================================
 // Kick drum parameter indices (must match Swift KickParam enum)
@@ -577,6 +603,10 @@ pub unsafe extern "C" fn gooey_engine_set_snare_param(
 ///   - DELAY_PARAM_TIME (0): 0.0-5.0 seconds
 ///   - DELAY_PARAM_FEEDBACK (1): 0.0-0.95
 ///   - DELAY_PARAM_MIX (2): 0.0-1.0
+/// - EFFECT_SATURATION (2):
+///   - SATURATION_PARAM_DRIVE (0): 0.0-1.0
+///   - SATURATION_PARAM_WARMTH (1): 0.0-1.0
+///   - SATURATION_PARAM_MIX (2): 0.0-1.0
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -603,6 +633,12 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
             DELAY_PARAM_TIME => engine.delay.set_time(value),
             DELAY_PARAM_FEEDBACK => engine.delay.set_feedback(value),
             DELAY_PARAM_MIX => engine.delay.set_mix(value),
+            _ => {} // Unknown parameter, ignore
+        },
+        EFFECT_SATURATION => match param {
+            SATURATION_PARAM_DRIVE => engine.saturation.set_drive(value),
+            SATURATION_PARAM_WARMTH => engine.saturation.set_warmth(value),
+            SATURATION_PARAM_MIX => engine.saturation.set_mix(value),
             _ => {} // Unknown parameter, ignore
         },
         _ => {} // Unknown effect, ignore
@@ -647,6 +683,12 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
             DELAY_PARAM_MIX => engine.delay.get_mix(),
             _ => -1.0, // Unknown parameter
         },
+        EFFECT_SATURATION => match param {
+            SATURATION_PARAM_DRIVE => engine.saturation.get_drive(),
+            SATURATION_PARAM_WARMTH => engine.saturation.get_warmth(),
+            SATURATION_PARAM_MIX => engine.saturation.get_mix(),
+            _ => -1.0, // Unknown parameter
+        },
         _ => -1.0, // Unknown effect
     }
 }
@@ -678,6 +720,7 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_enabled(
     match effect {
         EFFECT_LOWPASS_FILTER => engine.lowpass_filter_enabled = enabled,
         EFFECT_DELAY => engine.delay_enabled = enabled,
+        EFFECT_SATURATION => engine.saturation_enabled = enabled,
         _ => {} // Unknown effect, ignore
     }
 }
@@ -707,6 +750,7 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_enabled(
     match effect {
         EFFECT_LOWPASS_FILTER => engine.lowpass_filter_enabled,
         EFFECT_DELAY => engine.delay_enabled,
+        EFFECT_SATURATION => engine.saturation_enabled,
         _ => false, // Unknown effect
     }
 }
