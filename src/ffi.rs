@@ -35,6 +35,8 @@ pub const LFO_TIMING_EIGHTH: u32 = 5;
 pub const LFO_TIMING_SIXTEENTH: u32 = 6;
 /// LFO timing: Thirty-second note (1/8 beat)
 pub const LFO_TIMING_THIRTY_SECOND: u32 = 7;
+/// Invalid LFO value (returned on error or when LFO is in Hz mode)
+pub const LFO_INVALID: u32 = 0xFFFFFFFF;
 
 /// LFO route configuration
 #[derive(Clone)]
@@ -216,18 +218,17 @@ impl GooeyEngine {
             }
 
             // Process LFOs and apply modulation to routed parameters
-            // We collect route data first to avoid borrow checker issues
+            // Use index-based iteration to avoid allocation on audio thread
             for lfo_idx in 0..LFO_COUNT {
                 if self.lfo_enabled[lfo_idx] {
                     let lfo_value = self.lfos[lfo_idx].tick();
+                    let route_count = self.lfo_routes[lfo_idx].len();
 
-                    // Collect route targets to avoid borrow conflict
-                    let routes: Vec<(u32, u32, f32)> = self.lfo_routes[lfo_idx]
-                        .iter()
-                        .map(|r| (r.instrument, r.param, r.depth))
-                        .collect();
-
-                    for (instrument, param, depth) in routes {
+                    for route_idx in 0..route_count {
+                        // Access route data with short-lived borrows
+                        let instrument = self.lfo_routes[lfo_idx][route_idx].instrument;
+                        let param = self.lfo_routes[lfo_idx][route_idx].param;
+                        let depth = self.lfo_routes[lfo_idx][route_idx].depth;
                         let modulation = lfo_value * depth;
                         self.apply_modulation_by_index(instrument, param, modulation);
                     }
@@ -283,15 +284,9 @@ impl GooeyEngine {
                 SNARE_PARAM_DECAY => self.snare.params.decay.set_bipolar(value),
                 SNARE_PARAM_BRIGHTNESS => self.snare.params.brightness.set_bipolar(value),
                 SNARE_PARAM_VOLUME => self.snare.params.volume.set_bipolar(value),
-                SNARE_PARAM_TONAL => {
-                    self.snare.config.tonal_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                }
-                SNARE_PARAM_NOISE => {
-                    self.snare.config.noise_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                }
-                SNARE_PARAM_PITCH_DROP => {
-                    self.snare.config.pitch_drop = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                }
+                SNARE_PARAM_TONAL => self.snare.params.tonal.set_bipolar(value),
+                SNARE_PARAM_NOISE => self.snare.params.noise.set_bipolar(value),
+                SNARE_PARAM_PITCH_DROP => self.snare.params.pitch_drop.set_bipolar(value),
                 _ => {}
             },
             INSTRUMENT_HIHAT => match param {
@@ -303,29 +298,12 @@ impl GooeyEngine {
                 _ => {}
             },
             INSTRUMENT_TOM => match param {
-                TOM_PARAM_FREQUENCY => {
-                    // Map -1.0 to 1.0 -> 80Hz to 300Hz
-                    let freq = 80.0 + (value + 1.0) * 0.5 * (300.0 - 80.0);
-                    self.tom.config.tom_frequency = freq;
-                    self.tom.base_frequency = freq;
-                }
-                TOM_PARAM_TONAL => {
-                    self.tom.config.tonal_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                }
-                TOM_PARAM_PUNCH => {
-                    self.tom.config.punch_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                }
-                TOM_PARAM_DECAY => {
-                    // Map -1.0 to 1.0 -> 0.1s to 1.5s
-                    let decay = 0.1 + (value + 1.0) * 0.5 * (1.5 - 0.1);
-                    self.tom.config.decay_time = decay;
-                }
-                TOM_PARAM_PITCH_DROP => {
-                    self.tom.config.pitch_drop = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                }
-                TOM_PARAM_VOLUME => {
-                    self.tom.config.volume = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                }
+                TOM_PARAM_FREQUENCY => self.tom.params.frequency.set_bipolar(value),
+                TOM_PARAM_TONAL => self.tom.params.tonal.set_bipolar(value),
+                TOM_PARAM_PUNCH => self.tom.params.punch.set_bipolar(value),
+                TOM_PARAM_DECAY => self.tom.params.decay.set_bipolar(value),
+                TOM_PARAM_PITCH_DROP => self.tom.params.pitch_drop.set_bipolar(value),
+                TOM_PARAM_VOLUME => self.tom.params.volume.set_bipolar(value),
                 _ => {}
             },
             _ => {}
@@ -1486,7 +1464,7 @@ pub unsafe extern "C" fn gooey_engine_set_lfo_timing(
 /// * `lfo_index` - LFO index (0-7)
 ///
 /// # Returns
-/// The current timing constant, or 0xFFFFFFFF if invalid
+/// The current timing constant, or LFO_INVALID if invalid
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -1496,7 +1474,7 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_timing(
     lfo_index: u32,
 ) -> u32 {
     if engine.is_null() || lfo_index as usize >= LFO_COUNT {
-        return 0xFFFFFFFF;
+        return LFO_INVALID;
     }
     let engine = &*engine;
 
@@ -1511,7 +1489,7 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_timing(
             MusicalDivision::Sixteenth => LFO_TIMING_SIXTEENTH,
             MusicalDivision::ThirtySecond => LFO_TIMING_THIRTY_SECOND,
         },
-        crate::engine::lfo::LfoSyncMode::Hz(_) => 0xFFFFFFFF, // Hz mode, not BPM synced
+        crate::engine::lfo::LfoSyncMode::Hz(_) => LFO_INVALID, // Hz mode, not BPM synced
     }
 }
 
@@ -1618,7 +1596,7 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_offset(
 /// * `depth` - Route depth (0.0 to 1.0) - how strongly this route is modulated
 ///
 /// # Returns
-/// A route ID that can be used to remove this specific route, or 0xFFFFFFFF on error
+/// A route ID that can be used to remove this specific route, or LFO_INVALID on error
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -1631,14 +1609,14 @@ pub unsafe extern "C" fn gooey_engine_add_lfo_route(
     depth: f32,
 ) -> u32 {
     if engine.is_null() || lfo_index as usize >= LFO_COUNT {
-        return 0xFFFFFFFF;
+        return LFO_INVALID;
     }
     let engine = &mut *engine;
     let idx = lfo_index as usize;
 
     // Check if we've hit the max routes limit
     if engine.lfo_routes[idx].len() >= LFO_MAX_ROUTES {
-        return 0xFFFFFFFF;
+        return LFO_INVALID;
     }
 
     let route_id = engine.lfo_next_route_id[idx];
