@@ -63,6 +63,9 @@ pub struct SnareParams {
     pub decay: SmoothedParam,       // Decay time in seconds (0.01-2.0)
     pub brightness: SmoothedParam,  // Snap/crack tone amount (0-1)
     pub volume: SmoothedParam,      // Overall volume (0-1)
+    pub tonal: SmoothedParam,       // Tonal component amount (0-1)
+    pub noise: SmoothedParam,       // Noise component amount (0-1)
+    pub pitch_drop: SmoothedParam,  // Pitch drop amount (0-1)
 }
 
 impl SnareParams {
@@ -97,6 +100,27 @@ impl SnareParams {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
+            tonal: SmoothedParam::new(
+                config.tonal_amount,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            noise: SmoothedParam::new(
+                config.noise_amount,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            pitch_drop: SmoothedParam::new(
+                config.pitch_drop,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
         }
     }
 
@@ -107,6 +131,9 @@ impl SnareParams {
         self.decay.tick();
         self.brightness.tick();
         self.volume.tick();
+        self.tonal.tick();
+        self.noise.tick();
+        self.pitch_drop.tick();
         !self.is_settled()
     }
 
@@ -116,6 +143,9 @@ impl SnareParams {
             && self.decay.is_settled()
             && self.brightness.is_settled()
             && self.volume.is_settled()
+            && self.tonal.is_settled()
+            && self.noise.is_settled()
+            && self.pitch_drop.is_settled()
     }
 }
 
@@ -180,6 +210,9 @@ impl SnareDrum {
         self.params.decay.set_target(config.decay_time);
         self.params.brightness.set_target(config.crack_amount);
         self.params.volume.set_target(config.volume);
+        self.params.tonal.set_target(config.tonal_amount);
+        self.params.noise.set_target(config.noise_amount);
+        self.params.pitch_drop.set_target(config.pitch_drop);
     }
 
     /// Trigger the snare drum
@@ -195,6 +228,12 @@ impl SnareDrum {
         let decay = self.params.decay.get();
         let volume = self.params.volume.get();
         let brightness = self.params.brightness.get();
+        let tonal_amount = self.params.tonal.get();
+        let noise_amount = self.params.noise.get();
+        let pitch_drop = self.params.pitch_drop.get();
+
+        // Update pitch start multiplier from smoothed value
+        self.pitch_start_multiplier = 1.0 + pitch_drop * 1.5;
 
         // Configure pitch envelope
         self.pitch_envelope.set_config(ADSRConfig::new(
@@ -206,7 +245,7 @@ impl SnareDrum {
 
         // Configure tonal oscillator envelope
         self.tonal_oscillator.frequency_hz = base_freq;
-        self.tonal_oscillator.set_volume(self.config.tonal_amount * volume);
+        self.tonal_oscillator.set_volume(tonal_amount * volume);
         self.tonal_oscillator.set_adsr(ADSRConfig::new(
             0.001,         // Very fast attack
             decay * 0.8,   // Main decay
@@ -216,7 +255,7 @@ impl SnareDrum {
 
         // Configure noise oscillator envelope
         self.noise_oscillator.frequency_hz = base_freq * 8.0;
-        self.noise_oscillator.set_volume(self.config.noise_amount * volume * 0.8);
+        self.noise_oscillator.set_volume(noise_amount * volume * 0.8);
         self.noise_oscillator.set_adsr(ADSRConfig::new(
             0.001,         // Very fast attack
             decay * 0.6,   // Shorter decay for noise
@@ -305,14 +344,13 @@ impl SnareDrum {
     fn apply_params(&mut self) {
         let volume = self.params.volume.get();
         let brightness = self.params.brightness.get();
+        let tonal_amount = self.params.tonal.get();
+        let noise_amount = self.params.noise.get();
 
         // Update oscillator volumes with smoothed values
-        self.tonal_oscillator
-            .set_volume(self.config.tonal_amount * volume);
-        self.noise_oscillator
-            .set_volume(self.config.noise_amount * volume * 0.8);
-        self.crack_oscillator
-            .set_volume(brightness * volume * 0.4);
+        self.tonal_oscillator.set_volume(tonal_amount * volume);
+        self.noise_oscillator.set_volume(noise_amount * volume * 0.8);
+        self.crack_oscillator.set_volume(brightness * volume * 0.4);
     }
 
     /// Set volume (smoothed)
@@ -336,12 +374,14 @@ impl SnareDrum {
         self.params.brightness.set_target(brightness);
     }
 
+    /// Set tonal amount (smoothed)
     pub fn set_tonal(&mut self, tonal_amount: f32) {
-        self.config.tonal_amount = tonal_amount.clamp(0.0, 1.0);
+        self.params.tonal.set_target(tonal_amount);
     }
 
+    /// Set noise amount (smoothed)
     pub fn set_noise(&mut self, noise_amount: f32) {
-        self.config.noise_amount = noise_amount.clamp(0.0, 1.0);
+        self.params.noise.set_target(noise_amount);
     }
 
     /// Set crack amount (alias for set_brightness)
@@ -349,9 +389,9 @@ impl SnareDrum {
         self.set_brightness(crack_amount);
     }
 
+    /// Set pitch drop amount (smoothed)
     pub fn set_pitch_drop(&mut self, pitch_drop: f32) {
-        self.config.pitch_drop = pitch_drop.clamp(0.0, 1.0);
-        self.pitch_start_multiplier = 1.0 + self.config.pitch_drop * 1.5;
+        self.params.pitch_drop.set_target(pitch_drop);
     }
 }
 
@@ -408,17 +448,15 @@ impl crate::engine::Modulatable for SnareDrum {
                 Ok(())
             }
             "tonal" => {
-                // Map -1.0 to 1.0 -> 0.0 to 1.0
-                self.config.tonal_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                self.params.tonal.set_bipolar(value);
                 Ok(())
             }
             "noise" => {
-                self.config.noise_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                self.params.noise.set_bipolar(value);
                 Ok(())
             }
             "pitch_drop" => {
-                self.config.pitch_drop = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                self.pitch_start_multiplier = 1.0 + self.config.pitch_drop * 1.5;
+                self.params.pitch_drop.set_bipolar(value);
                 Ok(())
             }
             _ => Err(format!("Unknown parameter: {}", parameter)),
@@ -431,9 +469,9 @@ impl crate::engine::Modulatable for SnareDrum {
             "decay" => Some(self.params.decay.range()),
             "brightness" | "crack" => Some(self.params.brightness.range()),
             "volume" => Some(self.params.volume.range()),
-            "tonal" => Some((0.0, 1.0)),
-            "noise" => Some((0.0, 1.0)),
-            "pitch_drop" => Some((0.0, 1.0)),
+            "tonal" => Some(self.params.tonal.range()),
+            "noise" => Some(self.params.noise.range()),
+            "pitch_drop" => Some(self.params.pitch_drop.range()),
             _ => None,
         }
     }

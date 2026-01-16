@@ -1,6 +1,7 @@
 use crate::envelope::{ADSRConfig, Envelope};
 use crate::gen::oscillator::Oscillator;
 use crate::gen::waveform::Waveform;
+use crate::utils::smoother::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 #[derive(Clone, Copy, Debug)]
 pub struct TomConfig {
@@ -52,9 +53,78 @@ impl TomConfig {
     }
 }
 
+/// Smoothed parameters for real-time control of the tom drum
+/// These use one-pole smoothing to prevent clicks/pops during parameter changes
+pub struct TomParams {
+    pub frequency: SmoothedParam, // Base frequency (80-300 Hz)
+    pub decay: SmoothedParam,     // Decay time in seconds (0.1-1.5)
+    pub volume: SmoothedParam,    // Overall volume (0-1)
+    pub tonal: SmoothedParam,     // Tonal component amount (0-1)
+    pub punch: SmoothedParam,     // Punch component amount (0-1)
+    pub pitch_drop: SmoothedParam, // Pitch drop amount (0-1)
+}
+
+impl TomParams {
+    /// Create new smoothed parameters from a config
+    pub fn from_config(config: &TomConfig, sample_rate: f32) -> Self {
+        Self {
+            frequency: SmoothedParam::new(
+                config.tom_frequency,
+                80.0,
+                300.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            decay: SmoothedParam::new(
+                config.decay_time,
+                0.1,
+                1.5,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            volume: SmoothedParam::new(config.volume, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            tonal: SmoothedParam::new(
+                config.tonal_amount,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            punch: SmoothedParam::new(
+                config.punch_amount,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            pitch_drop: SmoothedParam::new(
+                config.pitch_drop,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+        }
+    }
+
+    /// Tick all smoothers
+    #[inline]
+    pub fn tick(&mut self) {
+        self.frequency.tick();
+        self.decay.tick();
+        self.volume.tick();
+        self.tonal.tick();
+        self.punch.tick();
+        self.pitch_drop.tick();
+    }
+}
+
 pub struct TomDrum {
     pub sample_rate: f32,
     pub config: TomConfig,
+
+    /// Smoothed parameters for click-free real-time control
+    pub params: TomParams,
 
     // Two oscillators for tom character
     pub tonal_oscillator: Oscillator, // Main tonal component (sine/triangle)
@@ -75,9 +145,11 @@ impl TomDrum {
     }
 
     pub fn with_config(sample_rate: f32, config: TomConfig) -> Self {
+        let params = TomParams::from_config(&config, sample_rate);
         let mut tom = Self {
             sample_rate,
             config,
+            params,
             tonal_oscillator: Oscillator::new(sample_rate, config.tom_frequency),
             punch_oscillator: Oscillator::new(sample_rate, config.tom_frequency * 3.0),
             pitch_envelope: Envelope::new(),
@@ -136,6 +208,10 @@ impl TomDrum {
     pub fn trigger(&mut self, time: f32) {
         self.is_active = true;
 
+        // Configure oscillators with current decay time at trigger
+        // This ensures decay parameter changes take effect on next note
+        self.configure_oscillators();
+
         // Trigger both oscillators
         self.tonal_oscillator.trigger(time);
         self.punch_oscillator.trigger(time);
@@ -153,20 +229,35 @@ impl TomDrum {
     }
 
     pub fn tick(&mut self, current_time: f32) -> f32 {
+        // Tick smoothed parameters for click-free modulation
+        self.params.tick();
+
         if !self.is_active {
             return 0.0;
         }
+
+        // Get smoothed parameter values
+        let frequency = self.params.frequency.get();
+        let volume = self.params.volume.get();
+        let tonal_amount = self.params.tonal.get();
+        let punch_amount = self.params.punch.get();
+        let pitch_drop = self.params.pitch_drop.get();
+
+        // Update pitch envelope multiplier from smoothed pitch_drop
+        self.pitch_start_multiplier = 1.0 + pitch_drop * 1.0;
 
         // Calculate pitch modulation
         let pitch_envelope_value = self.pitch_envelope.get_amplitude(current_time);
         let frequency_multiplier = 1.0 + (self.pitch_start_multiplier - 1.0) * pitch_envelope_value;
 
-        // Apply pitch envelope to tonal oscillator
-        self.tonal_oscillator.frequency_hz = self.base_frequency * frequency_multiplier;
+        // Apply smoothed frequency with pitch envelope
+        self.tonal_oscillator.frequency_hz = frequency * frequency_multiplier;
+        self.tonal_oscillator.set_volume(tonal_amount * volume);
 
         // Punch oscillator gets a more subtle pitch modulation
         self.punch_oscillator.frequency_hz =
-            self.base_frequency * 3.0 * (1.0 + (frequency_multiplier - 1.0) * 0.5);
+            frequency * 3.0 * (1.0 + (frequency_multiplier - 1.0) * 0.5);
+        self.punch_oscillator.set_volume(punch_amount * volume * 0.6);
 
         // Sum oscillator outputs
         let tonal_output = self.tonal_oscillator.tick(current_time);
@@ -187,34 +278,35 @@ impl TomDrum {
     }
 
     pub fn set_volume(&mut self, volume: f32) {
+        self.params.volume.set_target(volume);
         self.config.volume = volume.clamp(0.0, 1.0);
-        self.configure_oscillators();
     }
 
     pub fn set_frequency(&mut self, frequency: f32) {
-        self.config.tom_frequency = frequency.max(60.0).min(400.0);
+        self.params.frequency.set_target(frequency);
+        self.config.tom_frequency = frequency.clamp(80.0, 300.0);
         self.base_frequency = self.config.tom_frequency;
-        self.configure_oscillators();
     }
 
     pub fn set_decay(&mut self, decay_time: f32) {
-        self.config.decay_time = decay_time.max(0.05).min(3.0);
-        self.configure_oscillators();
+        self.params.decay.set_target(decay_time);
+        self.config.decay_time = decay_time.clamp(0.1, 1.5);
+        // Note: ADSR reconfiguration happens at trigger time, not during modulation
     }
 
     pub fn set_tonal(&mut self, tonal_amount: f32) {
+        self.params.tonal.set_target(tonal_amount);
         self.config.tonal_amount = tonal_amount.clamp(0.0, 1.0);
-        self.configure_oscillators();
     }
 
     pub fn set_punch(&mut self, punch_amount: f32) {
+        self.params.punch.set_target(punch_amount);
         self.config.punch_amount = punch_amount.clamp(0.0, 1.0);
-        self.configure_oscillators();
     }
 
     pub fn set_pitch_drop(&mut self, pitch_drop: f32) {
+        self.params.pitch_drop.set_target(pitch_drop);
         self.config.pitch_drop = pitch_drop.clamp(0.0, 1.0);
-        self.pitch_start_multiplier = 1.0 + self.config.pitch_drop * 1.0;
     }
 }
 
@@ -240,39 +332,34 @@ impl crate::engine::Instrument for TomDrum {
 // Implement modulation support for TomDrum
 impl crate::engine::Modulatable for TomDrum {
     fn modulatable_parameters(&self) -> Vec<&'static str> {
-        vec!["frequency", "tonal", "punch", "decay", "pitch_drop"]
+        vec!["frequency", "tonal", "punch", "decay", "pitch_drop", "volume"]
     }
 
     fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
+        // value is -1.0 to 1.0 (bipolar), set_bipolar maps this to the param range
         match parameter {
             "frequency" => {
-                // value is -1.0 to 1.0, map to frequency range
-                let range = self.parameter_range("frequency").unwrap();
-                self.config.tom_frequency = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
-                self.base_frequency = self.config.tom_frequency;
-                self.configure_oscillators();
+                self.params.frequency.set_bipolar(value);
                 Ok(())
             }
             "tonal" => {
-                // Map -1.0 to 1.0 -> 0.0 to 1.0
-                self.config.tonal_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                self.configure_oscillators();
+                self.params.tonal.set_bipolar(value);
                 Ok(())
             }
             "punch" => {
-                self.config.punch_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                self.configure_oscillators();
+                self.params.punch.set_bipolar(value);
                 Ok(())
             }
             "decay" => {
-                let range = self.parameter_range("decay").unwrap();
-                self.config.decay_time = range.0 + (value + 1.0) * 0.5 * (range.1 - range.0);
-                self.configure_oscillators();
+                self.params.decay.set_bipolar(value);
                 Ok(())
             }
             "pitch_drop" => {
-                self.config.pitch_drop = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
-                self.pitch_start_multiplier = 1.0 + self.config.pitch_drop * 1.0;
+                self.params.pitch_drop.set_bipolar(value);
+                Ok(())
+            }
+            "volume" => {
+                self.params.volume.set_bipolar(value);
                 Ok(())
             }
             _ => Err(format!("Unknown parameter: {}", parameter)),
@@ -286,6 +373,7 @@ impl crate::engine::Modulatable for TomDrum {
             "punch" => Some((0.0, 1.0)),
             "decay" => Some((0.1, 1.5)), // 100ms to 1.5s
             "pitch_drop" => Some((0.0, 1.0)),
+            "volume" => Some((0.0, 1.0)),
             _ => None,
         }
     }
