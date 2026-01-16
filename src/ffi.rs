@@ -4,10 +4,50 @@
 //! Designed for integration with iOS (and other platforms in the future).
 
 use crate::effects::{BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect};
+use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer};
 use crate::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+// =============================================================================
+// LFO constants
+// =============================================================================
+
+/// Number of LFOs in the pool
+pub const LFO_COUNT: usize = 8;
+/// Maximum number of routes per LFO
+pub const LFO_MAX_ROUTES: usize = 16;
+
+/// LFO timing: 4 bars (16 beats)
+pub const LFO_TIMING_FOUR_BARS: u32 = 0;
+/// LFO timing: 2 bars (8 beats)
+pub const LFO_TIMING_TWO_BARS: u32 = 1;
+/// LFO timing: 1 bar (4 beats)
+pub const LFO_TIMING_ONE_BAR: u32 = 2;
+/// LFO timing: Half note (2 beats)
+pub const LFO_TIMING_HALF: u32 = 3;
+/// LFO timing: Quarter note (1 beat)
+pub const LFO_TIMING_QUARTER: u32 = 4;
+/// LFO timing: Eighth note (1/2 beat)
+pub const LFO_TIMING_EIGHTH: u32 = 5;
+/// LFO timing: Sixteenth note (1/4 beat)
+pub const LFO_TIMING_SIXTEENTH: u32 = 6;
+/// LFO timing: Thirty-second note (1/8 beat)
+pub const LFO_TIMING_THIRTY_SECOND: u32 = 7;
+
+/// LFO route configuration
+#[derive(Clone)]
+struct LfoRoute {
+    /// Unique ID for this route (used for removal)
+    id: u32,
+    /// Target instrument (INSTRUMENT_KICK, etc.)
+    instrument: u32,
+    /// Target parameter index (KICK_PARAM_FREQUENCY, etc.)
+    param: u32,
+    /// Modulation depth for this route (0.0 to 1.0)
+    depth: f32,
+}
 
 /// Opaque wrapper around the audio engine for FFI
 ///
@@ -51,6 +91,12 @@ pub struct GooeyEngine {
     hihat_trigger_velocity: AtomicU32,
     tom_trigger_pending: AtomicBool,
     tom_trigger_velocity: AtomicU32,
+
+    // LFO pool (8 LFOs with multi-target routing)
+    lfos: [Lfo; LFO_COUNT],
+    lfo_enabled: [bool; LFO_COUNT],
+    lfo_routes: [Vec<LfoRoute>; LFO_COUNT],
+    lfo_next_route_id: [u32; LFO_COUNT],
 }
 
 impl GooeyEngine {
@@ -77,6 +123,10 @@ impl GooeyEngine {
         // Default cutoff at 20kHz means filter is effectively bypassed when enabled
         let lowpass_filter = LowpassFilterEffect::new(sample_rate, 20000.0, 0.0);
 
+        // Create LFO pool (8 LFOs, all disabled by default with quarter note timing)
+        let lfos = std::array::from_fn(|_| Lfo::with_sample_rate(sample_rate));
+        let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] = std::array::from_fn(|_| Vec::new());
+
         Self {
             kick,
             snare,
@@ -102,6 +152,11 @@ impl GooeyEngine {
             hihat_trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
             tom_trigger_pending: AtomicBool::new(false),
             tom_trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
+            // LFO pool
+            lfos,
+            lfo_enabled: [false; LFO_COUNT],
+            lfo_routes,
+            lfo_next_route_id: [0; LFO_COUNT],
         }
     }
 
@@ -153,6 +208,25 @@ impl GooeyEngine {
                 self.tom.trigger_with_velocity(self.current_time, velocity);
             }
 
+            // Process LFOs and apply modulation to routed parameters
+            // We collect route data first to avoid borrow checker issues
+            for lfo_idx in 0..LFO_COUNT {
+                if self.lfo_enabled[lfo_idx] {
+                    let lfo_value = self.lfos[lfo_idx].tick();
+
+                    // Collect route targets to avoid borrow conflict
+                    let routes: Vec<(u32, u32, f32)> = self.lfo_routes[lfo_idx]
+                        .iter()
+                        .map(|r| (r.instrument, r.param, r.depth))
+                        .collect();
+
+                    for (instrument, param, depth) in routes {
+                        let modulation = lfo_value * depth;
+                        self.apply_modulation_by_index(instrument, param, modulation);
+                    }
+                }
+            }
+
             // Generate and mix audio from all instruments
             let mut output = self.kick.tick(self.current_time)
                 + self.snare.tick(self.current_time)
@@ -174,6 +248,75 @@ impl GooeyEngine {
             *sample = self.limiter.process(output);
 
             self.current_time += sample_period;
+        }
+    }
+
+    /// Apply LFO modulation to an instrument parameter by index
+    /// This is used internally by the render loop to apply LFO values to routed parameters
+    fn apply_modulation_by_index(&mut self, instrument: u32, param: u32, value: f32) {
+        match instrument {
+            INSTRUMENT_KICK => match param {
+                KICK_PARAM_FREQUENCY => self.kick.params.frequency.set_bipolar(value),
+                KICK_PARAM_PUNCH => self.kick.params.punch.set_bipolar(value),
+                KICK_PARAM_SUB => self.kick.params.sub.set_bipolar(value),
+                KICK_PARAM_CLICK => self.kick.params.click.set_bipolar(value),
+                KICK_PARAM_SNAP => self.kick.params.snap.set_bipolar(value),
+                KICK_PARAM_DECAY => self.kick.params.decay.set_bipolar(value),
+                KICK_PARAM_PITCH_ENVELOPE => self.kick.params.pitch_envelope.set_bipolar(value),
+                KICK_PARAM_VOLUME => self.kick.params.volume.set_bipolar(value),
+                _ => {}
+            },
+            INSTRUMENT_SNARE => match param {
+                SNARE_PARAM_FREQUENCY => self.snare.params.frequency.set_bipolar(value),
+                SNARE_PARAM_DECAY => self.snare.params.decay.set_bipolar(value),
+                SNARE_PARAM_BRIGHTNESS => self.snare.params.brightness.set_bipolar(value),
+                SNARE_PARAM_VOLUME => self.snare.params.volume.set_bipolar(value),
+                SNARE_PARAM_TONAL => {
+                    self.snare.config.tonal_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                }
+                SNARE_PARAM_NOISE => {
+                    self.snare.config.noise_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                }
+                SNARE_PARAM_PITCH_DROP => {
+                    self.snare.config.pitch_drop = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                }
+                _ => {}
+            },
+            INSTRUMENT_HIHAT => match param {
+                HIHAT_PARAM_FREQUENCY => self.hihat.params.frequency.set_bipolar(value),
+                HIHAT_PARAM_BRIGHTNESS => self.hihat.params.brightness.set_bipolar(value),
+                HIHAT_PARAM_RESONANCE => self.hihat.params.resonance.set_bipolar(value),
+                HIHAT_PARAM_DECAY => self.hihat.params.decay.set_bipolar(value),
+                HIHAT_PARAM_VOLUME => self.hihat.params.volume.set_bipolar(value),
+                _ => {}
+            },
+            INSTRUMENT_TOM => match param {
+                TOM_PARAM_FREQUENCY => {
+                    // Map -1.0 to 1.0 -> 80Hz to 300Hz
+                    let freq = 80.0 + (value + 1.0) * 0.5 * (300.0 - 80.0);
+                    self.tom.config.tom_frequency = freq;
+                    self.tom.base_frequency = freq;
+                }
+                TOM_PARAM_TONAL => {
+                    self.tom.config.tonal_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                }
+                TOM_PARAM_PUNCH => {
+                    self.tom.config.punch_amount = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                }
+                TOM_PARAM_DECAY => {
+                    // Map -1.0 to 1.0 -> 0.1s to 1.5s
+                    let decay = 0.1 + (value + 1.0) * 0.5 * (1.5 - 0.1);
+                    self.tom.config.decay_time = decay;
+                }
+                TOM_PARAM_PITCH_DROP => {
+                    self.tom.config.pitch_drop = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                }
+                TOM_PARAM_VOLUME => {
+                    self.tom.config.volume = ((value + 1.0) * 0.5).clamp(0.0, 1.0);
+                }
+                _ => {}
+            },
+            _ => {}
         }
     }
 }
@@ -257,6 +400,29 @@ pub const SNARE_PARAM_DECAY: u32 = 1;
 pub const SNARE_PARAM_BRIGHTNESS: u32 = 2;
 /// Snare parameter: overall volume (0-1)
 pub const SNARE_PARAM_VOLUME: u32 = 3;
+/// Snare parameter: tonal body amount (0-1)
+pub const SNARE_PARAM_TONAL: u32 = 4;
+/// Snare parameter: noise amount (0-1)
+pub const SNARE_PARAM_NOISE: u32 = 5;
+/// Snare parameter: pitch drop amount (0-1)
+pub const SNARE_PARAM_PITCH_DROP: u32 = 6;
+
+// =============================================================================
+// Tom drum parameter indices (must match Swift TomParam enum)
+// =============================================================================
+
+/// Tom parameter: base frequency (80-300 Hz)
+pub const TOM_PARAM_FREQUENCY: u32 = 0;
+/// Tom parameter: tonal body amount (0-1)
+pub const TOM_PARAM_TONAL: u32 = 1;
+/// Tom parameter: punch/attack amount (0-1)
+pub const TOM_PARAM_PUNCH: u32 = 2;
+/// Tom parameter: decay time (0.1-1.5 seconds)
+pub const TOM_PARAM_DECAY: u32 = 3;
+/// Tom parameter: pitch drop amount (0-1)
+pub const TOM_PARAM_PITCH_DROP: u32 = 4;
+/// Tom parameter: overall volume (0-1)
+pub const TOM_PARAM_VOLUME: u32 = 5;
 
 // =============================================================================
 // Instrument IDs (must match Swift/C enum if used)
@@ -737,6 +903,11 @@ pub unsafe extern "C" fn gooey_engine_set_bpm(engine: *mut GooeyEngine, bpm: f32
     engine.snare_sequencer.set_bpm(bpm);
     engine.hihat_sequencer.set_bpm(bpm);
     engine.tom_sequencer.set_bpm(bpm);
+
+    // Update LFO BPM values for BPM-synced LFOs
+    for lfo in &mut engine.lfos {
+        lfo.set_bpm(bpm);
+    }
 }
 
 // =============================================================================
@@ -1164,4 +1335,408 @@ pub extern "C" fn gooey_engine_instrument_count() -> u32 {
 #[no_mangle]
 pub extern "C" fn gooey_engine_global_effect_count() -> u32 {
     EFFECT_COUNT
+}
+
+// =============================================================================
+// LFO control
+// =============================================================================
+
+/// Get the number of LFOs in the pool
+#[no_mangle]
+pub extern "C" fn gooey_engine_lfo_count() -> u32 {
+    LFO_COUNT as u32
+}
+
+/// Get the number of LFO timing options
+#[no_mangle]
+pub extern "C" fn gooey_engine_lfo_timing_count() -> u32 {
+    8 // FourBars, TwoBars, OneBar, Half, Quarter, Eighth, Sixteenth, ThirtySecond
+}
+
+/// Enable or disable an LFO
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `lfo_index` - LFO index (0-7)
+/// * `enabled` - Whether the LFO should be active
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_lfo_enabled(
+    engine: *mut GooeyEngine,
+    lfo_index: u32,
+    enabled: bool,
+) {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return;
+    }
+    let engine = &mut *engine;
+    engine.lfo_enabled[lfo_index as usize] = enabled;
+}
+
+/// Check if an LFO is enabled
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `lfo_index` - LFO index (0-7)
+///
+/// # Returns
+/// `true` if the LFO is enabled, `false` otherwise
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_lfo_enabled(
+    engine: *const GooeyEngine,
+    lfo_index: u32,
+) -> bool {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return false;
+    }
+    let engine = &*engine;
+    engine.lfo_enabled[lfo_index as usize]
+}
+
+/// Set the timing (musical division) for an LFO
+///
+/// The LFO will sync to the global BPM using the specified timing.
+/// Phase is preserved when changing timing, allowing smooth transitions.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `lfo_index` - LFO index (0-7)
+/// * `timing` - LFO timing constant (LFO_TIMING_QUARTER, etc.)
+///
+/// # Timing constants
+/// - LFO_TIMING_FOUR_BARS (0): 4 bars / 16 beats
+/// - LFO_TIMING_TWO_BARS (1): 2 bars / 8 beats
+/// - LFO_TIMING_ONE_BAR (2): 1 bar / 4 beats
+/// - LFO_TIMING_HALF (3): Half note / 2 beats
+/// - LFO_TIMING_QUARTER (4): Quarter note / 1 beat
+/// - LFO_TIMING_EIGHTH (5): Eighth note / 1/2 beat
+/// - LFO_TIMING_SIXTEENTH (6): Sixteenth note / 1/4 beat
+/// - LFO_TIMING_THIRTY_SECOND (7): Thirty-second note / 1/8 beat
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_lfo_timing(
+    engine: *mut GooeyEngine,
+    lfo_index: u32,
+    timing: u32,
+) {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return;
+    }
+    let engine = &mut *engine;
+
+    if let Some(division) = MusicalDivision::from_timing_constant(timing) {
+        engine.lfos[lfo_index as usize].set_sync_mode(division);
+    }
+}
+
+/// Get the current timing for an LFO
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `lfo_index` - LFO index (0-7)
+///
+/// # Returns
+/// The current timing constant, or 0xFFFFFFFF if invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_lfo_timing(
+    engine: *const GooeyEngine,
+    lfo_index: u32,
+) -> u32 {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return 0xFFFFFFFF;
+    }
+    let engine = &*engine;
+
+    match engine.lfos[lfo_index as usize].sync_mode() {
+        crate::engine::lfo::LfoSyncMode::BpmSync(division) => match division {
+            MusicalDivision::FourBars => LFO_TIMING_FOUR_BARS,
+            MusicalDivision::TwoBars => LFO_TIMING_TWO_BARS,
+            MusicalDivision::OneBar => LFO_TIMING_ONE_BAR,
+            MusicalDivision::Half => LFO_TIMING_HALF,
+            MusicalDivision::Quarter => LFO_TIMING_QUARTER,
+            MusicalDivision::Eighth => LFO_TIMING_EIGHTH,
+            MusicalDivision::Sixteenth => LFO_TIMING_SIXTEENTH,
+            MusicalDivision::ThirtySecond => LFO_TIMING_THIRTY_SECOND,
+        },
+        crate::engine::lfo::LfoSyncMode::Hz(_) => 0xFFFFFFFF, // Hz mode, not BPM synced
+    }
+}
+
+/// Set the modulation amount for an LFO
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `lfo_index` - LFO index (0-7)
+/// * `amount` - Modulation amount (0.0 to 1.0, typically)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_lfo_amount(
+    engine: *mut GooeyEngine,
+    lfo_index: u32,
+    amount: f32,
+) {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return;
+    }
+    let engine = &mut *engine;
+    engine.lfos[lfo_index as usize].amount = amount;
+}
+
+/// Get the modulation amount for an LFO
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `lfo_index` - LFO index (0-7)
+///
+/// # Returns
+/// The current modulation amount, or 0.0 if invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_lfo_amount(
+    engine: *const GooeyEngine,
+    lfo_index: u32,
+) -> f32 {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return 0.0;
+    }
+    let engine = &*engine;
+    engine.lfos[lfo_index as usize].amount
+}
+
+/// Set the center offset for an LFO
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `lfo_index` - LFO index (0-7)
+/// * `offset` - Center offset (-1.0 to 1.0, typically 0.0 for centered)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_lfo_offset(
+    engine: *mut GooeyEngine,
+    lfo_index: u32,
+    offset: f32,
+) {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return;
+    }
+    let engine = &mut *engine;
+    engine.lfos[lfo_index as usize].offset = offset;
+}
+
+/// Get the center offset for an LFO
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `lfo_index` - LFO index (0-7)
+///
+/// # Returns
+/// The current center offset, or 0.0 if invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_lfo_offset(
+    engine: *const GooeyEngine,
+    lfo_index: u32,
+) -> f32 {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return 0.0;
+    }
+    let engine = &*engine;
+    engine.lfos[lfo_index as usize].offset
+}
+
+/// Add a route from an LFO to an instrument parameter
+///
+/// Each LFO can have multiple routes to different parameters.
+/// The route's depth controls how much the LFO affects that particular target.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `lfo_index` - LFO index (0-7)
+/// * `instrument` - Target instrument (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+/// * `param` - Target parameter index (KICK_PARAM_FREQUENCY, etc.)
+/// * `depth` - Route depth (0.0 to 1.0) - how strongly this route is modulated
+///
+/// # Returns
+/// A route ID that can be used to remove this specific route, or 0xFFFFFFFF on error
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_add_lfo_route(
+    engine: *mut GooeyEngine,
+    lfo_index: u32,
+    instrument: u32,
+    param: u32,
+    depth: f32,
+) -> u32 {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return 0xFFFFFFFF;
+    }
+    let engine = &mut *engine;
+    let idx = lfo_index as usize;
+
+    // Check if we've hit the max routes limit
+    if engine.lfo_routes[idx].len() >= LFO_MAX_ROUTES {
+        return 0xFFFFFFFF;
+    }
+
+    let route_id = engine.lfo_next_route_id[idx];
+    engine.lfo_next_route_id[idx] = route_id.wrapping_add(1);
+
+    engine.lfo_routes[idx].push(LfoRoute {
+        id: route_id,
+        instrument,
+        param,
+        depth,
+    });
+
+    route_id
+}
+
+/// Remove a specific route from an LFO by route ID
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `lfo_index` - LFO index (0-7)
+/// * `route_id` - The route ID returned by `gooey_engine_add_lfo_route`
+///
+/// # Returns
+/// `true` if the route was found and removed, `false` otherwise
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_remove_lfo_route(
+    engine: *mut GooeyEngine,
+    lfo_index: u32,
+    route_id: u32,
+) -> bool {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return false;
+    }
+    let engine = &mut *engine;
+    let idx = lfo_index as usize;
+
+    if let Some(pos) = engine.lfo_routes[idx].iter().position(|r| r.id == route_id) {
+        engine.lfo_routes[idx].remove(pos);
+        true
+    } else {
+        false
+    }
+}
+
+/// Clear all routes for an LFO
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `lfo_index` - LFO index (0-7)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clear_lfo_routes(
+    engine: *mut GooeyEngine,
+    lfo_index: u32,
+) {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return;
+    }
+    let engine = &mut *engine;
+    engine.lfo_routes[lfo_index as usize].clear();
+}
+
+/// Get the number of routes for an LFO
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `lfo_index` - LFO index (0-7)
+///
+/// # Returns
+/// The number of active routes, or 0 if invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_lfo_route_count(
+    engine: *const GooeyEngine,
+    lfo_index: u32,
+) -> u32 {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return 0;
+    }
+    let engine = &*engine;
+    engine.lfo_routes[lfo_index as usize].len() as u32
+}
+
+/// Reset an LFO's phase to 0
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `lfo_index` - LFO index (0-7)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_reset_lfo_phase(
+    engine: *mut GooeyEngine,
+    lfo_index: u32,
+) {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return;
+    }
+    let engine = &mut *engine;
+    engine.lfos[lfo_index as usize].reset();
+}
+
+/// Get an LFO's current phase
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `lfo_index` - LFO index (0-7)
+///
+/// # Returns
+/// The current phase (0.0 to 1.0), or -1.0 if invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_lfo_phase(
+    engine: *const GooeyEngine,
+    lfo_index: u32,
+) -> f32 {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return -1.0;
+    }
+    let engine = &*engine;
+    engine.lfos[lfo_index as usize].phase()
+}
+
+/// Get the number of snare parameters
+#[no_mangle]
+pub extern "C" fn gooey_engine_snare_param_count() -> u32 {
+    7 // frequency, decay, brightness, volume, tonal, noise, pitch_drop
+}
+
+/// Get the number of tom parameters
+#[no_mangle]
+pub extern "C" fn gooey_engine_tom_param_count() -> u32 {
+    6 // frequency, tonal, punch, decay, pitch_drop, volume
 }

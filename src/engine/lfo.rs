@@ -41,6 +41,22 @@ impl MusicalDivision {
         // Cycles per second = beats per second / beats per cycle
         beats_per_second / self.beats()
     }
+
+    /// Convert from u32 timing constant (used by FFI)
+    /// Returns None if the value is out of range
+    pub fn from_timing_constant(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(MusicalDivision::FourBars),
+            1 => Some(MusicalDivision::TwoBars),
+            2 => Some(MusicalDivision::OneBar),
+            3 => Some(MusicalDivision::Half),
+            4 => Some(MusicalDivision::Quarter),
+            5 => Some(MusicalDivision::Eighth),
+            6 => Some(MusicalDivision::Sixteenth),
+            7 => Some(MusicalDivision::ThirtySecond),
+            _ => None,
+        }
+    }
 }
 
 /// LFO sync mode
@@ -81,6 +97,26 @@ impl Lfo {
             amount: 1.0,
             offset: 0.0,
         }
+    }
+
+    /// Create a new LFO with default settings (quarter note timing at 120 BPM)
+    /// Used for FFI pool initialization
+    pub fn with_sample_rate(sample_rate: f32) -> Self {
+        Self {
+            sync_mode: LfoSyncMode::BpmSync(MusicalDivision::Quarter),
+            bpm: 120.0,
+            phase: 0.0,
+            sample_rate,
+            target_instrument: String::new(),
+            target_parameter: String::new(),
+            amount: 1.0,
+            offset: 0.0,
+        }
+    }
+
+    /// Set the sample rate (used when sample rate changes)
+    pub fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.sample_rate = sample_rate;
     }
 
     /// Create a new BPM-synced LFO
