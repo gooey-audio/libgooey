@@ -167,6 +167,18 @@ pub struct SnareDrum {
     pub pitch_start_multiplier: f32,
 
     pub is_active: bool,
+
+    // Velocity-responsive state
+    /// Current trigger velocity (0.0-1.0), set on trigger
+    current_velocity: f32,
+
+    /// How much velocity affects decay time (0.0-1.0)
+    /// Higher values = more velocity sensitivity (shorter decay at high velocity)
+    velocity_to_decay: f32,
+
+    /// How much velocity affects pitch envelope decay (0.0-1.0)
+    /// Higher velocity = faster pitch decay (sharper, more aggressive attack)
+    velocity_to_pitch: f32,
 }
 
 impl SnareDrum {
@@ -188,6 +200,13 @@ impl SnareDrum {
             base_frequency: config.snare_frequency,
             pitch_start_multiplier: 1.0 + config.pitch_drop * 1.5, // Start 1-2.5x higher
             is_active: false,
+
+            // Initialize velocity state (matches default trigger velocity)
+            current_velocity: 0.5,
+            // Velocity scaling: 0.45 means velocity can reduce decay by up to 45%
+            velocity_to_decay: 0.45,
+            // Pitch velocity scaling: 0.5 for moderate pitch response
+            velocity_to_pitch: 0.5,
         };
 
         snare.setup_waveforms();
@@ -215,62 +234,91 @@ impl SnareDrum {
         self.params.pitch_drop.set_target(config.pitch_drop);
     }
 
-    /// Trigger the snare drum
-    ///
-    /// Configures envelopes using current smoothed parameter values,
-    /// then triggers all oscillators. This matches the kick pattern
-    /// and prepares for future velocity support.
+    /// Trigger the snare drum at default velocity (0.5)
     pub fn trigger(&mut self, time: f32) {
+        self.trigger_with_velocity(time, 0.5);
+    }
+
+    /// Trigger the snare drum with velocity sensitivity
+    ///
+    /// Velocity affects:
+    /// - Decay time: Higher velocity = shorter decay (tighter, punchier)
+    /// - Pitch envelope: Higher velocity = faster pitch decay (sharper attack)
+    /// - Crack volume: Higher velocity = more crack (brighter, snappier)
+    /// - Amplitude: Perceptually linear scaling via sqrt
+    pub fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+        self.current_velocity = velocity.clamp(0.0, 1.0);
         self.is_active = true;
+
+        let vel = self.current_velocity;
+
+        // Quadratic curve for natural acoustic-like response
+        let vel_squared = vel * vel;
+
+        // --- Decay time scaling ---
+        // Higher velocity = shorter decay (tighter, punchier sound)
+        let decay_scale = 1.0 - (self.velocity_to_decay * vel_squared);
+
+        // --- Pitch envelope scaling ---
+        // Higher velocity = faster pitch decay (sharper attack)
+        let pitch_decay_scale = 1.0 - (self.velocity_to_pitch * vel_squared);
 
         // Get current smoothed parameter values
         let base_freq = self.params.frequency.get();
-        let decay = self.params.decay.get();
+        let base_decay = self.params.decay.get();
         let volume = self.params.volume.get();
         let brightness = self.params.brightness.get();
         let tonal_amount = self.params.tonal.get();
         let noise_amount = self.params.noise.get();
         let pitch_drop = self.params.pitch_drop.get();
 
+        // Calculate velocity-scaled decay
+        let scaled_decay = base_decay * decay_scale;
+
         // Update pitch start multiplier from smoothed value
         self.pitch_start_multiplier = 1.0 + pitch_drop * 1.5;
 
-        // Configure pitch envelope
+        // Configure pitch envelope with velocity-scaled decay
+        // Base: 30% of amplitude decay, scaled by velocity
+        // Clamped to max 25% to ensure pitch settles before tonal decays (avoids pitch artifacts)
+        let pitch_decay = (scaled_decay * 0.3 * pitch_decay_scale).min(scaled_decay * 0.25);
         self.pitch_envelope.set_config(ADSRConfig::new(
-            0.001,         // Instant attack
-            decay * 0.3,   // Quick pitch drop
-            0.0,           // Drop to base frequency
-            decay * 0.1,   // Quick release
+            0.001,              // Instant attack
+            pitch_decay,        // Velocity-scaled pitch drop
+            0.0,                // Drop to base frequency
+            pitch_decay * 0.1,  // Quick release
         ));
 
-        // Configure tonal oscillator envelope
+        // Configure tonal oscillator envelope with velocity-scaled decay
         self.tonal_oscillator.frequency_hz = base_freq;
         self.tonal_oscillator.set_volume(tonal_amount * volume);
         self.tonal_oscillator.set_adsr(ADSRConfig::new(
-            0.001,         // Very fast attack
-            decay * 0.8,   // Main decay
-            0.0,           // No sustain
-            decay * 0.4,   // Medium release
+            0.001,                  // Very fast attack
+            scaled_decay * 0.8,     // Main decay (velocity-scaled)
+            0.0,                    // No sustain
+            scaled_decay * 0.4,     // Medium release
         ));
 
-        // Configure noise oscillator envelope
+        // Configure noise oscillator envelope with velocity-scaled decay
         self.noise_oscillator.frequency_hz = base_freq * 8.0;
         self.noise_oscillator.set_volume(noise_amount * volume * 0.8);
         self.noise_oscillator.set_adsr(ADSRConfig::new(
-            0.001,         // Very fast attack
-            decay * 0.6,   // Shorter decay for noise
-            0.0,           // No sustain
-            decay * 0.3,   // Quick release
+            0.001,                  // Very fast attack
+            scaled_decay * 0.6,     // Shorter decay for noise (velocity-scaled)
+            0.0,                    // No sustain
+            scaled_decay * 0.3,     // Quick release
         ));
 
-        // Configure crack oscillator envelope
+        // Configure crack oscillator envelope with velocity-scaled decay
+        // Crack gets velocity boost: range [0.7, 1.0] for more snap at high velocity
+        let crack_vel_scale = 0.7 + 0.3 * vel;
         self.crack_oscillator.frequency_hz = base_freq * 25.0;
-        self.crack_oscillator.set_volume(brightness * volume * 0.4);
+        self.crack_oscillator.set_volume(brightness * volume * 0.4 * crack_vel_scale);
         self.crack_oscillator.set_adsr(ADSRConfig::new(
-            0.001,         // Very fast attack
-            decay * 0.2,   // Very short decay for crack
-            0.0,           // No sustain
-            decay * 0.1,   // Very short release
+            0.001,                  // Very fast attack
+            scaled_decay * 0.2,     // Very short decay for crack (velocity-scaled)
+            0.0,                    // No sustain
+            scaled_decay * 0.1,     // Very short release
         ));
 
         // Trigger all oscillators
@@ -324,6 +372,10 @@ impl SnareDrum {
 
         let total_output = tonal_output + noise_output + crack_output;
 
+        // Apply velocity amplitude scaling (sqrt for perceptually linear loudness)
+        let velocity_amplitude = self.current_velocity.sqrt();
+        let final_output = total_output * velocity_amplitude;
+
         // Check if snare is still active
         if !self.tonal_oscillator.envelope.is_active
             && !self.noise_oscillator.envelope.is_active
@@ -332,7 +384,7 @@ impl SnareDrum {
             self.is_active = false;
         }
 
-        total_output
+        final_output
     }
 
     pub fn is_active(&self) -> bool {
@@ -347,10 +399,13 @@ impl SnareDrum {
         let tonal_amount = self.params.tonal.get();
         let noise_amount = self.params.noise.get();
 
+        // Crack gets velocity-sensitive volume boost (more snap at high velocity)
+        let crack_vel_scale = 0.7 + 0.3 * self.current_velocity;
+
         // Update oscillator volumes with smoothed values
         self.tonal_oscillator.set_volume(tonal_amount * volume);
         self.noise_oscillator.set_volume(noise_amount * volume * 0.8);
-        self.crack_oscillator.set_volume(brightness * volume * 0.4);
+        self.crack_oscillator.set_volume(brightness * volume * 0.4 * crack_vel_scale);
     }
 
     /// Set volume (smoothed)
@@ -396,9 +451,8 @@ impl SnareDrum {
 }
 
 impl crate::engine::Instrument for SnareDrum {
-    fn trigger_with_velocity(&mut self, time: f32, _velocity: f32) {
-        // Velocity not yet implemented for snare
-        SnareDrum::trigger(self, time);
+    fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+        SnareDrum::trigger_with_velocity(self, time, velocity);
     }
 
     fn tick(&mut self, current_time: f32) -> f32 {
