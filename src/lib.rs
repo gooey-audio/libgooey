@@ -265,18 +265,8 @@ pub mod web {
         }
 
         #[wasm_bindgen]
-        pub fn set_brightness(&mut self, brightness: f32) {
-            self.hihat.set_brightness(brightness);
-        }
-
-        #[wasm_bindgen]
-        pub fn set_resonance(&mut self, resonance: f32) {
-            self.hihat.set_resonance(resonance);
-        }
-
-        #[wasm_bindgen]
-        pub fn set_attack(&mut self, attack_time: f32) {
-            self.hihat.set_attack(attack_time);
+        pub fn set_filter(&mut self, filter: f32) {
+            self.hihat.set_filter(filter);
         }
 
         #[wasm_bindgen]
@@ -288,22 +278,12 @@ pub mod web {
         pub fn set_config(
             &mut self,
             base_frequency: f32,
-            resonance: f32,
-            brightness: f32,
+            filter: f32,
             decay_time: f32,
-            attack_time: f32,
             volume: f32,
             is_open: bool,
         ) {
-            let config = HiHatConfig::new(
-                base_frequency,
-                resonance,
-                brightness,
-                decay_time,
-                attack_time,
-                volume,
-                is_open,
-            );
+            let config = HiHatConfig::new(base_frequency, filter, decay_time, volume, is_open);
             self.hihat.set_config(config);
         }
     }
