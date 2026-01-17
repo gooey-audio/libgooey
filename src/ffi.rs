@@ -290,9 +290,8 @@ impl GooeyEngine {
                 _ => {}
             },
             INSTRUMENT_HIHAT => match param {
+                HIHAT_PARAM_FILTER => self.hihat.params.filter.set_bipolar(value),
                 HIHAT_PARAM_FREQUENCY => self.hihat.params.frequency.set_bipolar(value),
-                HIHAT_PARAM_BRIGHTNESS => self.hihat.params.brightness.set_bipolar(value),
-                HIHAT_PARAM_RESONANCE => self.hihat.params.resonance.set_bipolar(value),
                 HIHAT_PARAM_DECAY => self.hihat.params.decay.set_bipolar(value),
                 HIHAT_PARAM_VOLUME => self.hihat.params.volume.set_bipolar(value),
                 _ => {}
@@ -380,16 +379,14 @@ pub const KICK_PARAM_VOLUME: u32 = 7;
 // Hi-hat parameter indices (must match Swift HiHatParam enum)
 // =============================================================================
 
-/// Hi-hat parameter: filter cutoff frequency (2000-18000 Hz)
-pub const HIHAT_PARAM_FREQUENCY: u32 = 0;
-/// Hi-hat parameter: brightness/high-frequency emphasis (0-1) - also boosts filter cutoff
-pub const HIHAT_PARAM_BRIGHTNESS: u32 = 1;
-/// Hi-hat parameter: filter resonance (0-1)
-pub const HIHAT_PARAM_RESONANCE: u32 = 2;
-/// Hi-hat parameter: decay time (0.005-2.0 seconds) - ultra-tight to open
-pub const HIHAT_PARAM_DECAY: u32 = 3;
+/// Hi-hat parameter: combined brightness + resonance control (0-1)
+pub const HIHAT_PARAM_FILTER: u32 = 0;
+/// Hi-hat parameter: filter cutoff frequency (4000-16000 Hz)
+pub const HIHAT_PARAM_FREQUENCY: u32 = 1;
+/// Hi-hat parameter: decay time (0.005-0.4 seconds)
+pub const HIHAT_PARAM_DECAY: u32 = 2;
 /// Hi-hat parameter: overall volume (0-1)
-pub const HIHAT_PARAM_VOLUME: u32 = 4;
+pub const HIHAT_PARAM_VOLUME: u32 = 3;
 
 // =============================================================================
 // Snare drum parameter indices (must match Swift SnareParam enum)
@@ -674,9 +671,8 @@ pub unsafe extern "C" fn gooey_engine_set_hihat_param(
 
     // HiHat's setters now handle smoothing internally
     match param {
+        HIHAT_PARAM_FILTER => engine.hihat.set_filter(value),
         HIHAT_PARAM_FREQUENCY => engine.hihat.set_frequency(value),
-        HIHAT_PARAM_BRIGHTNESS => engine.hihat.set_brightness(value),
-        HIHAT_PARAM_RESONANCE => engine.hihat.set_resonance(value),
         HIHAT_PARAM_DECAY => engine.hihat.set_decay(value),
         HIHAT_PARAM_VOLUME => engine.hihat.set_volume(value),
         _ => {} // Unknown parameter, ignore
@@ -1337,7 +1333,7 @@ pub extern "C" fn gooey_engine_kick_param_count() -> u32 {
 /// Get the number of hi-hat parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_hihat_param_count() -> u32 {
-    5
+    4
 }
 
 /// Get the number of sequencer steps
