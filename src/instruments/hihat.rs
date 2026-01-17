@@ -161,6 +161,9 @@ pub struct HiHat {
     /// How much velocity affects frequency/pitch (0.0-1.0)
     /// Higher values = more frequency boost at high velocity
     velocity_to_pitch: f32,
+
+    /// Current velocity-based frequency boost multiplier (decays with filter envelope)
+    velocity_freq_boost: f32,
 }
 
 impl HiHat {
@@ -196,6 +199,7 @@ impl HiHat {
             current_velocity: 1.0,
             velocity_to_decay: 0.4,  // Decay shortened by up to 40% at high velocity
             velocity_to_pitch: 0.3,  // Frequency boosted by up to 30% at high velocity
+            velocity_freq_boost: 1.0, // No boost initially
         };
 
         hihat.configure_oscillators();
@@ -297,13 +301,13 @@ impl HiHat {
 
     /// Trigger with default velocity (1.0)
     pub fn trigger(&mut self, time: f32) {
-        self.trigger_with_vel(time, 1.0);
+        self.trigger_with_velocity(time, 1.0);
     }
 
     /// Trigger with velocity sensitivity
     /// - High velocity: higher pitch, shorter decay, louder
     /// - Low velocity: lower pitch, longer decay, quieter
-    pub fn trigger_with_vel(&mut self, time: f32, velocity: f32) {
+    pub fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
         self.is_active = true;
         self.current_velocity = velocity.clamp(0.0, 1.0);
 
@@ -313,7 +317,6 @@ impl HiHat {
 
         // Read base parameters
         let base_decay = self.params.decay.get();
-        let base_freq = self.params.frequency.get();
         let filter = self.params.filter.get();
         const ATTACK: f32 = 0.001;
 
@@ -322,12 +325,8 @@ impl HiHat {
         let scaled_decay = base_decay * decay_scale;
 
         // High velocity = higher frequency (brighter, more cutting sound)
-        let freq_boost = 1.0 + (self.velocity_to_pitch * vel_squared);
-        let scaled_freq = (base_freq * freq_boost).min(self.sample_rate * 0.45);
-
-        // Temporarily apply velocity-scaled frequency to the filter cutoff
-        // This affects the tick() method's filter calculation
-        self.params.frequency.set_target(scaled_freq);
+        // Store the boost factor - it will be applied transiently in tick() via filter envelope
+        self.velocity_freq_boost = 1.0 + (self.velocity_to_pitch * vel_squared);
 
         // Configure and trigger noise oscillator envelope based on open/closed
         if self.is_open {
@@ -433,11 +432,16 @@ impl HiHat {
         // Apply filter envelope for subtle brightness decay
         // Envelope starts at 1.0 (bright) and decays to 0.0 (base cutoff)
         let filter_env = self.filter_envelope.get_amplitude(current_time);
+
+        // Velocity frequency boost decays with filter envelope (transient, not permanent)
+        let velocity_cutoff_boost = (self.velocity_freq_boost - 1.0) * filter_env * base_cutoff;
+
         // Filter envelope adds extra brightness at attack, then decays
         let envelope_boost = filter_env * self.filter_envelope_amount * base_cutoff;
 
-        // Filter param adds up to 6kHz, filter envelope adds subtle extra boost
-        let cutoff = (base_cutoff + filter * 6000.0 + envelope_boost).min(self.sample_rate * 0.45);
+        // Filter param adds up to 6kHz, plus transient velocity and envelope boosts
+        let cutoff = (base_cutoff + filter * 6000.0 + envelope_boost + velocity_cutoff_boost)
+            .min(self.sample_rate * 0.45);
         let normalized_freq = cutoff / self.sample_rate;
         // One-pole coefficient: g = 1 - e^(-2*pi*fc/fs)
         let g = 1.0 - (-2.0 * std::f32::consts::PI * normalized_freq).exp();
@@ -503,7 +507,7 @@ impl HiHat {
 // Implement the Instrument trait for engine compatibility
 impl crate::engine::Instrument for HiHat {
     fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
-        self.trigger_with_vel(time, velocity);
+        HiHat::trigger_with_velocity(self, time, velocity);
     }
 
     fn tick(&mut self, current_time: f32) -> f32 {
