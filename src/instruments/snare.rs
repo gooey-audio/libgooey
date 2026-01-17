@@ -201,8 +201,8 @@ impl SnareDrum {
             pitch_start_multiplier: 1.0 + config.pitch_drop * 1.5, // Start 1-2.5x higher
             is_active: false,
 
-            // Initialize velocity state
-            current_velocity: 1.0,
+            // Initialize velocity state (matches default trigger velocity)
+            current_velocity: 0.5,
             // Velocity scaling: 0.45 means velocity can reduce decay by up to 45%
             velocity_to_decay: 0.45,
             // Pitch velocity scaling: 0.5 for moderate pitch response
@@ -279,7 +279,8 @@ impl SnareDrum {
         self.pitch_start_multiplier = 1.0 + pitch_drop * 1.5;
 
         // Configure pitch envelope with velocity-scaled decay
-        // Pitch envelope should complete before tonal decay ends
+        // Base: 30% of amplitude decay, scaled by velocity
+        // Clamped to max 25% to ensure pitch settles before tonal decays (avoids pitch artifacts)
         let pitch_decay = (scaled_decay * 0.3 * pitch_decay_scale).min(scaled_decay * 0.25);
         self.pitch_envelope.set_config(ADSRConfig::new(
             0.001,              // Instant attack
@@ -309,9 +310,10 @@ impl SnareDrum {
         ));
 
         // Configure crack oscillator envelope with velocity-scaled decay
-        // Crack volume will be adjusted in apply_params() with velocity boost
+        // Crack gets velocity boost: range [0.7, 1.0] for more snap at high velocity
+        let crack_vel_scale = 0.7 + 0.3 * vel;
         self.crack_oscillator.frequency_hz = base_freq * 25.0;
-        self.crack_oscillator.set_volume(brightness * volume * 0.4);
+        self.crack_oscillator.set_volume(brightness * volume * 0.4 * crack_vel_scale);
         self.crack_oscillator.set_adsr(ADSRConfig::new(
             0.001,                  // Very fast attack
             scaled_decay * 0.2,     // Very short decay for crack (velocity-scaled)
