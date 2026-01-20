@@ -160,6 +160,11 @@ pub mod web {
         }
 
         #[wasm_bindgen]
+        pub fn set_pitch_curve(&mut self, pitch_curve: f32) {
+            self.kick_drum.set_pitch_curve(pitch_curve);
+        }
+
+        #[wasm_bindgen]
         pub fn set_config(
             &mut self,
             kick_frequency: f32,
@@ -169,6 +174,7 @@ pub mod web {
             snap_amount: f32,
             decay_time: f32,
             pitch_envelope: f32,
+            pitch_curve: f32,
             volume: f32,
         ) {
             let config = KickConfig::new(
@@ -179,6 +185,7 @@ pub mod web {
                 snap_amount,
                 decay_time,
                 pitch_envelope,
+                pitch_curve,
                 volume,
             );
             self.kick_drum.set_config(config);
