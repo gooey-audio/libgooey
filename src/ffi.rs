@@ -379,6 +379,15 @@ pub const KICK_PARAM_VOLUME: u32 = 7;
 pub const KICK_PARAM_SATURATION: u32 = 8;
 
 // =============================================================================
+// Kick drum effect indices (must match Swift KickEffect enum)
+// =============================================================================
+
+/// Kick effect: Soft saturation
+pub const KICK_EFFECT_SATURATION: u32 = 0;
+/// Total number of kick effects
+pub const KICK_EFFECT_COUNT: u32 = 1;
+
+// =============================================================================
 // Hi-hat parameter indices (must match Swift HiHatParam enum)
 // =============================================================================
 
@@ -640,6 +649,63 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
         KICK_PARAM_VOLUME => engine.kick.set_volume(value),
         KICK_PARAM_SATURATION => engine.kick.set_saturation(value),
         _ => {} // Unknown parameter, ignore
+    }
+}
+
+/// Enable or disable a kick drum effect
+///
+/// When disabled, the effect is bypassed and does not process audio.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `effect` - Effect ID (see KICK_EFFECT_* constants)
+/// * `enabled` - Whether the effect should be active
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_kick_effect_enabled(
+    engine: *mut GooeyEngine,
+    effect: u32,
+    enabled: bool,
+) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+
+    match effect {
+        KICK_EFFECT_SATURATION => engine.kick.set_saturation_enabled(enabled),
+        _ => {} // Unknown effect, ignore
+    }
+}
+
+/// Check if a kick drum effect is enabled
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `effect` - Effect ID (see KICK_EFFECT_* constants)
+///
+/// # Returns
+/// `true` if the effect is enabled, `false` if disabled or if the effect ID is invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_kick_effect_enabled(
+    engine: *mut GooeyEngine,
+    effect: u32,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+
+    let engine = &*engine;
+
+    match effect {
+        KICK_EFFECT_SATURATION => engine.kick.is_saturation_enabled(),
+        _ => false, // Unknown effect
     }
 }
 

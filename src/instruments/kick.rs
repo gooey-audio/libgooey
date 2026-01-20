@@ -6,6 +6,58 @@ use crate::gen::waveform::Waveform;
 use crate::instruments::fm_snap::FMSnapSynthesizer;
 use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
+/// Effects rack for the kick drum
+///
+/// Holds all insert effects that can be applied to the kick drum output.
+/// Each effect has an enable flag for bypassing. Effects are applied in order.
+pub struct KickEffectsRack {
+    /// Soft saturation effect for warmth and harmonics
+    pub soft_saturation: SoftSaturation,
+    /// Whether soft saturation is enabled
+    pub soft_saturation_enabled: bool,
+}
+
+impl KickEffectsRack {
+    /// Create a new effects rack with default settings
+    pub fn new() -> Self {
+        Self {
+            soft_saturation: SoftSaturation::new(1.0), // threshold=1 means bypass
+            soft_saturation_enabled: true,             // enabled by default when saturation > 0
+        }
+    }
+
+    /// Process audio through all enabled effects
+    #[inline]
+    pub fn process(&self, input: f32, saturation_amount: f32) -> f32 {
+        let mut output = input;
+
+        // Apply soft saturation if enabled and amount > 0
+        if self.soft_saturation_enabled && saturation_amount > 0.0 {
+            // Map saturation amount to threshold: sat=0 -> a=1 (bypass), sat=1 -> a=0 (max)
+            self.soft_saturation.set_threshold(1.0 - saturation_amount);
+            output = self.soft_saturation.process(output);
+        }
+
+        output
+    }
+
+    /// Set soft saturation enabled state
+    pub fn set_soft_saturation_enabled(&mut self, enabled: bool) {
+        self.soft_saturation_enabled = enabled;
+    }
+
+    /// Get soft saturation enabled state
+    pub fn is_soft_saturation_enabled(&self) -> bool {
+        self.soft_saturation_enabled
+    }
+}
+
+impl Default for KickEffectsRack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Static configuration for kick drum presets
 /// Used to initialize a KickDrum with specific parameter values
 #[derive(Clone, Copy, Debug)]
@@ -222,8 +274,8 @@ pub struct KickDrum {
     // FM snap synthesizer for beater sound
     pub fm_snap: FMSnapSynthesizer,
 
-    // Soft saturation effect
-    soft_saturation: SoftSaturation,
+    // Effects rack for insert effects
+    pub effects: KickEffectsRack,
 
     pub is_active: bool,
 
@@ -250,9 +302,10 @@ impl KickDrum {
 
     pub fn with_config(sample_rate: f32, config: KickConfig) -> Self {
         let params = KickParams::from_config(&config, sample_rate);
-        // Initialize soft saturation with threshold derived from config
+        // Initialize effects rack with saturation threshold derived from config
         // saturation=0 -> threshold=1 (bypass), saturation=1 -> threshold=0 (max sat)
-        let soft_saturation = SoftSaturation::new(1.0 - config.saturation);
+        let effects = KickEffectsRack::new();
+        effects.soft_saturation.set_threshold(1.0 - config.saturation);
         let mut kick = Self {
             sample_rate,
             params,
@@ -263,7 +316,7 @@ impl KickDrum {
             pitch_start_multiplier: 1.0 + config.pitch_envelope * 2.0, // Start 1-3x higher
             click_filter: ResonantHighpassFilter::new(sample_rate, 8000.0, 4.0),
             fm_snap: FMSnapSynthesizer::new(sample_rate),
-            soft_saturation,
+            effects,
             is_active: false,
 
             // Initialize velocity state
@@ -498,15 +551,9 @@ impl KickDrum {
             + filtered_click_output
             + (fm_snap_output * snap * self.params.volume.get());
 
-        // Apply soft saturation (before velocity scaling)
+        // Apply effects rack (before velocity scaling)
         let saturation_amount = self.params.saturation.get();
-        let saturated_output = if saturation_amount > 0.0 {
-            // Map saturation amount to threshold: sat=0 -> a=1 (bypass), sat=1 -> a=0 (max)
-            self.soft_saturation.set_threshold(1.0 - saturation_amount);
-            self.soft_saturation.process(total_output)
-        } else {
-            total_output
-        };
+        let saturated_output = self.effects.process(total_output, saturation_amount);
 
         // Apply velocity amplitude scaling (sqrt for perceptually linear loudness)
         let velocity_amplitude = self.current_velocity.sqrt();
@@ -572,6 +619,16 @@ impl KickDrum {
     /// 0.0 = no saturation (bypass), 1.0 = maximum saturation
     pub fn set_saturation(&mut self, saturation: f32) {
         self.params.saturation.set_target(saturation);
+    }
+
+    /// Set soft saturation effect enabled state
+    pub fn set_saturation_enabled(&mut self, enabled: bool) {
+        self.effects.set_soft_saturation_enabled(enabled);
+    }
+
+    /// Get soft saturation effect enabled state
+    pub fn is_saturation_enabled(&self) -> bool {
+        self.effects.is_soft_saturation_enabled()
     }
 }
 
