@@ -12,7 +12,6 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 default = ["native"]
 native = ["cpal"]
 ios = []  # iOS target - no native audio output, just the engine
-web = ["wasm-bindgen", "js-sys", "web-sys"]
 crossterm = ["dep:crossterm"]
 visualization = ["glfw", "gl", "rustfft"]
 midi = ["midir"]  # MIDI input support for examples
@@ -29,24 +28,6 @@ glfw = { version = "0.58", optional = true }
 gl = { version = "0.14", optional = true }
 rustfft = { version = "6.2", optional = true }
 midir = { version = "0.10", optional = true }
-
-[dependencies.wasm-bindgen]
-version = "0.2"
-optional = true
-
-[dependencies.js-sys]
-version = "0.3"
-optional = true
-
-[dependencies.web-sys]
-version = "0.3"
-optional = true
-features = ["AudioContext"]
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "0.2"
-js-sys = "0.3"
-web-sys = { version = "0.3", features = ["AudioContext"] }
 
 [[example]]
 name = "kick"

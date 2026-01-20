@@ -509,11 +509,8 @@ dependencies = [
  "crossterm",
  "gl",
  "glfw",
- "js-sys",
  "midir",
  "rustfft",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]
