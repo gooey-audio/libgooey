@@ -277,6 +277,7 @@ impl GooeyEngine {
                 KICK_PARAM_DECAY => self.kick.params.decay.set_bipolar(value),
                 KICK_PARAM_PITCH_ENVELOPE => self.kick.params.pitch_envelope.set_bipolar(value),
                 KICK_PARAM_VOLUME => self.kick.params.volume.set_bipolar(value),
+                KICK_PARAM_SATURATION => self.kick.params.saturation.set_bipolar(value),
                 _ => {}
             },
             INSTRUMENT_SNARE => match param {
@@ -374,6 +375,8 @@ pub const KICK_PARAM_DECAY: u32 = 5;
 pub const KICK_PARAM_PITCH_ENVELOPE: u32 = 6;
 /// Kick parameter: overall volume (0-1)
 pub const KICK_PARAM_VOLUME: u32 = 7;
+/// Kick parameter: soft saturation amount (0-1)
+pub const KICK_PARAM_SATURATION: u32 = 8;
 
 // =============================================================================
 // Hi-hat parameter indices (must match Swift HiHatParam enum)
@@ -609,6 +612,7 @@ pub unsafe extern "C" fn gooey_engine_trigger_kick(engine: *mut GooeyEngine) {
 /// - 5 (DECAY): 0.01-5.0 seconds
 /// - 6 (PITCH_ENVELOPE): 0-1
 /// - 7 (VOLUME): 0-1
+/// - 8 (SATURATION): 0-1 soft saturation amount
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -634,6 +638,7 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
         KICK_PARAM_DECAY => engine.kick.set_decay(value),
         KICK_PARAM_PITCH_ENVELOPE => engine.kick.set_pitch_envelope(value),
         KICK_PARAM_VOLUME => engine.kick.set_volume(value),
+        KICK_PARAM_SATURATION => engine.kick.set_saturation(value),
         _ => {} // Unknown parameter, ignore
     }
 }
@@ -1327,7 +1332,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_enabled(
 /// Get the number of kick parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_kick_param_count() -> u32 {
-    8
+    9
 }
 
 /// Get the number of hi-hat parameters
