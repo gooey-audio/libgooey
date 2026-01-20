@@ -4,7 +4,7 @@ This document provides guidelines for AI coding agents working on the libgooey c
 
 ## Project Overview
 
-libgooey is a Rust audio synthesis engine supporting native (desktop), iOS, and WASM targets.
+libgooey is a Rust audio synthesis engine supporting native (desktop) and iOS targets.
 It provides drum synthesizers, sequencing, LFO modulation, and effects processing.
 
 ## Build Commands
@@ -14,7 +14,6 @@ It provides drum synthesizers, sequencing, LFO modulation, and effects processin
 cargo build                          # Debug build (default features: native)
 cargo build --release                # Release build
 cargo build --features ios           # iOS target (no native audio output)
-cargo build --features web           # WASM target
 
 # Run examples (require native + crossterm features)
 cargo run --example kick --features "native,crossterm"
@@ -65,7 +64,6 @@ cargo clippy --fix --all-targets --all-features
 |---------|-------------|
 | `native` | Desktop audio output via cpal (default) |
 | `ios` | iOS target - engine only, no audio output |
-| `web` | WASM/WebAssembly bindings |
 | `crossterm` | Terminal UI for examples |
 | `visualization` | Waveform display (requires glfw, gl, rustfft) |
 
@@ -182,9 +180,6 @@ Use feature gates for platform-specific code:
 ```rust
 #[cfg(feature = "native")]
 pub mod engine_output;
-
-#[cfg(feature = "web")]
-pub mod web { /* WASM bindings */ }
 ```
 
 ## Testing Patterns
