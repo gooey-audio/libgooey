@@ -277,6 +277,7 @@ impl GooeyEngine {
                 KICK_PARAM_DECAY => self.kick.params.decay.set_bipolar(value),
                 KICK_PARAM_PITCH_ENVELOPE => self.kick.params.pitch_envelope.set_bipolar(value),
                 KICK_PARAM_VOLUME => self.kick.params.volume.set_bipolar(value),
+                KICK_PARAM_SATURATION => self.kick.params.saturation.set_bipolar(value),
                 _ => {}
             },
             INSTRUMENT_SNARE => match param {
@@ -374,6 +375,17 @@ pub const KICK_PARAM_DECAY: u32 = 5;
 pub const KICK_PARAM_PITCH_ENVELOPE: u32 = 6;
 /// Kick parameter: overall volume (0-1)
 pub const KICK_PARAM_VOLUME: u32 = 7;
+/// Kick parameter: soft saturation amount (0-1)
+pub const KICK_PARAM_SATURATION: u32 = 8;
+
+// =============================================================================
+// Kick drum effect indices (must match Swift KickEffect enum)
+// =============================================================================
+
+/// Kick effect: Soft saturation
+pub const KICK_EFFECT_SATURATION: u32 = 0;
+/// Total number of kick effects
+pub const KICK_EFFECT_COUNT: u32 = 1;
 
 // =============================================================================
 // Hi-hat parameter indices (must match Swift HiHatParam enum)
@@ -609,6 +621,7 @@ pub unsafe extern "C" fn gooey_engine_trigger_kick(engine: *mut GooeyEngine) {
 /// - 5 (DECAY): 0.01-5.0 seconds
 /// - 6 (PITCH_ENVELOPE): 0-1
 /// - 7 (VOLUME): 0-1
+/// - 8 (SATURATION): 0-1 soft saturation amount
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -634,7 +647,65 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
         KICK_PARAM_DECAY => engine.kick.set_decay(value),
         KICK_PARAM_PITCH_ENVELOPE => engine.kick.set_pitch_envelope(value),
         KICK_PARAM_VOLUME => engine.kick.set_volume(value),
+        KICK_PARAM_SATURATION => engine.kick.set_saturation(value),
         _ => {} // Unknown parameter, ignore
+    }
+}
+
+/// Enable or disable a kick drum effect
+///
+/// When disabled, the effect is bypassed and does not process audio.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `effect` - Effect ID (see KICK_EFFECT_* constants)
+/// * `enabled` - Whether the effect should be active
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_kick_effect_enabled(
+    engine: *mut GooeyEngine,
+    effect: u32,
+    enabled: bool,
+) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+
+    match effect {
+        KICK_EFFECT_SATURATION => engine.kick.set_saturation_enabled(enabled),
+        _ => {} // Unknown effect, ignore
+    }
+}
+
+/// Check if a kick drum effect is enabled
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `effect` - Effect ID (see KICK_EFFECT_* constants)
+///
+/// # Returns
+/// `true` if the effect is enabled, `false` if disabled or if the effect ID is invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_kick_effect_enabled(
+    engine: *mut GooeyEngine,
+    effect: u32,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+
+    let engine = &*engine;
+
+    match effect {
+        KICK_EFFECT_SATURATION => engine.kick.is_saturation_enabled(),
+        _ => false, // Unknown effect
     }
 }
 
@@ -1327,7 +1398,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_enabled(
 /// Get the number of kick parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_kick_param_count() -> u32 {
-    8
+    9
 }
 
 /// Get the number of hi-hat parameters

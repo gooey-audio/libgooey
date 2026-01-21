@@ -1,9 +1,79 @@
+use crate::effects::SoftSaturation;
 use crate::envelope::{ADSRConfig, Envelope};
 use crate::filters::ResonantHighpassFilter;
 use crate::gen::oscillator::Oscillator;
 use crate::gen::waveform::Waveform;
 use crate::instruments::fm_snap::FMSnapSynthesizer;
 use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
+
+/// Effects rack for the kick drum
+///
+/// Holds configuration for all insert effects that can be applied to the kick
+/// drum output. Each effect has an enable flag for bypassing.
+///
+/// # Smoothing Convention
+///
+/// This rack does NOT smooth parameters internally. Parameters (like saturation
+/// amount) should be smoothed by the caller via [`SmoothedParam`] before being
+/// passed to the `process()` method. This follows the project-wide convention
+/// documented in [`crate::effects`].
+///
+/// # Hot Path Optimization
+///
+/// The `process()` method uses direct function calls (e.g.,
+/// `SoftSaturation::process_with_params`) instead of trait methods, avoiding
+/// atomic operations in the audio thread hot path.
+pub struct KickEffectsRack {
+    /// Whether soft saturation is enabled
+    pub soft_saturation_enabled: bool,
+}
+
+impl KickEffectsRack {
+    /// Create a new effects rack with default settings
+    pub fn new() -> Self {
+        Self {
+            soft_saturation_enabled: true, // enabled by default when saturation > 0
+        }
+    }
+
+    /// Process audio through all enabled effects
+    ///
+    /// # Arguments
+    /// * `input` - Input audio sample
+    /// * `saturation_amount` - Saturation amount (0-1), should be pre-smoothed
+    ///
+    /// # Performance
+    /// Uses static method calls to avoid atomic operations per sample.
+    #[inline]
+    pub fn process(&self, input: f32, saturation_amount: f32) -> f32 {
+        let mut output = input;
+
+        // Apply soft saturation if enabled and amount > 0
+        if self.soft_saturation_enabled && saturation_amount > 0.0 {
+            // Map saturation amount to threshold: sat=0 -> a=1 (bypass), sat=1 -> a=0 (max)
+            let threshold = 1.0 - saturation_amount;
+            output = SoftSaturation::process_with_params(output, threshold);
+        }
+
+        output
+    }
+
+    /// Set soft saturation enabled state
+    pub fn set_soft_saturation_enabled(&mut self, enabled: bool) {
+        self.soft_saturation_enabled = enabled;
+    }
+
+    /// Get soft saturation enabled state
+    pub fn is_soft_saturation_enabled(&self) -> bool {
+        self.soft_saturation_enabled
+    }
+}
+
+impl Default for KickEffectsRack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Static configuration for kick drum presets
 /// Used to initialize a KickDrum with specific parameter values
@@ -15,8 +85,9 @@ pub struct KickConfig {
     pub click_amount: f32,   // High-frequency click (0.0-1.0)
     pub snap_amount: f32,    // FM snap transient/zap (0.0-1.0)
     pub decay_time: f32,     // Overall decay length in seconds
-    pub pitch_envelope: f32,     // Frequency sweep amount (0.0-1.0)
+    pub pitch_envelope: f32, // Frequency sweep amount (0.0-1.0)
     pub volume: f32,         // Overall volume (0.0-1.0)
+    pub saturation: f32,     // Soft saturation amount (0.0-1.0)
 }
 
 impl KickConfig {
@@ -29,6 +100,7 @@ impl KickConfig {
         decay_time: f32,
         pitch_envelope: f32,
         volume: f32,
+        saturation: f32,
     ) -> Self {
         Self {
             kick_frequency: kick_frequency.max(30.0).min(80.0), // Typical kick drum frequency range
@@ -39,41 +111,47 @@ impl KickConfig {
             decay_time: decay_time.max(0.01).min(5.0), // Reasonable decay range
             pitch_envelope: pitch_envelope.clamp(0.0, 1.0),
             volume: volume.clamp(0.0, 1.0),
+            saturation: saturation.clamp(0.0, 1.0),
         }
     }
 
     pub fn default() -> Self {
         // snap_amount defaults to 0.3 for subtle attack transient
-        Self::new(30.0, 0.80, 0.80, 0.20, 0.3, 0.28, 0.20, 0.80)
+        // saturation defaults to 0.0 (no saturation)
+        Self::new(30.0, 0.80, 0.80, 0.20, 0.3, 0.28, 0.20, 0.80, 0.0)
     }
 
     pub fn punchy() -> Self {
         // punchy preset gets more snap for aggressive attack
-        Self::new(60.0, 0.9, 0.6, 0.4, 0.6, 0.6, 0.7, 0.85)
+        // light saturation (0.3) for extra punch
+        Self::new(60.0, 0.9, 0.6, 0.4, 0.6, 0.6, 0.7, 0.85, 0.3)
     }
 
     pub fn deep() -> Self {
         // deep preset has less snap for smoother attack
-        Self::new(45.0, 0.5, 1.0, 0.2, 0.2, 1.2, 0.5, 0.9)
+        // subtle saturation (0.1) for warmth
+        Self::new(45.0, 0.5, 1.0, 0.2, 0.2, 1.2, 0.5, 0.9, 0.1)
     }
 
     pub fn tight() -> Self {
         // tight preset has moderate snap
-        Self::new(70.0, 0.8, 0.7, 0.5, 0.5, 0.4, 0.8, 0.8)
+        // moderate saturation (0.4) for more aggressive character
+        Self::new(70.0, 0.8, 0.7, 0.5, 0.5, 0.4, 0.8, 0.8, 0.4)
     }
 }
 
 /// Smoothed parameters for real-time control of the kick drum
 /// These use one-pole smoothing to prevent clicks/pops during parameter changes
 pub struct KickParams {
-    pub frequency: SmoothedParam,  // Base frequency (30-80 Hz)
-    pub punch: SmoothedParam,      // Mid-frequency presence (0-1)
-    pub sub: SmoothedParam,        // Sub-bass presence (0-1)
-    pub click: SmoothedParam,      // High-frequency click (0-1)
-    pub snap: SmoothedParam,       // FM snap transient/zap (0-1)
-    pub decay: SmoothedParam,      // Decay time in seconds (0.01-5.0)
+    pub frequency: SmoothedParam,      // Base frequency (30-80 Hz)
+    pub punch: SmoothedParam,          // Mid-frequency presence (0-1)
+    pub sub: SmoothedParam,            // Sub-bass presence (0-1)
+    pub click: SmoothedParam,          // High-frequency click (0-1)
+    pub snap: SmoothedParam,           // FM snap transient/zap (0-1)
+    pub decay: SmoothedParam,          // Decay time in seconds (0.01-5.0)
     pub pitch_envelope: SmoothedParam, // Pitch envelope amount (0-1)
-    pub volume: SmoothedParam,     // Overall volume (0-1)
+    pub volume: SmoothedParam,         // Overall volume (0-1)
+    pub saturation: SmoothedParam,     // Soft saturation amount (0-1)
 }
 
 impl KickParams {
@@ -136,6 +214,13 @@ impl KickParams {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
+            saturation: SmoothedParam::new(
+                config.saturation,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
         }
     }
 
@@ -150,6 +235,7 @@ impl KickParams {
         self.decay.tick();
         self.pitch_envelope.tick();
         self.volume.tick();
+        self.saturation.tick();
 
         // Return true if any smoother is still active
         !self.is_settled()
@@ -165,6 +251,7 @@ impl KickParams {
             && self.decay.is_settled()
             && self.pitch_envelope.is_settled()
             && self.volume.is_settled()
+            && self.saturation.is_settled()
     }
 
     /// Get a snapshot of current values as a KickConfig (for reading back)
@@ -178,6 +265,7 @@ impl KickParams {
             decay_time: self.decay.get(),
             pitch_envelope: self.pitch_envelope.get(),
             volume: self.volume.get(),
+            saturation: self.saturation.get(),
         }
     }
 }
@@ -202,6 +290,9 @@ pub struct KickDrum {
 
     // FM snap synthesizer for beater sound
     pub fm_snap: FMSnapSynthesizer,
+
+    // Effects rack for insert effects
+    pub effects: KickEffectsRack,
 
     pub is_active: bool,
 
@@ -228,6 +319,8 @@ impl KickDrum {
 
     pub fn with_config(sample_rate: f32, config: KickConfig) -> Self {
         let params = KickParams::from_config(&config, sample_rate);
+        // Initialize effects rack (saturation amount is derived from params at process time)
+        let effects = KickEffectsRack::new();
         let mut kick = Self {
             sample_rate,
             params,
@@ -238,6 +331,7 @@ impl KickDrum {
             pitch_start_multiplier: 1.0 + config.pitch_envelope * 2.0, // Start 1-3x higher
             click_filter: ResonantHighpassFilter::new(sample_rate, 8000.0, 4.0),
             fm_snap: FMSnapSynthesizer::new(sample_rate),
+            effects,
             is_active: false,
 
             // Initialize velocity state
@@ -334,6 +428,7 @@ impl KickDrum {
         self.params.decay.set_target(config.decay_time);
         self.params.pitch_envelope.set_target(config.pitch_envelope);
         self.params.volume.set_target(config.volume);
+        self.params.saturation.set_target(config.saturation);
 
         // Reconfigure envelopes for new decay time
         self.configure_oscillators();
@@ -471,9 +566,13 @@ impl KickDrum {
             + filtered_click_output
             + (fm_snap_output * snap * self.params.volume.get());
 
+        // Apply effects rack (before velocity scaling)
+        let saturation_amount = self.params.saturation.get();
+        let saturated_output = self.effects.process(total_output, saturation_amount);
+
         // Apply velocity amplitude scaling (sqrt for perceptually linear loudness)
         let velocity_amplitude = self.current_velocity.sqrt();
-        let final_output = total_output * velocity_amplitude;
+        let final_output = saturated_output * velocity_amplitude;
 
         // Check if kick is still active
         if !self.sub_oscillator.envelope.is_active
@@ -530,6 +629,22 @@ impl KickDrum {
     pub fn set_pitch_envelope(&mut self, pitch_envelope: f32) {
         self.params.pitch_envelope.set_target(pitch_envelope);
     }
+
+    /// Set saturation amount (smoothed)
+    /// 0.0 = no saturation (bypass), 1.0 = maximum saturation
+    pub fn set_saturation(&mut self, saturation: f32) {
+        self.params.saturation.set_target(saturation);
+    }
+
+    /// Set soft saturation effect enabled state
+    pub fn set_saturation_enabled(&mut self, enabled: bool) {
+        self.effects.set_soft_saturation_enabled(enabled);
+    }
+
+    /// Get soft saturation effect enabled state
+    pub fn is_saturation_enabled(&self) -> bool {
+        self.effects.is_soft_saturation_enabled()
+    }
 }
 
 impl crate::engine::Instrument for KickDrum {
@@ -562,6 +677,7 @@ impl crate::engine::Modulatable for KickDrum {
             "decay",
             "pitch_envelope",
             "volume",
+            "saturation",
         ]
     }
 
@@ -600,6 +716,10 @@ impl crate::engine::Modulatable for KickDrum {
                 self.params.volume.set_bipolar(value);
                 Ok(())
             }
+            "saturation" => {
+                self.params.saturation.set_bipolar(value);
+                Ok(())
+            }
             _ => Err(format!("Unknown parameter: {}", parameter)),
         }
     }
@@ -614,6 +734,7 @@ impl crate::engine::Modulatable for KickDrum {
             "decay" => Some(self.params.decay.range()),
             "pitch_envelope" => Some(self.params.pitch_envelope.range()),
             "volume" => Some(self.params.volume.range()),
+            "saturation" => Some(self.params.saturation.range()),
             _ => None,
         }
     }
