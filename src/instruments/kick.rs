@@ -1,4 +1,4 @@
-use crate::effects::{Effect, SoftSaturation};
+use crate::effects::SoftSaturation;
 use crate::envelope::{ADSRConfig, Envelope};
 use crate::filters::ResonantHighpassFilter;
 use crate::gen::oscillator::Oscillator;
@@ -8,11 +8,22 @@ use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 /// Effects rack for the kick drum
 ///
-/// Holds all insert effects that can be applied to the kick drum output.
-/// Each effect has an enable flag for bypassing. Effects are applied in order.
+/// Holds configuration for all insert effects that can be applied to the kick
+/// drum output. Each effect has an enable flag for bypassing.
+///
+/// # Smoothing Convention
+///
+/// This rack does NOT smooth parameters internally. Parameters (like saturation
+/// amount) should be smoothed by the caller via [`SmoothedParam`] before being
+/// passed to the `process()` method. This follows the project-wide convention
+/// documented in [`crate::effects`].
+///
+/// # Hot Path Optimization
+///
+/// The `process()` method uses direct function calls (e.g.,
+/// `SoftSaturation::process_with_params`) instead of trait methods, avoiding
+/// atomic operations in the audio thread hot path.
 pub struct KickEffectsRack {
-    /// Soft saturation effect for warmth and harmonics
-    pub soft_saturation: SoftSaturation,
     /// Whether soft saturation is enabled
     pub soft_saturation_enabled: bool,
 }
@@ -21,12 +32,18 @@ impl KickEffectsRack {
     /// Create a new effects rack with default settings
     pub fn new() -> Self {
         Self {
-            soft_saturation: SoftSaturation::new(1.0), // threshold=1 means bypass
-            soft_saturation_enabled: true,             // enabled by default when saturation > 0
+            soft_saturation_enabled: true, // enabled by default when saturation > 0
         }
     }
 
     /// Process audio through all enabled effects
+    ///
+    /// # Arguments
+    /// * `input` - Input audio sample
+    /// * `saturation_amount` - Saturation amount (0-1), should be pre-smoothed
+    ///
+    /// # Performance
+    /// Uses static method calls to avoid atomic operations per sample.
     #[inline]
     pub fn process(&self, input: f32, saturation_amount: f32) -> f32 {
         let mut output = input;
@@ -34,8 +51,8 @@ impl KickEffectsRack {
         // Apply soft saturation if enabled and amount > 0
         if self.soft_saturation_enabled && saturation_amount > 0.0 {
             // Map saturation amount to threshold: sat=0 -> a=1 (bypass), sat=1 -> a=0 (max)
-            self.soft_saturation.set_threshold(1.0 - saturation_amount);
-            output = self.soft_saturation.process(output);
+            let threshold = 1.0 - saturation_amount;
+            output = SoftSaturation::process_with_params(output, threshold);
         }
 
         output
@@ -302,10 +319,8 @@ impl KickDrum {
 
     pub fn with_config(sample_rate: f32, config: KickConfig) -> Self {
         let params = KickParams::from_config(&config, sample_rate);
-        // Initialize effects rack with saturation threshold derived from config
-        // saturation=0 -> threshold=1 (bypass), saturation=1 -> threshold=0 (max sat)
+        // Initialize effects rack (saturation amount is derived from params at process time)
         let effects = KickEffectsRack::new();
-        effects.soft_saturation.set_threshold(1.0 - config.saturation);
         let mut kick = Self {
             sample_rate,
             params,
