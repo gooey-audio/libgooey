@@ -10,7 +10,7 @@ use crossterm::{
 use std::io::{self, Write};
 
 use gooey::engine::{Engine, EngineOutput};
-use gooey::instruments::KickDrum;
+use gooey::instruments::{KickConfig, KickDrum};
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "midi")]
@@ -74,6 +74,17 @@ impl MidiHandler {
     }
 }
 
+fn get_preset_config(index: usize) -> (KickConfig, &'static str) {
+    match index {
+        0 => (KickConfig::default(), "Default"),
+        1 => (KickConfig::punchy(), "Punchy"),
+        2 => (KickConfig::deep(), "Deep"),
+        3 => (KickConfig::tight(), "Tight"),
+        4 => (KickConfig::ds_kick(), "DS Kick"),
+        _ => (KickConfig::default(), "Default"),
+    }
+}
+
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
     let sample_rate = 44100.0;
@@ -101,8 +112,14 @@ fn main() -> anyhow::Result<()> {
     // Start the audio stream
     engine_output.start()?;
 
+    // Current preset tracking
+    let current_preset = Arc::new(Mutex::new(0usize)); // 0=default, 1=punchy, 2=deep, 3=tight, 4=ds_kick
+
     println!("=== Kick Drum Example ===");
     println!("Press SPACE to trigger kick drum, 'q' to quit");
+    println!("Press 1-5 to switch presets:");
+    println!("  1: Default  2: Punchy  3: Deep  4: Tight  5: DS Kick");
+    println!();
 
     // Try to initialize MIDI input (optional, fails gracefully)
     #[cfg(feature = "midi")]
@@ -125,6 +142,10 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "visualization")]
     println!("Waveform visualization enabled");
+
+    // Display current preset
+    let (_, preset_name) = get_preset_config(0);
+    println!("Current preset: {}", preset_name);
     println!();
 
     // Enable raw mode for immediate key detection
@@ -163,6 +184,29 @@ fn main() -> anyhow::Result<()> {
                         let mut engine = audio_engine.lock().unwrap();
                         engine.trigger_instrument("kick");
                         print!("*");
+                        io::stdout().flush().unwrap();
+                    }
+                    KeyCode::Char('1') | KeyCode::Char('2') | KeyCode::Char('3')
+                    | KeyCode::Char('4') | KeyCode::Char('5') => {
+                        let preset_idx = match code {
+                            KeyCode::Char('1') => 0,
+                            KeyCode::Char('2') => 1,
+                            KeyCode::Char('3') => 2,
+                            KeyCode::Char('4') => 3,
+                            KeyCode::Char('5') => 4,
+                            _ => 0,
+                        };
+
+                        // Update preset
+                        *current_preset.lock().unwrap() = preset_idx;
+                        let (config, name) = get_preset_config(preset_idx);
+
+                        // Replace kick drum with new config
+                        let mut engine = audio_engine.lock().unwrap();
+                        let new_kick = KickDrum::with_config(sample_rate, config);
+                        engine.add_instrument("kick", Box::new(new_kick));
+
+                        println!("\rPreset: {}                    ", name);
                         io::stdout().flush().unwrap();
                     }
                     KeyCode::Char('q') | KeyCode::Esc => {

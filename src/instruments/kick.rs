@@ -2,22 +2,25 @@ use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
 use crate::filters::ResonantHighpassFilter;
 use crate::gen::oscillator::Oscillator;
 use crate::gen::waveform::Waveform;
-use crate::instruments::fm_snap::FMSnapSynthesizer;
+use crate::instruments::fm_snap::{FMSnapSynthesizer, PhaseModulator};
 use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 /// Static configuration for kick drum presets
 /// Used to initialize a KickDrum with specific parameter values
 #[derive(Clone, Copy, Debug)]
 pub struct KickConfig {
-    pub kick_frequency: f32, // Base frequency (30-80Hz typical)
-    pub punch_amount: f32,   // Mid-frequency presence (0.0-1.0)
-    pub sub_amount: f32,     // Sub-bass presence (0.0-1.0)
-    pub click_amount: f32,   // High-frequency click (0.0-1.0)
-    pub snap_amount: f32,    // FM snap transient/zap (0.0-1.0)
-    pub decay_time: f32,     // Overall decay length in seconds
-    pub pitch_envelope: f32, // Frequency sweep amount (0.0-1.0)
-    pub pitch_curve: f32,    // Pitch envelope decay curve (0.1-10.0, 1.0 = linear)
-    pub volume: f32,         // Overall volume (0.0-1.0)
+    pub kick_frequency: f32,     // Base frequency (30-80Hz typical)
+    pub punch_amount: f32,       // Mid-frequency presence (0.0-1.0)
+    pub sub_amount: f32,         // Sub-bass presence (0.0-1.0)
+    pub click_amount: f32,       // High-frequency click (0.0-1.0)
+    pub snap_amount: f32,        // FM snap transient/zap (0.0-1.0)
+    pub decay_time: f32,         // Overall decay length in seconds
+    pub pitch_envelope: f32,     // Frequency sweep amount (0.0-1.0)
+    pub pitch_curve: f32,        // Pitch envelope decay curve (0.1-10.0, 1.0 = linear)
+    pub volume: f32,             // Overall volume (0.0-1.0)
+    pub pitch_start_ratio: f32,  // Starting pitch multiplier (1.0-10.0, default 3.0)
+    pub phase_mod_enabled: bool, // Enable DS-style phase modulation for transient
+    pub phase_mod_amount: f32,   // Phase modulation depth (0.0-1.0)
 }
 
 impl KickConfig {
@@ -42,6 +45,41 @@ impl KickConfig {
             pitch_envelope: pitch_envelope.clamp(0.0, 1.0),
             pitch_curve: pitch_curve.clamp(0.1, 10.0), // Curve exponent for pitch envelope decay
             volume: volume.clamp(0.0, 1.0),
+            // Backward-compatible defaults for new DS Kick parameters
+            pitch_start_ratio: 3.0,    // Default matches old behavior (1.0 + 1.0 * 2.0 = 3.0 max)
+            phase_mod_enabled: false,  // Disabled by default for compatibility
+            phase_mod_amount: 0.0,
+        }
+    }
+
+    /// Create a KickConfig with all parameters including DS Kick features
+    pub fn new_full(
+        kick_frequency: f32,
+        punch_amount: f32,
+        sub_amount: f32,
+        click_amount: f32,
+        snap_amount: f32,
+        decay_time: f32,
+        pitch_envelope: f32,
+        pitch_curve: f32,
+        volume: f32,
+        pitch_start_ratio: f32,
+        phase_mod_enabled: bool,
+        phase_mod_amount: f32,
+    ) -> Self {
+        Self {
+            kick_frequency: kick_frequency.max(30.0).min(200.0), // Extended range for DS style
+            punch_amount: punch_amount.clamp(0.0, 1.0),
+            sub_amount: sub_amount.clamp(0.0, 1.0),
+            click_amount: click_amount.clamp(0.0, 1.0),
+            snap_amount: snap_amount.clamp(0.0, 1.0),
+            decay_time: decay_time.max(0.01).min(5.0),
+            pitch_envelope: pitch_envelope.clamp(0.0, 1.0),
+            pitch_curve: pitch_curve.clamp(0.1, 10.0),
+            volume: volume.clamp(0.0, 1.0),
+            pitch_start_ratio: pitch_start_ratio.clamp(1.0, 10.0),
+            phase_mod_enabled,
+            phase_mod_amount: phase_mod_amount.clamp(0.0, 1.0),
         }
     }
 
@@ -68,20 +106,43 @@ impl KickConfig {
         // pitch_curve 0.25 = aggressive pitch drop for tight, punchy sound
         Self::new(70.0, 0.8, 0.7, 0.5, 0.5, 0.4, 0.8, 0.25, 0.8)
     }
+
+    /// DS Kick preset - Ableton Drum Synth style
+    /// Single sine oscillator with 5:1 pitch ratio and phase modulation transient
+    /// Based on analysis of the Ableton DS Kick Max MSP patch
+    pub fn ds_kick() -> Self {
+        Self::new_full(
+            50.0,  // Base frequency - classic kick range
+            0.0,   // Punch disabled - DS uses single oscillator
+            1.0,   // Full sub (sine) output
+            0.0,   // Click disabled - using phase mod instead
+            0.0,   // Snap disabled - using phase mod instead
+            0.5,   // 500ms decay
+            1.0,   // Full pitch envelope
+            0.25,  // Approximates Max's -0.83 convex curve
+            0.85,  // Slight headroom
+            5.0,   // DS signature: 5x pitch ratio
+            true,  // Enable phase modulation
+            0.7,   // Strong phase mod for transient snap
+        )
+    }
 }
 
 /// Smoothed parameters for real-time control of the kick drum
 /// These use one-pole smoothing to prevent clicks/pops during parameter changes
 pub struct KickParams {
-    pub frequency: SmoothedParam,  // Base frequency (30-80 Hz)
-    pub punch: SmoothedParam,      // Mid-frequency presence (0-1)
-    pub sub: SmoothedParam,        // Sub-bass presence (0-1)
-    pub click: SmoothedParam,      // High-frequency click (0-1)
-    pub snap: SmoothedParam,       // FM snap transient/zap (0-1)
-    pub decay: SmoothedParam,      // Decay time in seconds (0.01-5.0)
-    pub pitch_envelope: SmoothedParam, // Pitch envelope amount (0-1)
-    pub pitch_curve: SmoothedParam,    // Pitch envelope decay curve (0.1-10.0)
-    pub volume: SmoothedParam,     // Overall volume (0-1)
+    pub frequency: SmoothedParam,       // Base frequency (30-200 Hz)
+    pub punch: SmoothedParam,           // Mid-frequency presence (0-1)
+    pub sub: SmoothedParam,             // Sub-bass presence (0-1)
+    pub click: SmoothedParam,           // High-frequency click (0-1)
+    pub snap: SmoothedParam,            // FM snap transient/zap (0-1)
+    pub decay: SmoothedParam,           // Decay time in seconds (0.01-5.0)
+    pub pitch_envelope: SmoothedParam,  // Pitch envelope amount (0-1)
+    pub pitch_curve: SmoothedParam,     // Pitch envelope decay curve (0.1-10.0)
+    pub volume: SmoothedParam,          // Overall volume (0-1)
+    pub pitch_start_ratio: SmoothedParam, // Starting pitch multiplier (1.0-10.0)
+    pub phase_mod_enabled: bool,        // Enable DS-style phase modulation (not smoothed)
+    pub phase_mod_amount: SmoothedParam,  // Phase modulation depth (0-1)
 }
 
 impl KickParams {
@@ -91,7 +152,7 @@ impl KickParams {
             frequency: SmoothedParam::new(
                 config.kick_frequency,
                 30.0,
-                80.0,
+                200.0, // Extended range for DS style
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
@@ -151,6 +212,21 @@ impl KickParams {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
+            pitch_start_ratio: SmoothedParam::new(
+                config.pitch_start_ratio,
+                1.0,
+                10.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            phase_mod_enabled: config.phase_mod_enabled,
+            phase_mod_amount: SmoothedParam::new(
+                config.phase_mod_amount,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
         }
     }
 
@@ -166,6 +242,8 @@ impl KickParams {
         self.pitch_envelope.tick();
         self.pitch_curve.tick();
         self.volume.tick();
+        self.pitch_start_ratio.tick();
+        self.phase_mod_amount.tick();
 
         // Return true if any smoother is still active
         !self.is_settled()
@@ -182,6 +260,8 @@ impl KickParams {
             && self.pitch_envelope.is_settled()
             && self.pitch_curve.is_settled()
             && self.volume.is_settled()
+            && self.pitch_start_ratio.is_settled()
+            && self.phase_mod_amount.is_settled()
     }
 
     /// Get a snapshot of current values as a KickConfig (for reading back)
@@ -196,6 +276,9 @@ impl KickParams {
             pitch_envelope: self.pitch_envelope.get(),
             pitch_curve: self.pitch_curve.get(),
             volume: self.volume.get(),
+            pitch_start_ratio: self.pitch_start_ratio.get(),
+            phase_mod_enabled: self.phase_mod_enabled,
+            phase_mod_amount: self.phase_mod_amount.get(),
         }
     }
 }
@@ -220,6 +303,9 @@ pub struct KickDrum {
 
     // FM snap synthesizer for beater sound
     pub fm_snap: FMSnapSynthesizer,
+
+    // DS Kick-style phase modulator for transient snap
+    pub phase_modulator: PhaseModulator,
 
     pub is_active: bool,
 
@@ -246,6 +332,13 @@ impl KickDrum {
 
     pub fn with_config(sample_rate: f32, config: KickConfig) -> Self {
         let params = KickParams::from_config(&config, sample_rate);
+
+        // Calculate pitch start multiplier from pitch_start_ratio and pitch_envelope
+        // At pitch_envelope=1.0, we get the full pitch_start_ratio
+        // At pitch_envelope=0.0, we get 1.0 (no pitch sweep)
+        let pitch_start_multiplier =
+            1.0 + (config.pitch_start_ratio - 1.0) * config.pitch_envelope;
+
         let mut kick = Self {
             sample_rate,
             params,
@@ -253,9 +346,10 @@ impl KickDrum {
             punch_oscillator: Oscillator::new(sample_rate, config.kick_frequency * 2.5),
             click_oscillator: Oscillator::new(sample_rate, config.kick_frequency * 40.0),
             pitch_envelope: Envelope::new(),
-            pitch_start_multiplier: 1.0 + config.pitch_envelope * 2.0, // Start 1-3x higher
+            pitch_start_multiplier,
             click_filter: ResonantHighpassFilter::new(sample_rate, 8000.0, 4.0),
             fm_snap: FMSnapSynthesizer::new(sample_rate),
+            phase_modulator: PhaseModulator::new(sample_rate),
             is_active: false,
 
             // Initialize velocity state
@@ -325,10 +419,13 @@ impl KickDrum {
         let sub = self.params.sub.get();
         let click = self.params.click.get();
         let pitch_envelope = self.params.pitch_envelope.get();
+        let pitch_start_ratio = self.params.pitch_start_ratio.get();
         let volume = self.params.volume.get();
 
-        // Update pitch start multiplier
-        self.pitch_start_multiplier = 1.0 + pitch_envelope * 2.0;
+        // Update pitch start multiplier using configurable ratio
+        // At pitch_envelope=1.0, we get the full pitch_start_ratio
+        // At pitch_envelope=0.0, we get 1.0 (no pitch sweep)
+        self.pitch_start_multiplier = 1.0 + (pitch_start_ratio - 1.0) * pitch_envelope;
 
         // Light velocity scaling for click: range [0.6, 1.0]
         // Higher velocity = more click, lower velocity = less click
@@ -353,6 +450,9 @@ impl KickDrum {
         self.params.pitch_envelope.set_target(config.pitch_envelope);
         self.params.pitch_curve.set_target(config.pitch_curve);
         self.params.volume.set_target(config.volume);
+        self.params.pitch_start_ratio.set_target(config.pitch_start_ratio);
+        self.params.phase_mod_enabled = config.phase_mod_enabled;
+        self.params.phase_mod_amount.set_target(config.phase_mod_amount);
 
         // Reconfigure envelopes for new decay time
         self.configure_oscillators();
@@ -395,15 +495,13 @@ impl KickDrum {
 
         // Get base parameters
         let base_decay = self.params.decay.get() * decay_scale;
-        // Pitch decay must be at most 60% of amplitude decay to ensure pitch settles
-        // before sound ends (fixes "phantom pitch" at end of decay)
-        let pitch_decay = (self.params.decay.get() * pitch_decay_scale).min(base_decay * 0.6);
         let base_freq = self.params.frequency.get();
 
-        // Configure pitch envelope with velocity-scaled decay and curve
+        // Configure pitch envelope with same duration as amplitude envelope
+        // The exponential curve will make the pitch sweep complete early,
+        // but the envelope stays active (at sustain=0) to prevent artifacts
         // High velocity = short pitch decay (sharp, punchy attack)
         // Low velocity = long pitch decay (smooth, subtle pitch sweep)
-        // Pitch envelope always completes before amplitude to prevent pitch artifacts
         let pitch_curve_value = self.params.pitch_curve.get();
         let decay_curve = if (pitch_curve_value - 1.0).abs() < 0.01 {
             // Close enough to 1.0 = use linear for efficiency
@@ -411,8 +509,13 @@ impl KickDrum {
         } else {
             EnvelopeCurve::Exponential(pitch_curve_value)
         };
+
+        // CRITICAL: Pitch envelope must have same total duration as amplitude envelope
+        // to prevent phase discontinuities and pops at the end
+        // The exponential curve ensures pitch sweep completes early (within ~60% of decay)
+        // while the envelope stays active to keep frequency stable
         self.pitch_envelope.set_config(
-            ADSRConfig::new(0.001, pitch_decay, 0.0, pitch_decay * 0.1)
+            ADSRConfig::new(0.001, base_decay, 0.0, base_decay * 0.2)
                 .with_decay_curve(decay_curve),
         );
 
@@ -444,6 +547,11 @@ impl KickDrum {
         // Trigger FM snap for beater sound
         self.fm_snap.trigger(time);
 
+        // Trigger phase modulator if enabled (DS Kick-style transient)
+        if self.params.phase_mod_enabled {
+            self.phase_modulator.trigger(time);
+        }
+
         // Reset filter state for clean click transients
         self.click_filter.reset();
     }
@@ -470,9 +578,19 @@ impl KickDrum {
 
         let base_frequency = self.params.frequency.get();
 
-        // Calculate pitch modulation
+        // Calculate pitch modulation from envelope
         let pitch_envelope_value = self.pitch_envelope.get_amplitude(current_time);
-        let frequency_multiplier = 1.0 + (self.pitch_start_multiplier - 1.0) * pitch_envelope_value;
+        let mut frequency_multiplier =
+            1.0 + (self.pitch_start_multiplier - 1.0) * pitch_envelope_value;
+
+        // Apply phase modulation if enabled (DS Kick-style transient snap)
+        // This adds a brief frequency boost at the attack for extra punch
+        if self.params.phase_mod_enabled {
+            let phase_mod = self.phase_modulator.tick(current_time);
+            let phase_mod_amount = self.params.phase_mod_amount.get();
+            // Phase mod adds brief frequency boost (multiplier of up to 3x at full amount)
+            frequency_multiplier *= 1.0 + (phase_mod * phase_mod_amount * 2.0);
+        }
 
         // Apply pitch envelope to oscillators
         self.sub_oscillator.frequency_hz = base_frequency * frequency_multiplier;
@@ -508,6 +626,7 @@ impl KickDrum {
             && !self.punch_oscillator.envelope.is_active
             && !self.click_oscillator.envelope.is_active
             && !self.fm_snap.is_active()
+            && !self.phase_modulator.is_active()
         {
             self.is_active = false;
         }
@@ -566,6 +685,26 @@ impl KickDrum {
     pub fn set_pitch_curve(&mut self, pitch_curve: f32) {
         self.params.pitch_curve.set_target(pitch_curve.clamp(0.1, 10.0));
     }
+
+    /// Set pitch start ratio (smoothed)
+    /// Controls how much higher the initial pitch is relative to the base frequency
+    /// 1.0 = no pitch sweep, 3.0 = default, 5.0 = DS Kick style, up to 10.0
+    pub fn set_pitch_start_ratio(&mut self, ratio: f32) {
+        self.params.pitch_start_ratio.set_target(ratio.clamp(1.0, 10.0));
+    }
+
+    /// Enable/disable DS Kick-style phase modulation
+    /// When enabled, adds a brief frequency burst at note onset for transient snap
+    pub fn set_phase_mod_enabled(&mut self, enabled: bool) {
+        self.params.phase_mod_enabled = enabled;
+    }
+
+    /// Set phase modulation amount (smoothed)
+    /// Controls the intensity of the DS Kick-style transient snap
+    /// 0.0 = no effect, 1.0 = maximum effect
+    pub fn set_phase_mod_amount(&mut self, amount: f32) {
+        self.params.phase_mod_amount.set_target(amount.clamp(0.0, 1.0));
+    }
 }
 
 impl crate::engine::Instrument for KickDrum {
@@ -599,6 +738,8 @@ impl crate::engine::Modulatable for KickDrum {
             "pitch_envelope",
             "pitch_curve",
             "volume",
+            "pitch_start_ratio",
+            "phase_mod_amount",
         ]
     }
 
@@ -641,6 +782,14 @@ impl crate::engine::Modulatable for KickDrum {
                 self.params.volume.set_bipolar(value);
                 Ok(())
             }
+            "pitch_start_ratio" => {
+                self.params.pitch_start_ratio.set_bipolar(value);
+                Ok(())
+            }
+            "phase_mod_amount" => {
+                self.params.phase_mod_amount.set_bipolar(value);
+                Ok(())
+            }
             _ => Err(format!("Unknown parameter: {}", parameter)),
         }
     }
@@ -656,6 +805,8 @@ impl crate::engine::Modulatable for KickDrum {
             "pitch_envelope" => Some(self.params.pitch_envelope.range()),
             "pitch_curve" => Some(self.params.pitch_curve.range()),
             "volume" => Some(self.params.volume.range()),
+            "pitch_start_ratio" => Some(self.params.pitch_start_ratio.range()),
+            "phase_mod_amount" => Some(self.params.phase_mod_amount.range()),
             _ => None,
         }
     }
