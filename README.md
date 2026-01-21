@@ -8,7 +8,7 @@
 - Parameter smoothing
 - 16-step sequencer with sample-accurate timing
 - C FFI for integration with Swift/iOS and other languages
-- Cross-platform support (native, iOS, WASM)
+- Cross-platform support (native, iOS)
 
 ## Building
 

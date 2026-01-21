@@ -1,4 +1,4 @@
-//! Shared audio engine logic for both native (CPAL) and WASM (web)
+//! Shared audio engine logic for native (CPAL) and iOS targets
 
 pub mod envelope;
 pub mod filters;
