@@ -1,3 +1,4 @@
+use crate::effects::waveshaper::Waveshaper;
 use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
 use crate::filters::{ResonantHighpassFilter, ResonantLowpassFilter};
 use crate::gen::oscillator::Oscillator;
@@ -25,6 +26,7 @@ pub struct KickConfig {
     pub noise_amount: f32,       // Pink noise layer amount (0.0-1.0)
     pub noise_cutoff: f32,       // Noise lowpass filter cutoff (20.0-20000.0 Hz)
     pub noise_resonance: f32,    // Noise lowpass filter resonance (0.0-10.0)
+    pub overdrive_amount: f32,   // Overdrive/saturation amount (0.0-1.0, 0.0 = bypass)
 }
 
 impl KickConfig {
@@ -57,6 +59,8 @@ impl KickConfig {
             noise_amount: 0.0,
             noise_cutoff: 2000.0,
             noise_resonance: 2.0,
+            // Overdrive default (bypass)
+            overdrive_amount: 0.0,
         }
     }
 
@@ -77,6 +81,7 @@ impl KickConfig {
         noise_amount: f32,
         noise_cutoff: f32,
         noise_resonance: f32,
+        overdrive_amount: f32,
     ) -> Self {
         Self {
             kick_frequency: kick_frequency.max(30.0).min(200.0), // Extended range for DS style
@@ -94,6 +99,7 @@ impl KickConfig {
             noise_amount: noise_amount.clamp(0.0, 1.0),
             noise_cutoff: noise_cutoff.clamp(20.0, 20000.0),
             noise_resonance: noise_resonance.clamp(0.0, 10.0),
+            overdrive_amount: overdrive_amount.clamp(0.0, 1.0),
         }
     }
 
@@ -141,6 +147,7 @@ impl KickConfig {
             0.07,  // Very subtle pink noise (7%) for warmth/body - matches Max patch 0.2 * 0.3 scaling
             100.0, // Very low cutoff (100 Hz) for subtle rumble - matches Max patch lores~ 100
             0.2,   // Minimal resonance (Q=0.2) for natural sound - matches Max patch
+            0.2,   // Low amount of initial overdrive - user can increase for saturation
         )
     }
 }
@@ -163,6 +170,7 @@ pub struct KickParams {
     pub noise_amount: SmoothedParam,    // Pink noise layer amount (0-1)
     pub noise_cutoff: SmoothedParam,    // Noise lowpass filter cutoff (20-20000 Hz)
     pub noise_resonance: SmoothedParam, // Noise lowpass filter resonance (0-10)
+    pub overdrive: SmoothedParam,       // Overdrive/saturation amount (0-1, 0 = bypass)
 }
 
 impl KickParams {
@@ -268,6 +276,13 @@ impl KickParams {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
+            overdrive: SmoothedParam::new(
+                config.overdrive_amount,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
         }
     }
 
@@ -288,6 +303,7 @@ impl KickParams {
         self.noise_amount.tick();
         self.noise_cutoff.tick();
         self.noise_resonance.tick();
+        self.overdrive.tick();
 
         // Return true if any smoother is still active
         !self.is_settled()
@@ -309,6 +325,7 @@ impl KickParams {
             && self.noise_amount.is_settled()
             && self.noise_cutoff.is_settled()
             && self.noise_resonance.is_settled()
+            && self.overdrive.is_settled()
     }
 
     /// Get a snapshot of current values as a KickConfig (for reading back)
@@ -329,6 +346,7 @@ impl KickParams {
             noise_amount: self.noise_amount.get(),
             noise_cutoff: self.noise_cutoff.get(),
             noise_resonance: self.noise_resonance.get(),
+            overdrive_amount: self.overdrive.get(),
         }
     }
 }
@@ -361,6 +379,9 @@ pub struct KickDrum {
     pub pink_noise: PinkNoise,
     pub noise_filter: ResonantLowpassFilter,
     pub noise_envelope: Envelope,
+
+    // Overdrive/saturation effect (Max MSP overdrive~ style)
+    pub waveshaper: Waveshaper,
 
     pub is_active: bool,
 
@@ -408,6 +429,7 @@ impl KickDrum {
             pink_noise: PinkNoise::new(),
             noise_filter: ResonantLowpassFilter::new(sample_rate, config.noise_cutoff, config.noise_resonance),
             noise_envelope: Envelope::new(),
+            waveshaper: Waveshaper::new(config.overdrive_amount, 1.0), // Full wet mix
             is_active: false,
 
             // Initialize velocity state
@@ -522,6 +544,7 @@ impl KickDrum {
         self.params.noise_amount.set_target(config.noise_amount);
         self.params.noise_cutoff.set_target(config.noise_cutoff);
         self.params.noise_resonance.set_target(config.noise_resonance);
+        self.params.overdrive.set_target(config.overdrive_amount);
 
         // Reconfigure envelopes for new decay time
         self.configure_oscillators();
@@ -721,9 +744,18 @@ impl KickDrum {
             + (fm_snap_output * snap * self.params.volume.get())
             + noise_output;
 
+        // Map overdrive amount (0.0-1.0) to drive (1.0-10.0)
+        // 0.0 = bypass (drive 1.0), 1.0 = maximum saturation (drive 10.0)
+        let overdrive_amount = self.params.overdrive.get();
+        let drive = 1.0 + (overdrive_amount * 9.0);
+        self.waveshaper.set_drive(drive);
+
+        // Apply overdrive/saturation effect (Max MSP overdrive~ style)
+        let overdriven_output = self.waveshaper.process(total_output);
+
         // Apply velocity amplitude scaling (sqrt for perceptually linear loudness)
         let velocity_amplitude = self.current_velocity.sqrt();
-        let final_output = total_output * velocity_amplitude;
+        let final_output = overdriven_output * velocity_amplitude;
 
         // Check if kick is still active
         if !self.sub_oscillator.envelope.is_active
@@ -831,6 +863,14 @@ impl KickDrum {
     pub fn set_noise_resonance(&mut self, resonance: f32) {
         self.params.noise_resonance.set_target(resonance.clamp(0.0, 10.0));
     }
+
+    /// Set overdrive amount (smoothed)
+    /// Controls the soft-clipping saturation applied to the kick output
+    /// 0.0 = bypass (no distortion), 1.0 = maximum saturation
+    /// Internally mapped to drive range 1.0-10.0 for Max MSP overdrive~ behavior
+    pub fn set_overdrive(&mut self, amount: f32) {
+        self.params.overdrive.set_target(amount.clamp(0.0, 1.0));
+    }
 }
 
 impl crate::engine::Instrument for KickDrum {
@@ -869,6 +909,7 @@ impl crate::engine::Modulatable for KickDrum {
             "noise_amount",
             "noise_cutoff",
             "noise_resonance",
+            "overdrive",
         ]
     }
 
@@ -931,6 +972,10 @@ impl crate::engine::Modulatable for KickDrum {
                 self.params.noise_resonance.set_bipolar(value);
                 Ok(())
             }
+            "overdrive" => {
+                self.params.overdrive.set_bipolar(value);
+                Ok(())
+            }
             _ => Err(format!("Unknown parameter: {}", parameter)),
         }
     }
@@ -951,6 +996,7 @@ impl crate::engine::Modulatable for KickDrum {
             "noise_amount" => Some(self.params.noise_amount.range()),
             "noise_cutoff" => Some(self.params.noise_cutoff.range()),
             "noise_resonance" => Some(self.params.noise_resonance.range()),
+            "overdrive" => Some(self.params.overdrive.range()),
             _ => None,
         }
     }
