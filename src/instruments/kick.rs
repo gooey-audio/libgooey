@@ -1,4 +1,4 @@
-use crate::envelope::{ADSRConfig, Envelope};
+use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
 use crate::filters::ResonantHighpassFilter;
 use crate::gen::oscillator::Oscillator;
 use crate::gen::waveform::Waveform;
@@ -15,7 +15,8 @@ pub struct KickConfig {
     pub click_amount: f32,   // High-frequency click (0.0-1.0)
     pub snap_amount: f32,    // FM snap transient/zap (0.0-1.0)
     pub decay_time: f32,     // Overall decay length in seconds
-    pub pitch_envelope: f32,     // Frequency sweep amount (0.0-1.0)
+    pub pitch_envelope: f32, // Frequency sweep amount (0.0-1.0)
+    pub pitch_curve: f32,    // Pitch envelope decay curve (0.1-10.0, 1.0 = linear)
     pub volume: f32,         // Overall volume (0.0-1.0)
 }
 
@@ -28,6 +29,7 @@ impl KickConfig {
         snap_amount: f32,
         decay_time: f32,
         pitch_envelope: f32,
+        pitch_curve: f32,
         volume: f32,
     ) -> Self {
         Self {
@@ -38,28 +40,33 @@ impl KickConfig {
             snap_amount: snap_amount.clamp(0.0, 1.0),
             decay_time: decay_time.max(0.01).min(5.0), // Reasonable decay range
             pitch_envelope: pitch_envelope.clamp(0.0, 1.0),
+            pitch_curve: pitch_curve.clamp(0.1, 10.0), // Curve exponent for pitch envelope decay
             volume: volume.clamp(0.0, 1.0),
         }
     }
 
     pub fn default() -> Self {
         // snap_amount defaults to 0.3 for subtle attack transient
-        Self::new(30.0, 0.80, 0.80, 0.20, 0.3, 0.28, 0.20, 0.80)
+        // pitch_curve 0.3 = aggressive exponential pitch drop (very punchy)
+        Self::new(30.0, 0.80, 0.80, 0.20, 0.3, 0.28, 0.20, 0.3, 0.80)
     }
 
     pub fn punchy() -> Self {
         // punchy preset gets more snap for aggressive attack
-        Self::new(60.0, 0.9, 0.6, 0.4, 0.6, 0.6, 0.7, 0.85)
+        // pitch_curve 0.2 = very fast initial pitch drop for extreme 808-style sound
+        Self::new(60.0, 0.9, 0.6, 0.4, 0.6, 0.6, 0.7, 0.2, 0.85)
     }
 
     pub fn deep() -> Self {
         // deep preset has less snap for smoother attack
-        Self::new(45.0, 0.5, 1.0, 0.2, 0.2, 1.2, 0.5, 0.9)
+        // pitch_curve 3.0 = very slow initial pitch drop for deeper, smoother sound
+        Self::new(45.0, 0.5, 1.0, 0.2, 0.2, 1.2, 0.5, 3.0, 0.9)
     }
 
     pub fn tight() -> Self {
         // tight preset has moderate snap
-        Self::new(70.0, 0.8, 0.7, 0.5, 0.5, 0.4, 0.8, 0.8)
+        // pitch_curve 0.25 = aggressive pitch drop for tight, punchy sound
+        Self::new(70.0, 0.8, 0.7, 0.5, 0.5, 0.4, 0.8, 0.25, 0.8)
     }
 }
 
@@ -73,6 +80,7 @@ pub struct KickParams {
     pub snap: SmoothedParam,       // FM snap transient/zap (0-1)
     pub decay: SmoothedParam,      // Decay time in seconds (0.01-5.0)
     pub pitch_envelope: SmoothedParam, // Pitch envelope amount (0-1)
+    pub pitch_curve: SmoothedParam,    // Pitch envelope decay curve (0.1-10.0)
     pub volume: SmoothedParam,     // Overall volume (0-1)
 }
 
@@ -129,6 +137,13 @@ impl KickParams {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
+            pitch_curve: SmoothedParam::new(
+                config.pitch_curve,
+                0.1,
+                10.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
             volume: SmoothedParam::new(
                 config.volume,
                 0.0,
@@ -149,6 +164,7 @@ impl KickParams {
         self.snap.tick();
         self.decay.tick();
         self.pitch_envelope.tick();
+        self.pitch_curve.tick();
         self.volume.tick();
 
         // Return true if any smoother is still active
@@ -164,6 +180,7 @@ impl KickParams {
             && self.snap.is_settled()
             && self.decay.is_settled()
             && self.pitch_envelope.is_settled()
+            && self.pitch_curve.is_settled()
             && self.volume.is_settled()
     }
 
@@ -177,6 +194,7 @@ impl KickParams {
             snap_amount: self.snap.get(),
             decay_time: self.decay.get(),
             pitch_envelope: self.pitch_envelope.get(),
+            pitch_curve: self.pitch_curve.get(),
             volume: self.volume.get(),
         }
     }
@@ -333,6 +351,7 @@ impl KickDrum {
         self.params.snap.set_target(config.snap_amount);
         self.params.decay.set_target(config.decay_time);
         self.params.pitch_envelope.set_target(config.pitch_envelope);
+        self.params.pitch_curve.set_target(config.pitch_curve);
         self.params.volume.set_target(config.volume);
 
         // Reconfigure envelopes for new decay time
@@ -381,12 +400,21 @@ impl KickDrum {
         let pitch_decay = (self.params.decay.get() * pitch_decay_scale).min(base_decay * 0.6);
         let base_freq = self.params.frequency.get();
 
-        // Configure pitch envelope with velocity-scaled decay
+        // Configure pitch envelope with velocity-scaled decay and curve
         // High velocity = short pitch decay (sharp, punchy attack)
         // Low velocity = long pitch decay (smooth, subtle pitch sweep)
         // Pitch envelope always completes before amplitude to prevent pitch artifacts
-        self.pitch_envelope
-            .set_config(ADSRConfig::new(0.001, pitch_decay, 0.0, pitch_decay * 0.1));
+        let pitch_curve_value = self.params.pitch_curve.get();
+        let decay_curve = if (pitch_curve_value - 1.0).abs() < 0.01 {
+            // Close enough to 1.0 = use linear for efficiency
+            EnvelopeCurve::Linear
+        } else {
+            EnvelopeCurve::Exponential(pitch_curve_value)
+        };
+        self.pitch_envelope.set_config(
+            ADSRConfig::new(0.001, pitch_decay, 0.0, pitch_decay * 0.1)
+                .with_decay_curve(decay_curve),
+        );
 
         // Configure amplitude envelopes with velocity-scaled decay
         self.sub_oscillator
@@ -530,6 +558,14 @@ impl KickDrum {
     pub fn set_pitch_envelope(&mut self, pitch_envelope: f32) {
         self.params.pitch_envelope.set_target(pitch_envelope);
     }
+
+    /// Set pitch envelope decay curve (smoothed)
+    /// Values < 1.0: Fast initial pitch drop, slow settle (punchy 808-style)
+    /// Value = 1.0: Linear pitch sweep
+    /// Values > 1.0: Slow initial pitch drop, fast settle (softer)
+    pub fn set_pitch_curve(&mut self, pitch_curve: f32) {
+        self.params.pitch_curve.set_target(pitch_curve.clamp(0.1, 10.0));
+    }
 }
 
 impl crate::engine::Instrument for KickDrum {
@@ -561,6 +597,7 @@ impl crate::engine::Modulatable for KickDrum {
             "snap",
             "decay",
             "pitch_envelope",
+            "pitch_curve",
             "volume",
         ]
     }
@@ -596,6 +633,10 @@ impl crate::engine::Modulatable for KickDrum {
                 self.params.pitch_envelope.set_bipolar(value);
                 Ok(())
             }
+            "pitch_curve" => {
+                self.params.pitch_curve.set_bipolar(value);
+                Ok(())
+            }
             "volume" => {
                 self.params.volume.set_bipolar(value);
                 Ok(())
@@ -613,6 +654,7 @@ impl crate::engine::Modulatable for KickDrum {
             "snap" => Some(self.params.snap.range()),
             "decay" => Some(self.params.decay.range()),
             "pitch_envelope" => Some(self.params.pitch_envelope.range()),
+            "pitch_curve" => Some(self.params.pitch_curve.range()),
             "volume" => Some(self.params.volume.range()),
             _ => None,
         }
