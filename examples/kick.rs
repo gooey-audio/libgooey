@@ -9,8 +9,8 @@ use crossterm::{
 };
 use std::io::{self, Write};
 
-use libgooey::engine::{Engine, EngineOutput};
-use libgooey::instruments::KickDrum;
+use gooey::engine::{Engine, EngineOutput};
+use gooey::instruments::KickDrum;
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "midi")]

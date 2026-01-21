@@ -47,26 +47,26 @@ impl KickConfig {
 
     pub fn default() -> Self {
         // snap_amount defaults to 0.3 for subtle attack transient
-        // pitch_curve 1.0 = linear (backward compatible)
-        Self::new(30.0, 0.80, 0.80, 0.20, 0.3, 0.28, 0.20, 1.0, 0.80)
+        // pitch_curve 0.3 = aggressive exponential pitch drop (very punchy)
+        Self::new(30.0, 0.80, 0.80, 0.20, 0.3, 0.28, 0.20, 0.3, 0.80)
     }
 
     pub fn punchy() -> Self {
         // punchy preset gets more snap for aggressive attack
-        // pitch_curve 0.4 = fast initial pitch drop for punchy 808-style sound
-        Self::new(60.0, 0.9, 0.6, 0.4, 0.6, 0.6, 0.7, 0.4, 0.85)
+        // pitch_curve 0.2 = very fast initial pitch drop for extreme 808-style sound
+        Self::new(60.0, 0.9, 0.6, 0.4, 0.6, 0.6, 0.7, 0.2, 0.85)
     }
 
     pub fn deep() -> Self {
         // deep preset has less snap for smoother attack
-        // pitch_curve 1.5 = slower initial pitch drop for deeper sound
-        Self::new(45.0, 0.5, 1.0, 0.2, 0.2, 1.2, 0.5, 1.5, 0.9)
+        // pitch_curve 3.0 = very slow initial pitch drop for deeper, smoother sound
+        Self::new(45.0, 0.5, 1.0, 0.2, 0.2, 1.2, 0.5, 3.0, 0.9)
     }
 
     pub fn tight() -> Self {
         // tight preset has moderate snap
-        // pitch_curve 0.6 = moderately punchy pitch drop
-        Self::new(70.0, 0.8, 0.7, 0.5, 0.5, 0.4, 0.8, 0.6, 0.8)
+        // pitch_curve 0.25 = aggressive pitch drop for tight, punchy sound
+        Self::new(70.0, 0.8, 0.7, 0.5, 0.5, 0.4, 0.8, 0.25, 0.8)
     }
 }
 
