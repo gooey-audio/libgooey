@@ -1,6 +1,7 @@
 use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
-use crate::filters::ResonantHighpassFilter;
+use crate::filters::{ResonantHighpassFilter, ResonantLowpassFilter};
 use crate::gen::oscillator::Oscillator;
+use crate::gen::pink_noise::PinkNoise;
 use crate::gen::waveform::Waveform;
 use crate::instruments::fm_snap::{FMSnapSynthesizer, PhaseModulator};
 use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
@@ -21,6 +22,9 @@ pub struct KickConfig {
     pub pitch_start_ratio: f32,  // Starting pitch multiplier (1.0-10.0, default 3.0)
     pub phase_mod_enabled: bool, // Enable DS-style phase modulation for transient
     pub phase_mod_amount: f32,   // Phase modulation depth (0.0-1.0)
+    pub noise_amount: f32,       // Pink noise layer amount (0.0-1.0)
+    pub noise_cutoff: f32,       // Noise lowpass filter cutoff (20.0-20000.0 Hz)
+    pub noise_resonance: f32,    // Noise lowpass filter resonance (0.0-10.0)
 }
 
 impl KickConfig {
@@ -49,6 +53,10 @@ impl KickConfig {
             pitch_start_ratio: 3.0,    // Default matches old behavior (1.0 + 1.0 * 2.0 = 3.0 max)
             phase_mod_enabled: false,  // Disabled by default for compatibility
             phase_mod_amount: 0.0,
+            // Noise layer defaults (disabled by default)
+            noise_amount: 0.0,
+            noise_cutoff: 2000.0,
+            noise_resonance: 2.0,
         }
     }
 
@@ -66,6 +74,9 @@ impl KickConfig {
         pitch_start_ratio: f32,
         phase_mod_enabled: bool,
         phase_mod_amount: f32,
+        noise_amount: f32,
+        noise_cutoff: f32,
+        noise_resonance: f32,
     ) -> Self {
         Self {
             kick_frequency: kick_frequency.max(30.0).min(200.0), // Extended range for DS style
@@ -80,6 +91,9 @@ impl KickConfig {
             pitch_start_ratio: pitch_start_ratio.clamp(1.0, 10.0),
             phase_mod_enabled,
             phase_mod_amount: phase_mod_amount.clamp(0.0, 1.0),
+            noise_amount: noise_amount.clamp(0.0, 1.0),
+            noise_cutoff: noise_cutoff.clamp(20.0, 20000.0),
+            noise_resonance: noise_resonance.clamp(0.0, 10.0),
         }
     }
 
@@ -124,6 +138,9 @@ impl KickConfig {
             5.0,   // DS signature: 5x pitch ratio
             true,  // Enable phase modulation
             0.7,   // Strong phase mod for transient snap
+            0.07,  // Very subtle pink noise (7%) for warmth/body - matches Max patch 0.2 * 0.3 scaling
+            100.0, // Very low cutoff (100 Hz) for subtle rumble - matches Max patch lores~ 100
+            0.2,   // Minimal resonance (Q=0.2) for natural sound - matches Max patch
         )
     }
 }
@@ -143,6 +160,9 @@ pub struct KickParams {
     pub pitch_start_ratio: SmoothedParam, // Starting pitch multiplier (1.0-10.0)
     pub phase_mod_enabled: bool,        // Enable DS-style phase modulation (not smoothed)
     pub phase_mod_amount: SmoothedParam,  // Phase modulation depth (0-1)
+    pub noise_amount: SmoothedParam,    // Pink noise layer amount (0-1)
+    pub noise_cutoff: SmoothedParam,    // Noise lowpass filter cutoff (20-20000 Hz)
+    pub noise_resonance: SmoothedParam, // Noise lowpass filter resonance (0-10)
 }
 
 impl KickParams {
@@ -227,6 +247,27 @@ impl KickParams {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
+            noise_amount: SmoothedParam::new(
+                config.noise_amount,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            noise_cutoff: SmoothedParam::new(
+                config.noise_cutoff,
+                20.0,
+                20000.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            noise_resonance: SmoothedParam::new(
+                config.noise_resonance,
+                0.0,
+                10.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
         }
     }
 
@@ -244,6 +285,9 @@ impl KickParams {
         self.volume.tick();
         self.pitch_start_ratio.tick();
         self.phase_mod_amount.tick();
+        self.noise_amount.tick();
+        self.noise_cutoff.tick();
+        self.noise_resonance.tick();
 
         // Return true if any smoother is still active
         !self.is_settled()
@@ -262,6 +306,9 @@ impl KickParams {
             && self.volume.is_settled()
             && self.pitch_start_ratio.is_settled()
             && self.phase_mod_amount.is_settled()
+            && self.noise_amount.is_settled()
+            && self.noise_cutoff.is_settled()
+            && self.noise_resonance.is_settled()
     }
 
     /// Get a snapshot of current values as a KickConfig (for reading back)
@@ -279,6 +326,9 @@ impl KickParams {
             pitch_start_ratio: self.pitch_start_ratio.get(),
             phase_mod_enabled: self.phase_mod_enabled,
             phase_mod_amount: self.phase_mod_amount.get(),
+            noise_amount: self.noise_amount.get(),
+            noise_cutoff: self.noise_cutoff.get(),
+            noise_resonance: self.noise_resonance.get(),
         }
     }
 }
@@ -306,6 +356,11 @@ pub struct KickDrum {
 
     // DS Kick-style phase modulator for transient snap
     pub phase_modulator: PhaseModulator,
+
+    // Pink noise layer with resonant lowpass filter (DS Kick-style)
+    pub pink_noise: PinkNoise,
+    pub noise_filter: ResonantLowpassFilter,
+    pub noise_envelope: Envelope,
 
     pub is_active: bool,
 
@@ -350,6 +405,9 @@ impl KickDrum {
             click_filter: ResonantHighpassFilter::new(sample_rate, 8000.0, 4.0),
             fm_snap: FMSnapSynthesizer::new(sample_rate),
             phase_modulator: PhaseModulator::new(sample_rate),
+            pink_noise: PinkNoise::new(),
+            noise_filter: ResonantLowpassFilter::new(sample_rate, config.noise_cutoff, config.noise_resonance),
+            noise_envelope: Envelope::new(),
             is_active: false,
 
             // Initialize velocity state
@@ -410,6 +468,14 @@ impl KickDrum {
             0.0,          // Drop to base frequency
             pitch_decay * 0.1, // Very short release
         ));
+
+        // Noise envelope: Synchronized with amplitude envelope for consistent body
+        self.noise_envelope.set_config(ADSRConfig::new(
+            0.001,       // Very fast attack
+            decay,       // Synchronized decay time
+            0.0,         // No sustain
+            decay * 0.2, // Synchronized release
+        ));
     }
 
     /// Apply current smoothed parameters to oscillators (called per-sample)
@@ -453,6 +519,9 @@ impl KickDrum {
         self.params.pitch_start_ratio.set_target(config.pitch_start_ratio);
         self.params.phase_mod_enabled = config.phase_mod_enabled;
         self.params.phase_mod_amount.set_target(config.phase_mod_amount);
+        self.params.noise_amount.set_target(config.noise_amount);
+        self.params.noise_cutoff.set_target(config.noise_cutoff);
+        self.params.noise_resonance.set_target(config.noise_resonance);
 
         // Reconfigure envelopes for new decay time
         self.configure_oscillators();
@@ -491,7 +560,8 @@ impl KickDrum {
         // Higher velocity = faster/sharper pitch decay (more aggressive pitch drop)
         // Lower velocity = slower pitch decay (gentler, more subtle sweep)
         // Use a more aggressive scaling for pitch to make high velocity hits snappy
-        let pitch_decay_scale = 1.0 - (self.velocity_to_pitch * vel_squared);
+        // NOTE: Currently unused - pitch envelope duration matches amplitude to prevent pops
+        let _pitch_decay_scale = 1.0 - (self.velocity_to_pitch * vel_squared);
 
         // Get base parameters
         let base_decay = self.params.decay.get() * decay_scale;
@@ -552,8 +622,19 @@ impl KickDrum {
             self.phase_modulator.trigger(time);
         }
 
-        // Reset filter state for clean click transients
+        // Configure and trigger noise envelope with velocity-scaled decay
+        self.noise_envelope.set_config(ADSRConfig::new(
+            0.001,
+            base_decay,
+            0.0,
+            base_decay * 0.2,
+        ));
+        self.noise_envelope.trigger(time);
+
+        // Reset filter states for clean transients
         self.click_filter.reset();
+        self.noise_filter.reset();
+        self.pink_noise.reset();
     }
 
     pub fn release(&mut self, time: f32) {
@@ -612,10 +693,33 @@ impl KickDrum {
         let fm_snap_output = self.fm_snap.tick(current_time);
         let snap = self.params.snap.get();
 
+        // Generate and process pink noise layer (DS Kick-style)
+        let noise_amount = self.params.noise_amount.get();
+        let noise_output = if noise_amount > 0.001 {
+            // Generate pink noise sample
+            let pink_noise_sample = self.pink_noise.tick();
+
+            // Update filter parameters from smoothed params
+            let noise_cutoff = self.params.noise_cutoff.get();
+            let noise_resonance = self.params.noise_resonance.get();
+            self.noise_filter.set_cutoff_freq(noise_cutoff);
+            self.noise_filter.set_resonance(noise_resonance);
+
+            // Apply resonant lowpass filter
+            let filtered_noise = self.noise_filter.process(pink_noise_sample);
+
+            // Apply noise envelope
+            let noise_env = self.noise_envelope.get_amplitude(current_time);
+            filtered_noise * noise_env * noise_amount * self.params.volume.get()
+        } else {
+            0.0
+        };
+
         let total_output = sub_output
             + punch_output
             + filtered_click_output
-            + (fm_snap_output * snap * self.params.volume.get());
+            + (fm_snap_output * snap * self.params.volume.get())
+            + noise_output;
 
         // Apply velocity amplitude scaling (sqrt for perceptually linear loudness)
         let velocity_amplitude = self.current_velocity.sqrt();
@@ -627,6 +731,7 @@ impl KickDrum {
             && !self.click_oscillator.envelope.is_active
             && !self.fm_snap.is_active()
             && !self.phase_modulator.is_active()
+            && !self.noise_envelope.is_active
         {
             self.is_active = false;
         }
@@ -705,6 +810,27 @@ impl KickDrum {
     pub fn set_phase_mod_amount(&mut self, amount: f32) {
         self.params.phase_mod_amount.set_target(amount.clamp(0.0, 1.0));
     }
+
+    /// Set noise layer amount (smoothed)
+    /// Controls the mix level of the pink noise layer
+    /// 0.0 = no noise, 1.0 = full noise
+    pub fn set_noise_amount(&mut self, amount: f32) {
+        self.params.noise_amount.set_target(amount.clamp(0.0, 1.0));
+    }
+
+    /// Set noise filter cutoff frequency (smoothed)
+    /// Controls the lowpass filter cutoff for the noise layer
+    /// 20.0-20000.0 Hz
+    pub fn set_noise_cutoff(&mut self, cutoff: f32) {
+        self.params.noise_cutoff.set_target(cutoff.clamp(20.0, 20000.0));
+    }
+
+    /// Set noise filter resonance (smoothed)
+    /// Controls the resonance/Q of the lowpass filter
+    /// 0.0-10.0, typical 0.5-4.0
+    pub fn set_noise_resonance(&mut self, resonance: f32) {
+        self.params.noise_resonance.set_target(resonance.clamp(0.0, 10.0));
+    }
 }
 
 impl crate::engine::Instrument for KickDrum {
@@ -740,6 +866,9 @@ impl crate::engine::Modulatable for KickDrum {
             "volume",
             "pitch_start_ratio",
             "phase_mod_amount",
+            "noise_amount",
+            "noise_cutoff",
+            "noise_resonance",
         ]
     }
 
@@ -790,6 +919,18 @@ impl crate::engine::Modulatable for KickDrum {
                 self.params.phase_mod_amount.set_bipolar(value);
                 Ok(())
             }
+            "noise_amount" => {
+                self.params.noise_amount.set_bipolar(value);
+                Ok(())
+            }
+            "noise_cutoff" => {
+                self.params.noise_cutoff.set_bipolar(value);
+                Ok(())
+            }
+            "noise_resonance" => {
+                self.params.noise_resonance.set_bipolar(value);
+                Ok(())
+            }
             _ => Err(format!("Unknown parameter: {}", parameter)),
         }
     }
@@ -807,6 +948,9 @@ impl crate::engine::Modulatable for KickDrum {
             "volume" => Some(self.params.volume.range()),
             "pitch_start_ratio" => Some(self.params.pitch_start_ratio.range()),
             "phase_mod_amount" => Some(self.params.phase_mod_amount.range()),
+            "noise_amount" => Some(self.params.noise_amount.range()),
+            "noise_cutoff" => Some(self.params.noise_cutoff.range()),
+            "noise_resonance" => Some(self.params.noise_resonance.range()),
             _ => None,
         }
     }
