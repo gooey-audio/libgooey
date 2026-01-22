@@ -42,7 +42,7 @@ const PARAM_INFO: [ParamInfo; 16] = [
     ParamInfo { name: "click", coarse_step: 0.1, fine_step: 0.02, unit: "" },
     ParamInfo { name: "osc_decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 0.01-4.0s
     ParamInfo { name: "pitch_env_amt", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "pitch_env_crv", coarse_step: 0.1, fine_step: 0.02, unit: "" },       // 0-1 → 0.1-10.0
+    ParamInfo { name: "pitch_env_crv", coarse_step: 0.1, fine_step: 0.02, unit: "" },       // 0-1 → 0.1-4.0
     ParamInfo { name: "volume", coarse_step: 0.1, fine_step: 0.02, unit: "" },
     ParamInfo { name: "pitch_ratio", coarse_step: 0.1, fine_step: 0.02, unit: "" },         // 0-1 → 1.0-10.0x
     ParamInfo { name: "phase_mod_amt", coarse_step: 0.1, fine_step: 0.02, unit: "" },
@@ -142,12 +142,12 @@ fn make_bar(normalized: f32, width: usize) -> String {
 }
 
 // Render the parameter display
-fn render_display(kick: &KickDrum, selected: usize, trigger_count: u32, velocity: f32, preset_name: &str, phase_mod_enabled: bool) {
+fn render_display(kick: &KickDrum, selected: usize, trigger_count: u32, velocity: f32, preset_name: &str) {
     // Clear screen, move cursor to home, and disable line wrapping
     print!("\x1b[2J\x1b[H\x1b[?7l");
 
     print!("=== Kick Drum Lab ===\r\n");
-    print!("SPACE=hit Q=quit ↑↓=sel ←→=adj []=fine P=phase {}\r\n", if phase_mod_enabled { "ON " } else { "OFF" });
+    print!("SPACE=hit Q=quit ↑↓=sel ←→=adj []=fine\r\n");
     print!("Z/X/C/V=vel 25/50/75/100% +/-=adj 1-5=preset\r\n");
     print!("Preset: {}\r\n", preset_name);
     print!("\r\n");
@@ -278,7 +278,6 @@ fn main() -> anyhow::Result<()> {
     let mut trigger_count: u32 = 0;
     let mut current_velocity: f32 = 0.75;
     let mut current_preset = "Default";
-    let mut phase_mod_enabled = false;
     let mut needs_redraw = true;
 
     // Clear screen and enable raw mode
@@ -296,7 +295,7 @@ fn main() -> anyhow::Result<()> {
         // Render display if needed
         if needs_redraw {
             let k = kick.lock().unwrap();
-            render_display(&k, selected_param, trigger_count, current_velocity, current_preset, phase_mod_enabled);
+            render_display(&k, selected_param, trigger_count, current_velocity, current_preset);
             needs_redraw = false;
         }
 
@@ -362,48 +361,35 @@ fn main() -> anyhow::Result<()> {
                         needs_redraw = true;
                     }
 
-                    // Toggle phase modulation
-                    KeyCode::Char('p') | KeyCode::Char('P') => {
-                        phase_mod_enabled = !phase_mod_enabled;
-                        let mut k = kick.lock().unwrap();
-                        k.set_phase_mod_enabled(phase_mod_enabled);
-                        needs_redraw = true;
-                    }
-
                     // Presets
                     KeyCode::Char('1') => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::default());
                         current_preset = "Default";
-                        phase_mod_enabled = false;
                         needs_redraw = true;
                     }
                     KeyCode::Char('2') => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::punchy());
                         current_preset = "Punchy";
-                        phase_mod_enabled = false;
                         needs_redraw = true;
                     }
                     KeyCode::Char('3') => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::deep());
                         current_preset = "Deep";
-                        phase_mod_enabled = false;
                         needs_redraw = true;
                     }
                     KeyCode::Char('4') => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::tight());
                         current_preset = "Tight";
-                        phase_mod_enabled = false;
                         needs_redraw = true;
                     }
                     KeyCode::Char('5') => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::ds_kick());
                         current_preset = "DS Kick";
-                        phase_mod_enabled = true; // DS Kick uses phase mod
                         needs_redraw = true;
                     }
 
