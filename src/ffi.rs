@@ -316,6 +316,17 @@ impl GooeyEngine {
                 SNARE_PARAM_TONAL => self.snare.params.tonal.set_bipolar(value),
                 SNARE_PARAM_NOISE => self.snare.params.noise.set_bipolar(value),
                 SNARE_PARAM_PITCH_DROP => self.snare.params.pitch_drop.set_bipolar(value),
+                SNARE_PARAM_TONAL_DECAY => self.snare.params.tonal_decay.set_bipolar(value),
+                SNARE_PARAM_NOISE_DECAY => self.snare.params.noise_decay.set_bipolar(value),
+                SNARE_PARAM_NOISE_TAIL_DECAY => self.snare.params.noise_tail_decay.set_bipolar(value),
+                SNARE_PARAM_FILTER_CUTOFF => self.snare.params.filter_cutoff.set_bipolar(value),
+                SNARE_PARAM_FILTER_RESONANCE => self.snare.params.filter_resonance.set_bipolar(value),
+                SNARE_PARAM_XFADE => self.snare.params.xfade.set_bipolar(value),
+                SNARE_PARAM_PHASE_MOD_AMOUNT => self.snare.params.phase_mod_amount.set_bipolar(value),
+                SNARE_PARAM_OVERDRIVE => self.snare.params.overdrive.set_bipolar(value),
+                SNARE_PARAM_AMP_DECAY => self.snare.params.amp_decay.set_bipolar(value),
+                SNARE_PARAM_AMP_DECAY_CURVE => self.snare.params.amp_decay_curve.set_bipolar(value),
+                SNARE_PARAM_TONAL_DECAY_CURVE => self.snare.params.tonal_decay_curve.set_bipolar(value),
                 _ => {}
             },
             INSTRUMENT_HIHAT => match param {
@@ -430,9 +441,9 @@ pub const HIHAT_PARAM_VOLUME: u32 = 3;
 // Snare drum parameter indices (must match Swift SnareParam enum)
 // =============================================================================
 
-/// Snare parameter: base frequency (100-600 Hz)
+/// Snare parameter: base frequency (0-1 → 100-600 Hz)
 pub const SNARE_PARAM_FREQUENCY: u32 = 0;
-/// Snare parameter: decay time (0.01-2.0 seconds)
+/// Snare parameter: decay time (0-1 → 0.05-3.5 seconds)
 pub const SNARE_PARAM_DECAY: u32 = 1;
 /// Snare parameter: brightness/snap amount (0-1)
 pub const SNARE_PARAM_BRIGHTNESS: u32 = 2;
@@ -444,6 +455,30 @@ pub const SNARE_PARAM_TONAL: u32 = 4;
 pub const SNARE_PARAM_NOISE: u32 = 5;
 /// Snare parameter: pitch drop amount (0-1)
 pub const SNARE_PARAM_PITCH_DROP: u32 = 6;
+/// Snare parameter: tonal decay (0-1 → 0-3.5s)
+pub const SNARE_PARAM_TONAL_DECAY: u32 = 7;
+/// Snare parameter: noise decay (0-1 → 0-3.5s)
+pub const SNARE_PARAM_NOISE_DECAY: u32 = 8;
+/// Snare parameter: noise tail decay (0-1 → 0-3.5s)
+pub const SNARE_PARAM_NOISE_TAIL_DECAY: u32 = 9;
+/// Snare parameter: filter cutoff (0-1 → 100-10000 Hz)
+pub const SNARE_PARAM_FILTER_CUTOFF: u32 = 10;
+/// Snare parameter: filter resonance (0-1 → 0.5-10.0)
+pub const SNARE_PARAM_FILTER_RESONANCE: u32 = 11;
+/// Snare parameter: filter type (0=LP, 1=BP, 2=HP, 3=notch)
+pub const SNARE_PARAM_FILTER_TYPE: u32 = 12;
+/// Snare parameter: tonal/noise crossfade (0-1)
+pub const SNARE_PARAM_XFADE: u32 = 13;
+/// Snare parameter: phase modulation amount (0-1, 0 = disabled)
+pub const SNARE_PARAM_PHASE_MOD_AMOUNT: u32 = 14;
+/// Snare parameter: overdrive/saturation (0-1, 0 = bypass)
+pub const SNARE_PARAM_OVERDRIVE: u32 = 15;
+/// Snare parameter: master amplitude decay (0-1 → 0-4.0s)
+pub const SNARE_PARAM_AMP_DECAY: u32 = 16;
+/// Snare parameter: amplitude decay curve (0-1 → 0.1-10.0)
+pub const SNARE_PARAM_AMP_DECAY_CURVE: u32 = 17;
+/// Snare parameter: tonal decay curve (0-1 → 0.1-10.0)
+pub const SNARE_PARAM_TONAL_DECAY_CURVE: u32 = 18;
 
 // =============================================================================
 // Tom drum parameter indices (must match Swift TomParam enum)
@@ -740,17 +775,32 @@ pub unsafe extern "C" fn gooey_engine_set_hihat_param(
 /// Set a snare drum parameter
 ///
 /// All parameters are automatically smoothed to prevent clicks/pops.
+/// All parameters use normalized 0-1 range.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
 /// * `param` - Parameter index (see SNARE_PARAM_* constants)
-/// * `value` - Parameter value (range depends on parameter)
+/// * `value` - Parameter value (0-1 normalized)
 ///
-/// # Parameter indices and ranges
-/// - 0 (FREQUENCY): 100-600 Hz - base pitch
-/// - 1 (DECAY): 0.01-2.0 seconds - shortness/length
-/// - 2 (BRIGHTNESS): 0-1 - snap/crack tone amount
-/// - 3 (VOLUME): 0-1 - output level
+/// # Parameter indices and ranges (all 0-1 normalized)
+/// - 0 (FREQUENCY): 0-1 → 100-600 Hz
+/// - 1 (DECAY): 0-1 → 0.05-3.5 seconds
+/// - 2 (BRIGHTNESS): 0-1
+/// - 3 (VOLUME): 0-1
+/// - 4 (TONAL): 0-1
+/// - 5 (NOISE): 0-1
+/// - 6 (PITCH_DROP): 0-1
+/// - 7 (TONAL_DECAY): 0-1 → 0-3.5s
+/// - 8 (NOISE_DECAY): 0-1 → 0-3.5s
+/// - 9 (NOISE_TAIL_DECAY): 0-1 → 0-3.5s
+/// - 10 (FILTER_CUTOFF): 0-1 → 100-10000 Hz
+/// - 11 (FILTER_RESONANCE): 0-1 → 0.5-10.0
+/// - 12 (FILTER_TYPE): 0-3 (LP/BP/HP/notch)
+/// - 13 (XFADE): 0-1
+/// - 14 (PHASE_MOD_AMOUNT): 0-1
+/// - 15 (OVERDRIVE): 0-1
+/// - 16 (AMP_DECAY): 0-1 → 0-4.0s
+/// - 17 (AMP_DECAY_CURVE): 0-1 → 0.1-10.0
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -767,11 +817,27 @@ pub unsafe extern "C" fn gooey_engine_set_snare_param(
     let engine = &mut *engine;
 
     // SnareDrum's setters now handle smoothing internally
+    // All parameters use normalized 0-1 range
     match param {
         SNARE_PARAM_FREQUENCY => engine.snare.set_frequency(value),
         SNARE_PARAM_DECAY => engine.snare.set_decay(value),
         SNARE_PARAM_BRIGHTNESS => engine.snare.set_brightness(value),
         SNARE_PARAM_VOLUME => engine.snare.set_volume(value),
+        SNARE_PARAM_TONAL => engine.snare.set_tonal(value),
+        SNARE_PARAM_NOISE => engine.snare.set_noise(value),
+        SNARE_PARAM_PITCH_DROP => engine.snare.set_pitch_drop(value),
+        SNARE_PARAM_TONAL_DECAY => engine.snare.set_tonal_decay(value),
+        SNARE_PARAM_NOISE_DECAY => engine.snare.set_noise_decay(value),
+        SNARE_PARAM_NOISE_TAIL_DECAY => engine.snare.set_noise_tail_decay(value),
+        SNARE_PARAM_FILTER_CUTOFF => engine.snare.set_filter_cutoff(value),
+        SNARE_PARAM_FILTER_RESONANCE => engine.snare.set_filter_resonance(value),
+        SNARE_PARAM_FILTER_TYPE => engine.snare.set_filter_type(value as u8),
+        SNARE_PARAM_XFADE => engine.snare.set_xfade(value),
+        SNARE_PARAM_PHASE_MOD_AMOUNT => engine.snare.set_phase_mod_amount(value),
+        SNARE_PARAM_OVERDRIVE => engine.snare.set_overdrive(value),
+        SNARE_PARAM_AMP_DECAY => engine.snare.set_amp_decay(value),
+        SNARE_PARAM_AMP_DECAY_CURVE => engine.snare.set_amp_decay_curve(value),
+        SNARE_PARAM_TONAL_DECAY_CURVE => engine.snare.set_tonal_decay_curve(value),
         _ => {} // Unknown parameter, ignore
     }
 }
@@ -1815,7 +1881,10 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_phase(
 /// Get the number of snare parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_snare_param_count() -> u32 {
-    7 // frequency, decay, brightness, volume, tonal, noise, pitch_drop
+    19 // frequency, decay, brightness, volume, tonal, noise, pitch_drop,
+       // tonal_decay, noise_decay, noise_tail_decay, filter_cutoff, filter_resonance,
+       // filter_type, xfade, phase_mod_amount, overdrive, amp_decay, amp_decay_curve,
+       // tonal_decay_curve
 }
 
 /// Get the number of tom parameters
