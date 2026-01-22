@@ -274,8 +274,8 @@ impl GooeyEngine {
                 KICK_PARAM_SUB => self.kick.params.sub.set_bipolar(value),
                 KICK_PARAM_CLICK => self.kick.params.click.set_bipolar(value),
                 KICK_PARAM_SNAP => self.kick.params.snap.set_bipolar(value),
-                KICK_PARAM_DECAY => self.kick.params.decay.set_bipolar(value),
-                KICK_PARAM_PITCH_ENVELOPE => self.kick.params.pitch_envelope.set_bipolar(value),
+                KICK_PARAM_DECAY => self.kick.params.oscillator_decay.set_bipolar(value),
+                KICK_PARAM_PITCH_ENVELOPE => self.kick.params.pitch_envelope_amount.set_bipolar(value),
                 KICK_PARAM_VOLUME => self.kick.params.volume.set_bipolar(value),
                 _ => {}
             },
@@ -631,8 +631,8 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
         KICK_PARAM_SUB => engine.kick.set_sub(value),
         KICK_PARAM_CLICK => engine.kick.set_click(value),
         KICK_PARAM_SNAP => engine.kick.set_snap(value),
-        KICK_PARAM_DECAY => engine.kick.set_decay(value),
-        KICK_PARAM_PITCH_ENVELOPE => engine.kick.set_pitch_envelope(value),
+        KICK_PARAM_DECAY => engine.kick.set_oscillator_decay(value),
+        KICK_PARAM_PITCH_ENVELOPE => engine.kick.set_pitch_envelope_amount(value),
         KICK_PARAM_VOLUME => engine.kick.set_volume(value),
         _ => {} // Unknown parameter, ignore
     }
