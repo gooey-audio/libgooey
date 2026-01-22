@@ -273,7 +273,6 @@ impl GooeyEngine {
                 KICK_PARAM_PUNCH => self.kick.params.punch.set_bipolar(value),
                 KICK_PARAM_SUB => self.kick.params.sub.set_bipolar(value),
                 KICK_PARAM_CLICK => self.kick.params.click.set_bipolar(value),
-                KICK_PARAM_SNAP => self.kick.params.snap.set_bipolar(value),
                 KICK_PARAM_DECAY => self.kick.params.oscillator_decay.set_bipolar(value),
                 KICK_PARAM_PITCH_ENVELOPE => self.kick.params.pitch_envelope_amount.set_bipolar(value),
                 KICK_PARAM_VOLUME => self.kick.params.volume.set_bipolar(value),
@@ -366,14 +365,12 @@ pub const KICK_PARAM_PUNCH: u32 = 1;
 pub const KICK_PARAM_SUB: u32 = 2;
 /// Kick parameter: click/transient amount (0-1)
 pub const KICK_PARAM_CLICK: u32 = 3;
-/// Kick parameter: FM snap/zap transient amount (0-1)
-pub const KICK_PARAM_SNAP: u32 = 4;
 /// Kick parameter: decay time (0.01-5.0 seconds)
-pub const KICK_PARAM_DECAY: u32 = 5;
+pub const KICK_PARAM_DECAY: u32 = 4;
 /// Kick parameter: pitch envelope amount (0-1)
-pub const KICK_PARAM_PITCH_ENVELOPE: u32 = 6;
+pub const KICK_PARAM_PITCH_ENVELOPE: u32 = 5;
 /// Kick parameter: overall volume (0-1)
-pub const KICK_PARAM_VOLUME: u32 = 7;
+pub const KICK_PARAM_VOLUME: u32 = 6;
 
 // =============================================================================
 // Hi-hat parameter indices (must match Swift HiHatParam enum)
@@ -605,10 +602,9 @@ pub unsafe extern "C" fn gooey_engine_trigger_kick(engine: *mut GooeyEngine) {
 /// - 1 (PUNCH): 0-1
 /// - 2 (SUB): 0-1
 /// - 3 (CLICK): 0-1
-/// - 4 (SNAP): 0-1
-/// - 5 (DECAY): 0.01-5.0 seconds
-/// - 6 (PITCH_ENVELOPE): 0-1
-/// - 7 (VOLUME): 0-1
+/// - 4 (DECAY): 0.01-5.0 seconds
+/// - 5 (PITCH_ENVELOPE): 0-1
+/// - 6 (VOLUME): 0-1
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -630,7 +626,6 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
         KICK_PARAM_PUNCH => engine.kick.set_punch(value),
         KICK_PARAM_SUB => engine.kick.set_sub(value),
         KICK_PARAM_CLICK => engine.kick.set_click(value),
-        KICK_PARAM_SNAP => engine.kick.set_snap(value),
         KICK_PARAM_DECAY => engine.kick.set_oscillator_decay(value),
         KICK_PARAM_PITCH_ENVELOPE => engine.kick.set_pitch_envelope_amount(value),
         KICK_PARAM_VOLUME => engine.kick.set_volume(value),

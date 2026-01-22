@@ -35,12 +35,11 @@ struct ParamInfo {
     unit: &'static str,
 }
 
-const PARAM_INFO: [ParamInfo; 17] = [
+const PARAM_INFO: [ParamInfo; 16] = [
     ParamInfo { name: "frequency", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 30-120 Hz
     ParamInfo { name: "punch", coarse_step: 0.1, fine_step: 0.02, unit: "" },
     ParamInfo { name: "sub", coarse_step: 0.1, fine_step: 0.02, unit: "" },
     ParamInfo { name: "click", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "snap", coarse_step: 0.1, fine_step: 0.02, unit: "" },
     ParamInfo { name: "osc_decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 0.01-4.0s
     ParamInfo { name: "pitch_env_amt", coarse_step: 0.1, fine_step: 0.02, unit: "" },
     ParamInfo { name: "pitch_env_crv", coarse_step: 0.1, fine_step: 0.02, unit: "" },       // 0-1 → 0.1-10.0
@@ -49,7 +48,7 @@ const PARAM_INFO: [ParamInfo; 17] = [
     ParamInfo { name: "phase_mod_amt", coarse_step: 0.1, fine_step: 0.02, unit: "" },
     ParamInfo { name: "noise_amount", coarse_step: 0.1, fine_step: 0.02, unit: "" },
     ParamInfo { name: "noise_cutoff", coarse_step: 0.1, fine_step: 0.02, unit: "" },        // 0-1 → 20-10000 Hz
-    ParamInfo { name: "noise_res", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 0.0-10.0
+    ParamInfo { name: "noise_res", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 0.0-5.0
     ParamInfo { name: "overdrive", coarse_step: 0.1, fine_step: 0.02, unit: "" },
     ParamInfo { name: "amp_decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 0.0-4.0s
     ParamInfo { name: "amp_dcy_crv", coarse_step: 0.1, fine_step: 0.02, unit: "" },         // 0-1 → 0.1-10.0
@@ -84,19 +83,18 @@ fn get_param_value(kick: &KickDrum, index: usize) -> f32 {
         1 => kick.params.punch.get(),
         2 => kick.params.sub.get(),
         3 => kick.params.click.get(),
-        4 => kick.params.snap.get(),
-        5 => kick.params.oscillator_decay.get(),
-        6 => kick.params.pitch_envelope_amount.get(),
-        7 => kick.params.pitch_envelope_curve.get(),
-        8 => kick.params.volume.get(),
-        9 => kick.params.pitch_start_ratio.get(),
-        10 => kick.params.phase_mod_amount.get(),
-        11 => kick.params.noise_amount.get(),
-        12 => kick.params.noise_cutoff.get(),
-        13 => kick.params.noise_resonance.get(),
-        14 => kick.params.overdrive.get(),
-        15 => kick.params.amp_decay.get(),
-        16 => kick.params.amp_decay_curve.get(),
+        4 => kick.params.oscillator_decay.get(),
+        5 => kick.params.pitch_envelope_amount.get(),
+        6 => kick.params.pitch_envelope_curve.get(),
+        7 => kick.params.volume.get(),
+        8 => kick.params.pitch_start_ratio.get(),
+        9 => kick.params.phase_mod_amount.get(),
+        10 => kick.params.noise_amount.get(),
+        11 => kick.params.noise_cutoff.get(),
+        12 => kick.params.noise_resonance.get(),
+        13 => kick.params.overdrive.get(),
+        14 => kick.params.amp_decay.get(),
+        15 => kick.params.amp_decay_curve.get(),
         _ => 0.0,
     }
 }
@@ -112,19 +110,18 @@ fn set_param_value(kick: &mut KickDrum, index: usize, value: f32) {
         1 => kick.set_punch(value),
         2 => kick.set_sub(value),
         3 => kick.set_click(value),
-        4 => kick.set_snap(value),
-        5 => kick.set_oscillator_decay(value),
-        6 => kick.set_pitch_envelope_amount(value),
-        7 => kick.set_pitch_envelope_curve(value),
-        8 => kick.set_volume(value),
-        9 => kick.set_pitch_start_ratio(value),
-        10 => kick.set_phase_mod_amount(value),
-        11 => kick.set_noise_amount(value),
-        12 => kick.set_noise_cutoff(value),
-        13 => kick.set_noise_resonance(value),
-        14 => kick.set_overdrive(value),
-        15 => kick.set_amp_decay(value),
-        16 => kick.set_amp_decay_curve(value),
+        4 => kick.set_oscillator_decay(value),
+        5 => kick.set_pitch_envelope_amount(value),
+        6 => kick.set_pitch_envelope_curve(value),
+        7 => kick.set_volume(value),
+        8 => kick.set_pitch_start_ratio(value),
+        9 => kick.set_phase_mod_amount(value),
+        10 => kick.set_noise_amount(value),
+        11 => kick.set_noise_cutoff(value),
+        12 => kick.set_noise_resonance(value),
+        13 => kick.set_overdrive(value),
+        14 => kick.set_amp_decay(value),
+        15 => kick.set_amp_decay_curve(value),
         _ => {}
     }
 }

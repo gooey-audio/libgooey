@@ -17,7 +17,7 @@ fn test_kick_drum_modulation() {
     let lfo_idx = engine.add_lfo(lfo);
 
     // Test all KickDrum parameters (using new normalized 0-1 parameter names)
-    let params = ["frequency", "punch", "sub", "click", "snap", "oscillator_decay", "pitch_envelope_amount"];
+    let params = ["frequency", "punch", "sub", "click", "oscillator_decay", "pitch_envelope_amount"];
     for param in params {
         let result = engine.map_lfo_to_parameter(lfo_idx, "kick", param, 1.0);
         assert!(

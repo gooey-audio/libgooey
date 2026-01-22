@@ -4,7 +4,7 @@ use crate::filters::{ResonantHighpassFilter, ResonantLowpassFilter};
 use crate::gen::oscillator::Oscillator;
 use crate::gen::pink_noise::PinkNoise;
 use crate::gen::waveform::Waveform;
-use crate::instruments::fm_snap::{FMSnapSynthesizer, PhaseModulator};
+use crate::instruments::fm_snap::PhaseModulator;
 use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 /// Normalization ranges for kick drum parameters
@@ -30,9 +30,9 @@ pub mod ranges {
     pub const NOISE_CUTOFF_MIN: f32 = 20.0;
     pub const NOISE_CUTOFF_MAX: f32 = 10000.0;
 
-    /// Noise resonance: 0-1 maps to 0.0-10.0
+    /// Noise resonance: 0-1 maps to 0.0-5.0
     pub const NOISE_RES_MIN: f32 = 0.0;
-    pub const NOISE_RES_MAX: f32 = 10.0;
+    pub const NOISE_RES_MAX: f32 = 5.0;
 
     /// Amp decay: 0-1 maps to 0.0-4.0 seconds
     pub const AMP_DECAY_MIN: f32 = 0.0;
@@ -64,7 +64,6 @@ pub struct KickConfig {
     pub punch_amount: f32,           // Mid-frequency presence (0.0-1.0)
     pub sub_amount: f32,             // Sub-bass presence (0.0-1.0)
     pub click_amount: f32,           // High-frequency click (0.0-1.0)
-    pub snap_amount: f32,            // FM snap transient/zap (0.0-1.0)
     pub oscillator_decay: f32,       // Oscillator decay time (0-1 → 0.01-4.0s)
     pub pitch_envelope_amount: f32,  // Frequency sweep amount (0.0-1.0)
     pub pitch_envelope_curve: f32,   // Pitch envelope decay curve (0-1 → 0.1-10.0)
@@ -74,7 +73,7 @@ pub struct KickConfig {
     pub phase_mod_amount: f32,       // Phase modulation depth (0.0-1.0)
     pub noise_amount: f32,           // Pink noise layer amount (0.0-1.0)
     pub noise_cutoff: f32,           // Noise lowpass filter cutoff (0-1 → 20-10000Hz)
-    pub noise_resonance: f32,        // Noise lowpass filter resonance (0-1 → 0.0-10.0)
+    pub noise_resonance: f32,        // Noise lowpass filter resonance (0-1 → 0.0-5.0)
     pub overdrive_amount: f32,       // Overdrive/saturation amount (0.0-1.0, 0.0 = bypass)
     // Master amplitude envelope parameters
     // Note: amp_attack is hardcoded to instant (0.001s) for kick transients
@@ -90,7 +89,6 @@ impl KickConfig {
         punch_amount: f32,         // 0-1
         sub_amount: f32,           // 0-1
         click_amount: f32,         // 0-1
-        snap_amount: f32,          // 0-1
         oscillator_decay: f32,     // 0-1 → 0.01-4.0s
         pitch_envelope_amount: f32, // 0-1
         pitch_envelope_curve: f32, // 0-1 → 0.1-10.0
@@ -101,7 +99,6 @@ impl KickConfig {
             punch_amount: punch_amount.clamp(0.0, 1.0),
             sub_amount: sub_amount.clamp(0.0, 1.0),
             click_amount: click_amount.clamp(0.0, 1.0),
-            snap_amount: snap_amount.clamp(0.0, 1.0),
             oscillator_decay: oscillator_decay.clamp(0.0, 1.0),
             pitch_envelope_amount: pitch_envelope_amount.clamp(0.0, 1.0),
             pitch_envelope_curve: pitch_envelope_curve.clamp(0.0, 1.0),
@@ -125,7 +122,6 @@ impl KickConfig {
         punch_amount: f32,
         sub_amount: f32,
         click_amount: f32,
-        snap_amount: f32,
         oscillator_decay: f32,
         pitch_envelope_amount: f32,
         pitch_envelope_curve: f32,
@@ -145,7 +141,6 @@ impl KickConfig {
             punch_amount: punch_amount.clamp(0.0, 1.0),
             sub_amount: sub_amount.clamp(0.0, 1.0),
             click_amount: click_amount.clamp(0.0, 1.0),
-            snap_amount: snap_amount.clamp(0.0, 1.0),
             oscillator_decay: oscillator_decay.clamp(0.0, 1.0),
             pitch_envelope_amount: pitch_envelope_amount.clamp(0.0, 1.0),
             pitch_envelope_curve: pitch_envelope_curve.clamp(0.0, 1.0),
@@ -194,7 +189,7 @@ impl KickConfig {
         ranges::denormalize(self.noise_cutoff, ranges::NOISE_CUTOFF_MIN, ranges::NOISE_CUTOFF_MAX)
     }
 
-    /// Get actual noise resonance (0.0-10.0)
+    /// Get actual noise resonance (0.0-5.0)
     #[inline]
     pub fn noise_resonance_value(&self) -> f32 {
         ranges::denormalize(self.noise_resonance, ranges::NOISE_RES_MIN, ranges::NOISE_RES_MAX)
@@ -215,22 +210,22 @@ impl KickConfig {
     pub fn default() -> Self {
         // All values normalized 0-1
         // freq=0.0 (30Hz), decay=0.068 (~0.28s), pitch_curve=0.02 (~0.3)
-        Self::new(0.0, 0.80, 0.80, 0.20, 0.3, 0.068, 0.20, 0.02, 0.80)
+        Self::new(0.0, 0.80, 0.80, 0.20, 0.068, 0.20, 0.02, 0.80)
     }
 
     pub fn punchy() -> Self {
         // freq=0.333 (~60Hz), decay=0.148 (~0.6s), pitch_curve=0.01 (~0.2)
-        Self::new(0.333, 0.9, 0.6, 0.4, 0.6, 0.148, 0.7, 0.01, 0.85)
+        Self::new(0.333, 0.9, 0.6, 0.4, 0.148, 0.7, 0.01, 0.85)
     }
 
     pub fn deep() -> Self {
         // freq=0.167 (~45Hz), decay=0.298 (~1.2s), pitch_curve=0.293 (~3.0)
-        Self::new(0.167, 0.5, 1.0, 0.2, 0.2, 0.298, 0.5, 0.293, 0.9)
+        Self::new(0.167, 0.5, 1.0, 0.2, 0.298, 0.5, 0.293, 0.9)
     }
 
     pub fn tight() -> Self {
         // freq=0.444 (~70Hz), decay=0.098 (~0.4s), pitch_curve=0.015 (~0.25)
-        Self::new(0.444, 0.8, 0.7, 0.5, 0.5, 0.098, 0.8, 0.015, 0.8)
+        Self::new(0.444, 0.8, 0.7, 0.5, 0.098, 0.8, 0.015, 0.8)
     }
 
     /// DS Kick preset - Ableton Drum Synth style
@@ -241,7 +236,6 @@ impl KickConfig {
             0.0,    // Punch disabled - DS uses single oscillator
             1.0,    // Full sub (sine) output
             0.0,    // Click disabled - using phase mod instead
-            0.0,    // Snap disabled - using phase mod instead
             0.123,  // decay: ~0.5s
             1.0,    // Full pitch envelope
             0.015,  // pitch_curve: ~0.25
@@ -267,7 +261,6 @@ pub struct KickParams {
     pub punch: SmoothedParam,                // Mid-frequency presence (0-1)
     pub sub: SmoothedParam,                  // Sub-bass presence (0-1)
     pub click: SmoothedParam,                // High-frequency click (0-1)
-    pub snap: SmoothedParam,                 // FM snap transient/zap (0-1)
     pub oscillator_decay: SmoothedParam,     // Decay time (0-1 → 0.01-4.0s)
     pub pitch_envelope_amount: SmoothedParam, // Pitch envelope amount (0-1)
     pub pitch_envelope_curve: SmoothedParam, // Pitch envelope curve (0-1 → 0.1-10.0)
@@ -277,7 +270,7 @@ pub struct KickParams {
     pub phase_mod_amount: SmoothedParam,     // Phase modulation depth (0-1)
     pub noise_amount: SmoothedParam,         // Pink noise layer amount (0-1)
     pub noise_cutoff: SmoothedParam,         // Noise filter cutoff (0-1 → 20-10000 Hz)
-    pub noise_resonance: SmoothedParam,      // Noise filter resonance (0-1 → 0.0-10.0)
+    pub noise_resonance: SmoothedParam,      // Noise filter resonance (0-1 → 0.0-5.0)
     pub overdrive: SmoothedParam,            // Overdrive/saturation amount (0-1, 0 = bypass)
     // Master amplitude envelope parameters (amp_attack hardcoded to instant)
     pub amp_decay: SmoothedParam,            // Amplitude decay time (0-1 → 0.0-4.0s)
@@ -312,13 +305,6 @@ impl KickParams {
             ),
             click: SmoothedParam::new(
                 config.click_amount,
-                0.0,
-                1.0,
-                sample_rate,
-                DEFAULT_SMOOTH_TIME_MS,
-            ),
-            snap: SmoothedParam::new(
-                config.snap_amount,
                 0.0,
                 1.0,
                 sample_rate,
@@ -419,7 +405,6 @@ impl KickParams {
         self.punch.tick();
         self.sub.tick();
         self.click.tick();
-        self.snap.tick();
         self.oscillator_decay.tick();
         self.pitch_envelope_amount.tick();
         self.pitch_envelope_curve.tick();
@@ -443,7 +428,6 @@ impl KickParams {
             && self.punch.is_settled()
             && self.sub.is_settled()
             && self.click.is_settled()
-            && self.snap.is_settled()
             && self.oscillator_decay.is_settled()
             && self.pitch_envelope_amount.is_settled()
             && self.pitch_envelope_curve.is_settled()
@@ -465,7 +449,6 @@ impl KickParams {
             punch_amount: self.punch.get(),
             sub_amount: self.sub.get(),
             click_amount: self.click.get(),
-            snap_amount: self.snap.get(),
             oscillator_decay: self.oscillator_decay.get(),
             pitch_envelope_amount: self.pitch_envelope_amount.get(),
             pitch_envelope_curve: self.pitch_envelope_curve.get(),
@@ -514,7 +497,7 @@ impl KickParams {
         ranges::denormalize(self.noise_cutoff.get(), ranges::NOISE_CUTOFF_MIN, ranges::NOISE_CUTOFF_MAX)
     }
 
-    /// Get actual noise resonance (0.0-10.0)
+    /// Get actual noise resonance (0.0-5.0)
     #[inline]
     pub fn noise_resonance_value(&self) -> f32 {
         ranges::denormalize(self.noise_resonance.get(), ranges::NOISE_RES_MIN, ranges::NOISE_RES_MAX)
@@ -550,9 +533,6 @@ pub struct KickDrum {
 
     // High-pass filter for click oscillator
     pub click_filter: ResonantHighpassFilter,
-
-    // FM snap synthesizer for beater sound
-    pub fm_snap: FMSnapSynthesizer,
 
     // DS Kick-style phase modulator for transient snap
     pub phase_modulator: PhaseModulator,
@@ -615,7 +595,6 @@ impl KickDrum {
             pitch_envelope: Envelope::new(),
             pitch_start_multiplier,
             click_filter: ResonantHighpassFilter::new(sample_rate, 8000.0, 4.0),
-            fm_snap: FMSnapSynthesizer::new(sample_rate),
             phase_modulator: PhaseModulator::new(sample_rate),
             pink_noise: PinkNoise::new(),
             noise_filter: ResonantLowpassFilter::new(sample_rate, noise_cutoff_hz, noise_res),
@@ -727,7 +706,6 @@ impl KickDrum {
         self.params.punch.set_target(config.punch_amount);
         self.params.sub.set_target(config.sub_amount);
         self.params.click.set_target(config.click_amount);
-        self.params.snap.set_target(config.snap_amount);
         self.params.oscillator_decay.set_target(config.oscillator_decay);
         self.params.pitch_envelope_amount.set_target(config.pitch_envelope_amount);
         self.params.pitch_envelope_curve.set_target(config.pitch_envelope_curve);
@@ -833,9 +811,6 @@ impl KickDrum {
         // Trigger pitch envelope
         self.pitch_envelope.trigger(time);
 
-        // Trigger FM snap for beater sound
-        self.fm_snap.trigger(time);
-
         // Trigger phase modulator if enabled (DS Kick-style transient)
         if self.params.phase_mod_enabled {
             self.phase_modulator.trigger(time);
@@ -931,10 +906,6 @@ impl KickDrum {
         // Apply resonant high-pass filtering to click for more realistic sound
         let filtered_click_output = self.click_filter.process(raw_click_output);
 
-        // Add FM snap for beater sound (controlled by snap_amount parameter)
-        let fm_snap_output = self.fm_snap.tick(current_time);
-        let snap = self.params.snap.get();
-
         // Generate and process pink noise layer (DS Kick-style)
         let noise_amount = self.params.noise_amount.get();
         let noise_output = if noise_amount > 0.001 {
@@ -951,8 +922,9 @@ impl KickDrum {
             let filtered_noise = self.noise_filter.process(pink_noise_sample);
 
             // Apply noise envelope
+            // Scale noise_amount by 0.5 to reduce maximum volume
             let noise_env = self.noise_envelope.get_amplitude(current_time);
-            filtered_noise * noise_env * noise_amount * self.params.volume.get()
+            filtered_noise * noise_env * noise_amount * 0.5 * self.params.volume.get()
         } else {
             0.0
         };
@@ -960,7 +932,6 @@ impl KickDrum {
         let total_output = sub_output
             + punch_output
             + filtered_click_output
-            + (fm_snap_output * snap * self.params.volume.get())
             + noise_output;
 
         // Map overdrive amount (0.0-1.0) to drive (1.0-10.0)
@@ -1023,11 +994,6 @@ impl KickDrum {
         self.params.click.set_target(click_amount.clamp(0.0, 1.0));
     }
 
-    /// Set snap amount (smoothed, 0-1) - controls FM snap transient/zap
-    pub fn set_snap(&mut self, snap_amount: f32) {
-        self.params.snap.set_target(snap_amount.clamp(0.0, 1.0));
-    }
-
     /// Set pitch envelope amount (smoothed, 0-1)
     pub fn set_pitch_envelope_amount(&mut self, amount: f32) {
         self.params.pitch_envelope_amount.set_target(amount.clamp(0.0, 1.0));
@@ -1068,7 +1034,7 @@ impl KickDrum {
         self.params.noise_cutoff.set_target(cutoff.clamp(0.0, 1.0));
     }
 
-    /// Set noise filter resonance (smoothed, normalized 0-1 → 0.0-10.0)
+    /// Set noise filter resonance (smoothed, normalized 0-1 → 0.0-5.0)
     pub fn set_noise_resonance(&mut self, resonance: f32) {
         self.params.noise_resonance.set_target(resonance.clamp(0.0, 1.0));
     }
@@ -1119,7 +1085,6 @@ impl crate::engine::Modulatable for KickDrum {
             "punch",
             "sub",
             "click",
-            "snap",
             "oscillator_decay",
             "pitch_envelope_amount",
             "pitch_envelope_curve",
@@ -1152,10 +1117,6 @@ impl crate::engine::Modulatable for KickDrum {
             }
             "click" => {
                 self.params.click.set_bipolar(value);
-                Ok(())
-            }
-            "snap" => {
-                self.params.snap.set_bipolar(value);
                 Ok(())
             }
             "oscillator_decay" => {
@@ -1217,7 +1178,6 @@ impl crate::engine::Modulatable for KickDrum {
             "punch" => Some(self.params.punch.range()),
             "sub" => Some(self.params.sub.range()),
             "click" => Some(self.params.click.range()),
-            "snap" => Some(self.params.snap.range()),
             "oscillator_decay" => Some(self.params.oscillator_decay.range()),
             "pitch_envelope_amount" => Some(self.params.pitch_envelope_amount.range()),
             "pitch_envelope_curve" => Some(self.params.pitch_envelope_curve.range()),
