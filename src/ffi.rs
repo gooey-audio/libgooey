@@ -7,6 +7,7 @@ use crate::effects::{BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect,
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer};
 use crate::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
+use crate::utils::SmoothedParam;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -101,6 +102,13 @@ pub struct GooeyEngine {
     lfo_enabled: [bool; LFO_COUNT],
     lfo_routes: [Vec<LfoRoute>; LFO_COUNT],
     lfo_next_route_id: [u32; LFO_COUNT],
+
+    // Per-instrument mute/solo state (indexed by INSTRUMENT_* constants)
+    instrument_muted: [AtomicBool; NUM_INSTRUMENTS],
+    instrument_soloed: [AtomicBool; NUM_INSTRUMENTS],
+
+    // Smoothed gain multipliers for click-free mute/solo transitions
+    instrument_gains: [SmoothedParam; NUM_INSTRUMENTS],
 }
 
 impl GooeyEngine {
@@ -166,6 +174,11 @@ impl GooeyEngine {
             lfo_enabled: [false; LFO_COUNT],
             lfo_routes,
             lfo_next_route_id: [0; LFO_COUNT],
+            // Mute/solo state (all unmuted, none soloed by default)
+            instrument_muted: std::array::from_fn(|_| AtomicBool::new(false)),
+            instrument_soloed: std::array::from_fn(|_| AtomicBool::new(false)),
+            // Smoothed gains for click-free mute/solo transitions (10ms smoothing)
+            instrument_gains: std::array::from_fn(|_| SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0)),
         }
     }
 
@@ -191,6 +204,20 @@ impl GooeyEngine {
         }
 
         let sample_period = 1.0 / self.sample_rate;
+
+        // Update mute/solo gain targets (check once per buffer for efficiency)
+        let any_soloed = self
+            .instrument_soloed
+            .iter()
+            .any(|s| s.load(Ordering::Relaxed));
+        for i in 0..NUM_INSTRUMENTS {
+            let target = Self::calculate_instrument_gain(
+                self.instrument_muted[i].load(Ordering::Relaxed),
+                self.instrument_soloed[i].load(Ordering::Relaxed),
+                any_soloed,
+            );
+            self.instrument_gains[i].set_target(target);
+        }
 
         for sample in buffer.iter_mut() {
             // Tick ALL sequencers first to ensure sample-accurate synchronization
@@ -235,11 +262,15 @@ impl GooeyEngine {
                 }
             }
 
-            // Generate and mix audio from all instruments
+            // Generate and mix audio from all instruments with mute/solo gains
             let mut output = self.kick.tick(self.current_time)
+                * self.instrument_gains[INSTRUMENT_KICK as usize].tick()
                 + self.snare.tick(self.current_time)
+                    * self.instrument_gains[INSTRUMENT_SNARE as usize].tick()
                 + self.hihat.tick(self.current_time)
-                + self.tom.tick(self.current_time);
+                    * self.instrument_gains[INSTRUMENT_HIHAT as usize].tick()
+                + self.tom.tick(self.current_time)
+                    * self.instrument_gains[INSTRUMENT_TOM as usize].tick();
 
             // Apply global effects chain
             // 1. Delay (if enabled)
@@ -307,6 +338,29 @@ impl GooeyEngine {
             },
             _ => {}
         }
+    }
+
+    /// Calculate the target gain for an instrument based on mute/solo state
+    /// Returns 1.0 (full volume) or 0.0 (silent)
+    #[inline]
+    fn calculate_instrument_gain(muted: bool, soloed: bool, any_soloed: bool) -> f32 {
+        // Solo takes precedence: if this instrument is soloed, it plays
+        if soloed {
+            return 1.0;
+        }
+
+        // If any instrument is soloed but this one isn't, silence it
+        if any_soloed {
+            return 0.0;
+        }
+
+        // No solo active: check mute state
+        if muted {
+            return 0.0;
+        }
+
+        // Not muted, not affected by solo: full volume
+        1.0
     }
 }
 
@@ -438,6 +492,8 @@ pub const INSTRUMENT_HIHAT: u32 = 2;
 pub const INSTRUMENT_TOM: u32 = 3;
 /// Total number of instruments
 pub const INSTRUMENT_COUNT: u32 = 4;
+/// Internal usize version for array indexing
+const NUM_INSTRUMENTS: usize = INSTRUMENT_COUNT as usize;
 
 // =============================================================================
 // Engine lifecycle
@@ -1764,4 +1820,101 @@ pub extern "C" fn gooey_engine_snare_param_count() -> u32 {
 #[no_mangle]
 pub extern "C" fn gooey_engine_tom_param_count() -> u32 {
     6 // frequency, tonal, punch, decay, pitch_drop, volume
+}
+
+// =============================================================================
+// Instrument mute/solo control
+// =============================================================================
+
+/// Set the mute state for an instrument
+///
+/// When muted, the instrument's audio output is silenced.
+/// Solo takes precedence: if an instrument is both muted and soloed, it will play.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+/// * `muted` - Whether the instrument should be muted
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_instrument_mute(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    muted: bool,
+) {
+    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+        return;
+    }
+    (*engine).instrument_muted[instrument as usize].store(muted, Ordering::Release);
+}
+
+/// Get the mute state for an instrument
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+///
+/// # Returns
+/// `true` if the instrument is muted, `false` otherwise (or if invalid instrument)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_instrument_mute(
+    engine: *const GooeyEngine,
+    instrument: u32,
+) -> bool {
+    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+        return false;
+    }
+    (*engine).instrument_muted[instrument as usize].load(Ordering::Acquire)
+}
+
+/// Set the solo state for an instrument
+///
+/// When any instrument is soloed, only soloed instruments produce audio.
+/// Multiple instruments can be soloed simultaneously.
+/// Solo takes precedence over mute.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+/// * `soloed` - Whether the instrument should be soloed
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_instrument_solo(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    soloed: bool,
+) {
+    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+        return;
+    }
+    (*engine).instrument_soloed[instrument as usize].store(soloed, Ordering::Release);
+}
+
+/// Get the solo state for an instrument
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+///
+/// # Returns
+/// `true` if the instrument is soloed, `false` otherwise (or if invalid instrument)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_instrument_solo(
+    engine: *const GooeyEngine,
+    instrument: u32,
+) -> bool {
+    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+        return false;
+    }
+    (*engine).instrument_soloed[instrument as usize].load(Ordering::Acquire)
 }
