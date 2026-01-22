@@ -34,7 +34,7 @@ struct ParamInfo {
     unit: &'static str,
 }
 
-const PARAM_INFO: [ParamInfo; 9] = [
+const PARAM_INFO: [ParamInfo; 19] = [
     ParamInfo { name: "frequency", coarse_step: 5.0, fine_step: 1.0, unit: " Hz" },
     ParamInfo { name: "punch", coarse_step: 0.1, fine_step: 0.02, unit: "" },
     ParamInfo { name: "sub", coarse_step: 0.1, fine_step: 0.02, unit: "" },
@@ -44,6 +44,16 @@ const PARAM_INFO: [ParamInfo; 9] = [
     ParamInfo { name: "pitch_envelope", coarse_step: 0.1, fine_step: 0.02, unit: "" },
     ParamInfo { name: "pitch_curve", coarse_step: 0.5, fine_step: 0.1, unit: "" },
     ParamInfo { name: "volume", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo { name: "pitch_start_ratio", coarse_step: 0.5, fine_step: 0.1, unit: "" },
+    ParamInfo { name: "phase_mod_amount", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo { name: "noise_amount", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo { name: "noise_cutoff", coarse_step: 100.0, fine_step: 20.0, unit: " Hz" },
+    ParamInfo { name: "noise_resonance", coarse_step: 0.5, fine_step: 0.1, unit: "" },
+    ParamInfo { name: "overdrive", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo { name: "amp_attack", coarse_step: 0.01, fine_step: 0.001, unit: " s" },
+    ParamInfo { name: "amp_decay", coarse_step: 0.1, fine_step: 0.02, unit: " s" },
+    ParamInfo { name: "amp_attack_curve", coarse_step: 0.5, fine_step: 0.1, unit: "" },
+    ParamInfo { name: "amp_decay_curve", coarse_step: 0.5, fine_step: 0.1, unit: "" },
 ];
 
 // Wrapper to share KickDrum between audio thread and main thread
@@ -79,6 +89,16 @@ fn get_param_value(kick: &KickDrum, index: usize) -> f32 {
         6 => kick.params.pitch_envelope.get(),
         7 => kick.params.pitch_curve.get(),
         8 => kick.params.volume.get(),
+        9 => kick.params.pitch_start_ratio.get(),
+        10 => kick.params.phase_mod_amount.get(),
+        11 => kick.params.noise_amount.get(),
+        12 => kick.params.noise_cutoff.get(),
+        13 => kick.params.noise_resonance.get(),
+        14 => kick.params.overdrive.get(),
+        15 => kick.params.amp_attack.get(),
+        16 => kick.params.amp_decay.get(),
+        17 => kick.params.amp_attack_curve.get(),
+        18 => kick.params.amp_decay_curve.get(),
         _ => 0.0,
     }
 }
@@ -94,6 +114,16 @@ fn get_param_range(kick: &KickDrum, index: usize) -> (f32, f32) {
         6 => kick.params.pitch_envelope.range(),
         7 => kick.params.pitch_curve.range(),
         8 => kick.params.volume.range(),
+        9 => kick.params.pitch_start_ratio.range(),
+        10 => kick.params.phase_mod_amount.range(),
+        11 => kick.params.noise_amount.range(),
+        12 => kick.params.noise_cutoff.range(),
+        13 => kick.params.noise_resonance.range(),
+        14 => kick.params.overdrive.range(),
+        15 => kick.params.amp_attack.range(),
+        16 => kick.params.amp_decay.range(),
+        17 => kick.params.amp_attack_curve.range(),
+        18 => kick.params.amp_decay_curve.range(),
         _ => (0.0, 1.0),
     }
 }
@@ -109,6 +139,16 @@ fn set_param_value(kick: &mut KickDrum, index: usize, value: f32) {
         6 => kick.set_pitch_envelope(value),
         7 => kick.set_pitch_curve(value),
         8 => kick.set_volume(value),
+        9 => kick.set_pitch_start_ratio(value),
+        10 => kick.set_phase_mod_amount(value),
+        11 => kick.set_noise_amount(value),
+        12 => kick.set_noise_cutoff(value),
+        13 => kick.set_noise_resonance(value),
+        14 => kick.set_overdrive(value),
+        15 => kick.set_amp_attack(value),
+        16 => kick.set_amp_decay(value),
+        17 => kick.set_amp_attack_curve(value),
+        18 => kick.set_amp_decay_curve(value),
         _ => {}
     }
 }
@@ -129,13 +169,13 @@ fn make_bar(normalized: f32, width: usize) -> String {
 }
 
 // Render the parameter display
-fn render_display(kick: &KickDrum, selected: usize, trigger_count: u32, velocity: f32, preset_name: &str) {
+fn render_display(kick: &KickDrum, selected: usize, trigger_count: u32, velocity: f32, preset_name: &str, phase_mod_enabled: bool) {
     // Clear screen, move cursor to home, and disable line wrapping
     print!("\x1b[2J\x1b[H\x1b[?7l");
 
     print!("=== Kick Drum Lab ===\r\n");
-    print!("SPACE=hit Q=quit ↑↓=sel ←→=adj []=fine\r\n");
-    print!("Z/X/C/V=vel 25/50/75/100% +/-=adj 1-4=preset\r\n");
+    print!("SPACE=hit Q=quit ↑↓=sel ←→=adj []=fine P=phase {}\r\n", if phase_mod_enabled { "ON " } else { "OFF" });
+    print!("Z/X/C/V=vel 25/50/75/100% +/-=adj 1-5=preset\r\n");
     print!("Preset: {}\r\n", preset_name);
     print!("\r\n");
 
@@ -265,6 +305,7 @@ fn main() -> anyhow::Result<()> {
     let mut trigger_count: u32 = 0;
     let mut current_velocity: f32 = 0.75;
     let mut current_preset = "Default";
+    let mut phase_mod_enabled = false;
     let mut needs_redraw = true;
 
     // Clear screen and enable raw mode
@@ -282,7 +323,7 @@ fn main() -> anyhow::Result<()> {
         // Render display if needed
         if needs_redraw {
             let k = kick.lock().unwrap();
-            render_display(&k, selected_param, trigger_count, current_velocity, current_preset);
+            render_display(&k, selected_param, trigger_count, current_velocity, current_preset, phase_mod_enabled);
             needs_redraw = false;
         }
 
@@ -348,29 +389,48 @@ fn main() -> anyhow::Result<()> {
                         needs_redraw = true;
                     }
 
+                    // Toggle phase modulation
+                    KeyCode::Char('p') | KeyCode::Char('P') => {
+                        phase_mod_enabled = !phase_mod_enabled;
+                        let mut k = kick.lock().unwrap();
+                        k.set_phase_mod_enabled(phase_mod_enabled);
+                        needs_redraw = true;
+                    }
+
                     // Presets
                     KeyCode::Char('1') => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::default());
                         current_preset = "Default";
+                        phase_mod_enabled = false;
                         needs_redraw = true;
                     }
                     KeyCode::Char('2') => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::punchy());
                         current_preset = "Punchy";
+                        phase_mod_enabled = false;
                         needs_redraw = true;
                     }
                     KeyCode::Char('3') => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::deep());
                         current_preset = "Deep";
+                        phase_mod_enabled = false;
                         needs_redraw = true;
                     }
                     KeyCode::Char('4') => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::tight());
                         current_preset = "Tight";
+                        phase_mod_enabled = false;
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('5') => {
+                        let mut k = kick.lock().unwrap();
+                        k.set_config(KickConfig::ds_kick());
+                        current_preset = "DS Kick";
+                        phase_mod_enabled = true; // DS Kick uses phase mod
                         needs_redraw = true;
                     }
 
