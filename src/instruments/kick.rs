@@ -204,46 +204,94 @@ impl KickConfig {
     }
 
     pub fn default() -> Self {
-        // All values normalized 0-1
-        // freq=0.0 (30Hz), decay=0.068 (~0.28s), pitch_curve=0.02 (~0.3)
-        Self::new(0.0, 0.80, 0.80, 0.20, 0.068, 0.20, 0.02, 0.80)
+        Self::tight()
     }
 
-    pub fn punchy() -> Self {
-        // freq=0.333 (~60Hz), decay=0.148 (~0.6s), pitch_curve=0.01 (~0.2)
-        Self::new(0.333, 0.9, 0.6, 0.4, 0.148, 0.7, 0.01, 0.85)
-    }
-
-    pub fn deep() -> Self {
-        // freq=0.167 (~45Hz), decay=0.298 (~1.2s), pitch_curve=0.293 (~3.0)
-        Self::new(0.167, 0.5, 1.0, 0.2, 0.298, 0.5, 0.293, 0.9)
-    }
-
+    /// Tight - Short, punchy kick with strong pitch envelope
     pub fn tight() -> Self {
-        // freq=0.444 (~70Hz), decay=0.098 (~0.4s), pitch_curve=0.015 (~0.25)
-        Self::new(0.444, 0.8, 0.7, 0.5, 0.098, 0.8, 0.015, 0.8)
+        Self::new_full(
+            0.22,  // frequency
+            0.00,  // punch
+            1.00,  // sub
+            0.00,  // click
+            0.12,  // osc_decay
+            0.70,  // pitch_env_amt
+            0.01,  // pitch_env_crv
+            0.85,  // volume
+            0.64,  // pitch_ratio
+            1.00,  // phase_mod_amt
+            0.07,  // noise_amount
+            0.01,  // noise_cutoff
+            0.02,  // noise_res
+            0.20,  // overdrive
+            0.12,  // amp_decay
+            0.02,  // amp_dcy_crv
+        )
     }
 
-    /// DS Kick preset - Ableton Drum Synth style
-    /// Single sine oscillator with 5:1 pitch ratio and phase modulation transient
-    pub fn ds_kick() -> Self {
+    /// Punch - Mid-focused with click and resonant noise
+    pub fn punch() -> Self {
         Self::new_full(
-            0.222,  // freq: ~50Hz
-            0.0,    // Punch disabled - DS uses single oscillator
-            1.0,    // Full sub (sine) output
-            0.0,    // Click disabled - using phase mod instead
-            0.123,  // decay: ~0.5s
-            1.0,    // Full pitch envelope
-            0.015,  // pitch_curve: ~0.25
-            0.85,   // Slight headroom
-            0.444,  // pitch_ratio: ~5.0x
-            0.7,    // Strong phase mod for transient snap (DS Kick style)
-            0.07,   // Very subtle pink noise (7%)
-            0.008,  // noise_cutoff: ~100Hz
-            0.02,   // noise_resonance: ~0.2
-            0.2,    // Low amount of initial overdrive
-            0.125,  // amp_decay: ~0.5s
-            0.02,   // amp_decay_curve: ~0.3
+            0.50,  // frequency
+            0.20,  // punch
+            1.00,  // sub
+            0.20,  // click
+            0.12,  // osc_decay
+            0.60,  // pitch_env_amt
+            0.10,  // pitch_env_crv
+            0.85,  // volume
+            0.24,  // pitch_ratio
+            1.00,  // phase_mod_amt
+            0.07,  // noise_amount
+            0.11,  // noise_cutoff
+            0.42,  // noise_res
+            0.20,  // overdrive
+            0.12,  // amp_decay
+            0.02,  // amp_dcy_crv
+        )
+    }
+
+    /// Loose - Longer decay, more punch, subtle pitch envelope
+    pub fn loose() -> Self {
+        Self::new_full(
+            0.32,  // frequency
+            0.40,  // punch
+            1.00,  // sub
+            0.00,  // click
+            0.62,  // osc_decay
+            0.20,  // pitch_env_amt
+            0.12,  // pitch_env_crv
+            0.85,  // volume
+            0.84,  // pitch_ratio
+            1.00,  // phase_mod_amt
+            0.07,  // noise_amount
+            0.01,  // noise_cutoff
+            0.02,  // noise_res
+            0.30,  // overdrive
+            0.12,  // amp_decay
+            0.12,  // amp_dcy_crv
+        )
+    }
+
+    /// Dirt - Higher frequency, more noise with high resonance
+    pub fn dirt() -> Self {
+        Self::new_full(
+            0.62,  // frequency
+            0.10,  // punch
+            1.00,  // sub
+            0.10,  // click
+            0.10,  // osc_decay
+            0.60,  // pitch_env_amt
+            0.10,  // pitch_env_crv
+            0.85,  // volume
+            0.44,  // pitch_ratio
+            1.00,  // phase_mod_amt
+            0.20,  // noise_amount
+            0.10,  // noise_cutoff
+            0.82,  // noise_res
+            0.20,  // overdrive
+            0.10,  // amp_decay
+            0.10,  // amp_dcy_crv
         )
     }
 }

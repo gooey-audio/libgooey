@@ -148,7 +148,7 @@ fn render_display(kick: &KickDrum, selected: usize, trigger_count: u32, velocity
 
     print!("=== Kick Drum Lab ===\r\n");
     print!("SPACE=hit Q=quit ↑↓=sel ←→=adj []=fine\r\n");
-    print!("Z/X/C/V=vel 25/50/75/100% +/-=adj 1-5=preset\r\n");
+    print!("Z/X/C/V=vel 25/50/75/100% +/-=adj 1-4=preset\r\n");
     print!("Preset: {}\r\n", preset_name);
     print!("\r\n");
 
@@ -277,7 +277,7 @@ fn main() -> anyhow::Result<()> {
     let mut selected_param: usize = 0;
     let mut trigger_count: u32 = 0;
     let mut current_velocity: f32 = 0.75;
-    let mut current_preset = "Default";
+    let mut current_preset = "Tight";
     let mut needs_redraw = true;
 
     // Clear screen and enable raw mode
@@ -364,32 +364,26 @@ fn main() -> anyhow::Result<()> {
                     // Presets
                     KeyCode::Char('1') => {
                         let mut k = kick.lock().unwrap();
-                        k.set_config(KickConfig::default());
-                        current_preset = "Default";
-                        needs_redraw = true;
-                    }
-                    KeyCode::Char('2') => {
-                        let mut k = kick.lock().unwrap();
-                        k.set_config(KickConfig::punchy());
-                        current_preset = "Punchy";
-                        needs_redraw = true;
-                    }
-                    KeyCode::Char('3') => {
-                        let mut k = kick.lock().unwrap();
-                        k.set_config(KickConfig::deep());
-                        current_preset = "Deep";
-                        needs_redraw = true;
-                    }
-                    KeyCode::Char('4') => {
-                        let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::tight());
                         current_preset = "Tight";
                         needs_redraw = true;
                     }
-                    KeyCode::Char('5') => {
+                    KeyCode::Char('2') => {
                         let mut k = kick.lock().unwrap();
-                        k.set_config(KickConfig::ds_kick());
-                        current_preset = "DS Kick";
+                        k.set_config(KickConfig::punch());
+                        current_preset = "Punch";
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('3') => {
+                        let mut k = kick.lock().unwrap();
+                        k.set_config(KickConfig::loose());
+                        current_preset = "Loose";
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('4') => {
+                        let mut k = kick.lock().unwrap();
+                        k.set_config(KickConfig::dirt());
+                        current_preset = "Dirt";
                         needs_redraw = true;
                     }
 
