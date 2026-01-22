@@ -9,7 +9,7 @@ use crate::utils::{Blendable, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 /// Normalization ranges for kick drum parameters
 /// All external-facing parameters use 0.0-1.0 normalized values
-pub mod ranges {
+pub(crate) mod ranges {
     /// Frequency: 0-1 maps to 30-120 Hz
     pub const FREQ_MIN: f32 = 30.0;
     pub const FREQ_MAX: f32 = 120.0;
@@ -50,6 +50,7 @@ pub mod ranges {
 
     /// Map actual value to normalized 0-1 range
     #[inline]
+    #[allow(dead_code)]
     pub fn normalize(value: f32, min: f32, max: f32) -> f32 {
         ((value - min) / (max - min)).clamp(0.0, 1.0)
     }

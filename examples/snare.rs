@@ -27,32 +27,37 @@ const SNARE_NOTE: u8 = 38;
 const SNARE_NOTE_ALT: u8 = 40;
 
 // Parameter metadata for the UI
+// All parameters are now normalized 0-1
 struct ParamInfo {
     name: &'static str,
     coarse_step: f32,
     fine_step: f32,
+    display_min: f32,  // For display scaling
+    display_max: f32,
     unit: &'static str,
 }
 
-const PARAM_INFO: [ParamInfo; 18] = [
-    ParamInfo { name: "frequency", coarse_step: 10.0, fine_step: 2.0, unit: " Hz" },
-    ParamInfo { name: "decay", coarse_step: 0.1, fine_step: 0.02, unit: " s" },
-    ParamInfo { name: "brightness", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "volume", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "tonal", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "noise", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "pitch_drop", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "tonal_decay", coarse_step: 0.05, fine_step: 0.01, unit: " s" },
-    ParamInfo { name: "noise_decay", coarse_step: 0.1, fine_step: 0.02, unit: " s" },
-    ParamInfo { name: "noise_tail_decay", coarse_step: 0.1, fine_step: 0.02, unit: " s" },
-    ParamInfo { name: "noise_color", coarse_step: 50.0, fine_step: 10.0, unit: " Hz" },
-    ParamInfo { name: "filter_cutoff", coarse_step: 500.0, fine_step: 100.0, unit: " Hz" },
-    ParamInfo { name: "filter_resonance", coarse_step: 0.5, fine_step: 0.1, unit: "" },
-    ParamInfo { name: "filter_type", coarse_step: 1.0, fine_step: 1.0, unit: "" },
-    ParamInfo { name: "xfade", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "click_enabled", coarse_step: 1.0, fine_step: 1.0, unit: "" },
-    ParamInfo { name: "phase_mod_enabled", coarse_step: 1.0, fine_step: 1.0, unit: "" },
-    ParamInfo { name: "phase_mod_amount", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+// All parameters display normalized 0-1 values (matching the API)
+const PARAM_INFO: [ParamInfo; 19] = [
+    ParamInfo { name: "frequency", coarse_step: 0.05, fine_step: 0.01, display_min: 0.0, display_max: 1.0, unit: "" },        // 100-600 Hz
+    ParamInfo { name: "decay", coarse_step: 0.05, fine_step: 0.01, display_min: 0.0, display_max: 1.0, unit: "" },            // 0.05-3.5s
+    ParamInfo { name: "brightness", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
+    ParamInfo { name: "volume", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
+    ParamInfo { name: "tonal", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
+    ParamInfo { name: "noise", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
+    ParamInfo { name: "pitch_drop", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
+    ParamInfo { name: "tonal_decay", coarse_step: 0.05, fine_step: 0.01, display_min: 0.0, display_max: 1.0, unit: "" },      // 0-3.5s
+    ParamInfo { name: "noise_decay", coarse_step: 0.05, fine_step: 0.01, display_min: 0.0, display_max: 1.0, unit: "" },      // 0-3.5s
+    ParamInfo { name: "noise_tail_decay", coarse_step: 0.05, fine_step: 0.01, display_min: 0.0, display_max: 1.0, unit: "" }, // 0-3.5s
+    ParamInfo { name: "filter_cutoff", coarse_step: 0.05, fine_step: 0.01, display_min: 0.0, display_max: 1.0, unit: "" },    // 100-10000 Hz
+    ParamInfo { name: "filter_resonance", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },  // 0.5-10.0
+    ParamInfo { name: "filter_type", coarse_step: 1.0, fine_step: 1.0, display_min: 0.0, display_max: 1.0, unit: "" },        // 0-3 discrete
+    ParamInfo { name: "xfade", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
+    ParamInfo { name: "phase_mod_amount", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
+    ParamInfo { name: "overdrive", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
+    ParamInfo { name: "amp_decay", coarse_step: 0.05, fine_step: 0.01, display_min: 0.0, display_max: 1.0, unit: "" },        // 0-4.0s
+    ParamInfo { name: "amp_decay_curve", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },   // 0.1-10.0
+    ParamInfo { name: "tonal_decay_curve", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" }, // 0.1-10.0
 ];
 
 // Wrapper to share SnareDrum between audio thread and main thread
@@ -77,6 +82,7 @@ impl Instrument for SharedSnare {
 }
 
 // Helper functions for parameter access
+// All parameters are normalized 0-1
 fn get_param_value(snare: &SnareDrum, index: usize) -> f32 {
     match index {
         0 => snare.params.frequency.get(),
@@ -89,40 +95,22 @@ fn get_param_value(snare: &SnareDrum, index: usize) -> f32 {
         7 => snare.params.tonal_decay.get(),
         8 => snare.params.noise_decay.get(),
         9 => snare.params.noise_tail_decay.get(),
-        10 => snare.params.noise_color.get(),
-        11 => snare.params.filter_cutoff.get(),
-        12 => snare.params.filter_resonance.get(),
-        13 => snare.params.filter_type as f32,
-        14 => snare.params.xfade.get(),
-        15 => if snare.params.click_enabled { 1.0 } else { 0.0 },
-        16 => if snare.params.phase_mod_enabled { 1.0 } else { 0.0 },
-        17 => snare.params.phase_mod_amount.get(),
+        10 => snare.params.filter_cutoff.get(),
+        11 => snare.params.filter_resonance.get(),
+        12 => snare.params.filter_type as f32 / 3.0, // Normalize to 0-1 for display
+        13 => snare.params.xfade.get(),
+        14 => snare.params.phase_mod_amount.get(),
+        15 => snare.params.overdrive.get(),
+        16 => snare.params.amp_decay.get(),
+        17 => snare.params.amp_decay_curve.get(),
+        18 => snare.params.tonal_decay_curve.get(),
         _ => 0.0,
     }
 }
 
-fn get_param_range(snare: &SnareDrum, index: usize) -> (f32, f32) {
-    match index {
-        0 => snare.params.frequency.range(),
-        1 => snare.params.decay.range(),
-        2 => snare.params.brightness.range(),
-        3 => snare.params.volume.range(),
-        4 => snare.params.tonal.range(),
-        5 => snare.params.noise.range(),
-        6 => snare.params.pitch_drop.range(),
-        7 => snare.params.tonal_decay.range(),
-        8 => snare.params.noise_decay.range(),
-        9 => snare.params.noise_tail_decay.range(),
-        10 => snare.params.noise_color.range(),
-        11 => snare.params.filter_cutoff.range(),
-        12 => snare.params.filter_resonance.range(),
-        13 => (0.0, 3.0),
-        14 => snare.params.xfade.range(),
-        15 => (0.0, 1.0),
-        16 => (0.0, 1.0),
-        17 => snare.params.phase_mod_amount.range(),
-        _ => (0.0, 1.0),
-    }
+fn get_param_range(_snare: &SnareDrum, _index: usize) -> (f32, f32) {
+    // All parameters are normalized 0-1
+    (0.0, 1.0)
 }
 
 fn set_param_value(snare: &mut SnareDrum, index: usize, value: f32) {
@@ -137,14 +125,15 @@ fn set_param_value(snare: &mut SnareDrum, index: usize, value: f32) {
         7 => snare.set_tonal_decay(value),
         8 => snare.set_noise_decay(value),
         9 => snare.set_noise_tail_decay(value),
-        10 => snare.set_noise_color(value),
-        11 => snare.set_filter_cutoff(value),
-        12 => snare.set_filter_resonance(value),
-        13 => snare.set_filter_type(value as u8),
-        14 => snare.set_xfade(value),
-        15 => snare.set_click_enabled(value > 0.5),
-        16 => snare.set_phase_mod_enabled(value > 0.5),
-        17 => snare.set_phase_mod_amount(value),
+        10 => snare.set_filter_cutoff(value),
+        11 => snare.set_filter_resonance(value),
+        12 => snare.set_filter_type((value * 3.0).round() as u8),
+        13 => snare.set_xfade(value),
+        14 => snare.set_phase_mod_amount(value),
+        15 => snare.set_overdrive(value),
+        16 => snare.set_amp_decay(value),
+        17 => snare.set_amp_decay_curve(value),
+        18 => snare.set_tonal_decay_curve(value),
         _ => {}
     }
 }
@@ -153,20 +142,17 @@ fn adjust_param(snare: &mut SnareDrum, index: usize, delta: f32) {
     let current = get_param_value(snare, index);
     let (min, max) = get_param_range(snare, index);
 
-    // Special handling for boolean and discrete parameters
+    // Special handling for filter_type (discrete parameter)
     let new_value = match index {
-        13 => {
-            // Filter type: discrete values 0, 1, 2, 3
-            let current_int = current as i32;
+        12 => {
+            // Filter type: discrete values 0, 1, 2, 3 mapped to 0-1
+            let current_int = (current * 3.0).round() as i32;
             let delta_int = if delta > 0.0 { 1 } else { -1 };
-            ((current_int + delta_int).max(0).min(3)) as f32
-        }
-        15 | 16 => {
-            // Boolean toggles
-            if current > 0.5 { 0.0 } else { 1.0 }
+            let new_int = (current_int + delta_int).clamp(0, 3);
+            new_int as f32 / 3.0
         }
         _ => {
-            // Normal continuous parameters
+            // Normal continuous parameters (all normalized 0-1)
             (current + delta).clamp(min, max)
         }
     };
@@ -206,31 +192,22 @@ fn render_display(snare: &SnareDrum, selected: usize, trigger_count: u32, veloci
 
     for (i, info) in PARAM_INFO.iter().enumerate() {
         let value = get_param_value(snare, i);
-        let (min, max) = get_param_range(snare, i);
 
         let indicator = if i == selected { ">" } else { " " };
 
-        // Special formatting for certain parameters
-        match i {
-            13 => {
-                // Filter type - show name instead of number
-                let filter_name = get_filter_type_name(value as u8);
-                print!("{} {:<18} {:<14} {:>6}\r\n", indicator, info.name, "", filter_name);
-            }
-            15 | 16 => {
-                // Boolean parameters
-                let state = if value > 0.5 { "ON " } else { "OFF" };
-                print!("{} {:<18} {:<14} {:>6}\r\n", indicator, info.name, "", state);
-            }
-            _ => {
-                // Normal parameters with bars
-                let normalized = (value - min) / (max - min);
-                let bar = make_bar(normalized, 10);
-                print!(
-                    "{} {:<18} [{}] {:>6.2}{:<3}\r\n",
-                    indicator, info.name, bar, value, info.unit
-                );
-            }
+        // Special formatting for filter_type
+        if i == 12 {
+            // Filter type - show name instead of number
+            let filter_name = get_filter_type_name(snare.params.filter_type);
+            print!("{} {:<18} {:<14} {:>6}\r\n", indicator, info.name, "", filter_name);
+        } else {
+            // Normal parameters with bars - show scaled display value
+            let display_value = info.display_min + value * (info.display_max - info.display_min);
+            let bar = make_bar(value, 10);
+            print!(
+                "{} {:<18} [{}] {:>6.2}{:<3}\r\n",
+                indicator, info.name, bar, display_value, info.unit
+            );
         }
     }
 
