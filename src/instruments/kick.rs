@@ -5,7 +5,7 @@ use crate::gen::oscillator::Oscillator;
 use crate::gen::pink_noise::PinkNoise;
 use crate::gen::waveform::Waveform;
 use crate::instruments::fm_snap::PhaseModulator;
-use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
+use crate::utils::{Blendable, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 /// Normalization ranges for kick drum parameters
 /// All external-facing parameters use 0.0-1.0 normalized values
@@ -296,6 +296,31 @@ impl KickConfig {
     }
 }
 
+impl Blendable for KickConfig {
+    fn lerp(&self, other: &Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        let inv_t = 1.0 - t;
+        Self {
+            frequency: self.frequency * inv_t + other.frequency * t,
+            punch_amount: self.punch_amount * inv_t + other.punch_amount * t,
+            sub_amount: self.sub_amount * inv_t + other.sub_amount * t,
+            click_amount: self.click_amount * inv_t + other.click_amount * t,
+            oscillator_decay: self.oscillator_decay * inv_t + other.oscillator_decay * t,
+            pitch_envelope_amount: self.pitch_envelope_amount * inv_t + other.pitch_envelope_amount * t,
+            pitch_envelope_curve: self.pitch_envelope_curve * inv_t + other.pitch_envelope_curve * t,
+            volume: self.volume * inv_t + other.volume * t,
+            pitch_start_ratio: self.pitch_start_ratio * inv_t + other.pitch_start_ratio * t,
+            phase_mod_amount: self.phase_mod_amount * inv_t + other.phase_mod_amount * t,
+            noise_amount: self.noise_amount * inv_t + other.noise_amount * t,
+            noise_cutoff: self.noise_cutoff * inv_t + other.noise_cutoff * t,
+            noise_resonance: self.noise_resonance * inv_t + other.noise_resonance * t,
+            overdrive_amount: self.overdrive_amount * inv_t + other.overdrive_amount * t,
+            amp_decay: self.amp_decay * inv_t + other.amp_decay * t,
+            amp_decay_curve: self.amp_decay_curve * inv_t + other.amp_decay_curve * t,
+        }
+    }
+}
+
 /// Smoothed parameters for real-time control of the kick drum
 /// These use one-pole smoothing to prevent clicks/pops during parameter changes
 /// All parameters use normalized 0-1 ranges for external interface
@@ -569,7 +594,10 @@ pub struct KickDrum {
 
     // Pitch envelope for frequency sweeping
     pub pitch_envelope: Envelope,
-    pitch_start_multiplier: f32,
+    /// Pitch start multiplier snapshot (frozen at trigger time)
+    triggered_pitch_multiplier: f32,
+    /// Base frequency snapshot in Hz (frozen at trigger time)
+    triggered_frequency: f32,
 
     // High-pass filter for click oscillator
     pub click_filter: ResonantHighpassFilter,
@@ -615,16 +643,15 @@ impl KickDrum {
     pub fn with_config(sample_rate: f32, config: KickConfig) -> Self {
         let params = KickParams::from_config(&config, sample_rate);
 
-        // Calculate pitch start multiplier from pitch_start_ratio and pitch_envelope
-        // Using actual denormalized values for audio processing
-        let pitch_start_ratio_actual = config.pitch_start_ratio_value();
-        let pitch_start_multiplier =
-            1.0 + (pitch_start_ratio_actual - 1.0) * config.pitch_envelope_amount;
-
         // Get actual Hz values for oscillators
         let freq_hz = config.frequency_hz();
         let noise_cutoff_hz = config.noise_cutoff_hz();
         let noise_res = config.noise_resonance_value();
+
+        // Calculate initial pitch start multiplier from pitch_start_ratio and pitch_envelope
+        let pitch_start_ratio_actual = config.pitch_start_ratio_value();
+        let triggered_pitch_multiplier =
+            1.0 + (pitch_start_ratio_actual - 1.0) * config.pitch_envelope_amount;
 
         let mut kick = Self {
             sample_rate,
@@ -633,7 +660,8 @@ impl KickDrum {
             punch_oscillator: Oscillator::new(sample_rate, freq_hz * 2.5),
             click_oscillator: Oscillator::new(sample_rate, freq_hz * 40.0),
             pitch_envelope: Envelope::new(),
-            pitch_start_multiplier,
+            triggered_pitch_multiplier,
+            triggered_frequency: freq_hz,
             click_filter: ResonantHighpassFilter::new(sample_rate, 8000.0, 4.0),
             phase_modulator: PhaseModulator::new(sample_rate),
             pink_noise: PinkNoise::new(),
@@ -713,26 +741,22 @@ impl KickDrum {
     }
 
     /// Apply current smoothed parameters to oscillators (called per-sample)
+    ///
+    /// NOTE: Only mix/volume parameters are applied here. Pitch-related parameters
+    /// (frequency, pitch_start_multiplier) are frozen at trigger time to prevent
+    /// discontinuities when parameters change during decay.
     #[inline]
     fn apply_params(&mut self) {
         let punch = self.params.punch.get();
         let sub = self.params.sub.get();
         let click = self.params.click.get();
-        let pitch_envelope_amount = self.params.pitch_envelope_amount.get();
-        // Get actual pitch_start_ratio (1.0-10.0) from normalized value
-        let pitch_start_ratio = self.params.pitch_start_ratio_value();
         let volume = self.params.volume.get();
-
-        // Update pitch start multiplier using configurable ratio
-        // At pitch_envelope=1.0, we get the full pitch_start_ratio
-        // At pitch_envelope=0.0, we get 1.0 (no pitch sweep)
-        self.pitch_start_multiplier = 1.0 + (pitch_start_ratio - 1.0) * pitch_envelope_amount;
 
         // Light velocity scaling for click: range [0.6, 1.0]
         // Higher velocity = more click, lower velocity = less click
         let click_vel_scale = 0.6 + 0.4 * self.current_velocity;
 
-        // Update oscillator volumes (these can change smoothly)
+        // Update oscillator volumes (these can change smoothly without pops)
         self.sub_oscillator.set_volume(sub * volume);
         self.punch_oscillator.set_volume(punch * volume * 0.7);
         // Click reduced from 0.3 to 0.15, with velocity scaling
@@ -742,6 +766,7 @@ impl KickDrum {
 
     pub fn set_config(&mut self, config: KickConfig) {
         // Set all parameter targets (normalized 0-1 values)
+        // These will smoothly transition via SmoothedParam
         self.params.frequency.set_target(config.frequency);
         self.params.punch.set_target(config.punch_amount);
         self.params.sub.set_target(config.sub_amount);
@@ -759,8 +784,11 @@ impl KickDrum {
         self.params.amp_decay.set_target(config.amp_decay);
         self.params.amp_decay_curve.set_target(config.amp_decay_curve);
 
-        // Reconfigure envelopes for new decay time
-        self.configure_oscillators();
+        // NOTE: We intentionally do NOT call configure_oscillators() here.
+        // Envelope configurations (decay times, curves) are applied on trigger,
+        // not during parameter changes. This prevents pops/discontinuities when
+        // parameters change while a sound is still decaying.
+        // Smoothable params (volume, filter, mix) update in real-time via apply_params().
     }
 
     /// Get current config snapshot (reads current smoothed values)
@@ -802,6 +830,13 @@ impl KickDrum {
         // Get base parameters (denormalized to actual values)
         let base_decay = self.params.oscillator_decay_secs() * decay_scale;
         let base_freq = self.params.frequency_hz();
+
+        // Snapshot pitch parameters at trigger time
+        // These values are frozen for the entire decay to prevent discontinuities
+        self.triggered_frequency = base_freq;
+        let pitch_envelope_amount = self.params.pitch_envelope_amount.get();
+        let pitch_start_ratio = self.params.pitch_start_ratio_value();
+        self.triggered_pitch_multiplier = 1.0 + (pitch_start_ratio - 1.0) * pitch_envelope_amount;
 
         // Configure pitch envelope with same duration as amplitude envelope
         // The exponential curve will make the pitch sweep complete early,
@@ -909,16 +944,16 @@ impl KickDrum {
             return 0.0;
         }
 
-        // Apply smoothed parameters to oscillators
+        // Apply smoothed parameters to oscillators (mix/volume only)
         self.apply_params();
 
-        // Get actual frequency in Hz (denormalized from 0-1)
-        let base_frequency = self.params.frequency_hz();
+        // Use triggered (snapshot) frequency - frozen at trigger time to prevent pitch snaps
+        let base_frequency = self.triggered_frequency;
 
-        // Calculate pitch modulation from envelope
+        // Calculate pitch modulation from envelope using triggered pitch multiplier
         let pitch_envelope_value = self.pitch_envelope.get_amplitude(current_time);
         let mut frequency_multiplier =
-            1.0 + (self.pitch_start_multiplier - 1.0) * pitch_envelope_value;
+            1.0 + (self.triggered_pitch_multiplier - 1.0) * pitch_envelope_value;
 
         // Apply phase modulation if enabled (amount > 0, DS Kick-style transient snap)
         // This adds a brief frequency boost at the attack for extra punch

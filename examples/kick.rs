@@ -13,6 +13,7 @@ use std::io::{self, Write};
 
 use gooey::engine::{Engine, EngineOutput, Instrument};
 use gooey::instruments::{KickConfig, KickDrum};
+use gooey::utils::PresetBlender;
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "midi")]
@@ -141,15 +142,90 @@ fn make_bar(normalized: f32, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
 }
 
+// Blend mode state
+struct BlendState {
+    enabled: bool,
+    x: f32,
+    y: f32,
+    blender: PresetBlender<KickConfig>,
+}
+
+impl BlendState {
+    fn new() -> Self {
+        Self {
+            enabled: false,
+            x: 0.5,
+            y: 0.5,
+            blender: PresetBlender::new(
+                KickConfig::tight(),  // Bottom-left (0,0)
+                KickConfig::punch(),  // Bottom-right (1,0)
+                KickConfig::loose(),  // Top-left (0,1)
+                KickConfig::dirt(),   // Top-right (1,1)
+            ),
+        }
+    }
+}
+
 // Render the parameter display
-fn render_display(kick: &KickDrum, selected: usize, trigger_count: u32, velocity: f32, preset_name: &str) {
+fn render_display(
+    kick: &KickDrum,
+    selected: usize,
+    trigger_count: u32,
+    velocity: f32,
+    preset_name: &str,
+    blend: &BlendState,
+) {
     // Clear screen, move cursor to home, and disable line wrapping
     print!("\x1b[2J\x1b[H\x1b[?7l");
 
     print!("=== Kick Drum Lab ===\r\n");
-    print!("SPACE=hit Q=quit ↑↓=sel ←→=adj []=fine\r\n");
-    print!("Z/X/C/V=vel 25/50/75/100% +/-=adj 1-4=preset\r\n");
+    if blend.enabled {
+        print!("SPACE=hit Q=quit WASD=blend B=exit blend mode\r\n");
+        print!("Z/X/C/V=vel 25/50/75/100%\r\n");
+    } else {
+        print!("SPACE=hit Q=quit ↑↓=sel ←→=adj []=fine B=blend\r\n");
+        print!("Z/X/C/V=vel 25/50/75/100% +/-=adj 1-4=preset\r\n");
+    }
     print!("Preset: {}\r\n", preset_name);
+
+    // Show blend X/Y pad visualization when in blend mode
+    if blend.enabled {
+        print!("\r\n");
+        print!("  X/Y Blend Pad (WASD to move)\r\n");
+        print!("  ┌──────────────────────┐\r\n");
+
+        // Render 8x8 pad with cursor
+        let pad_w = 20;
+        let pad_h = 8;
+        let cursor_x = (blend.x * (pad_w - 1) as f32).round() as usize;
+        let cursor_y = ((1.0 - blend.y) * (pad_h - 1) as f32).round() as usize;
+
+        for row in 0..pad_h {
+            print!("  │");
+            for col in 0..pad_w {
+                if row == cursor_y && col == cursor_x {
+                    print!("●");
+                } else {
+                    // Show corner labels
+                    if row == 0 && col == 0 {
+                        print!("L"); // Loose (top-left)
+                    } else if row == 0 && col == pad_w - 1 {
+                        print!("D"); // Dirt (top-right)
+                    } else if row == pad_h - 1 && col == 0 {
+                        print!("T"); // Tight (bottom-left)
+                    } else if row == pad_h - 1 && col == pad_w - 1 {
+                        print!("P"); // Punch (bottom-right)
+                    } else {
+                        print!("·");
+                    }
+                }
+            }
+            print!("│\r\n");
+        }
+        print!("  └──────────────────────┘\r\n");
+        print!("  X: {:.2}  Y: {:.2}\r\n", blend.x, blend.y);
+    }
+
     print!("\r\n");
 
     for (i, info) in PARAM_INFO.iter().enumerate() {
@@ -279,6 +355,7 @@ fn main() -> anyhow::Result<()> {
     let mut current_velocity: f32 = 0.75;
     let mut current_preset = "Tight";
     let mut needs_redraw = true;
+    let mut blend = BlendState::new();
 
     // Clear screen and enable raw mode
     execute!(io::stdout(), Clear(ClearType::All), cursor::Hide)?;
@@ -295,7 +372,7 @@ fn main() -> anyhow::Result<()> {
         // Render display if needed
         if needs_redraw {
             let k = kick.lock().unwrap();
-            render_display(&k, selected_param, trigger_count, current_velocity, current_preset);
+            render_display(&k, selected_param, trigger_count, current_velocity, current_preset, &blend);
             needs_redraw = false;
         }
 
@@ -319,25 +396,25 @@ fn main() -> anyhow::Result<()> {
         if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(KeyEvent { code, .. }) = event::read()? {
                 match code {
-                    // Parameter navigation
-                    KeyCode::Up => {
+                    // Parameter navigation (only when not in blend mode)
+                    KeyCode::Up if !blend.enabled => {
                         selected_param = selected_param.saturating_sub(1);
                         needs_redraw = true;
                     }
-                    KeyCode::Down => {
+                    KeyCode::Down if !blend.enabled => {
                         selected_param = (selected_param + 1).min(PARAM_INFO.len() - 1);
                         needs_redraw = true;
                     }
 
-                    // Coarse adjustment
-                    KeyCode::Left => {
+                    // Coarse adjustment (only when not in blend mode)
+                    KeyCode::Left if !blend.enabled => {
                         let step = PARAM_INFO[selected_param].coarse_step;
                         let mut k = kick.lock().unwrap();
                         adjust_param(&mut k, selected_param, -step);
                         current_preset = "Custom";
                         needs_redraw = true;
                     }
-                    KeyCode::Right => {
+                    KeyCode::Right if !blend.enabled => {
                         let step = PARAM_INFO[selected_param].coarse_step;
                         let mut k = kick.lock().unwrap();
                         adjust_param(&mut k, selected_param, step);
@@ -345,15 +422,15 @@ fn main() -> anyhow::Result<()> {
                         needs_redraw = true;
                     }
 
-                    // Fine adjustment
-                    KeyCode::Char('[') => {
+                    // Fine adjustment (only when not in blend mode)
+                    KeyCode::Char('[') if !blend.enabled => {
                         let step = PARAM_INFO[selected_param].fine_step;
                         let mut k = kick.lock().unwrap();
                         adjust_param(&mut k, selected_param, -step);
                         current_preset = "Custom";
                         needs_redraw = true;
                     }
-                    KeyCode::Char(']') => {
+                    KeyCode::Char(']') if !blend.enabled => {
                         let step = PARAM_INFO[selected_param].fine_step;
                         let mut k = kick.lock().unwrap();
                         adjust_param(&mut k, selected_param, step);
@@ -361,26 +438,73 @@ fn main() -> anyhow::Result<()> {
                         needs_redraw = true;
                     }
 
-                    // Presets
-                    KeyCode::Char('1') => {
+                    // Toggle blend mode
+                    KeyCode::Char('b') | KeyCode::Char('B') => {
+                        blend.enabled = !blend.enabled;
+                        if blend.enabled {
+                            // Apply current blend position
+                            let blended = blend.blender.blend(blend.x, blend.y);
+                            let mut k = kick.lock().unwrap();
+                            k.set_config(blended);
+                            current_preset = "Blended";
+                        }
+                        needs_redraw = true;
+                    }
+
+                    // Blend mode WASD controls
+                    KeyCode::Char('w') | KeyCode::Char('W') if blend.enabled => {
+                        blend.y = (blend.y + 0.05).min(1.0);
+                        let blended = blend.blender.blend(blend.x, blend.y);
+                        let mut k = kick.lock().unwrap();
+                        k.set_config(blended);
+                        current_preset = "Blended";
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('s') | KeyCode::Char('S') if blend.enabled => {
+                        blend.y = (blend.y - 0.05).max(0.0);
+                        let blended = blend.blender.blend(blend.x, blend.y);
+                        let mut k = kick.lock().unwrap();
+                        k.set_config(blended);
+                        current_preset = "Blended";
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') if blend.enabled => {
+                        blend.x = (blend.x - 0.05).max(0.0);
+                        let blended = blend.blender.blend(blend.x, blend.y);
+                        let mut k = kick.lock().unwrap();
+                        k.set_config(blended);
+                        current_preset = "Blended";
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') if blend.enabled => {
+                        blend.x = (blend.x + 0.05).min(1.0);
+                        let blended = blend.blender.blend(blend.x, blend.y);
+                        let mut k = kick.lock().unwrap();
+                        k.set_config(blended);
+                        current_preset = "Blended";
+                        needs_redraw = true;
+                    }
+
+                    // Presets (only when not in blend mode)
+                    KeyCode::Char('1') if !blend.enabled => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::tight());
                         current_preset = "Tight";
                         needs_redraw = true;
                     }
-                    KeyCode::Char('2') => {
+                    KeyCode::Char('2') if !blend.enabled => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::punch());
                         current_preset = "Punch";
                         needs_redraw = true;
                     }
-                    KeyCode::Char('3') => {
+                    KeyCode::Char('3') if !blend.enabled => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::loose());
                         current_preset = "Loose";
                         needs_redraw = true;
                     }
-                    KeyCode::Char('4') => {
+                    KeyCode::Char('4') if !blend.enabled => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::dirt());
                         current_preset = "Dirt";
