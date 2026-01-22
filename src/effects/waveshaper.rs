@@ -49,8 +49,15 @@ impl Waveshaper {
         // tanh provides smooth saturation similar to tube/analog overdrive
         let saturated = (input * self.drive).tanh();
 
+        // Gain compensation: normalize output level to match drive=1.0
+        // Uses reference level (typical signal amplitude) to calculate
+        // how much quieter the output should be to maintain constant loudness
+        let reference = 0.5_f32;
+        let compensation = reference.tanh() / (reference * self.drive).tanh();
+        let compensated = saturated * compensation;
+
         // Mix dry/wet
-        input * (1.0 - self.mix) + saturated * self.mix
+        input * (1.0 - self.mix) + compensated * self.mix
     }
 
     /// Set the drive amount (1.0-10.0)
@@ -95,15 +102,30 @@ mod tests {
     #[test]
     fn test_soft_clipping() {
         let ws = Waveshaper::new(10.0, 1.0);
-        // High drive with moderate input should saturate
-        // tanh(10.0) ≈ 0.9999999999 (very close to 1.0)
+        // High drive with gain compensation should produce gain-normalized output
+        // The compensation factor at drive=10 is approx tanh(0.5)/tanh(5.0) ≈ 0.46
         let output = ws.process(1.0);
-        assert!(output > 0.99); // Should be saturated near +1
+        assert!(output > 0.4 && output < 0.5); // Compensated output near 0.46
 
-        // Lower input should be less saturated
+        // Lower input should be proportionally less saturated
         let output_low = ws.process(0.1);
-        assert!(output_low < 0.8); // Should be less than full saturation
         assert!(output_low > 0.0);
+        assert!(output_low < output); // Lower input = lower output
+    }
+
+    #[test]
+    fn test_gain_compensation_consistency() {
+        // Test that output level stays relatively consistent across drive values
+        let input = 0.5_f32;
+        let ws_low = Waveshaper::new(2.0, 1.0);
+        let ws_high = Waveshaper::new(10.0, 1.0);
+
+        let output_low = ws_low.process(input);
+        let output_high = ws_high.process(input);
+
+        // With compensation, outputs should be similar (within 20% of each other)
+        let ratio = output_high / output_low;
+        assert!(ratio > 0.8 && ratio < 1.2, "Outputs differ too much: {output_low} vs {output_high}");
     }
 
     #[test]
