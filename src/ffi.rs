@@ -6,7 +6,8 @@
 use crate::effects::{BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect, TubeSaturation};
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer};
-use crate::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
+use crate::instruments::{HiHat, KickConfig, KickDrum, SnareDrum, TomDrum};
+use crate::utils::PresetBlender;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -101,6 +102,14 @@ pub struct GooeyEngine {
     lfo_enabled: [bool; LFO_COUNT],
     lfo_routes: [Vec<LfoRoute>; LFO_COUNT],
     lfo_next_route_id: [u32; LFO_COUNT],
+
+    // Per-instrument preset blend state (2D X/Y pad interpolation)
+    // Only kick is implemented initially; other instruments will be added as they implement Blendable
+    kick_blender: PresetBlender<KickConfig>,
+    blend_enabled: [bool; INSTRUMENT_COUNT as usize],
+    blend_x: [f32; INSTRUMENT_COUNT as usize],
+    blend_y: [f32; INSTRUMENT_COUNT as usize],
+    blend_corner_presets: [[u32; 4]; INSTRUMENT_COUNT as usize],
 }
 
 impl GooeyEngine {
@@ -134,6 +143,16 @@ impl GooeyEngine {
         // Create LFO pool (8 LFOs, all disabled by default with quarter note timing)
         let lfos = std::array::from_fn(|_| Lfo::with_sample_rate(sample_rate));
         let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] = std::array::from_fn(|_| Vec::new());
+
+        // Create kick preset blender with default corner presets
+        // BL(0,0)=Tight, BR(1,0)=Punch, TL(0,1)=Loose, TR(1,1)=Dirt
+        let kick_blender = PresetBlender::new(
+            KickConfig::tight(),
+            KickConfig::punch(),
+            KickConfig::loose(),
+            KickConfig::dirt(),
+        );
+
         Self {
             kick,
             snare,
@@ -166,6 +185,17 @@ impl GooeyEngine {
             lfo_enabled: [false; LFO_COUNT],
             lfo_routes,
             lfo_next_route_id: [0; LFO_COUNT],
+            // Preset blend state
+            kick_blender,
+            blend_enabled: [false; INSTRUMENT_COUNT as usize],
+            blend_x: [0.5; INSTRUMENT_COUNT as usize],
+            blend_y: [0.5; INSTRUMENT_COUNT as usize],
+            blend_corner_presets: [
+                [KICK_PRESET_TIGHT, KICK_PRESET_PUNCH, KICK_PRESET_LOOSE, KICK_PRESET_DIRT],
+                [0, 1, 2, 3], // Snare: placeholder
+                [0, 1, 2, 3], // HiHat: placeholder
+                [0, 1, 2, 3], // Tom: placeholder
+            ],
         }
     }
 
@@ -307,6 +337,17 @@ impl GooeyEngine {
             _ => {}
         }
     }
+
+    /// Get a KickConfig preset by ID
+    fn kick_preset_by_id(id: u32) -> Option<KickConfig> {
+        match id {
+            KICK_PRESET_TIGHT => Some(KickConfig::tight()),
+            KICK_PRESET_PUNCH => Some(KickConfig::punch()),
+            KICK_PRESET_LOOSE => Some(KickConfig::loose()),
+            KICK_PRESET_DIRT => Some(KickConfig::dirt()),
+            _ => None,
+        }
+    }
 }
 
 // =============================================================================
@@ -435,6 +476,28 @@ pub const INSTRUMENT_HIHAT: u32 = 2;
 pub const INSTRUMENT_TOM: u32 = 3;
 /// Total number of instruments
 pub const INSTRUMENT_COUNT: u32 = 4;
+
+// =============================================================================
+// Preset blend constants
+// =============================================================================
+
+/// Kick preset: Tight - short, punchy kick with strong pitch envelope
+pub const KICK_PRESET_TIGHT: u32 = 0;
+/// Kick preset: Punch - mid-focused with click and resonant noise
+pub const KICK_PRESET_PUNCH: u32 = 1;
+/// Kick preset: Loose - longer decay, more punch, subtle pitch envelope
+pub const KICK_PRESET_LOOSE: u32 = 2;
+/// Kick preset: Dirt - higher frequency, more noise with high resonance
+pub const KICK_PRESET_DIRT: u32 = 3;
+
+/// Blend corner: bottom-left (x=0, y=0)
+pub const BLEND_CORNER_BOTTOM_LEFT: u32 = 0;
+/// Blend corner: bottom-right (x=1, y=0)
+pub const BLEND_CORNER_BOTTOM_RIGHT: u32 = 1;
+/// Blend corner: top-left (x=0, y=1)
+pub const BLEND_CORNER_TOP_LEFT: u32 = 2;
+/// Blend corner: top-right (x=1, y=1)
+pub const BLEND_CORNER_TOP_RIGHT: u32 = 3;
 
 // =============================================================================
 // Engine lifecycle
@@ -1759,4 +1822,332 @@ pub extern "C" fn gooey_engine_snare_param_count() -> u32 {
 #[no_mangle]
 pub extern "C" fn gooey_engine_tom_param_count() -> u32 {
     6 // frequency, tonal, punch, decay, pitch_drop, volume
+}
+
+// =============================================================================
+// Preset blend (2D X/Y pad interpolation)
+// =============================================================================
+
+/// Enable preset blend mode for an instrument
+///
+/// When enabled, use `gooey_engine_blend_set_position` to blend between
+/// the 4 corner presets using X/Y coordinates.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_enable(engine: *mut GooeyEngine, instrument: u32) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let idx = instrument as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return;
+    }
+
+    engine.blend_enabled[idx] = true;
+}
+
+/// Disable preset blend mode for an instrument
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_disable(engine: *mut GooeyEngine, instrument: u32) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let idx = instrument as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return;
+    }
+
+    engine.blend_enabled[idx] = false;
+}
+
+/// Check if preset blend mode is enabled for an instrument
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+///
+/// # Returns
+/// `true` if blend mode is enabled, `false` otherwise
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_is_enabled(
+    engine: *const GooeyEngine,
+    instrument: u32,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    let engine = &*engine;
+    let idx = instrument as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return false;
+    }
+
+    engine.blend_enabled[idx]
+}
+
+/// Set the X/Y blend position for an instrument
+///
+/// Performs bilinear interpolation between the 4 corner presets
+/// and applies the blended config to the instrument with smoothing.
+///
+/// Coordinate space:
+/// ```text
+///        Y=1
+///    TL ---- TR
+///     |      |
+///     |      |
+///    BL ---- BR
+///        Y=0
+///   X=0      X=1
+/// ```
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+/// * `x` - Horizontal position (0.0 = left, 1.0 = right)
+/// * `y` - Vertical position (0.0 = bottom, 1.0 = top)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_set_position(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    x: f32,
+    y: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let idx = instrument as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return;
+    }
+    if !engine.blend_enabled[idx] {
+        return;
+    }
+
+    engine.blend_x[idx] = x.clamp(0.0, 1.0);
+    engine.blend_y[idx] = y.clamp(0.0, 1.0);
+
+    match instrument {
+        INSTRUMENT_KICK => {
+            let blended = engine.kick_blender.blend(engine.blend_x[idx], engine.blend_y[idx]);
+            engine.kick.set_config(blended);
+        }
+        // Future: INSTRUMENT_SNARE, INSTRUMENT_HIHAT, INSTRUMENT_TOM
+        // when they implement Blendable
+        _ => {}
+    }
+}
+
+/// Get the current X blend position for an instrument
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+///
+/// # Returns
+/// X position (0.0-1.0), or -1.0 if invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_get_position_x(
+    engine: *const GooeyEngine,
+    instrument: u32,
+) -> f32 {
+    if engine.is_null() {
+        return -1.0;
+    }
+    let engine = &*engine;
+    let idx = instrument as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return -1.0;
+    }
+
+    engine.blend_x[idx]
+}
+
+/// Get the current Y blend position for an instrument
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+///
+/// # Returns
+/// Y position (0.0-1.0), or -1.0 if invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_get_position_y(
+    engine: *const GooeyEngine,
+    instrument: u32,
+) -> f32 {
+    if engine.is_null() {
+        return -1.0;
+    }
+    let engine = &*engine;
+    let idx = instrument as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return -1.0;
+    }
+
+    engine.blend_y[idx]
+}
+
+/// Set a corner preset by preset ID
+///
+/// Allows customizing which preset is at each corner of the blend space.
+/// Changes take effect immediately on the next blend position update.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+/// * `corner` - Corner position (BLEND_CORNER_BOTTOM_LEFT, etc.)
+/// * `preset_id` - Preset ID (KICK_PRESET_TIGHT, etc.)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_set_corner_preset(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    corner: u32,
+    preset_id: u32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let idx = instrument as usize;
+    let corner_idx = corner as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return;
+    }
+    if corner_idx >= 4 {
+        return;
+    }
+
+    engine.blend_corner_presets[idx][corner_idx] = preset_id;
+
+    match instrument {
+        INSTRUMENT_KICK => {
+            if let Some(config) = GooeyEngine::kick_preset_by_id(preset_id) {
+                match corner {
+                    BLEND_CORNER_BOTTOM_LEFT => engine.kick_blender.set_bottom_left(config),
+                    BLEND_CORNER_BOTTOM_RIGHT => engine.kick_blender.set_bottom_right(config),
+                    BLEND_CORNER_TOP_LEFT => engine.kick_blender.set_top_left(config),
+                    BLEND_CORNER_TOP_RIGHT => engine.kick_blender.set_top_right(config),
+                    _ => {}
+                }
+            }
+        }
+        // Future: other instruments when they implement Blendable
+        _ => {}
+    }
+}
+
+/// Get the preset ID at a corner
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+/// * `corner` - Corner position (BLEND_CORNER_BOTTOM_LEFT, etc.)
+///
+/// # Returns
+/// Preset ID, or 0xFFFFFFFF if invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_get_corner_preset(
+    engine: *const GooeyEngine,
+    instrument: u32,
+    corner: u32,
+) -> u32 {
+    if engine.is_null() {
+        return 0xFFFFFFFF;
+    }
+    let engine = &*engine;
+    let idx = instrument as usize;
+    let corner_idx = corner as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return 0xFFFFFFFF;
+    }
+    if corner_idx >= 4 {
+        return 0xFFFFFFFF;
+    }
+
+    engine.blend_corner_presets[idx][corner_idx]
+}
+
+/// Reset blend corners to default presets
+///
+/// Restores the default corner configuration for an instrument.
+/// For kick: BL=Tight, BR=Punch, TL=Loose, TR=Dirt
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_reset_corners(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let idx = instrument as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return;
+    }
+
+    match instrument {
+        INSTRUMENT_KICK => {
+            engine.kick_blender = PresetBlender::new(
+                KickConfig::tight(),
+                KickConfig::punch(),
+                KickConfig::loose(),
+                KickConfig::dirt(),
+            );
+            engine.blend_corner_presets[idx] =
+                [KICK_PRESET_TIGHT, KICK_PRESET_PUNCH, KICK_PRESET_LOOSE, KICK_PRESET_DIRT];
+        }
+        // Future: other instruments when they implement Blendable
+        _ => {}
+    }
 }
