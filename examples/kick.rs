@@ -11,7 +11,7 @@ use crossterm::{
 };
 use std::io::{self, Write};
 
-use gooey::engine::{Engine, EngineOutput, Instrument, Modulatable};
+use gooey::engine::{Engine, EngineOutput, Instrument};
 use gooey::instruments::{KickConfig, KickDrum};
 use std::sync::{Arc, Mutex};
 
@@ -62,7 +62,7 @@ impl Instrument for SharedKick {
         self.0.lock().unwrap().is_active()
     }
 
-    fn as_modulatable(&mut self) -> Option<&mut dyn Modulatable> {
+    fn as_modulatable(&mut self) -> Option<&mut dyn gooey::engine::Modulatable> {
         None // We control params directly, not through modulation
     }
 }
@@ -129,13 +129,14 @@ fn make_bar(normalized: f32, width: usize) -> String {
 }
 
 // Render the parameter display
-fn render_display(kick: &KickDrum, selected: usize, trigger_count: u32, velocity: f32) {
-    // Clear screen, move cursor to home, and use alternate screen buffer
-    print!("\x1b[2J\x1b[H\x1b[?7l"); // Also disable line wrapping
+fn render_display(kick: &KickDrum, selected: usize, trigger_count: u32, velocity: f32, preset_name: &str) {
+    // Clear screen, move cursor to home, and disable line wrapping
+    print!("\x1b[2J\x1b[H\x1b[?7l");
 
     print!("=== Kick Drum Lab ===\r\n");
     print!("SPACE=hit Q=quit ↑↓=sel ←→=adj []=fine\r\n");
     print!("Z/X/C/V=vel 25/50/75/100% +/-=adj 1-4=preset\r\n");
+    print!("Preset: {}\r\n", preset_name);
     print!("\r\n");
 
     for (i, info) in PARAM_INFO.iter().enumerate() {
@@ -146,7 +147,7 @@ fn render_display(kick: &KickDrum, selected: usize, trigger_count: u32, velocity
 
         let indicator = if i == selected { ">" } else { " " };
         print!(
-            "{} {:<14} [{}] {:>6.2}{:<3}\r\n",
+            "{} {:<18} [{}] {:>6.2}{:<3}\r\n",
             indicator, info.name, bar, value, info.unit
         );
     }
@@ -263,6 +264,7 @@ fn main() -> anyhow::Result<()> {
     let mut selected_param: usize = 0;
     let mut trigger_count: u32 = 0;
     let mut current_velocity: f32 = 0.75;
+    let mut current_preset = "Default";
     let mut needs_redraw = true;
 
     // Clear screen and enable raw mode
@@ -280,7 +282,7 @@ fn main() -> anyhow::Result<()> {
         // Render display if needed
         if needs_redraw {
             let k = kick.lock().unwrap();
-            render_display(&k, selected_param, trigger_count, current_velocity);
+            render_display(&k, selected_param, trigger_count, current_velocity, current_preset);
             needs_redraw = false;
         }
 
@@ -319,12 +321,14 @@ fn main() -> anyhow::Result<()> {
                         let step = PARAM_INFO[selected_param].coarse_step;
                         let mut k = kick.lock().unwrap();
                         adjust_param(&mut k, selected_param, -step);
+                        current_preset = "Custom";
                         needs_redraw = true;
                     }
                     KeyCode::Right => {
                         let step = PARAM_INFO[selected_param].coarse_step;
                         let mut k = kick.lock().unwrap();
                         adjust_param(&mut k, selected_param, step);
+                        current_preset = "Custom";
                         needs_redraw = true;
                     }
 
@@ -333,12 +337,14 @@ fn main() -> anyhow::Result<()> {
                         let step = PARAM_INFO[selected_param].fine_step;
                         let mut k = kick.lock().unwrap();
                         adjust_param(&mut k, selected_param, -step);
+                        current_preset = "Custom";
                         needs_redraw = true;
                     }
                     KeyCode::Char(']') => {
                         let step = PARAM_INFO[selected_param].fine_step;
                         let mut k = kick.lock().unwrap();
                         adjust_param(&mut k, selected_param, step);
+                        current_preset = "Custom";
                         needs_redraw = true;
                     }
 
@@ -346,21 +352,25 @@ fn main() -> anyhow::Result<()> {
                     KeyCode::Char('1') => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::default());
+                        current_preset = "Default";
                         needs_redraw = true;
                     }
                     KeyCode::Char('2') => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::punchy());
+                        current_preset = "Punchy";
                         needs_redraw = true;
                     }
                     KeyCode::Char('3') => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::deep());
+                        current_preset = "Deep";
                         needs_redraw = true;
                     }
                     KeyCode::Char('4') => {
                         let mut k = kick.lock().unwrap();
                         k.set_config(KickConfig::tight());
+                        current_preset = "Tight";
                         needs_redraw = true;
                     }
 
