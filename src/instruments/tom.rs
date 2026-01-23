@@ -31,9 +31,10 @@ pub(crate) mod ranges {
     pub const DECAY_MIN: f32 = 0.03;
     pub const DECAY_MAX: f32 = 0.8;
 
-    // Decay curve: 0.1-10.0 exponential
-    pub const DECAY_CURVE_MIN: f32 = 0.1;
-    pub const DECAY_CURVE_MAX: f32 = 10.0;
+    // Decay curve: 0.2-1.5 exponential
+    // < 1.0 = punchy (fast initial decay), > 1.0 = soft (slow initial decay)
+    pub const DECAY_CURVE_MIN: f32 = 0.2;
+    pub const DECAY_CURVE_MAX: f32 = 1.5;
 
     /// Denormalize a 0-1 value to a range
     #[inline]
