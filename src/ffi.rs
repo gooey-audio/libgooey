@@ -6,8 +6,8 @@
 use crate::effects::{BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect, TubeSaturation};
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer};
-use crate::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
-use crate::utils::SmoothedParam;
+use crate::instruments::{HiHat, KickConfig, KickDrum, SnareDrum, TomDrum};
+use crate::utils::{PresetBlender, SmoothedParam};
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -109,6 +109,14 @@ pub struct GooeyEngine {
 
     // Smoothed gain multipliers for click-free mute/solo transitions
     instrument_gains: [SmoothedParam; NUM_INSTRUMENTS],
+
+    // Per-instrument preset blend state (2D X/Y pad interpolation)
+    // Only kick is implemented initially; other instruments will be added as they implement Blendable
+    kick_blender: PresetBlender<KickConfig>,
+    blend_enabled: [bool; INSTRUMENT_COUNT as usize],
+    blend_x: [f32; INSTRUMENT_COUNT as usize],
+    blend_y: [f32; INSTRUMENT_COUNT as usize],
+    blend_corner_presets: [[u32; 4]; INSTRUMENT_COUNT as usize],
 }
 
 impl GooeyEngine {
@@ -142,6 +150,16 @@ impl GooeyEngine {
         // Create LFO pool (8 LFOs, all disabled by default with quarter note timing)
         let lfos = std::array::from_fn(|_| Lfo::with_sample_rate(sample_rate));
         let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] = std::array::from_fn(|_| Vec::new());
+
+        // Create kick preset blender with default corner presets
+        // BL(0,0)=Tight, BR(1,0)=Punch, TL(0,1)=Loose, TR(1,1)=Dirt
+        let kick_blender = PresetBlender::new(
+            KickConfig::tight(),
+            KickConfig::punch(),
+            KickConfig::loose(),
+            KickConfig::dirt(),
+        );
+
         Self {
             kick,
             snare,
@@ -179,6 +197,17 @@ impl GooeyEngine {
             instrument_soloed: std::array::from_fn(|_| AtomicBool::new(false)),
             // Smoothed gains for click-free mute/solo transitions (10ms smoothing)
             instrument_gains: std::array::from_fn(|_| SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0)),
+            // Preset blend state
+            kick_blender,
+            blend_enabled: [false; INSTRUMENT_COUNT as usize],
+            blend_x: [0.5; INSTRUMENT_COUNT as usize],
+            blend_y: [0.5; INSTRUMENT_COUNT as usize],
+            blend_corner_presets: [
+                [KICK_PRESET_TIGHT, KICK_PRESET_PUNCH, KICK_PRESET_LOOSE, KICK_PRESET_DIRT],
+                [0, 1, 2, 3], // Snare: placeholder
+                [0, 1, 2, 3], // HiHat: placeholder
+                [0, 1, 2, 3], // Tom: placeholder
+            ],
         }
     }
 
@@ -304,9 +333,8 @@ impl GooeyEngine {
                 KICK_PARAM_PUNCH => self.kick.params.punch.set_bipolar(value),
                 KICK_PARAM_SUB => self.kick.params.sub.set_bipolar(value),
                 KICK_PARAM_CLICK => self.kick.params.click.set_bipolar(value),
-                KICK_PARAM_SNAP => self.kick.params.snap.set_bipolar(value),
-                KICK_PARAM_DECAY => self.kick.params.decay.set_bipolar(value),
-                KICK_PARAM_PITCH_ENVELOPE => self.kick.params.pitch_envelope.set_bipolar(value),
+                KICK_PARAM_DECAY => self.kick.params.oscillator_decay.set_bipolar(value),
+                KICK_PARAM_PITCH_ENVELOPE => self.kick.params.pitch_envelope_amount.set_bipolar(value),
                 KICK_PARAM_VOLUME => self.kick.params.volume.set_bipolar(value),
                 _ => {}
             },
@@ -318,6 +346,17 @@ impl GooeyEngine {
                 SNARE_PARAM_TONAL => self.snare.params.tonal.set_bipolar(value),
                 SNARE_PARAM_NOISE => self.snare.params.noise.set_bipolar(value),
                 SNARE_PARAM_PITCH_DROP => self.snare.params.pitch_drop.set_bipolar(value),
+                SNARE_PARAM_TONAL_DECAY => self.snare.params.tonal_decay.set_bipolar(value),
+                SNARE_PARAM_NOISE_DECAY => self.snare.params.noise_decay.set_bipolar(value),
+                SNARE_PARAM_NOISE_TAIL_DECAY => self.snare.params.noise_tail_decay.set_bipolar(value),
+                SNARE_PARAM_FILTER_CUTOFF => self.snare.params.filter_cutoff.set_bipolar(value),
+                SNARE_PARAM_FILTER_RESONANCE => self.snare.params.filter_resonance.set_bipolar(value),
+                SNARE_PARAM_XFADE => self.snare.params.xfade.set_bipolar(value),
+                SNARE_PARAM_PHASE_MOD_AMOUNT => self.snare.params.phase_mod_amount.set_bipolar(value),
+                SNARE_PARAM_OVERDRIVE => self.snare.params.overdrive.set_bipolar(value),
+                SNARE_PARAM_AMP_DECAY => self.snare.params.amp_decay.set_bipolar(value),
+                SNARE_PARAM_AMP_DECAY_CURVE => self.snare.params.amp_decay_curve.set_bipolar(value),
+                SNARE_PARAM_TONAL_DECAY_CURVE => self.snare.params.tonal_decay_curve.set_bipolar(value),
                 _ => {}
             },
             INSTRUMENT_HIHAT => match param {
@@ -361,6 +400,17 @@ impl GooeyEngine {
 
         // Not muted, not affected by solo: full volume
         1.0
+    }
+
+    /// Get a KickConfig preset by ID
+    fn kick_preset_by_id(id: u32) -> Option<KickConfig> {
+        match id {
+            KICK_PRESET_TIGHT => Some(KickConfig::tight()),
+            KICK_PRESET_PUNCH => Some(KickConfig::punch()),
+            KICK_PRESET_LOOSE => Some(KickConfig::loose()),
+            KICK_PRESET_DIRT => Some(KickConfig::dirt()),
+            _ => None,
+        }
     }
 }
 
@@ -420,14 +470,12 @@ pub const KICK_PARAM_PUNCH: u32 = 1;
 pub const KICK_PARAM_SUB: u32 = 2;
 /// Kick parameter: click/transient amount (0-1)
 pub const KICK_PARAM_CLICK: u32 = 3;
-/// Kick parameter: FM snap/zap transient amount (0-1)
-pub const KICK_PARAM_SNAP: u32 = 4;
 /// Kick parameter: decay time (0.01-5.0 seconds)
-pub const KICK_PARAM_DECAY: u32 = 5;
+pub const KICK_PARAM_DECAY: u32 = 4;
 /// Kick parameter: pitch envelope amount (0-1)
-pub const KICK_PARAM_PITCH_ENVELOPE: u32 = 6;
+pub const KICK_PARAM_PITCH_ENVELOPE: u32 = 5;
 /// Kick parameter: overall volume (0-1)
-pub const KICK_PARAM_VOLUME: u32 = 7;
+pub const KICK_PARAM_VOLUME: u32 = 6;
 
 // =============================================================================
 // Hi-hat parameter indices (must match Swift HiHatParam enum)
@@ -446,9 +494,9 @@ pub const HIHAT_PARAM_VOLUME: u32 = 3;
 // Snare drum parameter indices (must match Swift SnareParam enum)
 // =============================================================================
 
-/// Snare parameter: base frequency (100-600 Hz)
+/// Snare parameter: base frequency (0-1 → 100-600 Hz)
 pub const SNARE_PARAM_FREQUENCY: u32 = 0;
-/// Snare parameter: decay time (0.01-2.0 seconds)
+/// Snare parameter: decay time (0-1 → 0.05-3.5 seconds)
 pub const SNARE_PARAM_DECAY: u32 = 1;
 /// Snare parameter: brightness/snap amount (0-1)
 pub const SNARE_PARAM_BRIGHTNESS: u32 = 2;
@@ -460,6 +508,30 @@ pub const SNARE_PARAM_TONAL: u32 = 4;
 pub const SNARE_PARAM_NOISE: u32 = 5;
 /// Snare parameter: pitch drop amount (0-1)
 pub const SNARE_PARAM_PITCH_DROP: u32 = 6;
+/// Snare parameter: tonal decay (0-1 → 0-3.5s)
+pub const SNARE_PARAM_TONAL_DECAY: u32 = 7;
+/// Snare parameter: noise decay (0-1 → 0-3.5s)
+pub const SNARE_PARAM_NOISE_DECAY: u32 = 8;
+/// Snare parameter: noise tail decay (0-1 → 0-3.5s)
+pub const SNARE_PARAM_NOISE_TAIL_DECAY: u32 = 9;
+/// Snare parameter: filter cutoff (0-1 → 100-10000 Hz)
+pub const SNARE_PARAM_FILTER_CUTOFF: u32 = 10;
+/// Snare parameter: filter resonance (0-1 → 0.5-10.0)
+pub const SNARE_PARAM_FILTER_RESONANCE: u32 = 11;
+/// Snare parameter: filter type (0=LP, 1=BP, 2=HP, 3=notch)
+pub const SNARE_PARAM_FILTER_TYPE: u32 = 12;
+/// Snare parameter: tonal/noise crossfade (0-1)
+pub const SNARE_PARAM_XFADE: u32 = 13;
+/// Snare parameter: phase modulation amount (0-1, 0 = disabled)
+pub const SNARE_PARAM_PHASE_MOD_AMOUNT: u32 = 14;
+/// Snare parameter: overdrive/saturation (0-1, 0 = bypass)
+pub const SNARE_PARAM_OVERDRIVE: u32 = 15;
+/// Snare parameter: master amplitude decay (0-1 → 0-4.0s)
+pub const SNARE_PARAM_AMP_DECAY: u32 = 16;
+/// Snare parameter: amplitude decay curve (0-1 → 0.1-10.0)
+pub const SNARE_PARAM_AMP_DECAY_CURVE: u32 = 17;
+/// Snare parameter: tonal decay curve (0-1 → 0.1-10.0)
+pub const SNARE_PARAM_TONAL_DECAY_CURVE: u32 = 18;
 
 // =============================================================================
 // Tom drum parameter indices (must match Swift TomParam enum)
@@ -494,6 +566,28 @@ pub const INSTRUMENT_TOM: u32 = 3;
 pub const INSTRUMENT_COUNT: u32 = 4;
 /// Internal usize version for array indexing
 const NUM_INSTRUMENTS: usize = INSTRUMENT_COUNT as usize;
+
+// =============================================================================
+// Preset blend constants
+// =============================================================================
+
+/// Kick preset: Tight - short, punchy kick with strong pitch envelope
+pub const KICK_PRESET_TIGHT: u32 = 0;
+/// Kick preset: Punch - mid-focused with click and resonant noise
+pub const KICK_PRESET_PUNCH: u32 = 1;
+/// Kick preset: Loose - longer decay, more punch, subtle pitch envelope
+pub const KICK_PRESET_LOOSE: u32 = 2;
+/// Kick preset: Dirt - higher frequency, more noise with high resonance
+pub const KICK_PRESET_DIRT: u32 = 3;
+
+/// Blend corner: bottom-left (x=0, y=0)
+pub const BLEND_CORNER_BOTTOM_LEFT: u32 = 0;
+/// Blend corner: bottom-right (x=1, y=0)
+pub const BLEND_CORNER_BOTTOM_RIGHT: u32 = 1;
+/// Blend corner: top-left (x=0, y=1)
+pub const BLEND_CORNER_TOP_LEFT: u32 = 2;
+/// Blend corner: top-right (x=1, y=1)
+pub const BLEND_CORNER_TOP_RIGHT: u32 = 3;
 
 // =============================================================================
 // Engine lifecycle
@@ -661,10 +755,9 @@ pub unsafe extern "C" fn gooey_engine_trigger_kick(engine: *mut GooeyEngine) {
 /// - 1 (PUNCH): 0-1
 /// - 2 (SUB): 0-1
 /// - 3 (CLICK): 0-1
-/// - 4 (SNAP): 0-1
-/// - 5 (DECAY): 0.01-5.0 seconds
-/// - 6 (PITCH_ENVELOPE): 0-1
-/// - 7 (VOLUME): 0-1
+/// - 4 (DECAY): 0.01-5.0 seconds
+/// - 5 (PITCH_ENVELOPE): 0-1
+/// - 6 (VOLUME): 0-1
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -686,9 +779,8 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
         KICK_PARAM_PUNCH => engine.kick.set_punch(value),
         KICK_PARAM_SUB => engine.kick.set_sub(value),
         KICK_PARAM_CLICK => engine.kick.set_click(value),
-        KICK_PARAM_SNAP => engine.kick.set_snap(value),
-        KICK_PARAM_DECAY => engine.kick.set_decay(value),
-        KICK_PARAM_PITCH_ENVELOPE => engine.kick.set_pitch_envelope(value),
+        KICK_PARAM_DECAY => engine.kick.set_oscillator_decay(value),
+        KICK_PARAM_PITCH_ENVELOPE => engine.kick.set_pitch_envelope_amount(value),
         KICK_PARAM_VOLUME => engine.kick.set_volume(value),
         _ => {} // Unknown parameter, ignore
     }
@@ -738,17 +830,32 @@ pub unsafe extern "C" fn gooey_engine_set_hihat_param(
 /// Set a snare drum parameter
 ///
 /// All parameters are automatically smoothed to prevent clicks/pops.
+/// All parameters use normalized 0-1 range.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
 /// * `param` - Parameter index (see SNARE_PARAM_* constants)
-/// * `value` - Parameter value (range depends on parameter)
+/// * `value` - Parameter value (0-1 normalized)
 ///
-/// # Parameter indices and ranges
-/// - 0 (FREQUENCY): 100-600 Hz - base pitch
-/// - 1 (DECAY): 0.01-2.0 seconds - shortness/length
-/// - 2 (BRIGHTNESS): 0-1 - snap/crack tone amount
-/// - 3 (VOLUME): 0-1 - output level
+/// # Parameter indices and ranges (all 0-1 normalized)
+/// - 0 (FREQUENCY): 0-1 → 100-600 Hz
+/// - 1 (DECAY): 0-1 → 0.05-3.5 seconds
+/// - 2 (BRIGHTNESS): 0-1
+/// - 3 (VOLUME): 0-1
+/// - 4 (TONAL): 0-1
+/// - 5 (NOISE): 0-1
+/// - 6 (PITCH_DROP): 0-1
+/// - 7 (TONAL_DECAY): 0-1 → 0-3.5s
+/// - 8 (NOISE_DECAY): 0-1 → 0-3.5s
+/// - 9 (NOISE_TAIL_DECAY): 0-1 → 0-3.5s
+/// - 10 (FILTER_CUTOFF): 0-1 → 100-10000 Hz
+/// - 11 (FILTER_RESONANCE): 0-1 → 0.5-10.0
+/// - 12 (FILTER_TYPE): 0-3 (LP/BP/HP/notch)
+/// - 13 (XFADE): 0-1
+/// - 14 (PHASE_MOD_AMOUNT): 0-1
+/// - 15 (OVERDRIVE): 0-1
+/// - 16 (AMP_DECAY): 0-1 → 0-4.0s
+/// - 17 (AMP_DECAY_CURVE): 0-1 → 0.1-10.0
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -765,11 +872,27 @@ pub unsafe extern "C" fn gooey_engine_set_snare_param(
     let engine = &mut *engine;
 
     // SnareDrum's setters now handle smoothing internally
+    // All parameters use normalized 0-1 range
     match param {
         SNARE_PARAM_FREQUENCY => engine.snare.set_frequency(value),
         SNARE_PARAM_DECAY => engine.snare.set_decay(value),
         SNARE_PARAM_BRIGHTNESS => engine.snare.set_brightness(value),
         SNARE_PARAM_VOLUME => engine.snare.set_volume(value),
+        SNARE_PARAM_TONAL => engine.snare.set_tonal(value),
+        SNARE_PARAM_NOISE => engine.snare.set_noise(value),
+        SNARE_PARAM_PITCH_DROP => engine.snare.set_pitch_drop(value),
+        SNARE_PARAM_TONAL_DECAY => engine.snare.set_tonal_decay(value),
+        SNARE_PARAM_NOISE_DECAY => engine.snare.set_noise_decay(value),
+        SNARE_PARAM_NOISE_TAIL_DECAY => engine.snare.set_noise_tail_decay(value),
+        SNARE_PARAM_FILTER_CUTOFF => engine.snare.set_filter_cutoff(value),
+        SNARE_PARAM_FILTER_RESONANCE => engine.snare.set_filter_resonance(value),
+        SNARE_PARAM_FILTER_TYPE => engine.snare.set_filter_type(value as u8),
+        SNARE_PARAM_XFADE => engine.snare.set_xfade(value),
+        SNARE_PARAM_PHASE_MOD_AMOUNT => engine.snare.set_phase_mod_amount(value),
+        SNARE_PARAM_OVERDRIVE => engine.snare.set_overdrive(value),
+        SNARE_PARAM_AMP_DECAY => engine.snare.set_amp_decay(value),
+        SNARE_PARAM_AMP_DECAY_CURVE => engine.snare.set_amp_decay_curve(value),
+        SNARE_PARAM_TONAL_DECAY_CURVE => engine.snare.set_tonal_decay_curve(value),
         _ => {} // Unknown parameter, ignore
     }
 }
@@ -1813,7 +1936,10 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_phase(
 /// Get the number of snare parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_snare_param_count() -> u32 {
-    7 // frequency, decay, brightness, volume, tonal, noise, pitch_drop
+    19 // frequency, decay, brightness, volume, tonal, noise, pitch_drop,
+       // tonal_decay, noise_decay, noise_tail_decay, filter_cutoff, filter_resonance,
+       // filter_type, xfade, phase_mod_amount, overdrive, amp_decay, amp_decay_curve,
+       // tonal_decay_curve
 }
 
 /// Get the number of tom parameters
@@ -1917,4 +2043,332 @@ pub unsafe extern "C" fn gooey_engine_get_instrument_solo(
         return false;
     }
     (*engine).instrument_soloed[instrument as usize].load(Ordering::Acquire)
+}
+
+// =============================================================================
+// Preset blend (2D X/Y pad interpolation)
+// =============================================================================
+
+/// Enable preset blend mode for an instrument
+///
+/// When enabled, use `gooey_engine_blend_set_position` to blend between
+/// the 4 corner presets using X/Y coordinates.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_enable(engine: *mut GooeyEngine, instrument: u32) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let idx = instrument as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return;
+    }
+
+    engine.blend_enabled[idx] = true;
+}
+
+/// Disable preset blend mode for an instrument
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_disable(engine: *mut GooeyEngine, instrument: u32) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let idx = instrument as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return;
+    }
+
+    engine.blend_enabled[idx] = false;
+}
+
+/// Check if preset blend mode is enabled for an instrument
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+///
+/// # Returns
+/// `true` if blend mode is enabled, `false` otherwise
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_is_enabled(
+    engine: *const GooeyEngine,
+    instrument: u32,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    let engine = &*engine;
+    let idx = instrument as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return false;
+    }
+
+    engine.blend_enabled[idx]
+}
+
+/// Set the X/Y blend position for an instrument
+///
+/// Performs bilinear interpolation between the 4 corner presets
+/// and applies the blended config to the instrument with smoothing.
+///
+/// Coordinate space:
+/// ```text
+///        Y=1
+///    TL ---- TR
+///     |      |
+///     |      |
+///    BL ---- BR
+///        Y=0
+///   X=0      X=1
+/// ```
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+/// * `x` - Horizontal position (0.0 = left, 1.0 = right)
+/// * `y` - Vertical position (0.0 = bottom, 1.0 = top)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_set_position(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    x: f32,
+    y: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let idx = instrument as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return;
+    }
+    if !engine.blend_enabled[idx] {
+        return;
+    }
+
+    engine.blend_x[idx] = x.clamp(0.0, 1.0);
+    engine.blend_y[idx] = y.clamp(0.0, 1.0);
+
+    match instrument {
+        INSTRUMENT_KICK => {
+            let blended = engine.kick_blender.blend(engine.blend_x[idx], engine.blend_y[idx]);
+            engine.kick.set_config(blended);
+        }
+        // Future: INSTRUMENT_SNARE, INSTRUMENT_HIHAT, INSTRUMENT_TOM
+        // when they implement Blendable
+        _ => {}
+    }
+}
+
+/// Get the current X blend position for an instrument
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+///
+/// # Returns
+/// X position (0.0-1.0), or -1.0 if invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_get_position_x(
+    engine: *const GooeyEngine,
+    instrument: u32,
+) -> f32 {
+    if engine.is_null() {
+        return -1.0;
+    }
+    let engine = &*engine;
+    let idx = instrument as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return -1.0;
+    }
+
+    engine.blend_x[idx]
+}
+
+/// Get the current Y blend position for an instrument
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+///
+/// # Returns
+/// Y position (0.0-1.0), or -1.0 if invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_get_position_y(
+    engine: *const GooeyEngine,
+    instrument: u32,
+) -> f32 {
+    if engine.is_null() {
+        return -1.0;
+    }
+    let engine = &*engine;
+    let idx = instrument as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return -1.0;
+    }
+
+    engine.blend_y[idx]
+}
+
+/// Set a corner preset by preset ID
+///
+/// Allows customizing which preset is at each corner of the blend space.
+/// Changes take effect immediately on the next blend position update.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+/// * `corner` - Corner position (BLEND_CORNER_BOTTOM_LEFT, etc.)
+/// * `preset_id` - Preset ID (KICK_PRESET_TIGHT, etc.)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_set_corner_preset(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    corner: u32,
+    preset_id: u32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let idx = instrument as usize;
+    let corner_idx = corner as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return;
+    }
+    if corner_idx >= 4 {
+        return;
+    }
+
+    engine.blend_corner_presets[idx][corner_idx] = preset_id;
+
+    match instrument {
+        INSTRUMENT_KICK => {
+            if let Some(config) = GooeyEngine::kick_preset_by_id(preset_id) {
+                match corner {
+                    BLEND_CORNER_BOTTOM_LEFT => engine.kick_blender.set_bottom_left(config),
+                    BLEND_CORNER_BOTTOM_RIGHT => engine.kick_blender.set_bottom_right(config),
+                    BLEND_CORNER_TOP_LEFT => engine.kick_blender.set_top_left(config),
+                    BLEND_CORNER_TOP_RIGHT => engine.kick_blender.set_top_right(config),
+                    _ => {}
+                }
+            }
+        }
+        // Future: other instruments when they implement Blendable
+        _ => {}
+    }
+}
+
+/// Get the preset ID at a corner
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+/// * `corner` - Corner position (BLEND_CORNER_BOTTOM_LEFT, etc.)
+///
+/// # Returns
+/// Preset ID, or 0xFFFFFFFF if invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_get_corner_preset(
+    engine: *const GooeyEngine,
+    instrument: u32,
+    corner: u32,
+) -> u32 {
+    if engine.is_null() {
+        return 0xFFFFFFFF;
+    }
+    let engine = &*engine;
+    let idx = instrument as usize;
+    let corner_idx = corner as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return 0xFFFFFFFF;
+    }
+    if corner_idx >= 4 {
+        return 0xFFFFFFFF;
+    }
+
+    engine.blend_corner_presets[idx][corner_idx]
+}
+
+/// Reset blend corners to default presets
+///
+/// Restores the default corner configuration for an instrument.
+/// For kick: BL=Tight, BR=Punch, TL=Loose, TR=Dirt
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_blend_reset_corners(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let idx = instrument as usize;
+
+    if idx >= INSTRUMENT_COUNT as usize {
+        return;
+    }
+
+    match instrument {
+        INSTRUMENT_KICK => {
+            engine.kick_blender = PresetBlender::new(
+                KickConfig::tight(),
+                KickConfig::punch(),
+                KickConfig::loose(),
+                KickConfig::dirt(),
+            );
+            engine.blend_corner_presets[idx] =
+                [KICK_PRESET_TIGHT, KICK_PRESET_PUNCH, KICK_PRESET_LOOSE, KICK_PRESET_DIRT];
+        }
+        // Future: other instruments when they implement Blendable
+        _ => {}
+    }
 }

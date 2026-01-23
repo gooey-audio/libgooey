@@ -1,9 +1,39 @@
+/// Curve shape for envelope phases
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EnvelopeCurve {
+    /// Linear (default, maintains backward compatibility)
+    Linear,
+    /// Power curve: progress.powf(curvature)
+    /// < 1.0: Fast initial change, slow approach to target (punchy pitch drop)
+    /// > 1.0: Slow initial change, fast approach to target (softer)
+    Exponential(f32),
+}
+
+impl Default for EnvelopeCurve {
+    fn default() -> Self {
+        EnvelopeCurve::Linear
+    }
+}
+
+impl EnvelopeCurve {
+    /// Apply the curve to a linear progress value (0.0 to 1.0)
+    #[inline]
+    pub fn apply(&self, progress: f32) -> f32 {
+        match self {
+            EnvelopeCurve::Linear => progress,
+            EnvelopeCurve::Exponential(c) => progress.powf(c.clamp(0.1, 10.0)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ADSRConfig {
     pub attack_time: f32,   // seconds
     pub decay_time: f32,    // seconds
     pub sustain_level: f32, // 0.0 to 1.0
     pub release_time: f32,  // seconds
+    pub attack_curve: EnvelopeCurve, // Curve shape for attack phase
+    pub decay_curve: EnvelopeCurve,  // Curve shape for decay phase
 }
 
 impl ADSRConfig {
@@ -13,7 +43,21 @@ impl ADSRConfig {
             decay_time: decay.max(0.001),   // Minimum decay
             sustain_level: sustain.clamp(0.0, 1.0),
             release_time: release.max(0.001), // Minimum release
+            attack_curve: EnvelopeCurve::Linear, // Default to linear for backward compatibility
+            decay_curve: EnvelopeCurve::Linear,  // Default to linear for backward compatibility
         }
+    }
+
+    /// Builder method to set attack curve
+    pub fn with_attack_curve(mut self, curve: EnvelopeCurve) -> Self {
+        self.attack_curve = curve;
+        self
+    }
+
+    /// Builder method to set decay curve
+    pub fn with_decay_curve(mut self, curve: EnvelopeCurve) -> Self {
+        self.decay_curve = curve;
+        self
     }
 
     pub fn default() -> Self {
@@ -26,6 +70,8 @@ pub struct Envelope {
     pub decay_time: f32,    // seconds
     pub sustain_level: f32, // 0.0 to 1.0
     pub release_time: f32,  // seconds
+    pub attack_curve: EnvelopeCurve, // Curve shape for attack phase
+    pub decay_curve: EnvelopeCurve,  // Curve shape for decay phase
     pub current_time: f32,  // current time in the envelope
     pub is_active: bool,
     pub trigger_time: f32,               // when the envelope was triggered
@@ -44,6 +90,8 @@ impl Envelope {
             decay_time: config.decay_time,
             sustain_level: config.sustain_level,
             release_time: config.release_time,
+            attack_curve: config.attack_curve,
+            decay_curve: config.decay_curve,
             current_time: 0.0,
             is_active: false,
             trigger_time: 0.0,
@@ -56,6 +104,18 @@ impl Envelope {
         self.decay_time = config.decay_time;
         self.sustain_level = config.sustain_level;
         self.release_time = config.release_time;
+        self.attack_curve = config.attack_curve;
+        self.decay_curve = config.decay_curve;
+    }
+
+    /// Set attack curve directly
+    pub fn set_attack_curve(&mut self, curve: EnvelopeCurve) {
+        self.attack_curve = curve;
+    }
+
+    /// Set decay curve directly
+    pub fn set_decay_curve(&mut self, curve: EnvelopeCurve) {
+        self.decay_curve = curve;
     }
 
     /// Set attack time directly (more efficient than set_config for modulation)
@@ -105,13 +165,15 @@ impl Envelope {
             if release_elapsed < self.release_time {
                 // Calculate amplitude at release start
                 let release_amplitude = if elapsed < self.attack_time {
-                    // Released during attack
-                    elapsed / self.attack_time
+                    // Released during attack - apply attack curve
+                    let attack_progress = elapsed / self.attack_time;
+                    self.attack_curve.apply(attack_progress)
                 } else if elapsed < self.attack_time + self.decay_time {
                     // Released during decay
                     let decay_elapsed = elapsed - self.attack_time;
                     let decay_progress = decay_elapsed / self.decay_time;
-                    1.0 - (1.0 - self.sustain_level) * decay_progress
+                    let curved_progress = self.decay_curve.apply(decay_progress);
+                    1.0 - (1.0 - self.sustain_level) * curved_progress
                 } else {
                     // Released during sustain
                     self.sustain_level
@@ -128,13 +190,15 @@ impl Envelope {
         } else {
             // Normal ADSR without release triggered
             if elapsed < self.attack_time {
-                // Attack phase
-                elapsed / self.attack_time
+                // Attack phase - apply attack curve
+                let attack_progress = elapsed / self.attack_time;
+                self.attack_curve.apply(attack_progress)
             } else if elapsed < self.attack_time + self.decay_time {
                 // Decay phase
                 let decay_elapsed = elapsed - self.attack_time;
                 let decay_progress = decay_elapsed / self.decay_time;
-                1.0 - (1.0 - self.sustain_level) * decay_progress
+                let curved_progress = self.decay_curve.apply(decay_progress);
+                1.0 - (1.0 - self.sustain_level) * curved_progress
             } else {
                 // Sustain phase (holds until release is triggered)
                 // For drums with 0.0 sustain, automatically trigger release

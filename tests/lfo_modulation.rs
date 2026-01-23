@@ -16,8 +16,8 @@ fn test_kick_drum_modulation() {
     let lfo = Lfo::new_synced(MusicalDivision::OneBar, bpm, sample_rate);
     let lfo_idx = engine.add_lfo(lfo);
 
-    // Test all KickDrum parameters
-    let params = ["frequency", "punch", "sub", "click", "snap", "decay", "pitch_envelope"];
+    // Test all KickDrum parameters (using new normalized 0-1 parameter names)
+    let params = ["frequency", "punch", "sub", "click", "oscillator_decay", "pitch_envelope_amount"];
     for param in params {
         let result = engine.map_lfo_to_parameter(lfo_idx, "kick", param, 1.0);
         assert!(
@@ -164,7 +164,7 @@ fn test_multiple_lfos_on_same_instrument() {
 
     // Map different parameters to different LFOs
     let result1 = engine.map_lfo_to_parameter(lfo1_idx, "kick", "frequency", 1.0);
-    let result2 = engine.map_lfo_to_parameter(lfo2_idx, "kick", "pitch_envelope", 0.5);
+    let result2 = engine.map_lfo_to_parameter(lfo2_idx, "kick", "pitch_envelope_amount", 0.5);
 
     assert!(result1.is_ok(), "First LFO mapping should succeed");
     assert!(result2.is_ok(), "Second LFO mapping should succeed");

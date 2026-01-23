@@ -1,75 +1,63 @@
 //! Waveshaper distortion effect for velocity-responsive harmonic generation
 //!
-//! Provides asymmetric waveshaping with adjustable drive and mix for rich,
-//! complex harmonic content suitable for acoustic-like instrument response.
+//! Provides soft-clipping waveshaping similar to Max MSP's overdrive~ object,
+//! with adjustable drive and mix for saturation and warmth.
 
-/// Waveshaper distortion with configurable drive and asymmetry
+/// Waveshaper distortion with configurable drive
 ///
-/// Uses a combination of soft clipping (tanh) and polynomial waveshaping
-/// for rich harmonic content. Asymmetry adds even harmonics for warmth.
+/// Uses soft clipping (tanh) for smooth saturation similar to tube overdrive.
+/// Matches the behavior of Max MSP's overdrive~ object.
 pub struct Waveshaper {
-    /// Distortion amount (1.0-10.0)
+    /// Distortion amount (1.0-10.0, 1.0 = bypass)
     drive: f32,
     /// Dry/wet mix (0.0-1.0)
     mix: f32,
-    /// Positive bias for even harmonics (0.0-1.0)
-    asymmetry: f32,
 }
 
 impl Waveshaper {
     /// Create a new waveshaper with the given parameters
     ///
     /// # Arguments
-    /// * `drive` - Distortion amount (1.0-10.0, clamped)
+    /// * `drive` - Distortion amount (1.0-10.0, clamped, 1.0 = bypass)
     /// * `mix` - Dry/wet mix (0.0-1.0, clamped)
-    /// * `asymmetry` - Even harmonic bias (0.0-1.0, clamped)
-    pub fn new(drive: f32, mix: f32, asymmetry: f32) -> Self {
+    pub fn new(drive: f32, mix: f32) -> Self {
         Self {
             drive: drive.clamp(1.0, 10.0),
             mix: mix.clamp(0.0, 1.0),
-            asymmetry: asymmetry.clamp(0.0, 1.0),
         }
     }
 
-    /// Create a waveshaper with default settings (minimal distortion)
+    /// Create a waveshaper with default settings (bypass)
     pub fn default() -> Self {
-        Self::new(1.0, 0.0, 0.3)
+        Self::new(1.0, 0.0)
     }
 
     /// Process a single sample through the waveshaper
     ///
-    /// The waveshaping algorithm:
+    /// The waveshaping algorithm matches Max MSP's overdrive~:
     /// 1. Apply drive gain to input
-    /// 2. Add asymmetric bias for even harmonics
-    /// 3. Soft clip with tanh (smooth saturation)
-    /// 4. Add polynomial shaping for complex harmonics
-    /// 5. Remove DC offset from asymmetry
-    /// 6. Mix with dry signal
+    /// 2. Soft clip with tanh (smooth saturation to ±1)
+    /// 3. Mix with dry signal
     #[inline]
     pub fn process(&self, input: f32) -> f32 {
-        // Bypass if no effect
-        if self.mix <= 0.0001 {
+        // Bypass if no effect or drive is 1.0
+        if self.mix <= 0.0001 || self.drive <= 1.0 {
             return input;
         }
 
-        // Apply drive
-        let driven = input * self.drive;
+        // Apply drive gain and soft-clip using tanh
+        // tanh provides smooth saturation similar to tube/analog overdrive
+        let saturated = (input * self.drive).tanh();
 
-        // Asymmetric bias for even harmonics (adds warmth)
-        let biased = driven + self.asymmetry * 0.3 * driven.abs();
-
-        // Soft clip with tanh (smooth saturation)
-        let soft_clipped = biased.tanh();
-
-        // Add polynomial shaping for more complex harmonics
-        // f(x) = x - (x^3 / 3) gives a smooth S-curve
-        let poly_shaped = soft_clipped - (soft_clipped.powi(3) / 3.0);
-
-        // Remove DC offset introduced by asymmetry
-        let dc_blocked = poly_shaped - self.asymmetry * 0.1;
+        // Gain compensation: normalize output level to match drive=1.0
+        // Uses reference level (typical signal amplitude) to calculate
+        // how much quieter the output should be to maintain constant loudness
+        let reference = 0.5_f32;
+        let compensation = reference.tanh() / (reference * self.drive).tanh();
+        let compensated = saturated * compensation;
 
         // Mix dry/wet
-        input * (1.0 - self.mix) + dc_blocked * self.mix
+        input * (1.0 - self.mix) + compensated * self.mix
     }
 
     /// Set the drive amount (1.0-10.0)
@@ -91,16 +79,6 @@ impl Waveshaper {
     pub fn mix(&self) -> f32 {
         self.mix
     }
-
-    /// Set the asymmetry for even harmonics (0.0-1.0)
-    pub fn set_asymmetry(&mut self, asymmetry: f32) {
-        self.asymmetry = asymmetry.clamp(0.0, 1.0);
-    }
-
-    /// Get the current asymmetry amount
-    pub fn asymmetry(&self) -> f32 {
-        self.asymmetry
-    }
 }
 
 #[cfg(test)]
@@ -109,33 +87,59 @@ mod tests {
 
     #[test]
     fn test_bypass_when_mix_zero() {
-        let ws = Waveshaper::new(5.0, 0.0, 0.5);
+        let ws = Waveshaper::new(5.0, 0.0);
+        assert_eq!(ws.process(0.5), 0.5);
+        assert_eq!(ws.process(-0.3), -0.3);
+    }
+
+    #[test]
+    fn test_bypass_when_drive_one() {
+        let ws = Waveshaper::new(1.0, 1.0);
         assert_eq!(ws.process(0.5), 0.5);
         assert_eq!(ws.process(-0.3), -0.3);
     }
 
     #[test]
     fn test_soft_clipping() {
-        let ws = Waveshaper::new(10.0, 1.0, 0.0);
-        // High input should be soft-clipped below 1.0
+        let ws = Waveshaper::new(10.0, 1.0);
+        // High drive with gain compensation should produce gain-normalized output
+        // The compensation factor at drive=10 is approx tanh(0.5)/tanh(5.0) ≈ 0.46
         let output = ws.process(1.0);
-        assert!(output < 1.0);
-        assert!(output > 0.0);
+        assert!(output > 0.4 && output < 0.5); // Compensated output near 0.46
+
+        // Lower input should be proportionally less saturated
+        let output_low = ws.process(0.1);
+        assert!(output_low > 0.0);
+        assert!(output_low < output); // Lower input = lower output
+    }
+
+    #[test]
+    fn test_gain_compensation_consistency() {
+        // Test that output level stays relatively consistent across drive values
+        let input = 0.5_f32;
+        let ws_low = Waveshaper::new(2.0, 1.0);
+        let ws_high = Waveshaper::new(10.0, 1.0);
+
+        let output_low = ws_low.process(input);
+        let output_high = ws_high.process(input);
+
+        // With compensation, outputs should be similar (within 20% of each other)
+        let ratio = output_high / output_low;
+        assert!(ratio > 0.8 && ratio < 1.2, "Outputs differ too much: {output_low} vs {output_high}");
     }
 
     #[test]
     fn test_parameter_clamping() {
-        let ws = Waveshaper::new(100.0, 5.0, -1.0);
+        let ws = Waveshaper::new(100.0, 5.0);
         assert_eq!(ws.drive(), 10.0);
         assert_eq!(ws.mix(), 1.0);
-        assert_eq!(ws.asymmetry(), 0.0);
     }
 
     #[test]
     fn test_zero_input() {
-        let ws = Waveshaper::new(5.0, 1.0, 0.5);
+        let ws = Waveshaper::new(5.0, 1.0);
         let output = ws.process(0.0);
-        // Should be close to zero (small DC offset from asymmetry)
-        assert!(output.abs() < 0.1);
+        // Should be exactly zero with no asymmetry
+        assert_eq!(output, 0.0);
     }
 }
