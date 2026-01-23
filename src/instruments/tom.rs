@@ -27,9 +27,9 @@ pub(crate) mod ranges {
     pub const TONE_CUTOFF_MIN: f32 = 200.0;
     pub const TONE_CUTOFF_MAX: f32 = 8000.0;
 
-    // Decay: 0.05-3.0 seconds
-    pub const DECAY_MIN: f32 = 0.05;
-    pub const DECAY_MAX: f32 = 3.0;
+    // Decay: 0.03-0.8 seconds (toms are punchy, not sustained)
+    pub const DECAY_MIN: f32 = 0.03;
+    pub const DECAY_MAX: f32 = 0.8;
 
     // Decay curve: 0.1-10.0 exponential
     pub const DECAY_CURVE_MIN: f32 = 0.1;
@@ -144,16 +144,16 @@ impl TomConfig {
     }
 
     /// DS Tom preset - matches Max patch parameters
-    /// pitch: 57, color: 43, tone: 100, bend: 35%, decay: 23%
+    /// pitch: 57, color: 43, tone: 100, bend: 35%
     pub fn ds_tom() -> Self {
         Self::new(
             (57.0 - ranges::PITCH_MIN) / (ranges::PITCH_MAX - ranges::PITCH_MIN), // MIDI 57
-            0.43,                                                                  // color 43%
-            1.0,                                                                   // tone 100%
-            0.35,                                                                  // bend 35%
-            0.23,                                                                  // decay 23%
-            0.1,                                                                   // decay curve (linear-ish)
-            0.85,                                                                  // volume
+            0.43,  // color 43%
+            1.0,   // tone 100%
+            0.35,  // bend 35%
+            0.35,  // decay ~300ms
+            0.3,   // decay curve (punchy exponential)
+            0.85,  // volume
         )
     }
 
@@ -163,20 +163,20 @@ impl TomConfig {
             0.6,  // brighter
             0.7,
             0.4,
-            0.2,
-            0.1,
+            0.25, // decay ~220ms
+            0.35, // punchy curve
             0.85,
         )
     }
 
     pub fn mid_tom() -> Self {
         Self::new(
-            0.5, // ~MIDI 60
-            0.5, // neutral color
+            0.5,  // ~MIDI 60
+            0.5,  // neutral color
             0.5,
             0.3,
-            0.3,
-            0.1,
+            0.4,  // decay ~340ms
+            0.3,  // punchy curve
             0.85,
         )
     }
@@ -187,8 +187,8 @@ impl TomConfig {
             0.4,  // darker
             0.4,
             0.25,
-            0.4,
-            0.15,
+            0.55, // decay ~450ms
+            0.25, // slightly less punchy
             0.85,
         )
     }
@@ -199,8 +199,8 @@ impl TomConfig {
             0.35, // darker
             0.3,
             0.2,
-            0.5,
-            0.2,
+            0.7,  // decay ~570ms
+            0.2,  // rounder curve for floor tom
             0.9,
         )
     }
