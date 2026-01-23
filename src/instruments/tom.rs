@@ -19,6 +19,13 @@ const FILTER_GAINS: [f32; 13] = [
     1.0, 0.545, 0.380, 0.343, 0.375, 0.263, 0.316, 0.213, 0.160, 0.176, 0.226, 0.176, 0.093,
 ];
 
+/// Soft clipper using tanh - prevents hard clipping artifacts
+#[inline]
+fn soft_clip(x: f32) -> f32 {
+    // tanh naturally limits output to [-1, 1] with smooth saturation
+    x.tanh()
+}
+
 /// Parameter ranges for normalization
 pub(crate) mod ranges {
     // Pitch: MIDI note number 36-84 (C2-C6)
@@ -77,8 +84,12 @@ impl TomFilterBank {
             // Use bandpass mode (mode 1)
             output += self.filters[i].process_mode(input, 1) * self.current_gains[i];
         }
-        // Normalize output (13 filters summed)
-        output * 0.15
+        // Normalize output - reduced from 0.15 to account for resonant filter gain
+        // With Q values up to ~11, filters have significant gain at resonance
+        // Using 0.05 keeps worst-case peaks under 1.0
+        let normalized = output * 0.05;
+        // Soft clip as safety for any remaining peaks
+        soft_clip(normalized)
     }
 
     /// Reset all filter states
