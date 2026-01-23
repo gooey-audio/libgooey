@@ -95,8 +95,8 @@ fn test_tom_drum_modulation() {
     let lfo = Lfo::new_synced(MusicalDivision::OneBar, bpm, sample_rate);
     let lfo_idx = engine.add_lfo(lfo);
 
-    // Test all TomDrum parameters
-    let params = ["frequency", "tonal", "punch", "decay", "pitch_drop"];
+    // Test all TomDrum parameters (DS synthesis model)
+    let params = ["pitch", "color", "tone", "bend", "decay", "decay_curve", "volume"];
     for param in params {
         let result = engine.map_lfo_to_parameter(lfo_idx, "tom", param, 1.0);
         assert!(
