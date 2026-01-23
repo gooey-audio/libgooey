@@ -8,7 +8,9 @@ const FILTER_FREQUENCIES: [f32; 13] = [
     165.0, 228.0, 294.0, 320.0, 326.0, 356.0, 358.0, 419.0, 481.0, 549.0, 606.0, 724.0, 888.0,
 ];
 
-const FILTER_Q: [f32; 13] = [
+/// Max patch "Q" values are actually bandwidths in Hz, not resonance Q factors
+/// We store them here and convert to actual Q (frequency/bandwidth) at runtime
+const FILTER_BANDWIDTHS: [f32; 13] = [
     275.0, 220.0, 79.0, 65.0, 57.0, 86.0, 100.0, 58.0, 72.0, 86.0, 88.0, 87.0, 81.0,
 ];
 
@@ -53,8 +55,11 @@ struct TomFilterBank {
 impl TomFilterBank {
     fn new(sample_rate: f32) -> Self {
         // Initialize 13 SVF filters with preset data
+        // Convert Max bandwidth values to proper Q factors: Q = frequency / bandwidth
         let filters = core::array::from_fn(|i| {
-            StateVariableFilter::new(sample_rate, FILTER_FREQUENCIES[i], FILTER_Q[i])
+            let freq = FILTER_FREQUENCIES[i];
+            let q = freq / FILTER_BANDWIDTHS[i];
+            StateVariableFilter::new(sample_rate, freq, q)
         });
 
         Self {
