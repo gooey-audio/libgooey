@@ -367,11 +367,12 @@ impl GooeyEngine {
                 _ => {}
             },
             INSTRUMENT_TOM => match param {
-                TOM_PARAM_FREQUENCY => self.tom.params.frequency.set_bipolar(value),
-                TOM_PARAM_TONAL => self.tom.params.tonal.set_bipolar(value),
-                TOM_PARAM_PUNCH => self.tom.params.punch.set_bipolar(value),
+                TOM_PARAM_PITCH => self.tom.params.pitch.set_bipolar(value),
+                TOM_PARAM_COLOR => self.tom.params.color.set_bipolar(value),
+                TOM_PARAM_TONE => self.tom.params.tone.set_bipolar(value),
+                TOM_PARAM_BEND => self.tom.params.bend.set_bipolar(value),
                 TOM_PARAM_DECAY => self.tom.params.decay.set_bipolar(value),
-                TOM_PARAM_PITCH_DROP => self.tom.params.pitch_drop.set_bipolar(value),
+                TOM_PARAM_DECAY_CURVE => self.tom.params.decay_curve.set_bipolar(value),
                 TOM_PARAM_VOLUME => self.tom.params.volume.set_bipolar(value),
                 _ => {}
             },
@@ -537,18 +538,20 @@ pub const SNARE_PARAM_TONAL_DECAY_CURVE: u32 = 18;
 // Tom drum parameter indices (must match Swift TomParam enum)
 // =============================================================================
 
-/// Tom parameter: base frequency (80-300 Hz)
-pub const TOM_PARAM_FREQUENCY: u32 = 0;
-/// Tom parameter: tonal body amount (0-1)
-pub const TOM_PARAM_TONAL: u32 = 1;
-/// Tom parameter: punch/attack amount (0-1)
-pub const TOM_PARAM_PUNCH: u32 = 2;
-/// Tom parameter: decay time (0.1-1.5 seconds)
-pub const TOM_PARAM_DECAY: u32 = 3;
-/// Tom parameter: pitch drop amount (0-1)
-pub const TOM_PARAM_PITCH_DROP: u32 = 4;
+/// Tom parameter: pitch (0-1 → MIDI 36-84)
+pub const TOM_PARAM_PITCH: u32 = 0;
+/// Tom parameter: color (0-1, 0.5 neutral)
+pub const TOM_PARAM_COLOR: u32 = 1;
+/// Tom parameter: tone filter cutoff (0-1 → 200-8000 Hz)
+pub const TOM_PARAM_TONE: u32 = 2;
+/// Tom parameter: pitch bend envelope amount (0-1)
+pub const TOM_PARAM_BEND: u32 = 3;
+/// Tom parameter: decay time (0-1 → 0.05-3.0s)
+pub const TOM_PARAM_DECAY: u32 = 4;
+/// Tom parameter: decay curve shape (0-1 → 0.1-10.0)
+pub const TOM_PARAM_DECAY_CURVE: u32 = 5;
 /// Tom parameter: overall volume (0-1)
-pub const TOM_PARAM_VOLUME: u32 = 5;
+pub const TOM_PARAM_VOLUME: u32 = 6;
 
 // =============================================================================
 // Instrument IDs (must match Swift/C enum if used)
