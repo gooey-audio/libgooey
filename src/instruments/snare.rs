@@ -238,35 +238,66 @@ impl SnareConfig {
         ranges::denormalize(self.amp_decay_curve, ranges::AMP_DECAY_CURVE_MIN, ranges::AMP_DECAY_CURVE_MAX)
     }
 
-    pub fn default() -> Self {
+    /// Tight snare - short, punchy
+    pub fn tight() -> Self {
         // 200 Hz → (200-100)/(600-100) = 0.2
         // 0.15s decay → (0.15-0.05)/(3.5-0.05) ≈ 0.029
         Self::new(0.2, 0.4, 0.7, 0.5, 0.029, 0.3, 0.8)
     }
 
-    pub fn crispy() -> Self {
-        // 250 Hz → 0.3, 0.12s → 0.020
-        Self::new(0.3, 0.3, 0.8, 0.7, 0.020, 0.4, 0.85)
+    /// Loose snare - longer decay, more body
+    pub fn loose() -> Self {
+        Self::new_full(
+            0.16,  // frequency
+            0.80,  // tonal_amount
+            0.60,  // noise_amount
+            0.30,  // crack_amount (brightness)
+            0.79,  // decay
+            0.10,  // pitch_drop
+            0.90,  // volume
+            0.33,  // tonal_decay
+            0.20,  // tonal_decay_curve
+            0.23,  // noise_decay
+            0.34,  // noise_tail_decay
+            0.55,  // filter_cutoff
+            0.05,  // filter_resonance
+            1,     // filter_type: BP
+            0.50,  // xfade
+            0.00,  // phase_mod_amount
+            0.10,  // overdrive_amount
+            0.12,  // amp_decay
+            0.09,  // amp_decay_curve
+        )
     }
 
-    pub fn deep() -> Self {
-        // 180 Hz → 0.16, 0.2s → 0.043
-        Self::new(0.16, 0.6, 0.6, 0.3, 0.043, 0.2, 0.9)
+    /// Hiss snare - noise-focused with phase modulation
+    pub fn hiss() -> Self {
+        Self::new_full(
+            0.16,  // frequency
+            0.00,  // tonal_amount (no tonal)
+            0.60,  // noise_amount
+            0.30,  // crack_amount (brightness)
+            0.04,  // decay
+            0.40,  // pitch_drop
+            0.90,  // volume
+            0.53,  // tonal_decay
+            0.09,  // tonal_decay_curve
+            0.38,  // noise_decay
+            0.29,  // noise_tail_decay
+            0.29,  // filter_cutoff
+            0.45,  // filter_resonance
+            1,     // filter_type: BP
+            0.50,  // xfade
+            1.00,  // phase_mod_amount
+            0.20,  // overdrive_amount
+            0.18,  // amp_decay
+            0.09,  // amp_decay_curve
+        )
     }
 
-    pub fn tight() -> Self {
-        // 220 Hz → 0.24, 0.08s → 0.009
-        Self::new(0.24, 0.3, 0.8, 0.8, 0.009, 0.5, 0.8)
-    }
-
-    pub fn fat() -> Self {
-        // 160 Hz → 0.12, 0.25s → 0.058
-        Self::new(0.12, 0.7, 0.5, 0.4, 0.058, 0.1, 0.9)
-    }
-
-    /// DS Snare preset - Ableton Drum Synth style
+    /// Smack snare - Ableton Drum Synth style
     /// Features: phase modulation transient, SVF-filtered noise, tonal/noise crossfade
-    pub fn ds_snare() -> Self {
+    pub fn smack() -> Self {
         Self::new_full(
             0.2,    // frequency: 200 Hz
             0.3,    // tonal_amount
@@ -651,7 +682,7 @@ pub struct SnareDrum {
 
 impl SnareDrum {
     pub fn new(sample_rate: f32) -> Self {
-        let config = SnareConfig::default();
+        let config = SnareConfig::tight();
         Self::with_config(sample_rate, config)
     }
 
