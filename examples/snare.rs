@@ -13,6 +13,7 @@ use std::io::{self, Write};
 
 use gooey::engine::{Engine, EngineOutput, Instrument};
 use gooey::instruments::{SnareConfig, SnareDrum};
+use gooey::utils::PresetBlender;
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "midi")]
@@ -78,6 +79,30 @@ impl Instrument for SharedSnare {
 
     fn as_modulatable(&mut self) -> Option<&mut dyn gooey::engine::Modulatable> {
         None // We control params directly, not through modulation
+    }
+}
+
+// Blend mode state
+struct BlendState {
+    enabled: bool,
+    x: f32,
+    y: f32,
+    blender: PresetBlender<SnareConfig>,
+}
+
+impl BlendState {
+    fn new() -> Self {
+        Self {
+            enabled: false,
+            x: 0.5,
+            y: 0.5,
+            blender: PresetBlender::new(
+                SnareConfig::tight(),   // Bottom-left (0,0)
+                SnareConfig::loose(),   // Bottom-right (1,0)
+                SnareConfig::hiss(),    // Top-left (0,1)
+                SnareConfig::smack(),   // Top-right (1,1)
+            ),
+        }
     }
 }
 
@@ -180,14 +205,65 @@ fn get_filter_type_name(filter_type: u8) -> &'static str {
 }
 
 // Render the parameter display
-fn render_display(snare: &SnareDrum, selected: usize, trigger_count: u32, velocity: f32, preset_name: &str) {
+fn render_display(
+    snare: &SnareDrum,
+    selected: usize,
+    trigger_count: u32,
+    velocity: f32,
+    preset_name: &str,
+    blend: &BlendState,
+) {
     // Clear screen, move cursor to home, and disable line wrapping
     print!("\x1b[2J\x1b[H\x1b[?7l");
 
     print!("=== Snare Drum Lab ===\r\n");
-    print!("SPACE=hit Q=quit ↑↓=sel ←→=adj []=fine\r\n");
-    print!("Z/X/C/V=vel 25/50/75/100% +/-=adj 1-6=preset\r\n");
+    if blend.enabled {
+        print!("SPACE=hit Q=quit WASD=blend B=exit blend mode\r\n");
+        print!("Z/X/C/V=vel 25/50/75/100%\r\n");
+    } else {
+        print!("SPACE=hit Q=quit ↑↓=sel ←→=adj []=fine B=blend\r\n");
+        print!("Z/X/C/V=vel 25/50/75/100% +/-=adj 1-4=preset\r\n");
+    }
     print!("Preset: {}\r\n", preset_name);
+
+    // Show blend X/Y pad visualization when in blend mode
+    if blend.enabled {
+        print!("\r\n");
+        print!("  X/Y Blend Pad (WASD to move)\r\n");
+        print!("  ┌──────────────────────┐\r\n");
+
+        // Render 8x8 pad with cursor
+        let pad_w = 20;
+        let pad_h = 8;
+        let cursor_x = (blend.x * (pad_w - 1) as f32).round() as usize;
+        let cursor_y = ((1.0 - blend.y) * (pad_h - 1) as f32).round() as usize;
+
+        for row in 0..pad_h {
+            print!("  │");
+            for col in 0..pad_w {
+                if row == cursor_y && col == cursor_x {
+                    print!("●");
+                } else {
+                    // Show corner labels
+                    if row == 0 && col == 0 {
+                        print!("H"); // Hiss (top-left)
+                    } else if row == 0 && col == pad_w - 1 {
+                        print!("S"); // Smack (top-right)
+                    } else if row == pad_h - 1 && col == 0 {
+                        print!("T"); // Tight (bottom-left)
+                    } else if row == pad_h - 1 && col == pad_w - 1 {
+                        print!("L"); // Loose (bottom-right)
+                    } else {
+                        print!("·");
+                    }
+                }
+            }
+            print!("│\r\n");
+        }
+        print!("  └──────────────────────┘\r\n");
+        print!("  X: {:.2}  Y: {:.2}\r\n", blend.x, blend.y);
+    }
+
     print!("\r\n");
 
     for (i, info) in PARAM_INFO.iter().enumerate() {
@@ -323,8 +399,9 @@ fn main() -> anyhow::Result<()> {
     let mut selected_param: usize = 0;
     let mut trigger_count: u32 = 0;
     let mut current_velocity: f32 = 0.75;
-    let mut current_preset = "Default";
+    let mut current_preset = "Tight";
     let mut needs_redraw = true;
+    let mut blend = BlendState::new();
 
     // Clear screen and enable raw mode
     execute!(io::stdout(), Clear(ClearType::All), cursor::Hide)?;
@@ -341,7 +418,7 @@ fn main() -> anyhow::Result<()> {
         // Render display if needed
         if needs_redraw {
             let s = snare.lock().unwrap();
-            render_display(&s, selected_param, trigger_count, current_velocity, current_preset);
+            render_display(&s, selected_param, trigger_count, current_velocity, current_preset, &blend);
             needs_redraw = false;
         }
 
@@ -407,41 +484,76 @@ fn main() -> anyhow::Result<()> {
                         needs_redraw = true;
                     }
 
-                    // Presets
-                    KeyCode::Char('1') => {
-                        let mut s = snare.lock().unwrap();
-                        s.set_config(SnareConfig::default());
-                        current_preset = "Default";
-                        needs_redraw = true;
-                    }
-                    KeyCode::Char('2') => {
-                        let mut s = snare.lock().unwrap();
-                        s.set_config(SnareConfig::crispy());
-                        current_preset = "Crispy";
-                        needs_redraw = true;
-                    }
-                    KeyCode::Char('3') => {
-                        let mut s = snare.lock().unwrap();
-                        s.set_config(SnareConfig::deep());
-                        current_preset = "Deep";
-                        needs_redraw = true;
-                    }
-                    KeyCode::Char('4') => {
+                    // Presets (only when not in blend mode)
+                    KeyCode::Char('1') if !blend.enabled => {
                         let mut s = snare.lock().unwrap();
                         s.set_config(SnareConfig::tight());
                         current_preset = "Tight";
                         needs_redraw = true;
                     }
-                    KeyCode::Char('5') => {
+                    KeyCode::Char('2') if !blend.enabled => {
                         let mut s = snare.lock().unwrap();
-                        s.set_config(SnareConfig::fat());
-                        current_preset = "Fat";
+                        s.set_config(SnareConfig::loose());
+                        current_preset = "Loose";
                         needs_redraw = true;
                     }
-                    KeyCode::Char('6') => {
+                    KeyCode::Char('3') if !blend.enabled => {
                         let mut s = snare.lock().unwrap();
-                        s.set_config(SnareConfig::ds_snare());
-                        current_preset = "DS Snare";
+                        s.set_config(SnareConfig::hiss());
+                        current_preset = "Hiss";
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('4') if !blend.enabled => {
+                        let mut s = snare.lock().unwrap();
+                        s.set_config(SnareConfig::smack());
+                        current_preset = "Smack";
+                        needs_redraw = true;
+                    }
+
+                    // Toggle blend mode
+                    KeyCode::Char('b') | KeyCode::Char('B') => {
+                        blend.enabled = !blend.enabled;
+                        if blend.enabled {
+                            // Apply current blend position
+                            let blended = blend.blender.blend(blend.x, blend.y);
+                            let mut s = snare.lock().unwrap();
+                            s.set_config(blended);
+                            current_preset = "Blended";
+                        }
+                        needs_redraw = true;
+                    }
+
+                    // Blend mode navigation (WASD)
+                    KeyCode::Char('w') | KeyCode::Char('W') if blend.enabled => {
+                        blend.y = (blend.y + 0.05).min(1.0);
+                        let blended = blend.blender.blend(blend.x, blend.y);
+                        let mut s = snare.lock().unwrap();
+                        s.set_config(blended);
+                        current_preset = "Blended";
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('s') | KeyCode::Char('S') if blend.enabled => {
+                        blend.y = (blend.y - 0.05).max(0.0);
+                        let blended = blend.blender.blend(blend.x, blend.y);
+                        let mut s = snare.lock().unwrap();
+                        s.set_config(blended);
+                        current_preset = "Blended";
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') if blend.enabled => {
+                        blend.x = (blend.x - 0.05).max(0.0);
+                        let blended = blend.blender.blend(blend.x, blend.y);
+                        let mut s = snare.lock().unwrap();
+                        s.set_config(blended);
+                        current_preset = "Blended";
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') if blend.enabled => {
+                        blend.x = (blend.x + 0.05).min(1.0);
+                        let blended = blend.blender.blend(blend.x, blend.y);
+                        let mut s = snare.lock().unwrap();
+                        s.set_config(blended);
+                        current_preset = "Blended";
                         needs_redraw = true;
                     }
 
