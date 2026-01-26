@@ -23,15 +23,16 @@ struct ParamInfo {
     unit: &'static str,
 }
 
+// Parameters in alphabetical order for display
 const PARAM_INFO: [ParamInfo; 8] = [
-    ParamInfo { name: "frequency", coarse_step: 0.1, fine_step: 0.02, unit: "" },      // 0-1 → 60-300 Hz
-    ParamInfo { name: "decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },          // 0-1 → 0.05-2.0s
-    ParamInfo { name: "tonal", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "punch", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "pitch_drop", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "volume", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "amp_decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },      // 0-1 → 0.0-3.0s
+    ParamInfo { name: "amp_decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },      // 0-1 → 0.0-4.0s
     ParamInfo { name: "amp_dcy_crv", coarse_step: 0.1, fine_step: 0.02, unit: "" },    // 0-1 → 0.1-10.0
+    ParamInfo { name: "decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },          // 0-1 → 0.05-2.0s
+    ParamInfo { name: "frequency", coarse_step: 0.1, fine_step: 0.02, unit: "" },      // 0-1 → 60-300 Hz
+    ParamInfo { name: "pitch_drop", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo { name: "punch", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo { name: "tonal", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo { name: "volume", coarse_step: 0.1, fine_step: 0.02, unit: "" },
 ];
 
 // Wrapper to share TomDrum between audio thread and main thread
@@ -57,16 +58,17 @@ impl Instrument for SharedTom {
 
 // Helper functions for parameter access
 // All parameters use normalized 0-1 values
+// Indices match alphabetical PARAM_INFO order
 fn get_param_value(tom: &TomDrum, index: usize) -> f32 {
     match index {
-        0 => tom.params.frequency.get(),
-        1 => tom.params.decay.get(),
-        2 => tom.params.tonal.get(),
-        3 => tom.params.punch.get(),
+        0 => tom.params.amp_decay.get(),
+        1 => tom.params.amp_decay_curve.get(),
+        2 => tom.params.decay.get(),
+        3 => tom.params.frequency.get(),
         4 => tom.params.pitch_drop.get(),
-        5 => tom.params.volume.get(),
-        6 => tom.params.amp_decay.get(),
-        7 => tom.params.amp_decay_curve.get(),
+        5 => tom.params.punch.get(),
+        6 => tom.params.tonal.get(),
+        7 => tom.params.volume.get(),
         _ => 0.0,
     }
 }
@@ -78,14 +80,14 @@ fn get_param_range(_tom: &TomDrum, _index: usize) -> (f32, f32) {
 
 fn set_param_value(tom: &mut TomDrum, index: usize, value: f32) {
     match index {
-        0 => tom.set_frequency(value),
-        1 => tom.set_decay(value),
-        2 => tom.set_tonal(value),
-        3 => tom.set_punch(value),
+        0 => tom.set_amp_decay(value),
+        1 => tom.set_amp_decay_curve(value),
+        2 => tom.set_decay(value),
+        3 => tom.set_frequency(value),
         4 => tom.set_pitch_drop(value),
-        5 => tom.set_volume(value),
-        6 => tom.set_amp_decay(value),
-        7 => tom.set_amp_decay_curve(value),
+        5 => tom.set_punch(value),
+        6 => tom.set_tonal(value),
+        7 => tom.set_volume(value),
         _ => {}
     }
 }

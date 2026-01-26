@@ -1,64 +1,212 @@
-use crate::envelope::{ADSRConfig, Envelope};
+use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
 use crate::gen::oscillator::Oscillator;
 use crate::gen::waveform::Waveform;
 use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
+/// Normalization ranges for hi-hat parameters
+/// All external-facing parameters use 0.0-1.0 normalized values
+pub(crate) mod ranges {
+    /// Frequency: 0-1 maps to 4000-16000 Hz
+    pub const FREQ_MIN: f32 = 4000.0;
+    pub const FREQ_MAX: f32 = 16000.0;
+
+    /// Decay: 0-1 maps to 0.005-0.4 seconds
+    pub const DECAY_MIN: f32 = 0.005;
+    pub const DECAY_MAX: f32 = 0.4;
+
+    /// Amp decay: 0-1 maps to 0.0-4.0 seconds
+    pub const AMP_DECAY_MIN: f32 = 0.0;
+    pub const AMP_DECAY_MAX: f32 = 4.0;
+
+    /// Amp decay curve: 0-1 maps to 0.1-10.0
+    pub const AMP_DECAY_CURVE_MIN: f32 = 0.1;
+    pub const AMP_DECAY_CURVE_MAX: f32 = 10.0;
+
+    /// Map normalized 0-1 value to actual range
+    #[inline]
+    pub fn denormalize(normalized: f32, min: f32, max: f32) -> f32 {
+        min + normalized.clamp(0.0, 1.0) * (max - min)
+    }
+
+    /// Map actual value to normalized 0-1 range
+    #[inline]
+    #[allow(dead_code)]
+    pub fn normalize(value: f32, min: f32, max: f32) -> f32 {
+        ((value - min) / (max - min)).clamp(0.0, 1.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct HiHatConfig {
-    pub base_frequency: f32, // Base frequency for filtering (4000-16000Hz)
-    pub filter: f32,         // Combined brightness + resonance control (0.0-1.0)
-    pub decay_time: f32,     // Decay length in seconds (0.005-0.4)
-    pub volume: f32,         // Overall volume (0.0-1.0)
-    pub is_open: bool,       // true for open, false for closed
+    pub base_frequency: f32,  // Base frequency for filtering (0-1 -> 4000-16000Hz)
+    pub filter: f32,          // Combined brightness + resonance control (0.0-1.0)
+    pub decay_time: f32,      // Decay length in seconds (0-1 -> 0.005-0.4s)
+    pub volume: f32,          // Overall volume (0.0-1.0)
+    pub is_open: bool,        // true for open, false for closed
+    pub amp_decay: f32,       // Master amplitude decay time (0-1 -> 0.0-4.0s)
+    pub amp_decay_curve: f32, // Decay curve shape (0-1 -> 0.1-10.0, lower = steep-then-long)
 }
 
 impl HiHatConfig {
-    pub fn new(base_frequency: f32, filter: f32, decay_time: f32, volume: f32, is_open: bool) -> Self {
+    /// Create a new HiHatConfig with all parameters normalized 0-1
+    pub fn new(frequency: f32, filter: f32, decay: f32, volume: f32, is_open: bool) -> Self {
         Self {
-            base_frequency: base_frequency.clamp(4000.0, 16000.0),
+            base_frequency: frequency.clamp(0.0, 1.0),
             filter: filter.clamp(0.0, 1.0),
-            decay_time: decay_time.clamp(0.005, 0.4),
+            decay_time: decay.clamp(0.0, 1.0),
             volume: volume.clamp(0.0, 1.0),
             is_open,
+            // Default amp envelope settings
+            amp_decay: 0.1,        // ~0.4s
+            amp_decay_curve: 0.02, // ~0.3 (steep-then-long)
         }
     }
 
+    /// Create a HiHatConfig with all parameters (all normalized 0-1)
+    pub fn new_full(
+        frequency: f32,
+        filter: f32,
+        decay: f32,
+        volume: f32,
+        is_open: bool,
+        amp_decay: f32,
+        amp_decay_curve: f32,
+    ) -> Self {
+        Self {
+            base_frequency: frequency.clamp(0.0, 1.0),
+            filter: filter.clamp(0.0, 1.0),
+            decay_time: decay.clamp(0.0, 1.0),
+            volume: volume.clamp(0.0, 1.0),
+            is_open,
+            amp_decay: amp_decay.clamp(0.0, 1.0),
+            amp_decay_curve: amp_decay_curve.clamp(0.0, 1.0),
+        }
+    }
+
+    // Helper methods to get actual (denormalized) values for audio processing
+
+    /// Get actual frequency in Hz (4000-16000)
+    #[inline]
+    pub fn frequency_hz(&self) -> f32 {
+        ranges::denormalize(self.base_frequency, ranges::FREQ_MIN, ranges::FREQ_MAX)
+    }
+
+    /// Get actual decay in seconds (0.005-0.4)
+    #[inline]
+    pub fn decay_secs(&self) -> f32 {
+        ranges::denormalize(self.decay_time, ranges::DECAY_MIN, ranges::DECAY_MAX)
+    }
+
+    /// Get actual amp decay in seconds (0.0-4.0)
+    #[inline]
+    pub fn amp_decay_secs(&self) -> f32 {
+        ranges::denormalize(self.amp_decay, ranges::AMP_DECAY_MIN, ranges::AMP_DECAY_MAX)
+    }
+
+    /// Get actual amp decay curve value (0.1-10.0)
+    #[inline]
+    pub fn amp_decay_curve_value(&self) -> f32 {
+        ranges::denormalize(self.amp_decay_curve, ranges::AMP_DECAY_CURVE_MIN, ranges::AMP_DECAY_CURVE_MAX)
+    }
+
+    // Presets - using normalized 0-1 values
+    // Frequency mapping: 4000Hz=0.0, 10000Hz=0.5, 16000Hz=1.0
+    // Decay mapping: 0.005s=0.0, 0.2s=0.5, 0.4s=1.0
+
     pub fn closed_default() -> Self {
-        Self::new(8000.0, 0.6, 0.08, 0.8, false)
+        // 8000Hz, 0.08s decay
+        Self::new_full(
+            0.33,  // frequency: ~8000Hz
+            0.6,   // filter
+            0.19,  // decay: ~0.08s
+            0.8,   // volume
+            false, // closed
+            0.1,   // amp_decay: ~0.4s
+            0.02,  // amp_decay_curve: ~0.3 (steep-then-long)
+        )
     }
 
     pub fn open_default() -> Self {
-        Self::new(10000.0, 0.6, 0.4, 0.7, true)
+        // 10000Hz, 0.4s decay
+        Self::new_full(
+            0.5,   // frequency: ~10000Hz
+            0.6,   // filter
+            1.0,   // decay: 0.4s
+            0.7,   // volume
+            true,  // open
+            0.25,  // amp_decay: ~1.0s
+            0.02,  // amp_decay_curve: ~0.3 (steep-then-long)
+        )
     }
 
     pub fn closed_tight() -> Self {
-        Self::new(6000.0, 0.55, 0.015, 0.9, false)
+        // 6000Hz, 0.015s decay
+        Self::new_full(
+            0.17,  // frequency: ~6000Hz
+            0.55,  // filter
+            0.025, // decay: ~0.015s
+            0.9,   // volume
+            false, // closed
+            0.05,  // amp_decay: ~0.2s
+            0.02,  // amp_decay_curve: ~0.3 (steep-then-long)
+        )
     }
 
     pub fn open_bright() -> Self {
-        Self::new(14000.0, 0.7, 0.4, 0.8, true)
+        // 14000Hz, 0.4s decay
+        Self::new_full(
+            0.83,  // frequency: ~14000Hz
+            0.7,   // filter
+            1.0,   // decay: 0.4s
+            0.8,   // volume
+            true,  // open
+            0.25,  // amp_decay: ~1.0s
+            0.02,  // amp_decay_curve: ~0.3 (steep-then-long)
+        )
     }
 
     pub fn closed_dark() -> Self {
-        Self::new(4000.0, 0.4, 0.1, 0.7, false)
+        // 4000Hz, 0.1s decay
+        Self::new_full(
+            0.0,   // frequency: 4000Hz
+            0.4,   // filter
+            0.24,  // decay: ~0.1s
+            0.7,   // volume
+            false, // closed
+            0.1,   // amp_decay: ~0.4s
+            0.02,  // amp_decay_curve: ~0.3 (steep-then-long)
+        )
     }
 
     pub fn open_long() -> Self {
-        Self::new(8000.0, 0.45, 0.4, 0.6, true)
+        // 8000Hz, 0.4s decay
+        Self::new_full(
+            0.33,  // frequency: ~8000Hz
+            0.45,  // filter
+            1.0,   // decay: 0.4s
+            0.6,   // volume
+            true,  // open
+            0.35,  // amp_decay: ~1.4s
+            0.02,  // amp_decay_curve: ~0.3 (steep-then-long)
+        )
     }
 }
 
 /// Smoothed parameters for real-time control of the hi-hat
 /// These use one-pole smoothing to prevent clicks/pops during parameter changes
+/// All parameters use normalized 0-1 values
 pub struct HiHatParams {
-    pub filter: SmoothedParam,    // Combined brightness + resonance (0-1)
-    pub frequency: SmoothedParam, // Output filter cutoff (4000-16000 Hz)
-    pub decay: SmoothedParam,     // Decay time in seconds (0.005-0.4)
-    pub volume: SmoothedParam,    // Overall volume (0-1)
+    pub filter: SmoothedParam,          // Combined brightness + resonance (0-1)
+    pub frequency: SmoothedParam,       // Base frequency (0-1 -> 4000-16000 Hz)
+    pub decay: SmoothedParam,           // Decay time (0-1 -> 0.005-0.4s)
+    pub volume: SmoothedParam,          // Overall volume (0-1)
+    pub amp_decay: SmoothedParam,       // Master amplitude decay (0-1 -> 0.0-4.0s)
+    pub amp_decay_curve: SmoothedParam, // Decay curve shape (0-1 -> 0.1-10.0)
 }
 
 impl HiHatParams {
     /// Create new smoothed parameters from a config
+    /// All parameters use normalized 0-1 values
     pub fn from_config(config: &HiHatConfig, sample_rate: f32) -> Self {
         Self {
             filter: SmoothedParam::new(
@@ -70,20 +218,34 @@ impl HiHatParams {
             ),
             frequency: SmoothedParam::new(
                 config.base_frequency,
-                4000.0,
-                16000.0,
+                0.0,
+                1.0,
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
             decay: SmoothedParam::new(
                 config.decay_time,
-                0.005,
-                0.4,
+                0.0,
+                1.0,
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
             volume: SmoothedParam::new(
                 config.volume,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            amp_decay: SmoothedParam::new(
+                config.amp_decay,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            amp_decay_curve: SmoothedParam::new(
+                config.amp_decay_curve,
                 0.0,
                 1.0,
                 sample_rate,
@@ -99,6 +261,8 @@ impl HiHatParams {
         self.frequency.tick();
         self.decay.tick();
         self.volume.tick();
+        self.amp_decay.tick();
+        self.amp_decay_curve.tick();
 
         // Return true if any smoother is still active
         !self.is_settled()
@@ -110,6 +274,32 @@ impl HiHatParams {
             && self.frequency.is_settled()
             && self.decay.is_settled()
             && self.volume.is_settled()
+            && self.amp_decay.is_settled()
+            && self.amp_decay_curve.is_settled()
+    }
+
+    /// Get actual frequency in Hz (4000-16000)
+    #[inline]
+    pub fn frequency_hz(&self) -> f32 {
+        ranges::denormalize(self.frequency.get(), ranges::FREQ_MIN, ranges::FREQ_MAX)
+    }
+
+    /// Get actual decay in seconds (0.005-0.4)
+    #[inline]
+    pub fn decay_secs(&self) -> f32 {
+        ranges::denormalize(self.decay.get(), ranges::DECAY_MIN, ranges::DECAY_MAX)
+    }
+
+    /// Get actual amp decay in seconds (0.0-4.0)
+    #[inline]
+    pub fn amp_decay_secs(&self) -> f32 {
+        ranges::denormalize(self.amp_decay.get(), ranges::AMP_DECAY_MIN, ranges::AMP_DECAY_MAX)
+    }
+
+    /// Get actual amp decay curve value (0.1-10.0)
+    #[inline]
+    pub fn amp_decay_curve_value(&self) -> f32 {
+        ranges::denormalize(self.amp_decay_curve.get(), ranges::AMP_DECAY_CURVE_MIN, ranges::AMP_DECAY_CURVE_MAX)
     }
 
     /// Get a snapshot of current values as a HiHatConfig (for reading back)
@@ -120,6 +310,8 @@ impl HiHatParams {
             decay_time: self.decay.get(),
             volume: self.volume.get(),
             is_open,
+            amp_decay: self.amp_decay.get(),
+            amp_decay_curve: self.amp_decay_curve.get(),
         }
     }
 }
@@ -184,12 +376,13 @@ impl HiHat {
 
     pub fn with_config(sample_rate: f32, config: HiHatConfig) -> Self {
         let params = HiHatParams::from_config(&config, sample_rate);
+        let freq_hz = config.frequency_hz();
         let mut hihat = Self {
             sample_rate,
             params,
             is_open: config.is_open,
-            noise_oscillator: Oscillator::new(sample_rate, config.base_frequency),
-            brightness_oscillator: Oscillator::new(sample_rate, config.base_frequency * 2.0),
+            noise_oscillator: Oscillator::new(sample_rate, freq_hz),
+            brightness_oscillator: Oscillator::new(sample_rate, freq_hz * 2.0),
             amplitude_envelope: Envelope::new(),
             filter_envelope: Envelope::new(),
             filter_envelope_amount: 0.15, // Subtle 15% filter sweep (much lighter than kick's pitch)
@@ -216,7 +409,7 @@ impl HiHat {
     /// Note: Volume is applied only at final output stage, not here
     fn configure_oscillators(&mut self) {
         let filter = self.params.filter.get();
-        let decay = self.params.decay.get();
+        let decay = self.params.decay_secs();
 
         // Fixed fast attack for hi-hats (always percussive)
         const ATTACK: f32 = 0.001;
@@ -293,6 +486,8 @@ impl HiHat {
         self.params.frequency.set_target(config.base_frequency);
         self.params.decay.set_target(config.decay_time);
         self.params.volume.set_target(config.volume);
+        self.params.amp_decay.set_target(config.amp_decay);
+        self.params.amp_decay_curve.set_target(config.amp_decay_curve);
         self.is_open = config.is_open;
 
         // Reconfigure envelopes for new decay time
@@ -315,14 +510,17 @@ impl HiHat {
         let vel = self.current_velocity;
         let vel_squared = vel * vel;
 
-        // Read base parameters
-        let base_decay = self.params.decay.get();
+        // Read base parameters (denormalized)
+        let base_decay = self.params.decay_secs();
         let filter = self.params.filter.get();
+        let amp_decay = self.params.amp_decay_secs();
+        let amp_decay_curve_val = self.params.amp_decay_curve_value();
         const ATTACK: f32 = 0.001;
 
         // High velocity = shorter decay (tighter, snappier sound)
         let decay_scale = 1.0 - (self.velocity_to_decay * vel_squared);
         let scaled_decay = base_decay * decay_scale;
+        let scaled_amp_decay = amp_decay * decay_scale;
 
         // High velocity = higher frequency (brighter, more cutting sound)
         // Store the boost factor - it will be applied transiently in tick() via filter envelope
@@ -357,22 +555,29 @@ impl HiHat {
         self.brightness_oscillator.set_volume(filter * 0.8); // Relative level; volume applied at output
         self.brightness_oscillator.trigger(time);
 
-        // Configure and trigger amplitude envelope
-        if self.is_open {
-            self.amplitude_envelope.set_config(ADSRConfig::new(
-                ATTACK,
-                scaled_decay * 0.3,
-                0.3,
-                scaled_decay * 0.7,
-            ));
+        // Configure and trigger amplitude envelope with decay curve
+        let amp_decay_curve = if (amp_decay_curve_val - 1.0).abs() < 0.01 {
+            EnvelopeCurve::Linear
         } else {
-            self.amplitude_envelope.set_config(ADSRConfig::new(
+            EnvelopeCurve::Exponential(amp_decay_curve_val)
+        };
+
+        let amp_config = if self.is_open {
+            ADSRConfig::new(
                 ATTACK,
-                scaled_decay,
+                scaled_amp_decay * 0.3,
+                0.3,
+                scaled_amp_decay * 0.7,
+            ).with_decay_curve(amp_decay_curve)
+        } else {
+            ADSRConfig::new(
+                ATTACK,
+                scaled_amp_decay,
                 0.0,
-                scaled_decay * 0.05,
-            ));
-        }
+                scaled_amp_decay * 0.05,
+            ).with_decay_curve(amp_decay_curve)
+        };
+        self.amplitude_envelope.set_config(amp_config);
         self.amplitude_envelope.trigger(time);
 
         // Configure and trigger filter envelope (subtle brightness decay)
@@ -426,8 +631,8 @@ impl HiHat {
         let resonant_output = final_output * resonance_factor;
 
         // Apply lowpass filter to tame harshness (one-pole filter)
-        // Base cutoff from frequency parameter, boosted by filter
-        let base_cutoff = self.params.frequency.get();
+        // Base cutoff from frequency parameter (denormalized), boosted by filter
+        let base_cutoff = self.params.frequency_hz();
 
         // Apply filter envelope for subtle brightness decay
         // Envelope starts at 1.0 (bright) and decays to 0.0 (base cutoff)
@@ -502,6 +707,16 @@ impl HiHat {
         self.is_open = is_open;
         self.configure_oscillators();
     }
+
+    /// Set amp decay (smoothed, takes effect on next trigger)
+    pub fn set_amp_decay(&mut self, amp_decay: f32) {
+        self.params.amp_decay.set_target(amp_decay.clamp(0.0, 1.0));
+    }
+
+    /// Set amp decay curve (smoothed, takes effect on next trigger)
+    pub fn set_amp_decay_curve(&mut self, amp_decay_curve: f32) {
+        self.params.amp_decay_curve.set_target(amp_decay_curve.clamp(0.0, 1.0));
+    }
 }
 
 // Implement the Instrument trait for engine compatibility
@@ -526,22 +741,30 @@ impl crate::engine::Instrument for HiHat {
 // Implement modulation support for HiHat
 impl crate::engine::Modulatable for HiHat {
     fn modulatable_parameters(&self) -> Vec<&'static str> {
-        vec!["filter", "frequency", "decay", "volume"]
+        vec!["amp_decay", "amp_decay_curve", "decay", "filter", "frequency", "volume"]
     }
 
     fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
         // value is -1.0 to 1.0 (bipolar), set_bipolar maps this to the param range
         match parameter {
+            "amp_decay" => {
+                self.params.amp_decay.set_bipolar(value);
+                Ok(())
+            }
+            "amp_decay_curve" => {
+                self.params.amp_decay_curve.set_bipolar(value);
+                Ok(())
+            }
+            "decay" => {
+                self.params.decay.set_bipolar(value);
+                Ok(())
+            }
             "filter" => {
                 self.params.filter.set_bipolar(value);
                 Ok(())
             }
             "frequency" => {
                 self.params.frequency.set_bipolar(value);
-                Ok(())
-            }
-            "decay" => {
-                self.params.decay.set_bipolar(value);
                 Ok(())
             }
             "volume" => {
@@ -554,9 +777,11 @@ impl crate::engine::Modulatable for HiHat {
 
     fn parameter_range(&self, parameter: &str) -> Option<(f32, f32)> {
         match parameter {
+            "amp_decay" => Some(self.params.amp_decay.range()),
+            "amp_decay_curve" => Some(self.params.amp_decay_curve.range()),
+            "decay" => Some(self.params.decay.range()),
             "filter" => Some(self.params.filter.range()),
             "frequency" => Some(self.params.frequency.range()),
-            "decay" => Some(self.params.decay.range()),
             "volume" => Some(self.params.volume.range()),
             _ => None,
         }

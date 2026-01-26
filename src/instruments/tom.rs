@@ -14,9 +14,9 @@ pub(crate) mod ranges {
     pub const DECAY_MIN: f32 = 0.05;
     pub const DECAY_MAX: f32 = 2.0;
 
-    /// Amp decay: 0-1 maps to 0.0-3.0 seconds
+    /// Amp decay: 0-1 maps to 0.0-4.0 seconds
     pub const AMP_DECAY_MIN: f32 = 0.0;
-    pub const AMP_DECAY_MAX: f32 = 3.0;
+    pub const AMP_DECAY_MAX: f32 = 4.0;
 
     /// Amp decay curve: 0-1 maps to 0.1-10.0
     pub const AMP_DECAY_CURVE_MIN: f32 = 0.1;
@@ -46,8 +46,8 @@ pub struct TomConfig {
     pub decay: f32,           // Oscillator decay time (0-1 -> 0.05-2.0s)
     pub pitch_drop: f32,      // Frequency sweep amount (0.0-1.0)
     pub volume: f32,          // Overall volume (0.0-1.0)
-    pub amp_decay: f32,       // Master amplitude decay time (0-1 -> 0.0-3.0s)
-    pub amp_decay_curve: f32, // Decay curve shape (0-1 -> 0.1-10.0, higher = faster initial decay)
+    pub amp_decay: f32,       // Master amplitude decay time (0-1 -> 0.0-4.0s)
+    pub amp_decay_curve: f32, // Decay curve shape (0-1 -> 0.1-10.0, lower = steep-then-long)
 }
 
 impl TomConfig {
@@ -67,8 +67,8 @@ impl TomConfig {
             pitch_drop: pitch_drop.clamp(0.0, 1.0),
             volume: volume.clamp(0.0, 1.0),
             // Default amp envelope settings
-            amp_decay: 0.2,       // ~0.6s
-            amp_decay_curve: 0.6, // ~6.0, natural exponential decay
+            amp_decay: 0.2,       // ~0.8s
+            amp_decay_curve: 0.02, // ~0.3 (steep-then-long)
         }
     }
 
@@ -109,7 +109,7 @@ impl TomConfig {
         ranges::denormalize(self.decay, ranges::DECAY_MIN, ranges::DECAY_MAX)
     }
 
-    /// Get actual amp decay in seconds (0.0-3.0)
+    /// Get actual amp decay in seconds (0.0-4.0)
     #[inline]
     pub fn amp_decay_secs(&self) -> f32 {
         ranges::denormalize(self.amp_decay, ranges::AMP_DECAY_MIN, ranges::AMP_DECAY_MAX)
@@ -133,8 +133,8 @@ impl TomConfig {
             0.18,  // decay: ~0.4s
             0.3,   // pitch_drop
             0.8,   // volume
-            0.2,   // amp_decay: ~0.6s
-            0.6,   // amp_decay_curve: ~6.0, natural exponential decay
+            0.2,   // amp_decay: ~0.8s
+            0.02,  // amp_decay_curve: ~0.3 (steep-then-long)
         )
     }
 
@@ -147,8 +147,8 @@ impl TomConfig {
             0.13,  // decay: ~0.3s
             0.4,   // pitch_drop
             0.85,  // volume
-            0.15,  // amp_decay: ~0.45s
-            0.7,   // amp_decay_curve: ~7.0, snappy transient
+            0.15,  // amp_decay: ~0.6s
+            0.02,  // amp_decay_curve: ~0.3 (steep-then-long)
         )
     }
 
@@ -166,8 +166,8 @@ impl TomConfig {
             0.28,  // decay: ~0.6s
             0.2,   // pitch_drop
             0.85,  // volume
-            0.3,   // amp_decay: ~0.9s
-            0.5,   // amp_decay_curve: ~5.0, natural decay
+            0.3,   // amp_decay: ~1.2s
+            0.02,  // amp_decay_curve: ~0.3 (steep-then-long)
         )
     }
 
@@ -180,8 +180,8 @@ impl TomConfig {
             0.38,  // decay: ~0.8s
             0.15,  // pitch_drop
             0.9,   // volume
-            0.4,   // amp_decay: ~1.2s
-            0.45,  // amp_decay_curve: ~4.5, natural acoustic decay
+            0.4,   // amp_decay: ~1.6s
+            0.02,  // amp_decay_curve: ~0.3 (steep-then-long)
         )
     }
 }
@@ -283,7 +283,7 @@ impl TomParams {
         ranges::denormalize(self.decay.get(), ranges::DECAY_MIN, ranges::DECAY_MAX)
     }
 
-    /// Get actual amp decay in seconds (0.0-3.0)
+    /// Get actual amp decay in seconds (0.0-4.0)
     #[inline]
     pub fn amp_decay_secs(&self) -> f32 {
         ranges::denormalize(self.amp_decay.get(), ranges::AMP_DECAY_MIN, ranges::AMP_DECAY_MAX)

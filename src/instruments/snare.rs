@@ -126,7 +126,7 @@ impl SnareConfig {
             // New parameters
             overdrive_amount: 0.0,
             amp_decay: 0.125,        // ~0.5s
-            amp_decay_curve: 0.091,  // ~1.0 (linear)
+            amp_decay_curve: 0.02,   // ~0.3 (steep-then-long)
         }
     }
 
@@ -266,7 +266,7 @@ impl SnareConfig {
             0.00,  // phase_mod_amount
             0.10,  // overdrive_amount
             0.12,  // amp_decay
-            0.09,  // amp_decay_curve
+            0.02,  // amp_decay_curve (steep-then-long)
         )
     }
 
@@ -291,7 +291,7 @@ impl SnareConfig {
             1.00,  // phase_mod_amount
             0.20,  // overdrive_amount
             0.18,  // amp_decay
-            0.09,  // amp_decay_curve
+            0.02,  // amp_decay_curve (steep-then-long)
         )
     }
 
@@ -318,7 +318,7 @@ impl SnareConfig {
             0.5,    // phase_mod_amount
             0.0,    // overdrive_amount
             0.125,  // amp_decay: ~0.5s
-            0.091,  // amp_decay_curve: ~1.0
+            0.02,   // amp_decay_curve: ~0.3 (steep-then-long)
         )
     }
 }
