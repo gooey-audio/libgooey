@@ -36,23 +36,24 @@ struct ParamInfo {
     unit: &'static str,
 }
 
+// Parameters in alphabetical order for display
 const PARAM_INFO: [ParamInfo; 16] = [
-    ParamInfo { name: "frequency", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 30-120 Hz
-    ParamInfo { name: "punch", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "sub", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo { name: "amp_decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 0.0-4.0s
+    ParamInfo { name: "amp_dcy_crv", coarse_step: 0.1, fine_step: 0.02, unit: "" },         // 0-1 → 0.1-10.0
     ParamInfo { name: "click", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "osc_decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 0.01-4.0s
-    ParamInfo { name: "pitch_env_amt", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "pitch_env_crv", coarse_step: 0.1, fine_step: 0.02, unit: "" },       // 0-1 → 0.1-4.0
-    ParamInfo { name: "volume", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "pitch_ratio", coarse_step: 0.1, fine_step: 0.02, unit: "" },         // 0-1 → 1.0-10.0x
-    ParamInfo { name: "phase_mod_amt", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo { name: "frequency", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 30-120 Hz
     ParamInfo { name: "noise_amount", coarse_step: 0.1, fine_step: 0.02, unit: "" },
     ParamInfo { name: "noise_cutoff", coarse_step: 0.1, fine_step: 0.02, unit: "" },        // 0-1 → 20-10000 Hz
     ParamInfo { name: "noise_res", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 0.0-5.0
+    ParamInfo { name: "osc_decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 0.01-4.0s
     ParamInfo { name: "overdrive", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "amp_decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 0.0-4.0s
-    ParamInfo { name: "amp_dcy_crv", coarse_step: 0.1, fine_step: 0.02, unit: "" },         // 0-1 → 0.1-10.0
+    ParamInfo { name: "phase_mod_amt", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo { name: "pitch_env_amt", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo { name: "pitch_env_crv", coarse_step: 0.1, fine_step: 0.02, unit: "" },       // 0-1 → 0.1-4.0
+    ParamInfo { name: "pitch_ratio", coarse_step: 0.1, fine_step: 0.02, unit: "" },         // 0-1 → 1.0-10.0x
+    ParamInfo { name: "punch", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo { name: "sub", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo { name: "volume", coarse_step: 0.1, fine_step: 0.02, unit: "" },
 ];
 
 // Wrapper to share KickDrum between audio thread and main thread
@@ -78,24 +79,25 @@ impl Instrument for SharedKick {
 
 // Helper functions for parameter access
 // All parameters use normalized 0-1 values
+// Indices match alphabetical PARAM_INFO order
 fn get_param_value(kick: &KickDrum, index: usize) -> f32 {
     match index {
-        0 => kick.params.frequency.get(),
-        1 => kick.params.punch.get(),
-        2 => kick.params.sub.get(),
-        3 => kick.params.click.get(),
-        4 => kick.params.oscillator_decay.get(),
-        5 => kick.params.pitch_envelope_amount.get(),
-        6 => kick.params.pitch_envelope_curve.get(),
-        7 => kick.params.volume.get(),
-        8 => kick.params.pitch_start_ratio.get(),
+        0 => kick.params.amp_decay.get(),
+        1 => kick.params.amp_decay_curve.get(),
+        2 => kick.params.click.get(),
+        3 => kick.params.frequency.get(),
+        4 => kick.params.noise_amount.get(),
+        5 => kick.params.noise_cutoff.get(),
+        6 => kick.params.noise_resonance.get(),
+        7 => kick.params.oscillator_decay.get(),
+        8 => kick.params.overdrive.get(),
         9 => kick.params.phase_mod_amount.get(),
-        10 => kick.params.noise_amount.get(),
-        11 => kick.params.noise_cutoff.get(),
-        12 => kick.params.noise_resonance.get(),
-        13 => kick.params.overdrive.get(),
-        14 => kick.params.amp_decay.get(),
-        15 => kick.params.amp_decay_curve.get(),
+        10 => kick.params.pitch_envelope_amount.get(),
+        11 => kick.params.pitch_envelope_curve.get(),
+        12 => kick.params.pitch_start_ratio.get(),
+        13 => kick.params.punch.get(),
+        14 => kick.params.sub.get(),
+        15 => kick.params.volume.get(),
         _ => 0.0,
     }
 }
@@ -107,22 +109,22 @@ fn get_param_range(_kick: &KickDrum, _index: usize) -> (f32, f32) {
 
 fn set_param_value(kick: &mut KickDrum, index: usize, value: f32) {
     match index {
-        0 => kick.set_frequency(value),
-        1 => kick.set_punch(value),
-        2 => kick.set_sub(value),
-        3 => kick.set_click(value),
-        4 => kick.set_oscillator_decay(value),
-        5 => kick.set_pitch_envelope_amount(value),
-        6 => kick.set_pitch_envelope_curve(value),
-        7 => kick.set_volume(value),
-        8 => kick.set_pitch_start_ratio(value),
+        0 => kick.set_amp_decay(value),
+        1 => kick.set_amp_decay_curve(value),
+        2 => kick.set_click(value),
+        3 => kick.set_frequency(value),
+        4 => kick.set_noise_amount(value),
+        5 => kick.set_noise_cutoff(value),
+        6 => kick.set_noise_resonance(value),
+        7 => kick.set_oscillator_decay(value),
+        8 => kick.set_overdrive(value),
         9 => kick.set_phase_mod_amount(value),
-        10 => kick.set_noise_amount(value),
-        11 => kick.set_noise_cutoff(value),
-        12 => kick.set_noise_resonance(value),
-        13 => kick.set_overdrive(value),
-        14 => kick.set_amp_decay(value),
-        15 => kick.set_amp_decay_curve(value),
+        10 => kick.set_pitch_envelope_amount(value),
+        11 => kick.set_pitch_envelope_curve(value),
+        12 => kick.set_pitch_start_ratio(value),
+        13 => kick.set_punch(value),
+        14 => kick.set_sub(value),
+        15 => kick.set_volume(value),
         _ => {}
     }
 }
