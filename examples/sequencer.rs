@@ -10,9 +10,9 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 // Import the engine and instruments
-use libgooey::effects::LowpassFilterEffect;
-use libgooey::engine::{Engine, EngineOutput, Lfo, MusicalDivision, Sequencer};
-use libgooey::instruments::HiHat;
+use gooey::effects::LowpassFilterEffect;
+use gooey::engine::{Engine, EngineOutput, Lfo, MusicalDivision, Sequencer};
+use gooey::instruments::HiHat;
 
 // CLI example for sequencer
 #[cfg(feature = "native")]
@@ -84,6 +84,7 @@ fn main() -> anyhow::Result<()> {
     println!("Press LEFT/RIGHT to cycle LFO division");
     println!("Press W/S to adjust filter cutoff frequency");
     println!("Press A/D to adjust filter resonance");
+    println!("Press Z/X to adjust swing (50 = neutral)");
     println!("Press 'q' to quit");
     #[cfg(feature = "visualization")]
     println!("\nVisualization window shows:");
@@ -145,7 +146,7 @@ fn main() -> anyhow::Result<()> {
                     KeyCode::Right => {
                         let mut engine = audio_engine.lock().unwrap();
                         if let Some(lfo) = engine.lfo_mut(0) {
-                            use libgooey::engine::LfoSyncMode;
+                            use gooey::engine::LfoSyncMode;
                             // Cycle to next division
                             let next_division = match lfo.sync_mode() {
                                 LfoSyncMode::BpmSync(div) => match div {
@@ -178,7 +179,7 @@ fn main() -> anyhow::Result<()> {
                     KeyCode::Left => {
                         let mut engine = audio_engine.lock().unwrap();
                         if let Some(lfo) = engine.lfo_mut(0) {
-                            use libgooey::engine::LfoSyncMode;
+                            use gooey::engine::LfoSyncMode;
                             // Cycle to previous division
                             let prev_division = match lfo.sync_mode() {
                                 LfoSyncMode::BpmSync(div) => match div {
@@ -234,6 +235,28 @@ fn main() -> anyhow::Result<()> {
                         let new_resonance = (current + 0.05).min(0.95);
                         filter_control.set_resonance(new_resonance);
                         println!("\rFilter Resonance: {:.2}  ", new_resonance);
+                        io::stdout().flush().unwrap();
+                    }
+                    KeyCode::Char('z') | KeyCode::Char('Z') => {
+                        let mut engine = audio_engine.lock().unwrap();
+                        if let Some(seq) = engine.sequencer_mut(0) {
+                            let current = seq.swing();
+                            let new_swing = (current - 0.02).max(0.0);
+                            seq.set_swing(new_swing);
+                            // Display as 0-100 scale where 50 = neutral
+                            println!("\rSwing: {:.0}  ", new_swing * 100.0);
+                        }
+                        io::stdout().flush().unwrap();
+                    }
+                    KeyCode::Char('x') | KeyCode::Char('X') => {
+                        let mut engine = audio_engine.lock().unwrap();
+                        if let Some(seq) = engine.sequencer_mut(0) {
+                            let current = seq.swing();
+                            let new_swing = (current + 0.02).min(1.0);
+                            seq.set_swing(new_swing);
+                            // Display as 0-100 scale where 50 = neutral
+                            println!("\rSwing: {:.0}  ", new_swing * 100.0);
+                        }
                         io::stdout().flush().unwrap();
                     }
                     KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
