@@ -2,6 +2,7 @@
 
 pub mod envelope;
 pub mod filters;
+pub mod max_curve;
 
 // New organized modules
 pub mod effects;
