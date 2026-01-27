@@ -52,3 +52,7 @@ required-features = ["native", "crossterm"]
 [[example]]
 name = "lfo_test"
 required-features = ["native", "crossterm"]
+
+[[example]]
+name = "tom2"
+required-features = ["native", "crossterm"]
