@@ -33,7 +33,7 @@ const PARAM_INFO: [ParamInfo; 5] = [
     ParamInfo { name: "tune", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
     ParamInfo { name: "bend", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
     ParamInfo { name: "tone", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
-    ParamInfo { name: "color", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 127.0 },
+    ParamInfo { name: "color", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
     ParamInfo { name: "decay", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
 ];
 
