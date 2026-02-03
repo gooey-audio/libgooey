@@ -1,24 +1,52 @@
-//! Simplified Tom2 instrument - minimal implementation for A/B testing with Max/MSP
+//! Tom2 instrument with morph oscillator for A/B testing with Max/MSP
 //!
-//! This replicates the exact signal flow from a Max patch:
+//! This replicates the signal flow from a Max patch with morph oscillator:
 //! - Single envelope controls both pitch and amplitude
-//! - Triangle oscillator at 327 Hz base frequency
-//! - Envelope: attack to 1.0 in 1ms (curve 0.8), decay to 0.0 in 2000ms (curve -0.83)
-//! - Pitch = base_freq * envelope_value
-//! - Output = oscillator * envelope_value
+//! - Morph oscillator combines sine and triangle sources (noise disabled for testing)
+//! - Envelope: attack to 1.0 in 1ms (curve 0.8), decay to 0.0 in decay_ms (curve -0.83)
+//!
+//! Pitch formula (matching Max patch):
+//! - frequency = (envelope × bend)² × tune_frequency
+//! - tune_frequency = zmap(tune, 0, 100, 40, 600)
+//! - bend is scaled 0-2 (like Max zmap 1 127 0 2), then (env × bend) is squared
+//!
+//! Output = morph_oscillator * envelope_value
+//!
+//! Parameters:
+//! - tune: Base frequency (0-100 maps to 40-600 Hz)
+//! - bend: Pitch envelope depth (0-100, scaled to 0-2, then (env×bend)² applied)
+//! - tone: Mix control position (0-100, at 100% output is silent - noise channel disabled)
+//! - color: Reserved for noise frequency modulation (currently unused)
+//! - decay: Envelope decay time (0-100 maps to 0.5-4000ms)
 
 use crate::engine::Instrument;
+use crate::gen::MorphOsc;
 use crate::max_curve::MaxCurveEnvelope;
 
-/// Simplified tom drum for A/B testing with Max/MSP reference
+/// Frequency range constants (from Max zmap 0 1 40 600)
+const FREQ_MIN: f32 = 40.0;
+const FREQ_MAX: f32 = 600.0;
+
+/// Decay range constants (from Max zmap 1 100 0.5 4000)
+const DECAY_MIN_MS: f32 = 0.5;
+const DECAY_MAX_MS: f32 = 4000.0;
+
+/// Tom drum with morph oscillator for A/B testing with Max/MSP reference
 pub struct Tom2 {
+    #[allow(dead_code)]
     sample_rate: f32,
-    base_frequency: f32,
-    phase: f32, // Oscillator phase accumulator (0.0 to 1.0)
+    morph_osc: MorphOsc,
     envelope: MaxCurveEnvelope,
     is_active: bool,
     trigger_time: f32,
-    past_attack: bool, // Track if we've passed the attack phase
+    past_attack: bool,
+
+    // Parameters (matching Max patch ranges)
+    tune: f32,  // 0-100: maps to 40-600 Hz
+    bend: f32,  // 0-100: pitch envelope depth
+    tone: f32,  // 0-100: mix control (100% = silent, noise channel disabled)
+    color: f32, // 0-127: reserved for noise (currently unused)
+    decay: f32, // 0-100: maps to 0.5-4000ms via zmap
 }
 
 impl Tom2 {
@@ -34,43 +62,116 @@ impl Tom2 {
 
         Self {
             sample_rate,
-            base_frequency: 327.0,
-            phase: 0.0,
+            morph_osc: MorphOsc::new(sample_rate),
             envelope,
             is_active: false,
             trigger_time: 0.0,
             past_attack: false,
+            // Default parameter values
+            tune: 51.25,  // ~327 Hz (maps to 327 via zmap formula)
+            bend: 100.0,  // Full pitch envelope by default
+            tone: 50.0,   // Middle mix position
+            color: 60.0,  // Reserved (unused)
+            decay: 50.0,  // ~2000ms decay (maps via zmap 1 100 0.5 4000)
         }
     }
 
-    /// Generate naive triangle wave from phase (0.0 to 1.0)
-    /// Returns value in range -1.0 to 1.0
+    /// Map tune parameter (0-100) to frequency (40-600 Hz)
+    /// Based on Max zmap: 0 1 40 600
     #[inline]
-    fn triangle_wave(phase: f32) -> f32 {
-        // Triangle: rises from -1 to 1 in first half, falls from 1 to -1 in second half
-        let t = phase.fract();
-        if t < 0.5 {
-            4.0 * t - 1.0 // -1 to 1
-        } else {
-            3.0 - 4.0 * t // 1 to -1
-        }
+    fn tune_to_freq(tune: f32) -> f32 {
+        let normalized = tune / 100.0;
+        FREQ_MIN + normalized * (FREQ_MAX - FREQ_MIN)
     }
 
-    /// Create with custom frequency
-    pub fn with_frequency(sample_rate: f32, frequency: f32) -> Self {
-        let mut tom = Self::new(sample_rate);
-        tom.base_frequency = frequency;
-        tom
+    /// Map frequency (40-600 Hz) to tune parameter (0-100)
+    #[inline]
+    fn freq_to_tune(freq: f32) -> f32 {
+        let clamped = freq.clamp(FREQ_MIN, FREQ_MAX);
+        ((clamped - FREQ_MIN) / (FREQ_MAX - FREQ_MIN)) * 100.0
     }
 
-    /// Set the base frequency
+    /// Map decay parameter (0-100) to milliseconds (0.5-4000)
+    /// Based on Max zmap: 1 100 0.5 4000
+    #[inline]
+    fn decay_to_ms(decay: f32) -> f32 {
+        let normalized = decay / 100.0;
+        DECAY_MIN_MS + normalized * (DECAY_MAX_MS - DECAY_MIN_MS)
+    }
+
+    /// Map milliseconds (0.5-4000) to decay parameter (0-100)
+    #[inline]
+    #[allow(dead_code)]
+    fn ms_to_decay(ms: f32) -> f32 {
+        let clamped = ms.clamp(DECAY_MIN_MS, DECAY_MAX_MS);
+        ((clamped - DECAY_MIN_MS) / (DECAY_MAX_MS - DECAY_MIN_MS)) * 100.0
+    }
+
+    /// Set tune parameter (0-100): maps to 40-600 Hz
+    pub fn set_tune(&mut self, tune: f32) {
+        self.tune = tune.clamp(0.0, 100.0);
+    }
+
+    /// Get tune parameter (0-100)
+    pub fn tune(&self) -> f32 {
+        self.tune
+    }
+
+    /// Set the base frequency directly (40-600 Hz, clamped)
     pub fn set_frequency(&mut self, frequency: f32) {
-        self.base_frequency = frequency;
+        self.tune = Self::freq_to_tune(frequency);
     }
 
-    /// Get the base frequency
+    /// Get the base frequency in Hz
     pub fn frequency(&self) -> f32 {
-        self.base_frequency
+        Self::tune_to_freq(self.tune)
+    }
+
+    /// Set bend parameter (0-100): pitch envelope depth
+    pub fn set_bend(&mut self, bend: f32) {
+        self.bend = bend.clamp(0.0, 100.0);
+    }
+
+    /// Get bend parameter
+    pub fn bend(&self) -> f32 {
+        self.bend
+    }
+
+    /// Set tone parameter (0-100): mix control
+    /// Note: at tone=100%, output is silent (noise channel disabled)
+    pub fn set_tone(&mut self, tone: f32) {
+        self.tone = tone.clamp(0.0, 100.0);
+    }
+
+    /// Get tone parameter
+    pub fn tone(&self) -> f32 {
+        self.tone
+    }
+
+    /// Set color parameter (0-127): reserved for noise frequency
+    /// Currently unused - noise is disabled for A/B testing
+    pub fn set_color(&mut self, color: f32) {
+        self.color = color.clamp(0.0, 127.0);
+    }
+
+    /// Get color parameter
+    pub fn color(&self) -> f32 {
+        self.color
+    }
+
+    /// Set decay parameter (0-100): maps to 0.5-4000ms
+    pub fn set_decay(&mut self, decay: f32) {
+        self.decay = decay.clamp(0.0, 100.0);
+    }
+
+    /// Get decay parameter (0-100)
+    pub fn decay(&self) -> f32 {
+        self.decay
+    }
+
+    /// Get the decay time in milliseconds
+    pub fn decay_ms(&self) -> f32 {
+        Self::decay_to_ms(self.decay)
     }
 }
 
@@ -79,7 +180,14 @@ impl Instrument for Tom2 {
         self.is_active = true;
         self.trigger_time = time;
         self.past_attack = false;
-        self.phase = 0.0; // Reset phase on trigger
+        self.morph_osc.reset(); // Reset oscillator phases on trigger
+
+        // Rebuild envelope with current decay value (mapped from 0-100 to ms)
+        let decay_ms = Self::decay_to_ms(self.decay);
+        self.envelope = MaxCurveEnvelope::new(vec![
+            (1.0, 1.0, 0.8),          // Attack: value=1.0, time=1ms, curve=0.8
+            (0.0, decay_ms, -0.83),   // Decay: value=0.0, time=decay ms, curve=-0.83
+        ]);
         self.envelope.trigger(time);
     }
 
@@ -96,13 +204,20 @@ impl Instrument for Tom2 {
             self.past_attack = true;
         }
 
-        // Pitch modulation: frequency = base_freq * envelope
-        let modulated_freq = self.base_frequency * env_value;
+        // Get base frequency from tune parameter
+        let base_frequency = Self::tune_to_freq(self.tune);
+
+        // Bend controls pitch envelope depth
+        // Max signal flow: curve~ → *~ bend → pow~ 2 → *~ tune_freq
+        // frequency = (envelope × bend)² × tune_frequency
+        // bend is 0-100, Max uses zmap 1 127 0 2, so scale to 0-2 range
+        let bend_scaled = (self.bend / 100.0) * 2.0;
+        let pitch_env = (env_value * bend_scaled).powi(2); // SQUARED like Max
+        let modulated_freq = base_frequency * pitch_env;
 
         // Threshold cutoffs to prevent sub-audio rumble
-        // Use a fade range to avoid pops from abrupt cutoff
-        const FADE_START_FREQ: f32 = 40.0; // Start fading at 40 Hz
-        const MIN_AUDIBLE_FREQ: f32 = 20.0; // Full cutoff at 20 Hz
+        const FADE_START_FREQ: f32 = 40.0;
+        const MIN_AUDIBLE_FREQ: f32 = 20.0;
 
         if self.envelope.is_complete()
             || (self.past_attack && modulated_freq < MIN_AUDIBLE_FREQ)
@@ -118,18 +233,18 @@ impl Instrument for Tom2 {
             1.0
         };
 
-        // Generate triangle wave directly (no separate oscillator envelope)
-        let osc_output = Self::triangle_wave(self.phase);
+        // Map tone (0-100) to mix control (-1 to 1)
+        let mix_control = (self.tone / 100.0) * 2.0 - 1.0;
 
-        // Advance phase based on current frequency
-        let phase_increment = modulated_freq / self.sample_rate;
-        self.phase += phase_increment;
-        if self.phase >= 1.0 {
-            self.phase -= 1.0;
-        }
+        // Generate morph oscillator output
+        let osc_output = self.morph_osc.tick(
+            modulated_freq,
+            mix_control,
+            self.color,
+            self.tone,
+        );
 
         // VCA: multiply oscillator output by envelope and fade factor
-        // This replicates Max's *~ multiplying tri~ output by curve~ signal
         osc_output * env_value * fade_factor
     }
 
