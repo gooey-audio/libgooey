@@ -20,12 +20,32 @@
 //! - decay: Envelope decay time (0-100 maps to 0.5-4000ms)
 
 use crate::engine::Instrument;
-use crate::gen::MorphOsc;
+use crate::gen::{ClickOsc, MorphOsc};
 use crate::max_curve::MaxCurveEnvelope;
 
 /// Frequency range constants (from Max zmap 0 1 40 600)
 const FREQ_MIN: f32 = 40.0;
 const FREQ_MAX: f32 = 600.0;
+
+/// Generate triangle wave from phase (0.0 to 1.0)
+#[inline]
+fn triangle(phase: f32) -> f32 {
+    let t = phase.fract();
+    if t < 0.5 {
+        4.0 * t - 1.0
+    } else {
+        3.0 - 4.0 * t
+    }
+}
+
+/// Advance a phase accumulator by frequency
+#[inline]
+fn advance_phase(phase: &mut f32, frequency: f32, sample_rate: f32) {
+    *phase += frequency / sample_rate;
+    if *phase >= 1.0 {
+        *phase -= 1.0;
+    }
+}
 
 /// Decay range constants (from Max zmap 1 100 0.5 4000)
 const DECAY_MIN_MS: f32 = 0.5;
@@ -33,13 +53,16 @@ const DECAY_MAX_MS: f32 = 4000.0;
 
 /// Tom drum with morph oscillator for A/B testing with Max/MSP reference
 pub struct Tom2 {
-    #[allow(dead_code)]
     sample_rate: f32,
     morph_osc: MorphOsc,
+    click_osc: ClickOsc,
     envelope: MaxCurveEnvelope,
     is_active: bool,
     #[allow(dead_code)]
     trigger_time: f32,
+
+    // Standalone triangle oscillator phase (separate from MorphOsc's internal tri)
+    tri_phase: f32,
 
     // Parameters (matching Max patch ranges)
     tune: f32,  // 0-100: maps to 40-600 Hz
@@ -63,9 +86,11 @@ impl Tom2 {
         Self {
             sample_rate,
             morph_osc: MorphOsc::new(sample_rate),
+            click_osc: ClickOsc::new(),
             envelope,
             is_active: false,
             trigger_time: 0.0,
+            tri_phase: 0.0,
             // Default parameter values
             tune: 51.25,  // ~327 Hz (maps to 327 via zmap formula)
             bend: 100.0,  // Full pitch envelope by default
@@ -179,6 +204,8 @@ impl Instrument for Tom2 {
         self.is_active = true;
         self.trigger_time = time;
         self.morph_osc.reset(); // Reset oscillator phases on trigger
+        self.click_osc.trigger(); // Start click impulse playback
+        self.tri_phase = 0.0; // Reset triangle phase
 
         // Rebuild envelope with current decay value (mapped from 0-100 to ms)
         let decay_ms = Self::decay_to_ms(self.decay);
@@ -197,6 +224,12 @@ impl Instrument for Tom2 {
         // Get envelope value (0.0 to 1.0)
         let env_value = self.envelope.get_value(current_time);
 
+        // Check if envelope is complete
+        if self.envelope.is_complete() {
+            self.is_active = false;
+            return 0.0;
+        }
+
         // Get base frequency from tune parameter
         let base_frequency = Self::tune_to_freq(self.tune);
 
@@ -208,12 +241,16 @@ impl Instrument for Tom2 {
         let pitch_env = (env_value * bend_scaled).powi(2); // SQUARED like Max
         let modulated_freq = base_frequency * pitch_env;
 
-        // Check if envelope is complete
-        if self.envelope.is_complete() {
-            self.is_active = false;
-            return 0.0;
-        }
+        // === Path 1: Click oscillator ===
+        // click~ output scaled by 1.1 (from Max patch)
+        let click_output = self.click_osc.tick() * 1.1;
 
+        // === Path 2: Standalone Triangle oscillator ===
+        // tri~ at modulated frequency, scaled by 0.5
+        let tri_output = triangle(self.tri_phase) * 0.5;
+        advance_phase(&mut self.tri_phase, modulated_freq, self.sample_rate);
+
+        // === Path 3: MorphOsc ===
         // Map tone (0-100) to mix control (-1 to 1)
         let mix_control = (self.tone / 100.0) * 2.0 - 1.0;
 
@@ -226,15 +263,21 @@ impl Instrument for Tom2 {
 
         // Generate morph oscillator output
         // Note: morph_osc applies second mtof internally to match Max's double-mtof chain
-        let osc_output = self.morph_osc.tick(
+        let morph_output = self.morph_osc.tick(
             modulated_freq,
             mix_control,
             color_freq_1,
             self.tone,
         );
 
-        // VCA: multiply oscillator output by envelope
-        osc_output * env_value
+        // === Mixing ===
+        // All three paths are summed, then go through biquad filter (to be added)
+        // For now: sum all paths with envelope applied to morph
+        let morph_vca = morph_output * env_value;
+
+        // Sum all three oscillator outputs
+        // TODO: Route through biquad bandpass filter before output
+        click_output + tri_output + morph_vca
     }
 
     fn is_active(&self) -> bool {
