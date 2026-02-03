@@ -15,8 +15,8 @@
 //! Parameters:
 //! - tune: Base frequency (0-100 maps to 40-600 Hz)
 //! - bend: Pitch envelope depth (0-100, scaled to 0-2, then (env×bend)² applied)
-//! - tone: Mix control position (0-100, at 100% output is silent - noise channel disabled)
-//! - color: Reserved for noise frequency modulation (currently unused)
+//! - tone: Mix control position (0-100, crossfades between ring mod, triangle+noise, noise+gated sine)
+//! - color: Noise rand~ rate (0-100 → double-mtof chain → ~116-2794 Hz)
 //! - decay: Envelope decay time (0-100 maps to 0.5-4000ms)
 
 use crate::engine::Instrument;
@@ -38,14 +38,14 @@ pub struct Tom2 {
     morph_osc: MorphOsc,
     envelope: MaxCurveEnvelope,
     is_active: bool,
+    #[allow(dead_code)]
     trigger_time: f32,
-    past_attack: bool,
 
     // Parameters (matching Max patch ranges)
     tune: f32,  // 0-100: maps to 40-600 Hz
     bend: f32,  // 0-100: pitch envelope depth
     tone: f32,  // 0-100: mix control (100% = silent, noise channel disabled)
-    color: f32, // 0-127: reserved for noise (currently unused)
+    color: f32, // 0-100: double-mtof chain gives rand~ rate 116-2794 Hz
     decay: f32, // 0-100: maps to 0.5-4000ms via zmap
 }
 
@@ -66,12 +66,11 @@ impl Tom2 {
             envelope,
             is_active: false,
             trigger_time: 0.0,
-            past_attack: false,
             // Default parameter values
             tune: 51.25,  // ~327 Hz (maps to 327 via zmap formula)
             bend: 100.0,  // Full pitch envelope by default
             tone: 50.0,   // Middle mix position
-            color: 60.0,  // Reserved (unused)
+            color: 50.0,  // Middle rand~ rate (maps to MIDI 40 → ~82 Hz)
             decay: 50.0,  // ~2000ms decay (maps via zmap 1 100 0.5 4000)
         }
     }
@@ -148,10 +147,10 @@ impl Tom2 {
         self.tone
     }
 
-    /// Set color parameter (0-127): reserved for noise frequency
-    /// Currently unused - noise is disabled for A/B testing
+    /// Set color parameter (0-100): controls rand~ rate
+    /// Maps via zmap 1 200 30 50 to MIDI 30-50, then mtof for frequency
     pub fn set_color(&mut self, color: f32) {
-        self.color = color.clamp(0.0, 127.0);
+        self.color = color.clamp(0.0, 100.0);
     }
 
     /// Get color parameter
@@ -179,7 +178,6 @@ impl Instrument for Tom2 {
     fn trigger_with_velocity(&mut self, time: f32, _velocity: f32) {
         self.is_active = true;
         self.trigger_time = time;
-        self.past_attack = false;
         self.morph_osc.reset(); // Reset oscillator phases on trigger
 
         // Rebuild envelope with current decay value (mapped from 0-100 to ms)
@@ -199,11 +197,6 @@ impl Instrument for Tom2 {
         // Get envelope value (0.0 to 1.0)
         let env_value = self.envelope.get_value(current_time);
 
-        // Track when we've passed the attack phase (reached near-peak)
-        if env_value > 0.9 {
-            self.past_attack = true;
-        }
-
         // Get base frequency from tune parameter
         let base_frequency = Self::tune_to_freq(self.tune);
 
@@ -215,37 +208,33 @@ impl Instrument for Tom2 {
         let pitch_env = (env_value * bend_scaled).powi(2); // SQUARED like Max
         let modulated_freq = base_frequency * pitch_env;
 
-        // Threshold cutoffs to prevent sub-audio rumble
-        const FADE_START_FREQ: f32 = 40.0;
-        const MIN_AUDIBLE_FREQ: f32 = 20.0;
-
-        if self.envelope.is_complete()
-            || (self.past_attack && modulated_freq < MIN_AUDIBLE_FREQ)
-        {
+        // Check if envelope is complete
+        if self.envelope.is_complete() {
             self.is_active = false;
             return 0.0;
         }
 
-        // Calculate fade factor for smooth cutoff (1.0 at 40Hz, 0.0 at 20Hz)
-        let fade_factor = if self.past_attack && modulated_freq < FADE_START_FREQ {
-            (modulated_freq - MIN_AUDIBLE_FREQ) / (FADE_START_FREQ - MIN_AUDIBLE_FREQ)
-        } else {
-            1.0
-        };
-
         // Map tone (0-100) to mix control (-1 to 1)
         let mix_control = (self.tone / 100.0) * 2.0 - 1.0;
 
+        // Map color (0-100) to rand~ frequency via double mtof (matching Max patch)
+        // Max chain: color → zmap 1 200 30 50 → mtof → sig~ → morphosc → mtof~ → rand~
+        // First mtof: MIDI 30-50 → freq 46-147 Hz
+        // Second mtof (in morphosc): treats freq as MIDI → 116-2794 Hz
+        let color_midi = 30.0 + (self.color / 100.0) * 20.0;
+        let color_freq_1 = 440.0 * 2.0_f32.powf((color_midi - 69.0) / 12.0); // First mtof
+
         // Generate morph oscillator output
+        // Note: morph_osc applies second mtof internally to match Max's double-mtof chain
         let osc_output = self.morph_osc.tick(
             modulated_freq,
             mix_control,
-            self.color,
+            color_freq_1,
             self.tone,
         );
 
-        // VCA: multiply oscillator output by envelope and fade factor
-        osc_output * env_value * fade_factor
+        // VCA: multiply oscillator output by envelope
+        osc_output * env_value
     }
 
     fn is_active(&self) -> bool {
