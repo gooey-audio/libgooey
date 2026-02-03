@@ -20,6 +20,7 @@
 //! - decay: Envelope decay time (0-100 maps to 0.5-4000ms)
 
 use crate::engine::Instrument;
+use crate::filters::BiquadBandpass;
 use crate::gen::{ClickOsc, MorphOsc};
 use crate::max_curve::MaxCurveEnvelope;
 
@@ -56,6 +57,7 @@ pub struct Tom2 {
     sample_rate: f32,
     morph_osc: MorphOsc,
     click_osc: ClickOsc,
+    bandpass_filter: BiquadBandpass,
     envelope: MaxCurveEnvelope,
     is_active: bool,
     #[allow(dead_code)]
@@ -68,7 +70,7 @@ pub struct Tom2 {
     tune: f32,  // 0-100: maps to 40-600 Hz
     bend: f32,  // 0-100: pitch envelope depth
     tone: f32,  // 0-100: mix control (100% = silent, noise channel disabled)
-    color: f32, // 0-100: double-mtof chain gives rand~ rate 116-2794 Hz
+    color: f32, // 0-100: double-mtof chain gives rand~ rate 116-2794 Hz AND filter cutoff
     decay: f32, // 0-100: maps to 0.5-4000ms via zmap
 }
 
@@ -87,6 +89,7 @@ impl Tom2 {
             sample_rate,
             morph_osc: MorphOsc::new(sample_rate),
             click_osc: ClickOsc::new(),
+            bandpass_filter: BiquadBandpass::new(sample_rate),
             envelope,
             is_active: false,
             trigger_time: 0.0,
@@ -95,7 +98,7 @@ impl Tom2 {
             tune: 51.25,  // ~327 Hz (maps to 327 via zmap formula)
             bend: 100.0,  // Full pitch envelope by default
             tone: 50.0,   // Middle mix position
-            color: 50.0,  // Middle rand~ rate (maps to MIDI 40 → ~82 Hz)
+            color: 50.0,  // Middle rand~ rate AND filter cutoff (squared mapping)
             decay: 50.0,  // ~2000ms decay (maps via zmap 1 100 0.5 4000)
         }
     }
@@ -206,6 +209,7 @@ impl Instrument for Tom2 {
         self.morph_osc.reset(); // Reset oscillator phases on trigger
         self.click_osc.trigger(); // Start click impulse playback
         self.tri_phase = 0.0; // Reset triangle phase
+        self.bandpass_filter.reset(); // Clear filter state
 
         // Rebuild envelope with current decay value (mapped from 0-100 to ms)
         let decay_ms = Self::decay_to_ms(self.decay);
@@ -271,13 +275,26 @@ impl Instrument for Tom2 {
         );
 
         // === Mixing ===
-        // All three paths are summed, then go through biquad filter (to be added)
-        // For now: sum all paths with envelope applied to morph
+        // Apply envelope to morph oscillator output
         let morph_vca = morph_output * env_value;
 
         // Sum all three oscillator outputs
-        // TODO: Route through biquad bandpass filter before output
-        click_output + tri_output + morph_vca
+        let mixed = click_output + tri_output + morph_vca;
+
+        // === Bandpass Filter ===
+        // Filter frequency TRACKS THE PITCH (same formula as oscillator)
+        // Max patch: curve~ × bend → pow~ 2 → *~ tune_freq → filtercoeff~
+        // This centers the bandpass on the fundamental, attenuating noise
+        let filter_freq = modulated_freq.max(20.0); // Same as oscillator pitch!
+
+        // Q from color squared: zmap 0 1 1 2
+        let color_norm = self.color / 100.0;
+        let color_squared = color_norm * color_norm;
+        let filter_q = 1.0 + color_squared;
+
+        // Apply bandpass filter with gain 1.1 (from Max patch loadbang)
+        self.bandpass_filter.set_params(filter_freq, filter_q, 1.1);
+        self.bandpass_filter.process(mixed)
     }
 
     fn is_active(&self) -> bool {
