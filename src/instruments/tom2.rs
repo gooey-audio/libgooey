@@ -28,6 +28,10 @@ use crate::max_curve::MaxCurveEnvelope;
 const FREQ_MIN: f32 = 40.0;
 const FREQ_MAX: f32 = 600.0;
 
+/// Fade range to prevent clicks on cutoff
+const FADE_START_FREQ: f32 = 40.0; // Start fading at 40 Hz
+const MIN_AUDIBLE_FREQ: f32 = 20.0; // Full cutoff at 20 Hz
+
 /// Decay range constants (from Max zmap 1 100 0.5 4000)
 const DECAY_MIN_MS: f32 = 0.5;
 const DECAY_MAX_MS: f32 = 4000.0;
@@ -66,6 +70,9 @@ pub struct Tom2 {
     // Standalone triangle oscillator phase (matches Max's tri~ outside morphoscillator)
     tri_phase: f32,
 
+    // Track if we've passed the attack phase for early cutoff
+    past_attack: bool,
+
     // Parameters (matching Max patch ranges)
     tune: f32,  // 0-100: maps to 40-600 Hz
     bend: f32,  // 0-100: pitch envelope depth
@@ -94,6 +101,7 @@ impl Tom2 {
             is_active: false,
             trigger_time: 0.0,
             tri_phase: 0.0,
+            past_attack: false,
             // Default parameter values
             tune: 50.0,   // 320 Hz (maps via zmap formula)
             bend: 30.0,   // Lower pitch envelope for testing
@@ -210,6 +218,7 @@ impl Instrument for Tom2 {
     fn trigger_with_velocity(&mut self, time: f32, _velocity: f32) {
         self.is_active = true;
         self.trigger_time = time;
+        self.past_attack = false; // Reset attack phase tracking
         self.morph_osc.reset(); // Reset oscillator phases on trigger
         self.click_osc.trigger(); // Start click impulse playback
         self.tri_phase = 0.0; // Reset standalone triangle phase
@@ -232,10 +241,9 @@ impl Instrument for Tom2 {
         // Get envelope value (0.0 to 1.0)
         let env_value = self.envelope.get_value(current_time);
 
-        // Check if envelope is complete
-        if self.envelope.is_complete() {
-            self.is_active = false;
-            return 0.0;
+        // Track when we've passed the attack phase (reached near-peak)
+        if env_value > 0.9 {
+            self.past_attack = true;
         }
 
         // Get base frequency from tune parameter
@@ -247,8 +255,25 @@ impl Instrument for Tom2 {
         // bend is 0-100, Max uses zmap 1 127 0 2, so scale to 0-2 range
         let bend_scaled = (self.bend / 100.0) * 2.0;
         let pitch_env = (env_value * bend_scaled).powi(2); // SQUARED like Max
-        // Floor at FREQ_MIN (40Hz) to prevent sub-bass as envelope decays toward 0
-        let modulated_freq = (base_frequency * pitch_env).max(FREQ_MIN);
+        let raw_freq = base_frequency * pitch_env;
+
+        // Early cutoff when pitch drops below audible threshold (like Max patch)
+        if self.envelope.is_complete()
+            || (self.past_attack && raw_freq < MIN_AUDIBLE_FREQ)
+        {
+            self.is_active = false;
+            return 0.0;
+        }
+
+        // Calculate fade factor for smooth cutoff (1.0 at 40Hz, 0.0 at 20Hz)
+        let fade_factor = if self.past_attack && raw_freq < FADE_START_FREQ {
+            (raw_freq - MIN_AUDIBLE_FREQ) / (FADE_START_FREQ - MIN_AUDIBLE_FREQ)
+        } else {
+            1.0
+        };
+
+        // Floor at FREQ_MIN (40Hz) for the oscillator
+        let modulated_freq = raw_freq.max(FREQ_MIN);
 
         // === Path 1: Click oscillator ===
         // click~ output scaled by 1.1 (from Max patch)
@@ -301,7 +326,7 @@ impl Instrument for Tom2 {
         // === VCA and output gain stages ===
         // Max: biquad → *~ envelope → *~ 0.5 → *~ 1.4 → out
         // Combined gain: 0.5 * 1.4 = 0.7
-        filtered * env_value * 0.7
+        filtered * env_value * fade_factor * 0.7
     }
 
     fn is_active(&self) -> bool {
