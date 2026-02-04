@@ -28,6 +28,10 @@ use crate::max_curve::MaxCurveEnvelope;
 const FREQ_MIN: f32 = 40.0;
 const FREQ_MAX: f32 = 600.0;
 
+/// Decay range constants (from Max zmap 1 100 0.5 4000)
+const DECAY_MIN_MS: f32 = 0.5;
+const DECAY_MAX_MS: f32 = 4000.0;
+
 /// Generate triangle wave from phase (0.0 to 1.0)
 #[inline]
 fn triangle(phase: f32) -> f32 {
@@ -48,10 +52,6 @@ fn advance_phase(phase: &mut f32, frequency: f32, sample_rate: f32) {
     }
 }
 
-/// Decay range constants (from Max zmap 1 100 0.5 4000)
-const DECAY_MIN_MS: f32 = 0.5;
-const DECAY_MAX_MS: f32 = 4000.0;
-
 /// Tom drum with morph oscillator for A/B testing with Max/MSP reference
 pub struct Tom2 {
     sample_rate: f32,
@@ -63,7 +63,7 @@ pub struct Tom2 {
     #[allow(dead_code)]
     trigger_time: f32,
 
-    // Standalone triangle oscillator phase (separate from MorphOsc's internal tri)
+    // Standalone triangle oscillator phase (matches Max's tri~ outside morphoscillator)
     tri_phase: f32,
 
     // Parameters (matching Max patch ranges)
@@ -95,8 +95,8 @@ impl Tom2 {
             trigger_time: 0.0,
             tri_phase: 0.0,
             // Default parameter values
-            tune: 51.25,  // ~327 Hz (maps to 327 via zmap formula)
-            bend: 100.0,  // Full pitch envelope by default
+            tune: 50.0,   // 320 Hz (maps via zmap formula)
+            bend: 30.0,   // Lower pitch envelope for testing
             tone: 50.0,   // Middle mix position
             color: 50.0,  // Middle rand~ rate AND filter cutoff (squared mapping)
             decay: 50.0,  // ~2000ms decay (maps via zmap 1 100 0.5 4000)
@@ -104,18 +104,22 @@ impl Tom2 {
     }
 
     /// Map tune parameter (0-100) to frequency (40-600 Hz)
-    /// Based on Max zmap: 0 1 40 600
+    /// Max signal flow: tune → zmap 1 100 0 1 → pow 2 → zmap 0 1 40 600
+    /// The tune value is SQUARED before mapping to frequency range
     #[inline]
     fn tune_to_freq(tune: f32) -> f32 {
         let normalized = tune / 100.0;
-        FREQ_MIN + normalized * (FREQ_MAX - FREQ_MIN)
+        let squared = normalized * normalized; // pow 2 like Max
+        FREQ_MIN + squared * (FREQ_MAX - FREQ_MIN)
     }
 
     /// Map frequency (40-600 Hz) to tune parameter (0-100)
+    /// Inverse of tune_to_freq: freq → normalized → sqrt → tune
     #[inline]
     fn freq_to_tune(freq: f32) -> f32 {
         let clamped = freq.clamp(FREQ_MIN, FREQ_MAX);
-        ((clamped - FREQ_MIN) / (FREQ_MAX - FREQ_MIN)) * 100.0
+        let squared = (clamped - FREQ_MIN) / (FREQ_MAX - FREQ_MIN);
+        squared.sqrt() * 100.0 // sqrt to invert the pow 2
     }
 
     /// Map decay parameter (0-100) to milliseconds (0.5-4000)
@@ -208,7 +212,7 @@ impl Instrument for Tom2 {
         self.trigger_time = time;
         self.morph_osc.reset(); // Reset oscillator phases on trigger
         self.click_osc.trigger(); // Start click impulse playback
-        self.tri_phase = 0.0; // Reset triangle phase
+        self.tri_phase = 0.0; // Reset standalone triangle phase
         self.bandpass_filter.reset(); // Clear filter state
 
         // Rebuild envelope with current decay value (mapped from 0-100 to ms)
@@ -243,14 +247,15 @@ impl Instrument for Tom2 {
         // bend is 0-100, Max uses zmap 1 127 0 2, so scale to 0-2 range
         let bend_scaled = (self.bend / 100.0) * 2.0;
         let pitch_env = (env_value * bend_scaled).powi(2); // SQUARED like Max
-        let modulated_freq = base_frequency * pitch_env;
+        // Floor at FREQ_MIN (40Hz) to prevent sub-bass as envelope decays toward 0
+        let modulated_freq = (base_frequency * pitch_env).max(FREQ_MIN);
 
         // === Path 1: Click oscillator ===
         // click~ output scaled by 1.1 (from Max patch)
         let click_output = self.click_osc.tick() * 1.1;
 
         // === Path 2: Standalone Triangle oscillator ===
-        // tri~ at modulated frequency, scaled by 0.5
+        // tri~ at modulated frequency, scaled by 0.5 (matches Max's standalone tri~ outside morphosc)
         let tri_output = triangle(self.tri_phase) * 0.5;
         advance_phase(&mut self.tri_phase, modulated_freq, self.sample_rate);
 
@@ -274,12 +279,9 @@ impl Instrument for Tom2 {
             self.tone,
         );
 
-        // === Mixing ===
-        // Apply envelope to morph oscillator output
-        let morph_vca = morph_output * env_value;
-
-        // Sum all three oscillator outputs
-        let mixed = click_output + tri_output + morph_vca;
+        // === Mixing (before filter, NO envelope yet!) ===
+        // Max signal flow: click + tri + morphosc → biquad → *envelope → *0.5 → *1.4
+        let mixed = click_output + tri_output + morph_output;
 
         // === Bandpass Filter ===
         // Filter frequency TRACKS THE PITCH (same formula as oscillator)
@@ -294,7 +296,12 @@ impl Instrument for Tom2 {
 
         // Apply bandpass filter with gain 1.1 (from Max patch loadbang)
         self.bandpass_filter.set_params(filter_freq, filter_q, 1.1);
-        self.bandpass_filter.process(mixed)
+        let filtered = self.bandpass_filter.process(mixed);
+
+        // === VCA and output gain stages ===
+        // Max: biquad → *~ envelope → *~ 0.5 → *~ 1.4 → out
+        // Combined gain: 0.5 * 1.4 = 0.7
+        filtered * env_value * 0.7
     }
 
     fn is_active(&self) -> bool {
