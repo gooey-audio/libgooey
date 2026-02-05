@@ -79,6 +79,9 @@ pub struct Tom2 {
     tone: f32,  // 0-100: mix control (100% = silent, noise channel disabled)
     color: f32, // 0-100: double-mtof chain gives rand~ rate 116-2794 Hz AND filter cutoff
     decay: f32, // 0-100: maps to 0.5-4000ms via zmap
+
+    // Toggle for standalone triangle oscillator (for A/B testing)
+    triangle_enabled: bool,
 }
 
 impl Tom2 {
@@ -108,6 +111,7 @@ impl Tom2 {
             tone: 50.0,   // Middle mix position
             color: 50.0,  // Middle rand~ rate AND filter cutoff (squared mapping)
             decay: 50.0,  // ~2000ms decay (maps via zmap 1 100 0.5 4000)
+            triangle_enabled: true, // Standalone triangle on by default
         }
     }
 
@@ -212,6 +216,16 @@ impl Tom2 {
     pub fn decay_ms(&self) -> f32 {
         Self::decay_to_ms(self.decay)
     }
+
+    /// Enable or disable the standalone triangle oscillator
+    pub fn set_triangle_enabled(&mut self, enabled: bool) {
+        self.triangle_enabled = enabled;
+    }
+
+    /// Check if triangle oscillator is enabled
+    pub fn triangle_enabled(&self) -> bool {
+        self.triangle_enabled
+    }
 }
 
 impl Instrument for Tom2 {
@@ -249,15 +263,17 @@ impl Instrument for Tom2 {
         // Get base frequency from tune parameter
         let base_frequency = Self::tune_to_freq(self.tune);
 
-        // Bend controls pitch envelope depth
-        // Max signal flow: curve~ → *~ bend → pow~ 2 → *~ tune_freq
-        // frequency = (envelope × bend)² × tune_frequency
-        // bend is 0-100, Max uses zmap 1 127 0 2, so scale to 0-2 range
+        // Bend controls pitch envelope depth (how much pitch drops from peak to base)
+        // bend=0: no pitch modulation, frequency stays at base_frequency
+        // bend=100: maximum pitch modulation, frequency starts at 5× base and drops to base
+        // Formula: frequency = base_frequency × (1 + (envelope × bend_scaled)²)
+        // bend is 0-100, scaled to 0-2 range
         let bend_scaled = (self.bend / 100.0) * 2.0;
-        let pitch_env = (env_value * bend_scaled).powi(2); // SQUARED like Max
-        let raw_freq = base_frequency * pitch_env;
+        let pitch_mod = (env_value * bend_scaled).powi(2);
+        let raw_freq = base_frequency * (1.0 + pitch_mod);
 
-        // Early cutoff when pitch drops below audible threshold (like Max patch)
+        // Early cutoff when pitch drops below audible threshold
+        // This prevents the triangle oscillator from creating a sub-bass rumble
         if self.envelope.is_complete()
             || (self.past_attack && raw_freq < MIN_AUDIBLE_FREQ)
         {
@@ -281,7 +297,12 @@ impl Instrument for Tom2 {
 
         // === Path 2: Standalone Triangle oscillator ===
         // tri~ at modulated frequency, scaled by 0.5 (matches Max's standalone tri~ outside morphosc)
-        let tri_output = triangle(self.tri_phase) * 0.5;
+        // Can be toggled off for A/B testing since it creates sub-bass at low frequencies
+        let tri_output = if self.triangle_enabled {
+            triangle(self.tri_phase) * 0.5
+        } else {
+            0.0
+        };
         advance_phase(&mut self.tri_phase, modulated_freq, self.sample_rate);
 
         // === Path 3: MorphOsc ===

@@ -102,7 +102,7 @@ fn render_display(tom: &Tom2, selected: usize, trigger_count: u32, velocity: f32
     print!("\x1b[2J\x1b[H\x1b[?7l");
 
     print!("=== Tom2 - Morph Oscillator Test ===\r\n");
-    print!("SPACE=hit Q=quit ↑↓=sel ←→=adj []=fine\r\n");
+    print!("SPACE=hit Q=quit ↑↓=sel ←→=adj []=fine T=tri\r\n");
     print!("Z/X/C/V=vel 25/50/75/100%\r\n");
     print!("\r\n");
 
@@ -134,7 +134,8 @@ fn render_display(tom: &Tom2, selected: usize, trigger_count: u32, velocity: f32
     }
 
     print!("\r\n");
-    print!("Hits: {} | Vel: {:.0}%\r\n", trigger_count, velocity * 100.0);
+    let tri_state = if tom.triangle_enabled() { "ON" } else { "OFF" };
+    print!("Hits: {} | Vel: {:.0}% | Triangle: {}\r\n", trigger_count, velocity * 100.0, tri_state);
     print!("\r\n");
     print!("Ch1: sine+fixed190Hz | Ch2: triangle | Ch3: (empty)\r\n");
     print!("tone=0: Ch1 only | tone=50: Ch2 only | tone=100: silent\r\n");
@@ -272,6 +273,14 @@ fn main() -> anyhow::Result<()> {
                         engine.trigger_instrument_with_velocity("tom2", 1.0);
                         trigger_count += 1;
                         current_velocity = 1.0;
+                        needs_redraw = true;
+                    }
+
+                    // Toggle triangle oscillator
+                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                        let mut t = tom2.lock().unwrap();
+                        let enabled = !t.triangle_enabled();
+                        t.set_triangle_enabled(enabled);
                         needs_redraw = true;
                     }
 
