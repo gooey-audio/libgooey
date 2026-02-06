@@ -20,7 +20,7 @@
 //! - decay: Envelope decay time (0-100 maps to 0.5-4000ms)
 
 use crate::engine::Instrument;
-use crate::filters::BiquadBandpass;
+use crate::filters::{BiquadBandpass, MembraneResonator};
 use crate::gen::{ClickOsc, MorphOsc};
 use crate::max_curve::MaxCurveEnvelope;
 use crate::utils::Blendable;
@@ -28,6 +28,10 @@ use crate::utils::Blendable;
 /// Frequency range constants (from Max zmap 0 1 40 600)
 const FREQ_MIN: f32 = 40.0;
 const FREQ_MAX: f32 = 600.0;
+
+/// Fade range to prevent clicks on cutoff
+const FADE_START_FREQ: f32 = 40.0; // Start fading at 40 Hz
+const MIN_AUDIBLE_FREQ: f32 = 20.0; // Full cutoff at 20 Hz
 
 /// Decay range constants (from Max zmap 1 100 0.5 4000)
 const DECAY_MIN_MS: f32 = 0.5;
@@ -67,23 +71,39 @@ pub struct Tom2 {
     // Standalone triangle oscillator phase (matches Max's tri~ outside morphoscillator)
     tri_phase: f32,
 
+    // Track if we've passed the attack phase for early cutoff
+    past_attack: bool,
+
     // Parameters (matching Max patch ranges)
     tune: f32,  // 0-100: maps to 40-600 Hz
     bend: f32,  // 0-100: pitch envelope depth
     tone: f32,  // 0-100: mix control (100% = silent, noise channel disabled)
     color: f32, // 0-100: double-mtof chain gives rand~ rate 116-2794 Hz AND filter cutoff
     decay: f32, // 0-100: maps to 0.5-4000ms via zmap
+
+    // Toggle for standalone triangle oscillator (for A/B testing)
+    triangle_enabled: bool,
+
+    // Membrane resonator effect - uses tom sound as input, rings independently of VCA
+    membrane_resonator: MembraneResonator,
+    membrane: f32,     // 0-100: mix amount
+    membrane_q: f32,   // 0-100: Q scale (maps to 0.005-0.02, centered at 0.01)
+
+    // Track when main tom sound is done but membrane is still ringing
+    main_sound_done: bool,
 }
 
 /// Static configuration for Tom2 presets
 /// All parameters use 0-100 ranges to match Max/MSP conventions
 #[derive(Clone, Copy, Debug)]
 pub struct Tom2Config {
-    pub tune: f32,   // 0-100: maps to 40-600 Hz
-    pub bend: f32,   // 0-100: pitch envelope depth
-    pub tone: f32,   // 0-100: mix control
-    pub color: f32,  // 0-100: noise rate / filter cutoff
-    pub decay: f32,  // 0-100: maps to 0.5-4000ms
+    pub tune: f32,        // 0-100: maps to 40-600 Hz
+    pub bend: f32,        // 0-100: pitch envelope depth
+    pub tone: f32,        // 0-100: mix control
+    pub color: f32,       // 0-100: noise rate / filter cutoff
+    pub decay: f32,       // 0-100: maps to 0.5-4000ms
+    pub membrane: f32,    // 0-100: membrane resonator mix
+    pub membrane_q: f32,  // 0-100: membrane Q scale (maps to 0.005-0.02)
 }
 
 impl Tom2Config {
@@ -95,6 +115,8 @@ impl Tom2Config {
             tone: 50.0,
             color: 0.0,
             decay: 20.0,
+            membrane: 0.0,
+            membrane_q: 50.0,
         }
     }
 
@@ -106,6 +128,8 @@ impl Tom2Config {
             tone: 10.0,
             color: 0.0,
             decay: 100.0,
+            membrane: 60.0,
+            membrane_q: 70.0,
         }
     }
 
@@ -117,6 +141,8 @@ impl Tom2Config {
             tone: 10.0,
             color: 90.0,
             decay: 30.0,
+            membrane: 0.0,
+            membrane_q: 50.0,
         }
     }
 
@@ -128,6 +154,8 @@ impl Tom2Config {
             tone: 100.0,
             color: 50.0,
             decay: 90.0,
+            membrane: 40.0,
+            membrane_q: 80.0,
         }
     }
 
@@ -147,6 +175,8 @@ impl Blendable for Tom2Config {
             tone: self.tone * inv_t + other.tone * t,
             color: self.color * inv_t + other.color * t,
             decay: self.decay * inv_t + other.decay * t,
+            membrane: self.membrane * inv_t + other.membrane * t,
+            membrane_q: self.membrane_q * inv_t + other.membrane_q * t,
         }
     }
 }
@@ -162,7 +192,7 @@ impl Tom2 {
             (0.0, 2000.0, -0.83), // Decay: value=0.0, time=2000ms, curve=-0.83
         ]);
 
-        Self {
+        let mut tom = Self {
             sample_rate,
             morph_osc: MorphOsc::new(sample_rate),
             click_osc: ClickOsc::new(),
@@ -171,13 +201,22 @@ impl Tom2 {
             is_active: false,
             trigger_time: 0.0,
             tri_phase: 0.0,
+            past_attack: false,
             // Default parameter values
             tune: 50.0,   // 320 Hz (maps via zmap formula)
             bend: 30.0,   // Lower pitch envelope for testing
             tone: 50.0,   // Middle mix position
             color: 50.0,  // Middle rand~ rate AND filter cutoff (squared mapping)
             decay: 50.0,  // ~2000ms decay (maps via zmap 1 100 0.5 4000)
-        }
+            triangle_enabled: true, // Standalone triangle on by default
+            // Membrane resonator effect
+            membrane_resonator: MembraneResonator::new(sample_rate),
+            membrane: 0.0,      // Off by default
+            membrane_q: 50.0,   // Middle Q scale
+            main_sound_done: false,
+        };
+        tom.update_membrane_params();
+        tom
     }
 
     /// Map tune parameter (0-100) to frequency (40-600 Hz)
@@ -282,6 +321,46 @@ impl Tom2 {
         Self::decay_to_ms(self.decay)
     }
 
+    /// Enable or disable the standalone triangle oscillator
+    pub fn set_triangle_enabled(&mut self, enabled: bool) {
+        self.triangle_enabled = enabled;
+    }
+
+    /// Check if triangle oscillator is enabled
+    pub fn triangle_enabled(&self) -> bool {
+        self.triangle_enabled
+    }
+
+    /// Set membrane mix amount (0-100)
+    pub fn set_membrane(&mut self, membrane: f32) {
+        self.membrane = membrane.clamp(0.0, 100.0);
+    }
+
+    /// Get membrane mix amount (0-100)
+    pub fn membrane(&self) -> f32 {
+        self.membrane
+    }
+
+    /// Set membrane Q scale (0-100): maps to 0.005-0.02 internally
+    pub fn set_membrane_q(&mut self, membrane_q: f32) {
+        self.membrane_q = membrane_q.clamp(0.0, 100.0);
+        self.update_membrane_params();
+    }
+
+    /// Get membrane Q scale (0-100)
+    pub fn membrane_q(&self) -> f32 {
+        self.membrane_q
+    }
+
+    /// Update membrane resonator parameters based on current membrane_q setting
+    fn update_membrane_params(&mut self) {
+        // Map 0-100 to Q scale range 0.005-0.02 (centered at 0.01 which matches membrane example)
+        let q_scale = 0.005 + (self.membrane_q / 100.0) * 0.015;
+        self.membrane_resonator.set_q_scale(q_scale);
+        // Higher gain scale for tom input (lower energy than noise)
+        self.membrane_resonator.set_gain_scale(0.003);
+    }
+
     /// Apply a config to this Tom2 instance
     pub fn set_config(&mut self, config: Tom2Config) {
         self.tune = config.tune;
@@ -289,6 +368,9 @@ impl Tom2 {
         self.tone = config.tone;
         self.color = config.color;
         self.decay = config.decay;
+        self.membrane = config.membrane;
+        self.membrane_q = config.membrane_q;
+        self.update_membrane_params();
     }
 
     /// Get current parameters as a config snapshot
@@ -299,6 +381,8 @@ impl Tom2 {
             tone: self.tone,
             color: self.color,
             decay: self.decay,
+            membrane: self.membrane,
+            membrane_q: self.membrane_q,
         }
     }
 }
@@ -307,10 +391,15 @@ impl Instrument for Tom2 {
     fn trigger_with_velocity(&mut self, time: f32, _velocity: f32) {
         self.is_active = true;
         self.trigger_time = time;
+        self.past_attack = false; // Reset attack phase tracking
         self.morph_osc.reset(); // Reset oscillator phases on trigger
         self.click_osc.trigger(); // Start click impulse playback
         self.tri_phase = 0.0; // Reset standalone triangle phase
         self.bandpass_filter.reset(); // Clear filter state
+
+        // Reset membrane resonator state
+        self.membrane_resonator.reset();
+        self.main_sound_done = false;
 
         // Rebuild envelope with current decay value (mapped from 0-100 to ms)
         let decay_ms = Self::decay_to_ms(self.decay);
@@ -329,23 +418,47 @@ impl Instrument for Tom2 {
         // Get envelope value (0.0 to 1.0)
         let env_value = self.envelope.get_value(current_time);
 
-        // Check if envelope is complete
-        if self.envelope.is_complete() {
-            self.is_active = false;
-            return 0.0;
+        // Track when we've passed the attack phase (reached near-peak)
+        if env_value > 0.9 {
+            self.past_attack = true;
         }
 
         // Get base frequency from tune parameter
         let base_frequency = Self::tune_to_freq(self.tune);
 
-        // Bend controls pitch envelope depth
-        // Max signal flow: curve~ → *~ bend → pow~ 2 → *~ tune_freq
-        // frequency = (envelope × bend)² × tune_frequency
-        // bend is 0-100, Max uses zmap 1 127 0 2, so scale to 0-2 range
+        // Bend controls pitch envelope depth (how much pitch drops from peak to base)
+        // bend=0: no pitch modulation, frequency stays at base_frequency
+        // bend=100: maximum pitch modulation, frequency starts at 5× base and drops to base
+        // Formula: frequency = base_frequency × (1 + (envelope × bend_scaled)²)
+        // bend is 0-100, scaled to 0-2 range
         let bend_scaled = (self.bend / 100.0) * 2.0;
-        let pitch_env = (env_value * bend_scaled).powi(2); // SQUARED like Max
-        // Floor at FREQ_MIN (40Hz) to prevent sub-bass as envelope decays toward 0
-        let modulated_freq = (base_frequency * pitch_env).max(FREQ_MIN);
+        let pitch_mod = (env_value * bend_scaled).powi(2);
+        let raw_freq = base_frequency * (1.0 + pitch_mod);
+
+        // Check if main tom sound should stop (envelope complete or pitch too low)
+        // But DON'T deactivate yet - membrane may still be ringing
+        let main_should_stop = self.envelope.is_complete()
+            || (self.past_attack && raw_freq < MIN_AUDIBLE_FREQ);
+
+        if main_should_stop {
+            self.main_sound_done = true;
+        }
+
+        // If main sound done and membrane is quiet, fully deactivate
+        if self.main_sound_done && !self.membrane_resonator.is_ringing() {
+            self.is_active = false;
+            return 0.0;
+        }
+
+        // Calculate fade factor for smooth cutoff (1.0 at 40Hz, 0.0 at 20Hz)
+        let fade_factor = if self.past_attack && raw_freq < FADE_START_FREQ {
+            (raw_freq - MIN_AUDIBLE_FREQ) / (FADE_START_FREQ - MIN_AUDIBLE_FREQ)
+        } else {
+            1.0
+        };
+
+        // Floor at FREQ_MIN (40Hz) for the oscillator
+        let modulated_freq = raw_freq.max(FREQ_MIN);
 
         // === Path 1: Click oscillator ===
         // click~ output scaled by 1.1 (from Max patch)
@@ -353,7 +466,12 @@ impl Instrument for Tom2 {
 
         // === Path 2: Standalone Triangle oscillator ===
         // tri~ at modulated frequency, scaled by 0.5 (matches Max's standalone tri~ outside morphosc)
-        let tri_output = triangle(self.tri_phase) * 0.5;
+        // Can be toggled off for A/B testing since it creates sub-bass at low frequencies
+        let tri_output = if self.triangle_enabled {
+            triangle(self.tri_phase) * 0.5
+        } else {
+            0.0
+        };
         advance_phase(&mut self.tri_phase, modulated_freq, self.sample_rate);
 
         // === Path 3: MorphOsc ===
@@ -395,10 +513,41 @@ impl Instrument for Tom2 {
         self.bandpass_filter.set_params(filter_freq, filter_q, 1.1);
         let filtered = self.bandpass_filter.process(mixed);
 
-        // === VCA and output gain stages ===
-        // Max: biquad → *~ envelope → *~ 0.5 → *~ 1.4 → out
+        // === Membrane Resonator ===
+        // Use the tom sound (pre-VCA) as input to excite the resonators
+        // The resonators ring independently - no envelope on output so it sustains naturally
+        let membrane_output = if self.membrane > 0.0 {
+            // When main sound is done, feed zero input - filters ring out naturally
+            let membrane_input = if self.main_sound_done {
+                0.0
+            } else {
+                filtered * env_value
+            };
+
+            // Process through the membrane resonator effect
+            self.membrane_resonator.process(membrane_input)
+        } else {
+            0.0
+        };
+
+        // If main sound is done, only output membrane ring (with fade for smooth ending)
+        if self.main_sound_done {
+            let membrane_mix = self.membrane / 100.0;
+            let fade = self.membrane_resonator.fade_multiplier();
+            return membrane_output * membrane_mix * fade * 0.7;
+        }
+
+        // Mix membrane with main signal
+        // Dry signal has VCA envelope, membrane output rings freely (no additional envelope)
+        let membrane_mix = self.membrane / 100.0;
+        let dry_gain = 1.0 - membrane_mix;
+        let wet_gain = membrane_mix;
+        let dry_output = filtered * env_value;  // VCA envelope on dry
+        let final_signal = dry_output * dry_gain + membrane_output * wet_gain;  // membrane rings independently
+
+        // === Output gain stages ===
         // Combined gain: 0.5 * 1.4 = 0.7
-        filtered * env_value * 0.7
+        final_signal * fade_factor * 0.7
     }
 
     fn is_active(&self) -> bool {

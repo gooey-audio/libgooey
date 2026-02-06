@@ -385,6 +385,8 @@ impl GooeyEngine {
                     TOM_PARAM_TONE => self.tom.set_tone(scaled),
                     TOM_PARAM_COLOR => self.tom.set_color(scaled),
                     TOM_PARAM_DECAY => self.tom.set_decay(scaled),
+                    TOM_PARAM_MEMBRANE => self.tom.set_membrane(scaled),
+                    TOM_PARAM_MEMBRANE_Q => self.tom.set_membrane_q(scaled),
                     _ => {}
                 }
             }
@@ -571,6 +573,10 @@ pub const TOM_PARAM_TONE: u32 = 2;
 pub const TOM_PARAM_COLOR: u32 = 3;
 /// Tom parameter: decay (0-1 → 0-100, maps to 0.5-4000ms)
 pub const TOM_PARAM_DECAY: u32 = 4;
+/// Tom parameter: membrane mix (0-1 → 0-100, resonator mix amount)
+pub const TOM_PARAM_MEMBRANE: u32 = 5;
+/// Tom parameter: membrane Q (0-1 → 0-100, resonator Q scale)
+pub const TOM_PARAM_MEMBRANE_Q: u32 = 6;
 
 // =============================================================================
 // Instrument IDs (must match Swift/C enum if used)
@@ -1976,7 +1982,7 @@ pub extern "C" fn gooey_engine_snare_param_count() -> u32 {
 /// Get the number of tom parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_tom_param_count() -> u32 {
-    5 // tune, bend, tone, color, decay (Tom2)
+    7 // tune, bend, tone, color, decay, membrane, membrane_q (Tom2)
 }
 
 // =============================================================================
