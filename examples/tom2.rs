@@ -29,12 +29,14 @@ struct ParamInfo {
     max: f32,
 }
 
-const PARAM_INFO: [ParamInfo; 5] = [
+const PARAM_INFO: [ParamInfo; 7] = [
     ParamInfo { name: "tune", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
     ParamInfo { name: "bend", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
     ParamInfo { name: "tone", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
     ParamInfo { name: "color", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
     ParamInfo { name: "decay", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
+    ParamInfo { name: "membrane", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
+    ParamInfo { name: "membrane_q", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
 ];
 
 // Wrapper to share Tom2 between audio thread and main thread
@@ -66,6 +68,8 @@ fn get_param_value(tom: &Tom2, index: usize) -> f32 {
         2 => tom.tone(),
         3 => tom.color(),
         4 => tom.decay(),
+        5 => tom.membrane(),
+        6 => tom.membrane_q(),
         _ => 0.0,
     }
 }
@@ -77,6 +81,8 @@ fn set_param_value(tom: &mut Tom2, index: usize, value: f32) {
         2 => tom.set_tone(value),
         3 => tom.set_color(value),
         4 => tom.set_decay(value),
+        5 => tom.set_membrane(value),
+        6 => tom.set_membrane_q(value),
         _ => {}
     }
 }
