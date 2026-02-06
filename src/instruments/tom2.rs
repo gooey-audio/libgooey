@@ -23,6 +23,7 @@ use crate::engine::Instrument;
 use crate::filters::BiquadBandpass;
 use crate::gen::{ClickOsc, MorphOsc};
 use crate::max_curve::MaxCurveEnvelope;
+use crate::utils::Blendable;
 
 /// Frequency range constants (from Max zmap 0 1 40 600)
 const FREQ_MIN: f32 = 40.0;
@@ -72,6 +73,82 @@ pub struct Tom2 {
     tone: f32,  // 0-100: mix control (100% = silent, noise channel disabled)
     color: f32, // 0-100: double-mtof chain gives rand~ rate 116-2794 Hz AND filter cutoff
     decay: f32, // 0-100: maps to 0.5-4000ms via zmap
+}
+
+/// Static configuration for Tom2 presets
+/// All parameters use 0-100 ranges to match Max/MSP conventions
+#[derive(Clone, Copy, Debug)]
+pub struct Tom2Config {
+    pub tune: f32,   // 0-100: maps to 40-600 Hz
+    pub bend: f32,   // 0-100: pitch envelope depth
+    pub tone: f32,   // 0-100: mix control
+    pub color: f32,  // 0-100: noise rate / filter cutoff
+    pub decay: f32,  // 0-100: maps to 0.5-4000ms
+}
+
+impl Tom2Config {
+    /// "derp" preset - punchy mid tom
+    pub fn derp() -> Self {
+        Self {
+            tune: 60.0,
+            bend: 70.0,
+            tone: 50.0,
+            color: 0.0,
+            decay: 20.0,
+        }
+    }
+
+    /// "ring" preset - high, long decay
+    pub fn ring() -> Self {
+        Self {
+            tune: 80.0,
+            bend: 20.0,
+            tone: 10.0,
+            color: 0.0,
+            decay: 100.0,
+        }
+    }
+
+    /// "brush" preset - low, textured
+    pub fn brush() -> Self {
+        Self {
+            tune: 40.0,
+            bend: 20.0,
+            tone: 10.0,
+            color: 90.0,
+            decay: 30.0,
+        }
+    }
+
+    /// "void" preset - atmospheric, long
+    pub fn void_preset() -> Self {
+        Self {
+            tune: 60.0,
+            bend: 30.0,
+            tone: 100.0,
+            color: 50.0,
+            decay: 90.0,
+        }
+    }
+
+    /// Default preset
+    pub fn default() -> Self {
+        Self::derp()
+    }
+}
+
+impl Blendable for Tom2Config {
+    fn lerp(&self, other: &Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        let inv_t = 1.0 - t;
+        Self {
+            tune: self.tune * inv_t + other.tune * t,
+            bend: self.bend * inv_t + other.bend * t,
+            tone: self.tone * inv_t + other.tone * t,
+            color: self.color * inv_t + other.color * t,
+            decay: self.decay * inv_t + other.decay * t,
+        }
+    }
 }
 
 impl Tom2 {
@@ -203,6 +280,26 @@ impl Tom2 {
     /// Get the decay time in milliseconds
     pub fn decay_ms(&self) -> f32 {
         Self::decay_to_ms(self.decay)
+    }
+
+    /// Apply a config to this Tom2 instance
+    pub fn set_config(&mut self, config: Tom2Config) {
+        self.tune = config.tune;
+        self.bend = config.bend;
+        self.tone = config.tone;
+        self.color = config.color;
+        self.decay = config.decay;
+    }
+
+    /// Get current parameters as a config snapshot
+    pub fn config(&self) -> Tom2Config {
+        Tom2Config {
+            tune: self.tune,
+            bend: self.bend,
+            tone: self.tone,
+            color: self.color,
+            decay: self.decay,
+        }
     }
 }
 

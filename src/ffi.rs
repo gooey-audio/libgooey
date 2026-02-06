@@ -6,7 +6,7 @@
 use crate::effects::{BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect, TubeSaturation};
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer};
-use crate::instruments::{HiHat, KickConfig, KickDrum, SnareDrum, TomDrum};
+use crate::instruments::{HiHat, KickConfig, KickDrum, SnareDrum, Tom2, Tom2Config};
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -65,7 +65,7 @@ pub struct GooeyEngine {
     kick: KickDrum,
     snare: SnareDrum,
     hihat: HiHat,
-    tom: TomDrum,
+    tom: Tom2,
 
     // Per-instrument sequencers (sample-accurate, synchronized)
     kick_sequencer: Sequencer,
@@ -111,8 +111,8 @@ pub struct GooeyEngine {
     instrument_gains: [SmoothedParam; NUM_INSTRUMENTS],
 
     // Per-instrument preset blend state (2D X/Y pad interpolation)
-    // Only kick is implemented initially; other instruments will be added as they implement Blendable
     kick_blender: PresetBlender<KickConfig>,
+    tom_blender: PresetBlender<Tom2Config>,
     blend_enabled: [bool; INSTRUMENT_COUNT as usize],
     blend_x: [f32; INSTRUMENT_COUNT as usize],
     blend_y: [f32; INSTRUMENT_COUNT as usize],
@@ -127,7 +127,7 @@ impl GooeyEngine {
         let kick = KickDrum::new(sample_rate);
         let snare = SnareDrum::new(sample_rate);
         let hihat = HiHat::new(sample_rate);
-        let tom = TomDrum::new(sample_rate);
+        let tom = Tom2::new(sample_rate);
 
         // Create a 16-step sequencer for each instrument
         // All use 16th notes at default 120 BPM, starting with all steps off
@@ -158,6 +158,15 @@ impl GooeyEngine {
             KickConfig::punch(),
             KickConfig::loose(),
             KickConfig::dirt(),
+        );
+
+        // Create tom preset blender with default corner presets
+        // BL(0,0)=Derp, BR(1,0)=Ring, TL(0,1)=Brush, TR(1,1)=Void
+        let tom_blender = PresetBlender::new(
+            Tom2Config::derp(),
+            Tom2Config::ring(),
+            Tom2Config::brush(),
+            Tom2Config::void_preset(),
         );
 
         Self {
@@ -199,6 +208,7 @@ impl GooeyEngine {
             instrument_gains: std::array::from_fn(|_| SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0)),
             // Preset blend state
             kick_blender,
+            tom_blender,
             blend_enabled: [false; INSTRUMENT_COUNT as usize],
             blend_x: [0.5; INSTRUMENT_COUNT as usize],
             blend_y: [0.5; INSTRUMENT_COUNT as usize],
@@ -206,7 +216,7 @@ impl GooeyEngine {
                 [KICK_PRESET_TIGHT, KICK_PRESET_PUNCH, KICK_PRESET_LOOSE, KICK_PRESET_DIRT],
                 [0, 1, 2, 3], // Snare: placeholder
                 [0, 1, 2, 3], // HiHat: placeholder
-                [0, 1, 2, 3], // Tom: placeholder
+                [TOM_PRESET_DERP, TOM_PRESET_RING, TOM_PRESET_BRUSH, TOM_PRESET_VOID],
             ],
         }
     }
@@ -366,15 +376,18 @@ impl GooeyEngine {
                 HIHAT_PARAM_VOLUME => self.hihat.params.volume.set_bipolar(value),
                 _ => {}
             },
-            INSTRUMENT_TOM => match param {
-                TOM_PARAM_FREQUENCY => self.tom.params.frequency.set_bipolar(value),
-                TOM_PARAM_TONAL => self.tom.params.tonal.set_bipolar(value),
-                TOM_PARAM_PUNCH => self.tom.params.punch.set_bipolar(value),
-                TOM_PARAM_DECAY => self.tom.params.decay.set_bipolar(value),
-                TOM_PARAM_PITCH_DROP => self.tom.params.pitch_drop.set_bipolar(value),
-                TOM_PARAM_VOLUME => self.tom.params.volume.set_bipolar(value),
-                _ => {}
-            },
+            INSTRUMENT_TOM => {
+                // Tom2 uses 0-100 range, FFI uses 0-1, so scale by 100
+                let scaled = value * 100.0;
+                match param {
+                    TOM_PARAM_TUNE => self.tom.set_tune(scaled),
+                    TOM_PARAM_BEND => self.tom.set_bend(scaled),
+                    TOM_PARAM_TONE => self.tom.set_tone(scaled),
+                    TOM_PARAM_COLOR => self.tom.set_color(scaled),
+                    TOM_PARAM_DECAY => self.tom.set_decay(scaled),
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
@@ -409,6 +422,17 @@ impl GooeyEngine {
             KICK_PRESET_PUNCH => Some(KickConfig::punch()),
             KICK_PRESET_LOOSE => Some(KickConfig::loose()),
             KICK_PRESET_DIRT => Some(KickConfig::dirt()),
+            _ => None,
+        }
+    }
+
+    /// Get a Tom2Config preset by ID
+    fn tom_preset_by_id(id: u32) -> Option<Tom2Config> {
+        match id {
+            TOM_PRESET_DERP => Some(Tom2Config::derp()),
+            TOM_PRESET_RING => Some(Tom2Config::ring()),
+            TOM_PRESET_BRUSH => Some(Tom2Config::brush()),
+            TOM_PRESET_VOID => Some(Tom2Config::void_preset()),
             _ => None,
         }
     }
@@ -534,21 +558,19 @@ pub const SNARE_PARAM_AMP_DECAY_CURVE: u32 = 17;
 pub const SNARE_PARAM_TONAL_DECAY_CURVE: u32 = 18;
 
 // =============================================================================
-// Tom drum parameter indices (must match Swift TomParam enum)
+// Tom drum parameter indices (Tom2 - must match Swift TomParam enum)
 // =============================================================================
 
-/// Tom parameter: base frequency (80-300 Hz)
-pub const TOM_PARAM_FREQUENCY: u32 = 0;
-/// Tom parameter: tonal body amount (0-1)
-pub const TOM_PARAM_TONAL: u32 = 1;
-/// Tom parameter: punch/attack amount (0-1)
-pub const TOM_PARAM_PUNCH: u32 = 2;
-/// Tom parameter: decay time (0.1-1.5 seconds)
-pub const TOM_PARAM_DECAY: u32 = 3;
-/// Tom parameter: pitch drop amount (0-1)
-pub const TOM_PARAM_PITCH_DROP: u32 = 4;
-/// Tom parameter: overall volume (0-1)
-pub const TOM_PARAM_VOLUME: u32 = 5;
+/// Tom parameter: tune (0-1 → 0-100, maps to 40-600 Hz)
+pub const TOM_PARAM_TUNE: u32 = 0;
+/// Tom parameter: bend (0-1 → 0-100, pitch envelope depth)
+pub const TOM_PARAM_BEND: u32 = 1;
+/// Tom parameter: tone (0-1 → 0-100, mix control)
+pub const TOM_PARAM_TONE: u32 = 2;
+/// Tom parameter: color (0-1 → 0-100, noise rate / filter cutoff)
+pub const TOM_PARAM_COLOR: u32 = 3;
+/// Tom parameter: decay (0-1 → 0-100, maps to 0.5-4000ms)
+pub const TOM_PARAM_DECAY: u32 = 4;
 
 // =============================================================================
 // Instrument IDs (must match Swift/C enum if used)
@@ -579,6 +601,15 @@ pub const KICK_PRESET_PUNCH: u32 = 1;
 pub const KICK_PRESET_LOOSE: u32 = 2;
 /// Kick preset: Dirt - higher frequency, more noise with high resonance
 pub const KICK_PRESET_DIRT: u32 = 3;
+
+/// Tom preset: Derp - punchy mid tom
+pub const TOM_PRESET_DERP: u32 = 0;
+/// Tom preset: Ring - high, long decay
+pub const TOM_PRESET_RING: u32 = 1;
+/// Tom preset: Brush - low, textured
+pub const TOM_PRESET_BRUSH: u32 = 2;
+/// Tom preset: Void - atmospheric, long
+pub const TOM_PRESET_VOID: u32 = 3;
 
 /// Blend corner: bottom-left (x=0, y=0)
 pub const BLEND_CORNER_BOTTOM_LEFT: u32 = 0;
@@ -1945,7 +1976,7 @@ pub extern "C" fn gooey_engine_snare_param_count() -> u32 {
 /// Get the number of tom parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_tom_param_count() -> u32 {
-    6 // frequency, tonal, punch, decay, pitch_drop, volume
+    5 // tune, bend, tone, color, decay (Tom2)
 }
 
 // =============================================================================
@@ -2179,8 +2210,11 @@ pub unsafe extern "C" fn gooey_engine_blend_set_position(
             let blended = engine.kick_blender.blend(engine.blend_x[idx], engine.blend_y[idx]);
             engine.kick.set_config(blended);
         }
-        // Future: INSTRUMENT_SNARE, INSTRUMENT_HIHAT, INSTRUMENT_TOM
-        // when they implement Blendable
+        INSTRUMENT_TOM => {
+            let blended = engine.tom_blender.blend(engine.blend_x[idx], engine.blend_y[idx]);
+            engine.tom.set_config(blended);
+        }
+        // Future: INSTRUMENT_SNARE, INSTRUMENT_HIHAT when they implement Blendable
         _ => {}
     }
 }
@@ -2291,6 +2325,17 @@ pub unsafe extern "C" fn gooey_engine_blend_set_corner_preset(
                 }
             }
         }
+        INSTRUMENT_TOM => {
+            if let Some(config) = GooeyEngine::tom_preset_by_id(preset_id) {
+                match corner {
+                    BLEND_CORNER_BOTTOM_LEFT => engine.tom_blender.set_bottom_left(config),
+                    BLEND_CORNER_BOTTOM_RIGHT => engine.tom_blender.set_bottom_right(config),
+                    BLEND_CORNER_TOP_LEFT => engine.tom_blender.set_top_left(config),
+                    BLEND_CORNER_TOP_RIGHT => engine.tom_blender.set_top_right(config),
+                    _ => {}
+                }
+            }
+        }
         // Future: other instruments when they implement Blendable
         _ => {}
     }
@@ -2367,6 +2412,16 @@ pub unsafe extern "C" fn gooey_engine_blend_reset_corners(
             );
             engine.blend_corner_presets[idx] =
                 [KICK_PRESET_TIGHT, KICK_PRESET_PUNCH, KICK_PRESET_LOOSE, KICK_PRESET_DIRT];
+        }
+        INSTRUMENT_TOM => {
+            engine.tom_blender = PresetBlender::new(
+                Tom2Config::derp(),
+                Tom2Config::ring(),
+                Tom2Config::brush(),
+                Tom2Config::void_preset(),
+            );
+            engine.blend_corner_presets[idx] =
+                [TOM_PRESET_DERP, TOM_PRESET_RING, TOM_PRESET_BRUSH, TOM_PRESET_VOID];
         }
         // Future: other instruments when they implement Blendable
         _ => {}
