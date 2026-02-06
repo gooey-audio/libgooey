@@ -20,7 +20,7 @@
 //! - decay: Envelope decay time (0-100 maps to 0.5-4000ms)
 
 use crate::engine::Instrument;
-use crate::filters::BiquadBandpass;
+use crate::filters::{BiquadBandpass, MembraneResonator};
 use crate::gen::{ClickOsc, MorphOsc};
 use crate::max_curve::MaxCurveEnvelope;
 
@@ -82,6 +82,14 @@ pub struct Tom2 {
 
     // Toggle for standalone triangle oscillator (for A/B testing)
     triangle_enabled: bool,
+
+    // Membrane resonator effect - uses tom sound as input, rings independently of VCA
+    membrane_resonator: MembraneResonator,
+    membrane: f32,     // 0-100: mix amount
+    membrane_q: f32,   // 0-100: Q scale (maps to 0.005-0.02, centered at 0.01)
+
+    // Track when main tom sound is done but membrane is still ringing
+    main_sound_done: bool,
 }
 
 impl Tom2 {
@@ -95,7 +103,7 @@ impl Tom2 {
             (0.0, 2000.0, -0.83), // Decay: value=0.0, time=2000ms, curve=-0.83
         ]);
 
-        Self {
+        let mut tom = Self {
             sample_rate,
             morph_osc: MorphOsc::new(sample_rate),
             click_osc: ClickOsc::new(),
@@ -112,7 +120,14 @@ impl Tom2 {
             color: 50.0,  // Middle rand~ rate AND filter cutoff (squared mapping)
             decay: 50.0,  // ~2000ms decay (maps via zmap 1 100 0.5 4000)
             triangle_enabled: true, // Standalone triangle on by default
-        }
+            // Membrane resonator effect
+            membrane_resonator: MembraneResonator::new(sample_rate),
+            membrane: 0.0,      // Off by default
+            membrane_q: 50.0,   // Middle Q scale
+            main_sound_done: false,
+        };
+        tom.update_membrane_params();
+        tom
     }
 
     /// Map tune parameter (0-100) to frequency (40-600 Hz)
@@ -226,6 +241,36 @@ impl Tom2 {
     pub fn triangle_enabled(&self) -> bool {
         self.triangle_enabled
     }
+
+    /// Set membrane mix amount (0-100)
+    pub fn set_membrane(&mut self, membrane: f32) {
+        self.membrane = membrane.clamp(0.0, 100.0);
+    }
+
+    /// Get membrane mix amount (0-100)
+    pub fn membrane(&self) -> f32 {
+        self.membrane
+    }
+
+    /// Set membrane Q scale (0-100): maps to 0.005-0.02 internally
+    pub fn set_membrane_q(&mut self, membrane_q: f32) {
+        self.membrane_q = membrane_q.clamp(0.0, 100.0);
+        self.update_membrane_params();
+    }
+
+    /// Get membrane Q scale (0-100)
+    pub fn membrane_q(&self) -> f32 {
+        self.membrane_q
+    }
+
+    /// Update membrane resonator parameters based on current membrane_q setting
+    fn update_membrane_params(&mut self) {
+        // Map 0-100 to Q scale range 0.005-0.02 (centered at 0.01 which matches membrane example)
+        let q_scale = 0.005 + (self.membrane_q / 100.0) * 0.015;
+        self.membrane_resonator.set_q_scale(q_scale);
+        // Higher gain scale for tom input (lower energy than noise)
+        self.membrane_resonator.set_gain_scale(0.003);
+    }
 }
 
 impl Instrument for Tom2 {
@@ -237,6 +282,10 @@ impl Instrument for Tom2 {
         self.click_osc.trigger(); // Start click impulse playback
         self.tri_phase = 0.0; // Reset standalone triangle phase
         self.bandpass_filter.reset(); // Clear filter state
+
+        // Reset membrane resonator state
+        self.membrane_resonator.reset();
+        self.main_sound_done = false;
 
         // Rebuild envelope with current decay value (mapped from 0-100 to ms)
         let decay_ms = Self::decay_to_ms(self.decay);
@@ -272,11 +321,17 @@ impl Instrument for Tom2 {
         let pitch_mod = (env_value * bend_scaled).powi(2);
         let raw_freq = base_frequency * (1.0 + pitch_mod);
 
-        // Early cutoff when pitch drops below audible threshold
-        // This prevents the triangle oscillator from creating a sub-bass rumble
-        if self.envelope.is_complete()
-            || (self.past_attack && raw_freq < MIN_AUDIBLE_FREQ)
-        {
+        // Check if main tom sound should stop (envelope complete or pitch too low)
+        // But DON'T deactivate yet - membrane may still be ringing
+        let main_should_stop = self.envelope.is_complete()
+            || (self.past_attack && raw_freq < MIN_AUDIBLE_FREQ);
+
+        if main_should_stop {
+            self.main_sound_done = true;
+        }
+
+        // If main sound done and membrane is quiet, fully deactivate
+        if self.main_sound_done && !self.membrane_resonator.is_ringing() {
             self.is_active = false;
             return 0.0;
         }
@@ -344,10 +399,41 @@ impl Instrument for Tom2 {
         self.bandpass_filter.set_params(filter_freq, filter_q, 1.1);
         let filtered = self.bandpass_filter.process(mixed);
 
-        // === VCA and output gain stages ===
-        // Max: biquad → *~ envelope → *~ 0.5 → *~ 1.4 → out
+        // === Membrane Resonator ===
+        // Use the tom sound (pre-VCA) as input to excite the resonators
+        // The resonators ring independently - no envelope on output so it sustains naturally
+        let membrane_output = if self.membrane > 0.0 {
+            // When main sound is done, feed zero input - filters ring out naturally
+            let membrane_input = if self.main_sound_done {
+                0.0
+            } else {
+                filtered * env_value
+            };
+
+            // Process through the membrane resonator effect
+            self.membrane_resonator.process(membrane_input)
+        } else {
+            0.0
+        };
+
+        // If main sound is done, only output membrane ring (with fade for smooth ending)
+        if self.main_sound_done {
+            let membrane_mix = self.membrane / 100.0;
+            let fade = self.membrane_resonator.fade_multiplier();
+            return membrane_output * membrane_mix * fade * 0.7;
+        }
+
+        // Mix membrane with main signal
+        // Dry signal has VCA envelope, membrane output rings freely (no additional envelope)
+        let membrane_mix = self.membrane / 100.0;
+        let dry_gain = 1.0 - membrane_mix;
+        let wet_gain = membrane_mix;
+        let dry_output = filtered * env_value;  // VCA envelope on dry
+        let final_signal = dry_output * dry_gain + membrane_output * wet_gain;  // membrane rings independently
+
+        // === Output gain stages ===
         // Combined gain: 0.5 * 1.4 = 0.7
-        filtered * env_value * fade_factor * 0.7
+        final_signal * fade_factor * 0.7
     }
 
     fn is_active(&self) -> bool {
