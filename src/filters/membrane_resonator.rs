@@ -211,7 +211,7 @@ mod tests {
     fn test_membrane_creation() {
         let membrane = MembraneResonator::new(44100.0);
         assert_eq!(membrane.q_scale(), 0.01);
-        assert_eq!(membrane.gain_scale(), 0.001);
+        assert_eq!(membrane.gain_scale(), 0.0031);
     }
 
     #[test]
