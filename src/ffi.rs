@@ -6,7 +6,7 @@
 use crate::effects::{BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect, TubeSaturation};
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer};
-use crate::instruments::{HiHat, KickConfig, KickDrum, SnareDrum, Tom2, Tom2Config};
+use crate::instruments::{HiHat, KickConfig, KickDrum, SnareConfig, SnareDrum, Tom2, Tom2Config};
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -112,6 +112,7 @@ pub struct GooeyEngine {
 
     // Per-instrument preset blend state (2D X/Y pad interpolation)
     kick_blender: PresetBlender<KickConfig>,
+    snare_blender: PresetBlender<SnareConfig>,
     tom_blender: PresetBlender<Tom2Config>,
     blend_enabled: [bool; INSTRUMENT_COUNT as usize],
     blend_x: [f32; INSTRUMENT_COUNT as usize],
@@ -158,6 +159,15 @@ impl GooeyEngine {
             KickConfig::punch(),
             KickConfig::loose(),
             KickConfig::dirt(),
+        );
+
+        // Create snare preset blender with default corner presets
+        // BL(0,0)=Tight, BR(1,0)=Loose, TL(0,1)=Hiss, TR(1,1)=Smack
+        let snare_blender = PresetBlender::new(
+            SnareConfig::tight(),
+            SnareConfig::loose(),
+            SnareConfig::hiss(),
+            SnareConfig::smack(),
         );
 
         // Create tom preset blender with default corner presets
@@ -208,13 +218,14 @@ impl GooeyEngine {
             instrument_gains: std::array::from_fn(|_| SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0)),
             // Preset blend state
             kick_blender,
+            snare_blender,
             tom_blender,
             blend_enabled: [false; INSTRUMENT_COUNT as usize],
             blend_x: [0.5; INSTRUMENT_COUNT as usize],
             blend_y: [0.5; INSTRUMENT_COUNT as usize],
             blend_corner_presets: [
                 [KICK_PRESET_TIGHT, KICK_PRESET_PUNCH, KICK_PRESET_LOOSE, KICK_PRESET_DIRT],
-                [0, 1, 2, 3], // Snare: placeholder
+                [SNARE_PRESET_TIGHT, SNARE_PRESET_LOOSE, SNARE_PRESET_HISS, SNARE_PRESET_SMACK],
                 [0, 1, 2, 3], // HiHat: placeholder
                 [TOM_PRESET_DERP, TOM_PRESET_RING, TOM_PRESET_BRUSH, TOM_PRESET_VOID],
             ],
@@ -438,6 +449,17 @@ impl GooeyEngine {
             _ => None,
         }
     }
+
+    /// Get a SnareConfig preset by ID
+    fn snare_preset_by_id(id: u32) -> Option<SnareConfig> {
+        match id {
+            SNARE_PRESET_TIGHT => Some(SnareConfig::tight()),
+            SNARE_PRESET_LOOSE => Some(SnareConfig::loose()),
+            SNARE_PRESET_HISS => Some(SnareConfig::hiss()),
+            SNARE_PRESET_SMACK => Some(SnareConfig::smack()),
+            _ => None,
+        }
+    }
 }
 
 // =============================================================================
@@ -616,6 +638,15 @@ pub const TOM_PRESET_RING: u32 = 1;
 pub const TOM_PRESET_BRUSH: u32 = 2;
 /// Tom preset: Void - atmospheric, long
 pub const TOM_PRESET_VOID: u32 = 3;
+
+/// Snare preset: Tight - short, punchy snare
+pub const SNARE_PRESET_TIGHT: u32 = 0;
+/// Snare preset: Loose - longer decay, more body
+pub const SNARE_PRESET_LOOSE: u32 = 1;
+/// Snare preset: Hiss - noise-focused with phase modulation
+pub const SNARE_PRESET_HISS: u32 = 2;
+/// Snare preset: Smack - DS-style transient with SVF noise
+pub const SNARE_PRESET_SMACK: u32 = 3;
 
 /// Blend corner: bottom-left (x=0, y=0)
 pub const BLEND_CORNER_BOTTOM_LEFT: u32 = 0;
@@ -2216,11 +2247,14 @@ pub unsafe extern "C" fn gooey_engine_blend_set_position(
             let blended = engine.kick_blender.blend(engine.blend_x[idx], engine.blend_y[idx]);
             engine.kick.set_config(blended);
         }
+        INSTRUMENT_SNARE => {
+            let blended = engine.snare_blender.blend(engine.blend_x[idx], engine.blend_y[idx]);
+            engine.snare.set_config(blended);
+        }
         INSTRUMENT_TOM => {
             let blended = engine.tom_blender.blend(engine.blend_x[idx], engine.blend_y[idx]);
             engine.tom.set_config(blended);
         }
-        // Future: INSTRUMENT_SNARE, INSTRUMENT_HIHAT when they implement Blendable
         _ => {}
     }
 }
@@ -2331,6 +2365,17 @@ pub unsafe extern "C" fn gooey_engine_blend_set_corner_preset(
                 }
             }
         }
+        INSTRUMENT_SNARE => {
+            if let Some(config) = GooeyEngine::snare_preset_by_id(preset_id) {
+                match corner {
+                    BLEND_CORNER_BOTTOM_LEFT => engine.snare_blender.set_bottom_left(config),
+                    BLEND_CORNER_BOTTOM_RIGHT => engine.snare_blender.set_bottom_right(config),
+                    BLEND_CORNER_TOP_LEFT => engine.snare_blender.set_top_left(config),
+                    BLEND_CORNER_TOP_RIGHT => engine.snare_blender.set_top_right(config),
+                    _ => {}
+                }
+            }
+        }
         INSTRUMENT_TOM => {
             if let Some(config) = GooeyEngine::tom_preset_by_id(preset_id) {
                 match corner {
@@ -2342,7 +2387,6 @@ pub unsafe extern "C" fn gooey_engine_blend_set_corner_preset(
                 }
             }
         }
-        // Future: other instruments when they implement Blendable
         _ => {}
     }
 }
@@ -2419,6 +2463,16 @@ pub unsafe extern "C" fn gooey_engine_blend_reset_corners(
             engine.blend_corner_presets[idx] =
                 [KICK_PRESET_TIGHT, KICK_PRESET_PUNCH, KICK_PRESET_LOOSE, KICK_PRESET_DIRT];
         }
+        INSTRUMENT_SNARE => {
+            engine.snare_blender = PresetBlender::new(
+                SnareConfig::tight(),
+                SnareConfig::loose(),
+                SnareConfig::hiss(),
+                SnareConfig::smack(),
+            );
+            engine.blend_corner_presets[idx] =
+                [SNARE_PRESET_TIGHT, SNARE_PRESET_LOOSE, SNARE_PRESET_HISS, SNARE_PRESET_SMACK];
+        }
         INSTRUMENT_TOM => {
             engine.tom_blender = PresetBlender::new(
                 Tom2Config::derp(),
@@ -2429,7 +2483,6 @@ pub unsafe extern "C" fn gooey_engine_blend_reset_corners(
             engine.blend_corner_presets[idx] =
                 [TOM_PRESET_DERP, TOM_PRESET_RING, TOM_PRESET_BRUSH, TOM_PRESET_VOID];
         }
-        // Future: other instruments when they implement Blendable
         _ => {}
     }
 }
