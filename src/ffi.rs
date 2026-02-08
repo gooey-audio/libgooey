@@ -60,6 +60,19 @@ struct LfoRoute {
 ///
 /// Parameter smoothing is handled internally by each instrument,
 /// so all parameter changes are automatically smoothed to prevent clicks/pops.
+#[repr(C)]
+pub struct GooeyRenderStats {
+    pub total_frames_rendered: u64,
+    pub render_calls: u64,
+    pub peak_render_time_us: u64,
+}
+
+#[repr(C)]
+pub struct GooeySequencerState {
+    pub samples_since_start: u64,
+    pub is_running: bool,
+}
+
 pub struct GooeyEngine {
     // Instruments
     kick: KickDrum,
@@ -86,6 +99,11 @@ pub struct GooeyEngine {
     sample_rate: f32,
     bpm: f32,
     current_time: f32,
+
+    // Debug stats
+    render_calls: u64,
+    total_frames_rendered: u64,
+    peak_render_time_us: u64,
 
     // Per-instrument manual trigger flags and velocities
     kick_trigger_pending: AtomicBool,
@@ -198,6 +216,9 @@ impl GooeyEngine {
             sample_rate,
             bpm,
             current_time: 0.0,
+            render_calls: 0,
+            total_frames_rendered: 0,
+            peak_render_time_us: 0,
             kick_trigger_pending: AtomicBool::new(false),
             kick_trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
             snare_trigger_pending: AtomicBool::new(false),
@@ -233,6 +254,8 @@ impl GooeyEngine {
     }
 
     fn render(&mut self, buffer: &mut [f32]) {
+        let render_start = std::time::Instant::now();
+
         // Check for pending manual triggers with velocity (all instruments)
         if self.kick_trigger_pending.swap(false, Ordering::Acquire) {
             let velocity = f32::from_bits(self.kick_trigger_velocity.load(Ordering::Acquire));
@@ -342,6 +365,13 @@ impl GooeyEngine {
             *sample = self.limiter.process(output);
 
             self.current_time += sample_period;
+        }
+
+        self.render_calls += 1;
+        self.total_frames_rendered += buffer.len() as u64;
+        let elapsed_us = render_start.elapsed().as_micros() as u64;
+        if elapsed_us > self.peak_render_time_us {
+            self.peak_render_time_us = elapsed_us;
         }
     }
 
@@ -2484,5 +2514,87 @@ pub unsafe extern "C" fn gooey_engine_blend_reset_corners(
                 [TOM_PRESET_DERP, TOM_PRESET_RING, TOM_PRESET_BRUSH, TOM_PRESET_VOID];
         }
         _ => {}
+    }
+}
+
+// =============================================================================
+// Debug / diagnostics
+// =============================================================================
+
+/// Get render statistics for diagnosing audio pipeline issues
+///
+/// Returns a struct with cumulative render stats. Compare `render_calls` over time
+/// to determine if the host is still calling the render callback. Compare
+/// `total_frames_rendered` to expected sample count to detect dropped buffers.
+/// `peak_render_time_us` shows the worst-case render duration in microseconds.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_render_stats(
+    engine: *const GooeyEngine,
+) -> GooeyRenderStats {
+    if engine.is_null() {
+        return GooeyRenderStats {
+            total_frames_rendered: 0,
+            render_calls: 0,
+            peak_render_time_us: 0,
+        };
+    }
+    let engine = &*engine;
+    GooeyRenderStats {
+        total_frames_rendered: engine.total_frames_rendered,
+        render_calls: engine.render_calls,
+        peak_render_time_us: engine.peak_render_time_us,
+    }
+}
+
+/// Check if the engine's internal state is consistent
+///
+/// Returns `true` if the engine appears healthy:
+/// - sample_rate is positive
+/// - bpm is in a sane range (0, 1000)
+/// - current_time is finite (not NaN or Inf)
+///
+/// Useful for the host to detect if a restart of the Rust engine is needed
+/// vs just restarting the audio session.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_is_healthy(engine: *const GooeyEngine) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    let engine = &*engine;
+    engine.sample_rate > 0.0
+        && engine.bpm > 0.0
+        && engine.bpm < 1000.0
+        && engine.current_time.is_finite()
+}
+
+/// Get the sequencer state for diagnostics
+///
+/// Returns the state of the kick sequencer (used as the reference clock since
+/// all 4 sequencers are ticked in lockstep). `samples_since_start` shows
+/// total samples processed — compare over time to confirm the sequencer is
+/// actually advancing. `is_running` indicates whether the sequencer is active.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_sequencer_state(
+    engine: *const GooeyEngine,
+) -> GooeySequencerState {
+    if engine.is_null() {
+        return GooeySequencerState {
+            samples_since_start: 0,
+            is_running: false,
+        };
+    }
+    let engine = &*engine;
+    GooeySequencerState {
+        samples_since_start: engine.kick_sequencer.sample_count(),
+        is_running: engine.kick_sequencer.is_running(),
     }
 }
