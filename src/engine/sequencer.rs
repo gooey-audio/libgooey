@@ -1,10 +1,29 @@
-/// Represents a single sequencer step with enabled state and velocity
+/// Absolute blend override for a sequencer step (X/Y in 0.0-1.0)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SequencerBlendOverride {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl SequencerBlendOverride {
+    /// Create a new absolute blend override (values are clamped to 0.0-1.0)
+    pub fn new(x: f32, y: f32) -> Self {
+        Self {
+            x: x.clamp(0.0, 1.0),
+            y: y.clamp(0.0, 1.0),
+        }
+    }
+}
+
+/// Represents a single sequencer step with enabled state, velocity, and optional overrides
 #[derive(Clone, Copy, Debug)]
 pub struct SequencerStep {
     /// Whether this step triggers the instrument
     pub enabled: bool,
     /// Velocity for this step (0.0-1.0, defaults to 1.0)
     pub velocity: f32,
+    /// Optional absolute blend override for this step
+    pub blend_override: Option<SequencerBlendOverride>,
 }
 
 impl Default for SequencerStep {
@@ -12,6 +31,7 @@ impl Default for SequencerStep {
         Self {
             enabled: true,
             velocity: 1.0,
+            blend_override: None,
         }
     }
 }
@@ -22,6 +42,7 @@ impl SequencerStep {
         Self {
             enabled,
             velocity: 1.0,
+            blend_override: None,
         }
     }
 
@@ -30,6 +51,20 @@ impl SequencerStep {
         Self {
             enabled,
             velocity: velocity.clamp(0.0, 1.0),
+            blend_override: None,
+        }
+    }
+
+    /// Create a new step with the given enabled state, velocity, and blend override
+    pub fn with_velocity_and_blend_override(
+        enabled: bool,
+        velocity: f32,
+        blend_override: Option<SequencerBlendOverride>,
+    ) -> Self {
+        Self {
+            enabled,
+            velocity: velocity.clamp(0.0, 1.0),
+            blend_override,
         }
     }
 }
@@ -40,7 +75,15 @@ impl From<bool> for SequencerStep {
     }
 }
 
-/// A sample-accurate step sequencer with per-step velocity
+/// Trigger info from a sequencer tick
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SequencerTrigger<'a> {
+    pub instrument_name: &'a str,
+    pub velocity: f32,
+    pub blend_override: Option<SequencerBlendOverride>,
+}
+
+/// A sample-accurate step sequencer with per-step velocity and optional blend overrides
 pub struct Sequencer {
     bpm: f32,
     sample_rate: f32,
@@ -63,6 +106,38 @@ pub struct Sequencer {
 
     // Whether the sequencer is running
     is_running: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_step_blend_override_set_get_clear() {
+        let mut sequencer = Sequencer::new(120.0, 44100.0, 4, "kick");
+        assert_eq!(sequencer.get_step_blend_override(0), None);
+
+        sequencer.set_step_blend_override(0, 0.2, 0.8);
+        assert_eq!(
+            sequencer.get_step_blend_override(0),
+            Some(SequencerBlendOverride::new(0.2, 0.8))
+        );
+
+        sequencer.clear_step_blend_override(0);
+        assert_eq!(sequencer.get_step_blend_override(0), None);
+    }
+
+    #[test]
+    fn test_step_with_velocity_preserves_override() {
+        let mut sequencer = Sequencer::new(120.0, 44100.0, 4, "kick");
+        sequencer.set_step_blend_override(1, 0.3, 0.6);
+        sequencer.set_step_with_velocity(1, true, 0.4);
+
+        assert_eq!(
+            sequencer.get_step_blend_override(1),
+            Some(SequencerBlendOverride::new(0.3, 0.6))
+        );
+    }
 }
 
 impl Sequencer {
@@ -193,10 +268,12 @@ impl Sequencer {
         }
     }
 
-    /// Set both enabled state and velocity for a step
+    /// Set both enabled state and velocity for a step (preserves any blend override)
     pub fn set_step_with_velocity(&mut self, step: usize, enabled: bool, velocity: f32) {
         if step < self.pattern.len() {
-            self.pattern[step] = SequencerStep::with_velocity(enabled, velocity);
+            let blend_override = self.pattern[step].blend_override;
+            self.pattern[step] =
+                SequencerStep::with_velocity_and_blend_override(enabled, velocity, blend_override);
         }
     }
 
@@ -208,6 +285,25 @@ impl Sequencer {
     /// Get a step's velocity (0.0-1.0)
     pub fn get_step_velocity(&self, step: usize) -> f32 {
         self.pattern.get(step).map(|s| s.velocity).unwrap_or(0.0)
+    }
+
+    /// Set a step's absolute blend override (0.0-1.0)
+    pub fn set_step_blend_override(&mut self, step: usize, x: f32, y: f32) {
+        if step < self.pattern.len() {
+            self.pattern[step].blend_override = Some(SequencerBlendOverride::new(x, y));
+        }
+    }
+
+    /// Clear a step's blend override
+    pub fn clear_step_blend_override(&mut self, step: usize) {
+        if step < self.pattern.len() {
+            self.pattern[step].blend_override = None;
+        }
+    }
+
+    /// Get a step's blend override
+    pub fn get_step_blend_override(&self, step: usize) -> Option<SequencerBlendOverride> {
+        self.pattern.get(step).and_then(|s| s.blend_override)
     }
 
     /// Get the pattern with velocity information
@@ -259,15 +355,14 @@ impl Sequencer {
         &self.instrument_name
     }
 
-    /// Process one sample and return trigger info if applicable
-    /// Returns Some((instrument_name, velocity)) if a trigger should happen, None otherwise
-    pub fn tick(&mut self) -> Option<(&str, f32)> {
+    /// Process one sample and return trigger info if applicable (with overrides)
+    pub fn tick_with_overrides(&mut self) -> Option<SequencerTrigger<'_>> {
         if !self.is_running || self.pattern.is_empty() {
             self.sample_count += 1;
             return None;
         }
 
-        let mut should_trigger = None;
+        let mut should_trigger: Option<SequencerTrigger<'_>> = None;
 
         // Check if we've reached the next trigger point
         if self.sample_count >= self.next_trigger_sample {
@@ -277,7 +372,11 @@ impl Sequencer {
             // Check if this step should trigger
             let step = &self.pattern[self.current_step];
             if step.enabled {
-                should_trigger = Some((self.instrument_name.as_str(), step.velocity));
+                should_trigger = Some(SequencerTrigger {
+                    instrument_name: self.instrument_name.as_str(),
+                    velocity: step.velocity,
+                    blend_override: step.blend_override,
+                });
             }
 
             // Advance to the next step (internal tracking)
@@ -290,6 +389,13 @@ impl Sequencer {
 
         self.sample_count += 1;
         should_trigger
+    }
+
+    /// Process one sample and return trigger info if applicable
+    /// Returns Some((instrument_name, velocity)) if a trigger should happen, None otherwise
+    pub fn tick(&mut self) -> Option<(&str, f32)> {
+        self.tick_with_overrides()
+            .map(|trigger| (trigger.instrument_name, trigger.velocity))
     }
 
     /// Get BPM
