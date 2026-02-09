@@ -22,11 +22,11 @@ struct ParamInfo {
 }
 
 const PARAM_INFO: [ParamInfo; 5] = [
-    ParamInfo { name: "Pitch", coarse_step: 0.05, fine_step: 0.01, unit: "Hz" },
-    ParamInfo { name: "Decay", coarse_step: 0.05, fine_step: 0.01, unit: "ms" },
-    ParamInfo { name: "Attack", coarse_step: 0.05, fine_step: 0.01, unit: "ms" },
-    ParamInfo { name: "Tone", coarse_step: 0.05, fine_step: 0.01, unit: "Hz" },
-    ParamInfo { name: "Volume", coarse_step: 0.05, fine_step: 0.01, unit: "" },
+    ParamInfo { name: "pitch", coarse_step: 0.05, fine_step: 0.01, unit: "" },
+    ParamInfo { name: "decay", coarse_step: 0.05, fine_step: 0.01, unit: "" },
+    ParamInfo { name: "attack", coarse_step: 0.05, fine_step: 0.01, unit: "" },
+    ParamInfo { name: "tone", coarse_step: 0.05, fine_step: 0.01, unit: "" },
+    ParamInfo { name: "volume", coarse_step: 0.05, fine_step: 0.01, unit: "" },
 ];
 
 struct SharedHiHat2(Arc<Mutex<HiHat2>>);
@@ -81,21 +81,7 @@ fn make_bar(normalized: f32, width: usize) -> String {
     let filled = (normalized * width as f32).round() as usize;
     let filled = filled.min(width);
     let empty = width - filled;
-    format!("{}{}", "=".repeat(filled), "-".repeat(empty))
-}
-
-fn display_value(index: usize, normalized: f32) -> f32 {
-    match index {
-        0 => {
-            let curved = normalized * normalized;
-            3500.0 + curved * (10000.0 - 3500.0)
-        }
-        1 => 0.5 + normalized * (4000.0 - 0.5),
-        2 => 0.5 + normalized * (200.0 - 0.5),
-        3 => 500.0 + normalized * (10000.0 - 500.0),
-        4 => normalized,
-        _ => normalized,
-    }
+    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
 }
 
 fn render_display(
@@ -108,7 +94,7 @@ fn render_display(
 ) {
     print!("\x1b[2J\x1b[H\x1b[?7l");
 
-    print!("=== HiHat2 Lab ===\r\n");
+    print!("=== Hi-Hat2 Lab ===\r\n");
     print!("SPACE=hit Q=quit arrows=sel/adj []=fine N=noise S=slope V/B=velocity\r\n");
     print!("\r\n");
 
@@ -124,13 +110,12 @@ fn render_display(
     for (i, info) in PARAM_INFO.iter().enumerate() {
         let value = get_param_value(hihat, i);
         let bar = make_bar(value, 10);
-        let display = display_value(i, value);
 
         let indicator = if i == selected { ">" } else { " " };
 
         print!(
-            "{} {:<8} [{}] {:>7.2}{}\r\n",
-            indicator, info.name, bar, display, info.unit
+            "{} {:<12} [{}] {:>6.2}{}\r\n",
+            indicator, info.name, bar, value, info.unit
         );
     }
 

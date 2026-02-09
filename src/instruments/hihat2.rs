@@ -1,6 +1,6 @@
 use std::f32::consts::PI;
 
-use crate::filters::{BiquadHighpass, StateVariableFilter};
+use crate::filters::{BiquadHighpass, StateVariableFilterTpt};
 use crate::gen::pink_noise::PinkNoise;
 use crate::max_curve::MaxCurveEnvelope;
 use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
@@ -100,13 +100,13 @@ impl HiHat2Config {
 impl Default for HiHat2Config {
     fn default() -> Self {
         Self::new(
-            0.55,             // pitch
-            0.2,              // decay
-            0.05,             // attack
+            0.409,            // pitch (~40.9)
+            0.126,            // decay (~12.6)
+            0.0,              // attack
             NoiseColor::White,
-            FilterSlope::Db24,
-            0.85,             // tone
-            0.8,              // volume
+            FilterSlope::Db12,
+            0.9055,           // tone (~90.6)
+            0.7,              // volume
         )
     }
 }
@@ -217,7 +217,7 @@ impl HiHat2Params {
 struct PhaseModOsc {
     sample_rate: f32,
     frequency_hz: f32,
-    phase: f32,
+    phase_cycle: f32,
 }
 
 impl PhaseModOsc {
@@ -225,7 +225,7 @@ impl PhaseModOsc {
         Self {
             sample_rate,
             frequency_hz,
-            phase: 0.0,
+            phase_cycle: 0.0,
         }
     }
 
@@ -234,14 +234,14 @@ impl PhaseModOsc {
     }
 
     fn reset_phase(&mut self) {
-        self.phase = 0.0;
+        self.phase_cycle = 0.0;
     }
 
     fn tick(&mut self, phase_mod: f32) -> f32 {
         let phase_inc = self.frequency_hz / self.sample_rate;
-        self.phase = (self.phase + phase_inc) % 1.0;
+        self.phase_cycle = (self.phase_cycle + phase_inc) % 1.0;
 
-        let mut phase = self.phase + phase_mod;
+        let mut phase = self.phase_cycle + phase_mod;
         phase -= phase.floor();
 
         (2.0 * PI * phase).sin()
@@ -299,7 +299,7 @@ pub struct HiHat2 {
 
     hpf_stage_1: BiquadHighpass,
     hpf_stage_2: BiquadHighpass,
-    svf: StateVariableFilter,
+    svf: StateVariableFilterTpt,
 
     white_noise_state: u64,
     pink_noise: PinkNoise,
@@ -329,7 +329,7 @@ impl HiHat2 {
             envelope_smoother: AsymmetricSmoother::new(100.0),
             hpf_stage_1: BiquadHighpass::new(sample_rate),
             hpf_stage_2: BiquadHighpass::new(sample_rate),
-            svf: StateVariableFilter::new(sample_rate, tone_hz, 0.5),
+            svf: StateVariableFilterTpt::new(sample_rate, tone_hz, 0.5),
             white_noise_state: 0x1234_5678_9abc_def0,
             pink_noise: PinkNoise::new(),
             is_active: false,
@@ -422,7 +422,7 @@ impl HiHat2 {
         let mod_signal = noise * 0.25;
         let mod_output = self.mod_osc.tick(mod_signal);
         let main_output = self.main_osc.tick(mod_output * 0.75);
-
+        //
         let mut filtered = {
             self.hpf_stage_1.set_params(pitch_hz, 1.0);
             self.hpf_stage_1.process(main_output)
@@ -437,12 +437,12 @@ impl HiHat2 {
         let env = self.envelope_smoother.process(env);
 
         let volume = self.params.volume.get();
-        let mut output = filtered * env * volume * self.current_velocity * 0.5;
+        let output = filtered * env * volume * self.current_velocity * 0.5;
 
         let tone_hz = self.params.tone_hz();
         self.svf.set_params(tone_hz, 0.5);
         let (_, _, high) = self.svf.process_all(output);
-        output = high;
+        let output = high;
 
         if self.envelope.is_complete() && self.envelope_smoother.current() < 1e-4 {
             self.is_active = false;

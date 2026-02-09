@@ -5,6 +5,7 @@ use cpal::{
     Device, FromSample, Sample, SizedSample, Stream, StreamConfig,
 };
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 #[cfg(feature = "visualization")]
@@ -19,6 +20,7 @@ pub struct EngineOutput {
     is_active: bool,
     start_time: Option<Instant>,
     sample_counter: Arc<Mutex<u64>>,
+    overrun_counter: Arc<AtomicUsize>,
     #[cfg(feature = "visualization")]
     audio_buffer: Option<AudioBuffer>,
     #[cfg(feature = "visualization")]
@@ -36,6 +38,7 @@ impl EngineOutput {
             is_active: false,
             start_time: None,
             sample_counter: Arc::new(Mutex::new(0)),
+            overrun_counter: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "visualization")]
             audio_buffer: None,
             #[cfg(feature = "visualization")]
@@ -147,6 +150,7 @@ impl EngineOutput {
 
         let supported_config = device.default_output_config()?;
         let sample_counter = self.sample_counter.clone();
+        let overrun_counter = self.overrun_counter.clone();
 
         #[cfg(feature = "visualization")]
         let audio_buffer = self.audio_buffer.clone();
@@ -156,34 +160,34 @@ impl EngineOutput {
 
         let stream = match supported_config.sample_format() {
             cpal::SampleFormat::I8 => {
-                Self::make_stream::<i8>(device, config, engine, sample_counter, audio_buffer)?
+                Self::make_stream::<i8>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
             }
             cpal::SampleFormat::I16 => {
-                Self::make_stream::<i16>(device, config, engine, sample_counter, audio_buffer)?
+                Self::make_stream::<i16>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
             }
             cpal::SampleFormat::I32 => {
-                Self::make_stream::<i32>(device, config, engine, sample_counter, audio_buffer)?
+                Self::make_stream::<i32>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
             }
             cpal::SampleFormat::I64 => {
-                Self::make_stream::<i64>(device, config, engine, sample_counter, audio_buffer)?
+                Self::make_stream::<i64>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
             }
             cpal::SampleFormat::U8 => {
-                Self::make_stream::<u8>(device, config, engine, sample_counter, audio_buffer)?
+                Self::make_stream::<u8>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
             }
             cpal::SampleFormat::U16 => {
-                Self::make_stream::<u16>(device, config, engine, sample_counter, audio_buffer)?
+                Self::make_stream::<u16>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
             }
             cpal::SampleFormat::U32 => {
-                Self::make_stream::<u32>(device, config, engine, sample_counter, audio_buffer)?
+                Self::make_stream::<u32>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
             }
             cpal::SampleFormat::U64 => {
-                Self::make_stream::<u64>(device, config, engine, sample_counter, audio_buffer)?
+                Self::make_stream::<u64>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
             }
             cpal::SampleFormat::F32 => {
-                Self::make_stream::<f32>(device, config, engine, sample_counter, audio_buffer)?
+                Self::make_stream::<f32>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
             }
             cpal::SampleFormat::F64 => {
-                Self::make_stream::<f64>(device, config, engine, sample_counter, audio_buffer)?
+                Self::make_stream::<f64>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
             }
             sample_format => {
                 return Err(anyhow::anyhow!(
@@ -224,6 +228,7 @@ impl EngineOutput {
         config: &StreamConfig,
         engine: Arc<Mutex<Engine>>,
         sample_counter: Arc<Mutex<u64>>,
+        overrun_counter: Arc<AtomicUsize>,
         audio_buffer: Option<AudioBuffer>,
     ) -> Result<Stream, anyhow::Error>
     where
@@ -237,6 +242,7 @@ impl EngineOutput {
         let stream = device.build_output_stream(
             config,
             move |output: &mut [T], _: &cpal::OutputCallbackInfo| {
+                let start = Instant::now();
                 Self::process_frame(
                     output,
                     &engine,
@@ -245,6 +251,12 @@ impl EngineOutput {
                     sample_rate,
                     audio_buffer.as_ref(),
                 );
+                let elapsed = start.elapsed().as_secs_f64();
+                let frames = output.len() / num_channels;
+                let buffer_duration = frames as f64 / sample_rate;
+                if elapsed > buffer_duration {
+                    overrun_counter.fetch_add(1, Ordering::Relaxed);
+                }
             },
             err_fn,
             None,
@@ -260,6 +272,7 @@ impl EngineOutput {
         config: &StreamConfig,
         engine: Arc<Mutex<Engine>>,
         sample_counter: Arc<Mutex<u64>>,
+        overrun_counter: Arc<AtomicUsize>,
         _audio_buffer: Option<()>,
     ) -> Result<Stream, anyhow::Error>
     where
@@ -273,6 +286,7 @@ impl EngineOutput {
         let stream = device.build_output_stream(
             config,
             move |output: &mut [T], _: &cpal::OutputCallbackInfo| {
+                let start = Instant::now();
                 Self::process_frame_no_viz(
                     output,
                     &engine,
@@ -280,6 +294,12 @@ impl EngineOutput {
                     &sample_counter,
                     sample_rate,
                 );
+                let elapsed = start.elapsed().as_secs_f64();
+                let frames = output.len() / num_channels;
+                let buffer_duration = frames as f64 / sample_rate;
+                if elapsed > buffer_duration {
+                    overrun_counter.fetch_add(1, Ordering::Relaxed);
+                }
             },
             err_fn,
             None,
@@ -411,5 +431,28 @@ impl EngineOutput {
     /// Check if the audio output is active
     pub fn is_active(&self) -> bool {
         self.is_active
+    }
+
+    /// Get the total number of callback overruns detected
+    ///
+    /// An overrun occurs when the audio callback takes longer than the buffer duration.
+    pub fn overrun_count(&self) -> usize {
+        self.overrun_counter.load(Ordering::Relaxed)
+    }
+
+    /// Get and reset the overrun counter (returns count since last call)
+    pub fn take_overrun_count(&self) -> usize {
+        self.overrun_counter.swap(0, Ordering::Relaxed)
+    }
+
+    /// Stop the stream if overruns exceed the provided threshold.
+    /// Returns true if the stream was stopped.
+    pub fn stop_if_overruns(&mut self, max_overruns: usize) -> bool {
+        let overruns = self.take_overrun_count();
+        if overruns >= max_overruns && self.is_active {
+            let _ = self.stop();
+            return true;
+        }
+        false
     }
 }
