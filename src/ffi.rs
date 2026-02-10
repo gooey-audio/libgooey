@@ -5,7 +5,7 @@
 
 use crate::effects::{BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect, TubeSaturation};
 use crate::engine::lfo::{Lfo, MusicalDivision};
-use crate::engine::{Instrument, Sequencer, SequencerBlendOverride};
+use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
 use crate::instruments::{HiHat, KickConfig, KickDrum, SnareConfig, SnareDrum, Tom2, Tom2Config};
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::slice;
@@ -272,32 +272,44 @@ impl GooeyEngine {
         for sample in buffer.iter_mut() {
             // Tick ALL sequencers first to ensure sample-accurate synchronization
             // (if two instruments trigger on the same step, they fire at exactly the same sample)
-            // Returns SequencerTrigger with velocity + optional blend override
-            let kick_trigger = self.kick_sequencer.tick_with_overrides();
-            let snare_trigger = self.snare_sequencer.tick_with_overrides();
-            let hihat_trigger = self.hihat_sequencer.tick_with_overrides();
-            let tom_trigger = self.tom_sequencer.tick_with_overrides();
+            // Returns SequencerTrigger with velocity + optional blend setting
+            let kick_trigger = self
+                .kick_sequencer
+                .tick_with_settings()
+                .map(|trigger| (trigger.velocity, trigger.blend));
+            let snare_trigger = self
+                .snare_sequencer
+                .tick_with_settings()
+                .map(|trigger| (trigger.velocity, trigger.blend));
+            let hihat_trigger = self
+                .hihat_sequencer
+                .tick_with_settings()
+                .map(|trigger| (trigger.velocity, trigger.blend));
+            let tom_trigger = self
+                .tom_sequencer
+                .tick_with_settings()
+                .map(|trigger| (trigger.velocity, trigger.blend));
 
             // Apply triggers with velocity after all sequencers have been ticked
-            if let Some(trigger) = kick_trigger {
-                self.apply_sequencer_blend_override(INSTRUMENT_KICK, trigger.blend_override);
+            if let Some((velocity, blend)) = kick_trigger {
+                self.apply_sequencer_blend_setting(INSTRUMENT_KICK, blend);
                 self.kick
-                    .trigger_with_velocity(self.current_time, trigger.velocity);
+                    .trigger_with_velocity(self.current_time, velocity);
             }
-            if let Some(trigger) = snare_trigger {
-                self.apply_sequencer_blend_override(INSTRUMENT_SNARE, trigger.blend_override);
+            if let Some((velocity, blend)) = snare_trigger {
+                self.apply_sequencer_blend_setting(INSTRUMENT_SNARE, blend);
                 self.snare
-                    .trigger_with_velocity(self.current_time, trigger.velocity);
+                    .trigger_with_velocity(self.current_time, velocity);
             }
-            if let Some(trigger) = hihat_trigger {
-                self.apply_sequencer_blend_override(INSTRUMENT_HIHAT, trigger.blend_override);
+            if let Some((velocity, blend)) = hihat_trigger {
+                self.apply_sequencer_blend_setting(INSTRUMENT_HIHAT, blend);
                 self.hihat
-                    .trigger_with_velocity(self.current_time, trigger.velocity);
+                    .trigger_with_velocity(self.current_time, velocity);
             }
-            if let Some(trigger) = tom_trigger {
-                self.apply_sequencer_blend_override(INSTRUMENT_TOM, trigger.blend_override);
+            if let Some((velocity, blend)) = tom_trigger {
+                self.apply_sequencer_blend_setting(INSTRUMENT_TOM, blend);
                 self.tom
-                    .trigger_with_velocity(self.current_time, trigger.velocity);
+                    .trigger_with_velocity(self.current_time, velocity);
             }
 
             // Process LFOs and apply modulation to routed parameters
@@ -351,13 +363,13 @@ impl GooeyEngine {
         }
     }
 
-    fn apply_sequencer_blend_override(
+    fn apply_sequencer_blend_setting(
         &mut self,
         instrument: u32,
-        blend_override: Option<SequencerBlendOverride>,
+        blend: Option<SequencerBlendSetting>,
     ) {
-        if let Some(override_position) = blend_override {
-            self.apply_blend_position(instrument, override_position.x, override_position.y);
+        if let Some(blend_setting) = blend {
+            self.apply_blend_position(instrument, blend_setting.x, blend_setting.y);
             return;
         }
 
@@ -1460,7 +1472,54 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_with_velocit
     }
 }
 
-/// Set an absolute blend override for a specific step (0.0-1.0 X/Y)
+/// Set a step with optional velocity and optional blend setting.
+///
+/// Omitted settings are left unchanged.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+/// * `step` - Step index (0-15 for a 16-step sequencer)
+/// * `enabled` - Whether the step should trigger
+/// * `set_velocity` - Whether to apply the `velocity` value
+/// * `velocity` - Velocity from 0.0 to 1.0 (used only when `set_velocity` is true)
+/// * `set_blend` - Whether to apply blend X/Y
+/// * `blend_x` - Blend X position (0.0-1.0, used only when `set_blend` is true)
+/// * `blend_y` - Blend Y position (0.0-1.0, used only when `set_blend` is true)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_settings(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+    enabled: bool,
+    set_velocity: bool,
+    velocity: f32,
+    set_blend: bool,
+    blend_x: f32,
+    blend_y: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+    if let Some(sequencer) = engine.sequencer_for_instrument(instrument) {
+        let settings = SequencerStepSettings {
+            velocity: if set_velocity { Some(velocity) } else { None },
+            blend: if set_blend {
+                Some(SequencerBlendSetting::new(blend_x, blend_y))
+            } else {
+                None
+            },
+        };
+        sequencer.set_step_with_settings(step as usize, enabled, settings);
+    }
+}
+
+/// Set an absolute blend setting for a specific step (0.0-1.0 X/Y)
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -1472,7 +1531,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_with_velocit
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
 #[no_mangle]
-pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_blend_override(
+pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_blend(
     engine: *mut GooeyEngine,
     instrument: u32,
     step: u32,
@@ -1485,11 +1544,23 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_blend_overri
 
     let engine = &mut *engine;
     if let Some(sequencer) = engine.sequencer_for_instrument(instrument) {
-        sequencer.set_step_blend_override(step as usize, x, y);
+        sequencer.set_step_blend(step as usize, x, y);
     }
 }
 
-/// Clear the blend override for a specific step
+/// Legacy alias for `gooey_engine_sequencer_set_instrument_step_blend`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_blend_override(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+    x: f32,
+    y: f32,
+) {
+    gooey_engine_sequencer_set_instrument_step_blend(engine, instrument, step, x, y);
+}
+
+/// Clear the blend setting for a specific step
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -1499,7 +1570,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_blend_overri
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
 #[no_mangle]
-pub unsafe extern "C" fn gooey_engine_sequencer_clear_instrument_step_blend_override(
+pub unsafe extern "C" fn gooey_engine_sequencer_clear_instrument_step_blend(
     engine: *mut GooeyEngine,
     instrument: u32,
     step: u32,
@@ -1510,8 +1581,18 @@ pub unsafe extern "C" fn gooey_engine_sequencer_clear_instrument_step_blend_over
 
     let engine = &mut *engine;
     if let Some(sequencer) = engine.sequencer_for_instrument(instrument) {
-        sequencer.clear_step_blend_override(step as usize);
+        sequencer.clear_step_blend(step as usize);
     }
+}
+
+/// Legacy alias for `gooey_engine_sequencer_clear_instrument_step_blend`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_clear_instrument_step_blend_override(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+) {
+    gooey_engine_sequencer_clear_instrument_step_blend(engine, instrument, step);
 }
 
 /// Set the entire 16-step pattern for an instrument's sequencer
@@ -1635,7 +1716,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_velocity(
     0.0
 }
 
-/// Get the blend override X position for a specific step
+/// Get the blend X setting for a specific step
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -1643,30 +1724,40 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_velocity(
 /// * `step` - Step index (0-15 for a 16-step sequencer)
 ///
 /// # Returns
-/// The X position (0.0-1.0), or -1.0 if no override or invalid engine/instrument/step
+/// The X position (0.0-1.0), or -1.0 if no blend setting or invalid engine/instrument/step
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_blend_x(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+) -> f32 {
+    if engine.is_null() {
+        return -1.0;
+    }
+
+    let engine = &*engine;
+    if let Some(sequencer) = engine.sequencer_for_instrument_ref(instrument) {
+        if let Some(blend_setting) = sequencer.get_step_blend(step as usize) {
+            return blend_setting.x;
+        }
+    }
+    -1.0
+}
+
+/// Legacy alias for `gooey_engine_sequencer_get_instrument_step_blend_x`.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_blend_override_x(
     engine: *mut GooeyEngine,
     instrument: u32,
     step: u32,
 ) -> f32 {
-    if engine.is_null() {
-        return -1.0;
-    }
-
-    let engine = &*engine;
-    if let Some(sequencer) = engine.sequencer_for_instrument_ref(instrument) {
-        if let Some(override_position) = sequencer.get_step_blend_override(step as usize) {
-            return override_position.x;
-        }
-    }
-    -1.0
+    gooey_engine_sequencer_get_instrument_step_blend_x(engine, instrument, step)
 }
 
-/// Get the blend override Y position for a specific step
+/// Get the blend Y setting for a specific step
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -1674,12 +1765,12 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_blend_overri
 /// * `step` - Step index (0-15 for a 16-step sequencer)
 ///
 /// # Returns
-/// The Y position (0.0-1.0), or -1.0 if no override or invalid engine/instrument/step
+/// The Y position (0.0-1.0), or -1.0 if no blend setting or invalid engine/instrument/step
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
 #[no_mangle]
-pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_blend_override_y(
+pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_blend_y(
     engine: *mut GooeyEngine,
     instrument: u32,
     step: u32,
@@ -1690,11 +1781,21 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_blend_overri
 
     let engine = &*engine;
     if let Some(sequencer) = engine.sequencer_for_instrument_ref(instrument) {
-        if let Some(override_position) = sequencer.get_step_blend_override(step as usize) {
-            return override_position.y;
+        if let Some(blend_setting) = sequencer.get_step_blend(step as usize) {
+            return blend_setting.y;
         }
     }
     -1.0
+}
+
+/// Legacy alias for `gooey_engine_sequencer_get_instrument_step_blend_y`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_blend_override_y(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+) -> f32 {
+    gooey_engine_sequencer_get_instrument_step_blend_y(engine, instrument, step)
 }
 
 /// Get the enabled state for a specific step in an instrument's sequencer
