@@ -1,0 +1,15 @@
+# Gooey DSL example: LFO modulation across instruments
+
+bpm 120
+
+inst kick kick
+inst snare snare
+inst hihat hihat closed
+inst tom tom
+
+# Note: kick.pitch_drop is an alias for kick.pitch_envelope_amount
+lfo 1bar kick.pitch_drop amt=1
+lfo 2bars snare.tonal amt=1
+lfo 1/2 hihat.decay amt=1
+lfo 1/4 tom.frequency amt=1
+

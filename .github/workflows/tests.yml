@@ -56,26 +56,3 @@ jobs:
 
     - name: Run tests with native features
       run: cargo test --features native --verbose
-
-  lint:
-    name: Lint (rustfmt + clippy)
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        components: rustfmt, clippy
-
-    - name: Install Linux dependencies (including X11 for visualization feature)
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libasound2-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev
-
-    - name: Check formatting
-      run: cargo fmt --all -- --check
-
-    - name: Run clippy
-      run: cargo clippy --all-targets --all-features

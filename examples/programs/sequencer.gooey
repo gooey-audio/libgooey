@@ -1,0 +1,14 @@
+# Gooey DSL example: sequencer + LFO + lowpass
+
+bpm 120
+master 0.25
+
+inst hihat hihat closed
+seq hihat x.x.x.x.|x.x.x.x.
+
+lfo 1bar hihat.decay amt=1
+
+fx clear
+fx lowpass 2000 0.3
+fx limiter 1.0
+
