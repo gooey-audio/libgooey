@@ -33,7 +33,7 @@ struct ParamInfo {
     name: &'static str,
     coarse_step: f32,
     fine_step: f32,
-    display_min: f32,  // For display scaling
+    display_min: f32, // For display scaling
     display_max: f32,
     unit: &'static str,
 }
@@ -41,25 +41,158 @@ struct ParamInfo {
 // Parameters in alphabetical order for display
 // All parameters display normalized 0-1 values (matching the API)
 const PARAM_INFO: [ParamInfo; 19] = [
-    ParamInfo { name: "amp_decay", coarse_step: 0.05, fine_step: 0.01, display_min: 0.0, display_max: 1.0, unit: "" },        // 0-4.0s
-    ParamInfo { name: "amp_decay_curve", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },   // 0.1-10.0
-    ParamInfo { name: "brightness", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
-    ParamInfo { name: "decay", coarse_step: 0.05, fine_step: 0.01, display_min: 0.0, display_max: 1.0, unit: "" },            // 0.05-3.5s
-    ParamInfo { name: "filter_cutoff", coarse_step: 0.05, fine_step: 0.01, display_min: 0.0, display_max: 1.0, unit: "" },    // 100-10000 Hz
-    ParamInfo { name: "filter_resonance", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },  // 0.5-10.0
-    ParamInfo { name: "filter_type", coarse_step: 1.0, fine_step: 1.0, display_min: 0.0, display_max: 1.0, unit: "" },        // 0-3 discrete
-    ParamInfo { name: "frequency", coarse_step: 0.05, fine_step: 0.01, display_min: 0.0, display_max: 1.0, unit: "" },        // 100-600 Hz
-    ParamInfo { name: "noise", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
-    ParamInfo { name: "noise_decay", coarse_step: 0.05, fine_step: 0.01, display_min: 0.0, display_max: 1.0, unit: "" },      // 0-3.5s
-    ParamInfo { name: "noise_tail_decay", coarse_step: 0.05, fine_step: 0.01, display_min: 0.0, display_max: 1.0, unit: "" }, // 0-3.5s
-    ParamInfo { name: "overdrive", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
-    ParamInfo { name: "phase_mod_amount", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
-    ParamInfo { name: "pitch_drop", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
-    ParamInfo { name: "tonal", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
-    ParamInfo { name: "tonal_decay", coarse_step: 0.05, fine_step: 0.01, display_min: 0.0, display_max: 1.0, unit: "" },      // 0-3.5s
-    ParamInfo { name: "tonal_decay_curve", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" }, // 0.1-10.0
-    ParamInfo { name: "volume", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
-    ParamInfo { name: "xfade", coarse_step: 0.1, fine_step: 0.02, display_min: 0.0, display_max: 1.0, unit: "" },
+    ParamInfo {
+        name: "amp_decay",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    }, // 0-4.0s
+    ParamInfo {
+        name: "amp_decay_curve",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    }, // 0.1-10.0
+    ParamInfo {
+        name: "brightness",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    },
+    ParamInfo {
+        name: "decay",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    }, // 0.05-3.5s
+    ParamInfo {
+        name: "filter_cutoff",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    }, // 100-10000 Hz
+    ParamInfo {
+        name: "filter_resonance",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    }, // 0.5-10.0
+    ParamInfo {
+        name: "filter_type",
+        coarse_step: 1.0,
+        fine_step: 1.0,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    }, // 0-3 discrete
+    ParamInfo {
+        name: "frequency",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    }, // 100-600 Hz
+    ParamInfo {
+        name: "noise",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    },
+    ParamInfo {
+        name: "noise_decay",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    }, // 0-3.5s
+    ParamInfo {
+        name: "noise_tail_decay",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    }, // 0-3.5s
+    ParamInfo {
+        name: "overdrive",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    },
+    ParamInfo {
+        name: "phase_mod_amount",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    },
+    ParamInfo {
+        name: "pitch_drop",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    },
+    ParamInfo {
+        name: "tonal",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    },
+    ParamInfo {
+        name: "tonal_decay",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    }, // 0-3.5s
+    ParamInfo {
+        name: "tonal_decay_curve",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    }, // 0.1-10.0
+    ParamInfo {
+        name: "volume",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    },
+    ParamInfo {
+        name: "xfade",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    },
 ];
 
 // Wrapper to share SnareDrum between audio thread and main thread
@@ -98,10 +231,10 @@ impl BlendState {
             x: 0.5,
             y: 0.5,
             blender: PresetBlender::new(
-                SnareConfig::tight(),   // Bottom-left (0,0)
-                SnareConfig::loose(),   // Bottom-right (1,0)
-                SnareConfig::hiss(),    // Top-left (0,1)
-                SnareConfig::smack(),   // Top-right (1,1)
+                SnareConfig::tight(), // Bottom-left (0,0)
+                SnareConfig::loose(), // Bottom-right (1,0)
+                SnareConfig::hiss(),  // Top-left (0,1)
+                SnareConfig::smack(), // Top-right (1,1)
             ),
         }
     }
@@ -277,7 +410,10 @@ fn render_display(
         if i == 12 {
             // Filter type - show name instead of number
             let filter_name = get_filter_type_name(snare.params.filter_type);
-            print!("{} {:<18} {:<14} {:>6}\r\n", indicator, info.name, "", filter_name);
+            print!(
+                "{} {:<18} {:<14} {:>6}\r\n",
+                indicator, info.name, "", filter_name
+            );
         } else {
             // Normal parameters with bars - show scaled display value
             let display_value = info.display_min + value * (info.display_max - info.display_min);
@@ -420,7 +556,14 @@ fn main() -> anyhow::Result<()> {
         // Render display if needed
         if needs_redraw {
             let s = snare.lock().unwrap();
-            render_display(&s, selected_param, trigger_count, current_velocity, current_preset, &blend);
+            render_display(
+                &s,
+                selected_param,
+                trigger_count,
+                current_velocity,
+                current_preset,
+                &blend,
+            );
             needs_redraw = false;
         }
 

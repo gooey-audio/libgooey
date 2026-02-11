@@ -14,7 +14,7 @@
 //! bpm 120
 //! master 0.25
 //!
-//! inst hihat hihat closed
+//! inst hihat hihat short
 //! seq hihat x.x.x.x.|x.x.x.x.
 //!
 //! lfo 1bar hihat.decay amt=1
@@ -119,7 +119,9 @@ impl Program {
                         }
                     }
 
-                    program.instruments.push(InstrumentDef { name, kind, preset });
+                    program
+                        .instruments
+                        .push(InstrumentDef { name, kind, preset });
                 }
                 "seq" | "s" => {
                     if tokens.len() < 3 {
@@ -187,8 +189,7 @@ impl Program {
                     })?;
                     index += 1;
 
-                    let (target_instrument, target_parameter) =
-                        parse_target(line_number, target)?;
+                    let (target_instrument, target_parameter) = parse_target(line_number, target)?;
 
                     let mut amount = 1.0;
                     let mut offset = 0.0;
@@ -204,8 +205,12 @@ impl Program {
                         }
                         if let Some((key, value)) = arg.split_once('=') {
                             match key.to_ascii_lowercase().as_str() {
-                                "amt" | "amount" => amount = parse_f32(line_number, "lfo amount", value)?,
-                                "off" | "offset" => offset = parse_f32(line_number, "lfo offset", value)?,
+                                "amt" | "amount" => {
+                                    amount = parse_f32(line_number, "lfo amount", value)?
+                                }
+                                "off" | "offset" => {
+                                    offset = parse_f32(line_number, "lfo offset", value)?
+                                }
                                 other => {
                                     return Err(format!(
                                         "line {}: unknown lfo argument '{}'",
@@ -232,10 +237,7 @@ impl Program {
                 }
                 "fx" | "effect" => {
                     if tokens.len() < 2 {
-                        return Err(format!(
-                            "line {}: fx expects: fx <type> [...]",
-                            line_number
-                        ));
+                        return Err(format!("line {}: fx expects: fx <type> [...]", line_number));
                     }
 
                     let fx_type = tokens[1].to_ascii_lowercase();
@@ -249,7 +251,10 @@ impl Program {
                     program.effects.push(def);
                 }
                 other => {
-                    return Err(format!("line {}: unknown statement '{}'", line_number, other));
+                    return Err(format!(
+                        "line {}: unknown statement '{}'",
+                        line_number, other
+                    ));
                 }
             }
         }
@@ -307,7 +312,9 @@ impl Program {
             let idx = engine.add_lfo(l);
 
             let resolved_parameter = resolve_parameter_alias(
-                instrument_kinds.get(lfo.target_instrument.as_str()).copied(),
+                instrument_kinds
+                    .get(lfo.target_instrument.as_str())
+                    .copied(),
                 lfo.target_parameter.as_str(),
             );
             engine.map_lfo_to_parameter(
@@ -391,34 +398,24 @@ impl InstrumentDef {
                 )),
             },
             InstrumentKind::HiHat => match preset.as_str() {
-                "default" | "closed" | "closed_default" => {
-                    Ok(Box::new(HiHat::with_config(
-                        sample_rate,
-                        HiHatConfig::closed_default(),
-                    )))
-                }
-                "open" | "open_default" => Ok(Box::new(HiHat::with_config(
+                "default" | "short" => Ok(Box::new(HiHat::with_config(
                     sample_rate,
-                    HiHatConfig::open_default(),
+                    HiHatConfig::short(),
                 ))),
-                "closed_tight" => Ok(Box::new(HiHat::with_config(
+                "loose" => Ok(Box::new(HiHat::with_config(
                     sample_rate,
-                    HiHatConfig::closed_tight(),
+                    HiHatConfig::loose(),
                 ))),
-                "open_bright" => Ok(Box::new(HiHat::with_config(
+                "dark" => Ok(Box::new(HiHat::with_config(
                     sample_rate,
-                    HiHatConfig::open_bright(),
+                    HiHatConfig::dark(),
                 ))),
-                "closed_dark" => Ok(Box::new(HiHat::with_config(
+                "soft" => Ok(Box::new(HiHat::with_config(
                     sample_rate,
-                    HiHatConfig::closed_dark(),
-                ))),
-                "open_long" => Ok(Box::new(HiHat::with_config(
-                    sample_rate,
-                    HiHatConfig::open_long(),
+                    HiHatConfig::soft(),
                 ))),
                 other => Err(format!(
-                    "unknown hihat preset '{}'. Try: closed, open, closed_tight, open_bright, closed_dark, open_long",
+                    "unknown hihat preset '{}'. Try: short, loose, dark, soft",
                     other
                 )),
             },
@@ -521,10 +518,23 @@ enum LfoRate {
 
 #[derive(Clone, Debug, PartialEq)]
 enum EffectDef {
-    Lowpass { cutoff_hz: f32, resonance: f32 },
-    Delay { time_s: f32, feedback: f32, mix: f32 },
-    Saturation { drive: f32, warmth: f32, mix: f32 },
-    Limiter { threshold: f32 },
+    Lowpass {
+        cutoff_hz: f32,
+        resonance: f32,
+    },
+    Delay {
+        time_s: f32,
+        feedback: f32,
+        mix: f32,
+    },
+    Saturation {
+        drive: f32,
+        warmth: f32,
+        mix: f32,
+    },
+    Limiter {
+        threshold: f32,
+    },
 }
 
 impl EffectDef {
@@ -583,9 +593,17 @@ impl EffectDef {
                 time_s,
                 feedback,
                 mix,
-            } => Ok(Box::new(DelayEffect::new(sample_rate, time_s, feedback, mix))),
+            } => Ok(Box::new(DelayEffect::new(
+                sample_rate,
+                time_s,
+                feedback,
+                mix,
+            ))),
             Self::Saturation { drive, warmth, mix } => Ok(Box::new(TubeSaturation::new(
-                sample_rate, drive, warmth, mix,
+                sample_rate,
+                drive,
+                warmth,
+                mix,
             ))),
             Self::Limiter { threshold } => Ok(Box::new(BrickWallLimiter::new(threshold))),
         }
@@ -623,7 +641,11 @@ fn strip_comment(line: &str) -> &str {
     line.split_once('#').map(|(head, _)| head).unwrap_or(line)
 }
 
-fn parse_single_f32_arg(statement: &str, line_number: usize, tokens: &[&str]) -> Result<f32, String> {
+fn parse_single_f32_arg(
+    statement: &str,
+    line_number: usize,
+    tokens: &[&str],
+) -> Result<f32, String> {
     match tokens.len() {
         2 => parse_f32(line_number, statement, tokens[1]),
         3 if tokens[1] == "=" => parse_f32(line_number, statement, tokens[2]),
@@ -673,7 +695,11 @@ fn parse_pattern(line_number: usize, pattern: &str) -> Result<Vec<SequencerStep>
     Ok(steps)
 }
 
-fn parse_lfo_rate(line_number: usize, tokens: &[&str], index: &mut usize) -> Result<LfoRate, String> {
+fn parse_lfo_rate(
+    line_number: usize,
+    tokens: &[&str],
+    index: &mut usize,
+) -> Result<LfoRate, String> {
     let token = tokens.get(*index).copied().ok_or_else(|| {
         format!(
             "line {}: lfo expects a rate (e.g. '1bar' or 'hz 0.5')",
@@ -684,9 +710,10 @@ fn parse_lfo_rate(line_number: usize, tokens: &[&str], index: &mut usize) -> Res
     let token_lc = token.to_ascii_lowercase();
     if token_lc == "hz" {
         *index += 1;
-        let freq_token = tokens.get(*index).copied().ok_or_else(|| {
-            format!("line {}: lfo hz expects a frequency number", line_number)
-        })?;
+        let freq_token = tokens
+            .get(*index)
+            .copied()
+            .ok_or_else(|| format!("line {}: lfo hz expects a frequency number", line_number))?;
         *index += 1;
         let freq = parse_f32(line_number, "lfo frequency", freq_token)?;
         return Ok(LfoRate::Hz(freq));

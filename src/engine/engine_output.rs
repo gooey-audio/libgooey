@@ -4,8 +4,8 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, FromSample, Sample, SizedSample, Stream, StreamConfig,
 };
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[cfg(feature = "visualization")]
@@ -159,36 +159,86 @@ impl EngineOutput {
         let audio_buffer: Option<()> = None;
 
         let stream = match supported_config.sample_format() {
-            cpal::SampleFormat::I8 => {
-                Self::make_stream::<i8>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
-            }
-            cpal::SampleFormat::I16 => {
-                Self::make_stream::<i16>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
-            }
-            cpal::SampleFormat::I32 => {
-                Self::make_stream::<i32>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
-            }
-            cpal::SampleFormat::I64 => {
-                Self::make_stream::<i64>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
-            }
-            cpal::SampleFormat::U8 => {
-                Self::make_stream::<u8>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
-            }
-            cpal::SampleFormat::U16 => {
-                Self::make_stream::<u16>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
-            }
-            cpal::SampleFormat::U32 => {
-                Self::make_stream::<u32>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
-            }
-            cpal::SampleFormat::U64 => {
-                Self::make_stream::<u64>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
-            }
-            cpal::SampleFormat::F32 => {
-                Self::make_stream::<f32>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
-            }
-            cpal::SampleFormat::F64 => {
-                Self::make_stream::<f64>(device, config, engine, sample_counter, overrun_counter, audio_buffer)?
-            }
+            cpal::SampleFormat::I8 => Self::make_stream::<i8>(
+                device,
+                config,
+                engine,
+                sample_counter,
+                overrun_counter,
+                audio_buffer,
+            )?,
+            cpal::SampleFormat::I16 => Self::make_stream::<i16>(
+                device,
+                config,
+                engine,
+                sample_counter,
+                overrun_counter,
+                audio_buffer,
+            )?,
+            cpal::SampleFormat::I32 => Self::make_stream::<i32>(
+                device,
+                config,
+                engine,
+                sample_counter,
+                overrun_counter,
+                audio_buffer,
+            )?,
+            cpal::SampleFormat::I64 => Self::make_stream::<i64>(
+                device,
+                config,
+                engine,
+                sample_counter,
+                overrun_counter,
+                audio_buffer,
+            )?,
+            cpal::SampleFormat::U8 => Self::make_stream::<u8>(
+                device,
+                config,
+                engine,
+                sample_counter,
+                overrun_counter,
+                audio_buffer,
+            )?,
+            cpal::SampleFormat::U16 => Self::make_stream::<u16>(
+                device,
+                config,
+                engine,
+                sample_counter,
+                overrun_counter,
+                audio_buffer,
+            )?,
+            cpal::SampleFormat::U32 => Self::make_stream::<u32>(
+                device,
+                config,
+                engine,
+                sample_counter,
+                overrun_counter,
+                audio_buffer,
+            )?,
+            cpal::SampleFormat::U64 => Self::make_stream::<u64>(
+                device,
+                config,
+                engine,
+                sample_counter,
+                overrun_counter,
+                audio_buffer,
+            )?,
+            cpal::SampleFormat::F32 => Self::make_stream::<f32>(
+                device,
+                config,
+                engine,
+                sample_counter,
+                overrun_counter,
+                audio_buffer,
+            )?,
+            cpal::SampleFormat::F64 => Self::make_stream::<f64>(
+                device,
+                config,
+                engine,
+                sample_counter,
+                overrun_counter,
+                audio_buffer,
+            )?,
             sample_format => {
                 return Err(anyhow::anyhow!(
                     "Unsupported sample format '{}'",

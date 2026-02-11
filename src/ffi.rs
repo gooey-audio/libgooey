@@ -6,7 +6,9 @@
 use crate::effects::{BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect, TubeSaturation};
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer};
-use crate::instruments::{HiHat, KickConfig, KickDrum, SnareConfig, SnareDrum, Tom2, Tom2Config};
+use crate::instruments::{
+    HiHat, HiHat2Config, KickConfig, KickDrum, SnareConfig, SnareDrum, Tom2, Tom2Config,
+};
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -113,6 +115,7 @@ pub struct GooeyEngine {
     // Per-instrument preset blend state (2D X/Y pad interpolation)
     kick_blender: PresetBlender<KickConfig>,
     snare_blender: PresetBlender<SnareConfig>,
+    hihat_blender: PresetBlender<HiHat2Config>,
     tom_blender: PresetBlender<Tom2Config>,
     blend_enabled: [bool; INSTRUMENT_COUNT as usize],
     blend_x: [f32; INSTRUMENT_COUNT as usize],
@@ -170,6 +173,15 @@ impl GooeyEngine {
             SnareConfig::smack(),
         );
 
+        // Create hihat preset blender with default corner presets
+        // BL(0,0)=Short, BR(1,0)=Loose, TL(0,1)=Dark, TR(1,1)=Soft
+        let hihat_blender = PresetBlender::new(
+            HiHat2Config::short(),
+            HiHat2Config::loose(),
+            HiHat2Config::dark(),
+            HiHat2Config::soft(),
+        );
+
         // Create tom preset blender with default corner presets
         // BL(0,0)=Derp, BR(1,0)=Ring, TL(0,1)=Brush, TR(1,1)=Void
         let tom_blender = PresetBlender::new(
@@ -215,19 +227,42 @@ impl GooeyEngine {
             instrument_muted: std::array::from_fn(|_| AtomicBool::new(false)),
             instrument_soloed: std::array::from_fn(|_| AtomicBool::new(false)),
             // Smoothed gains for click-free mute/solo transitions (10ms smoothing)
-            instrument_gains: std::array::from_fn(|_| SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0)),
+            instrument_gains: std::array::from_fn(|_| {
+                SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0)
+            }),
             // Preset blend state
             kick_blender,
             snare_blender,
+            hihat_blender,
             tom_blender,
             blend_enabled: [false; INSTRUMENT_COUNT as usize],
             blend_x: [0.5; INSTRUMENT_COUNT as usize],
             blend_y: [0.5; INSTRUMENT_COUNT as usize],
             blend_corner_presets: [
-                [KICK_PRESET_TIGHT, KICK_PRESET_PUNCH, KICK_PRESET_LOOSE, KICK_PRESET_DIRT],
-                [SNARE_PRESET_TIGHT, SNARE_PRESET_LOOSE, SNARE_PRESET_HISS, SNARE_PRESET_SMACK],
-                [0, 1, 2, 3], // HiHat: placeholder
-                [TOM_PRESET_DERP, TOM_PRESET_RING, TOM_PRESET_BRUSH, TOM_PRESET_VOID],
+                [
+                    KICK_PRESET_TIGHT,
+                    KICK_PRESET_PUNCH,
+                    KICK_PRESET_LOOSE,
+                    KICK_PRESET_DIRT,
+                ],
+                [
+                    SNARE_PRESET_TIGHT,
+                    SNARE_PRESET_LOOSE,
+                    SNARE_PRESET_HISS,
+                    SNARE_PRESET_SMACK,
+                ],
+                [
+                    HIHAT_PRESET_SHORT,
+                    HIHAT_PRESET_LOOSE,
+                    HIHAT_PRESET_DARK,
+                    HIHAT_PRESET_SOFT,
+                ],
+                [
+                    TOM_PRESET_DERP,
+                    TOM_PRESET_RING,
+                    TOM_PRESET_BRUSH,
+                    TOM_PRESET_VOID,
+                ],
             ],
         }
     }
@@ -355,7 +390,9 @@ impl GooeyEngine {
                 KICK_PARAM_SUB => self.kick.params.sub.set_bipolar(value),
                 KICK_PARAM_CLICK => self.kick.params.click.set_bipolar(value),
                 KICK_PARAM_DECAY => self.kick.params.oscillator_decay.set_bipolar(value),
-                KICK_PARAM_PITCH_ENVELOPE => self.kick.params.pitch_envelope_amount.set_bipolar(value),
+                KICK_PARAM_PITCH_ENVELOPE => {
+                    self.kick.params.pitch_envelope_amount.set_bipolar(value)
+                }
                 KICK_PARAM_VOLUME => self.kick.params.volume.set_bipolar(value),
                 _ => {}
             },
@@ -369,22 +406,30 @@ impl GooeyEngine {
                 SNARE_PARAM_PITCH_DROP => self.snare.params.pitch_drop.set_bipolar(value),
                 SNARE_PARAM_TONAL_DECAY => self.snare.params.tonal_decay.set_bipolar(value),
                 SNARE_PARAM_NOISE_DECAY => self.snare.params.noise_decay.set_bipolar(value),
-                SNARE_PARAM_NOISE_TAIL_DECAY => self.snare.params.noise_tail_decay.set_bipolar(value),
+                SNARE_PARAM_NOISE_TAIL_DECAY => {
+                    self.snare.params.noise_tail_decay.set_bipolar(value)
+                }
                 SNARE_PARAM_FILTER_CUTOFF => self.snare.params.filter_cutoff.set_bipolar(value),
-                SNARE_PARAM_FILTER_RESONANCE => self.snare.params.filter_resonance.set_bipolar(value),
+                SNARE_PARAM_FILTER_RESONANCE => {
+                    self.snare.params.filter_resonance.set_bipolar(value)
+                }
                 SNARE_PARAM_XFADE => self.snare.params.xfade.set_bipolar(value),
-                SNARE_PARAM_PHASE_MOD_AMOUNT => self.snare.params.phase_mod_amount.set_bipolar(value),
+                SNARE_PARAM_PHASE_MOD_AMOUNT => {
+                    self.snare.params.phase_mod_amount.set_bipolar(value)
+                }
                 SNARE_PARAM_OVERDRIVE => self.snare.params.overdrive.set_bipolar(value),
                 SNARE_PARAM_AMP_DECAY => self.snare.params.amp_decay.set_bipolar(value),
                 SNARE_PARAM_AMP_DECAY_CURVE => self.snare.params.amp_decay_curve.set_bipolar(value),
-                SNARE_PARAM_TONAL_DECAY_CURVE => self.snare.params.tonal_decay_curve.set_bipolar(value),
+                SNARE_PARAM_TONAL_DECAY_CURVE => {
+                    self.snare.params.tonal_decay_curve.set_bipolar(value)
+                }
                 _ => {}
             },
             INSTRUMENT_HIHAT => match param {
-                HIHAT_PARAM_FILTER => self.hihat.params.filter.set_bipolar(value),
-                HIHAT_PARAM_FREQUENCY => self.hihat.params.frequency.set_bipolar(value),
+                HIHAT_PARAM_PITCH => self.hihat.params.pitch.set_bipolar(value),
                 HIHAT_PARAM_DECAY => self.hihat.params.decay.set_bipolar(value),
-                HIHAT_PARAM_VOLUME => self.hihat.params.volume.set_bipolar(value),
+                HIHAT_PARAM_ATTACK => self.hihat.params.attack.set_bipolar(value),
+                HIHAT_PARAM_TONE => self.hihat.params.tone.set_bipolar(value),
                 _ => {}
             },
             INSTRUMENT_TOM => {
@@ -460,6 +505,17 @@ impl GooeyEngine {
             _ => None,
         }
     }
+
+    /// Get a HiHat2Config preset by ID
+    fn hihat_preset_by_id(id: u32) -> Option<HiHat2Config> {
+        match id {
+            HIHAT_PRESET_SHORT => Some(HiHat2Config::short()),
+            HIHAT_PRESET_LOOSE => Some(HiHat2Config::loose()),
+            HIHAT_PRESET_DARK => Some(HiHat2Config::dark()),
+            HIHAT_PRESET_SOFT => Some(HiHat2Config::soft()),
+            _ => None,
+        }
+    }
 }
 
 // =============================================================================
@@ -529,14 +585,14 @@ pub const KICK_PARAM_VOLUME: u32 = 6;
 // Hi-hat parameter indices (must match Swift HiHatParam enum)
 // =============================================================================
 
-/// Hi-hat parameter: combined brightness + resonance control (0-1)
-pub const HIHAT_PARAM_FILTER: u32 = 0;
-/// Hi-hat parameter: filter cutoff frequency (4000-16000 Hz)
-pub const HIHAT_PARAM_FREQUENCY: u32 = 1;
-/// Hi-hat parameter: decay time (0.005-0.4 seconds)
-pub const HIHAT_PARAM_DECAY: u32 = 2;
-/// Hi-hat parameter: overall volume (0-1)
-pub const HIHAT_PARAM_VOLUME: u32 = 3;
+/// Hi-hat parameter: oscillator pitch (0-1 normalized)
+pub const HIHAT_PARAM_PITCH: u32 = 0;
+/// Hi-hat parameter: decay time (0-1 normalized)
+pub const HIHAT_PARAM_DECAY: u32 = 1;
+/// Hi-hat parameter: attack time (0-1 normalized)
+pub const HIHAT_PARAM_ATTACK: u32 = 2;
+/// Hi-hat parameter: tone control (0-1 normalized)
+pub const HIHAT_PARAM_TONE: u32 = 3;
 
 // =============================================================================
 // Snare drum parameter indices (must match Swift SnareParam enum)
@@ -647,6 +703,15 @@ pub const SNARE_PRESET_LOOSE: u32 = 1;
 pub const SNARE_PRESET_HISS: u32 = 2;
 /// Snare preset: Smack - DS-style transient with SVF noise
 pub const SNARE_PRESET_SMACK: u32 = 3;
+
+/// Hi-hat preset: Short - bright and short
+pub const HIHAT_PRESET_SHORT: u32 = 0;
+/// Hi-hat preset: Loose - longer decay
+pub const HIHAT_PRESET_LOOSE: u32 = 1;
+/// Hi-hat preset: Dark - lower pitch and tone
+pub const HIHAT_PRESET_DARK: u32 = 2;
+/// Hi-hat preset: Soft - softer attack and tone
+pub const HIHAT_PRESET_SOFT: u32 = 3;
 
 /// Blend corner: bottom-left (x=0, y=0)
 pub const BLEND_CORNER_BOTTOM_LEFT: u32 = 0;
@@ -864,12 +929,10 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
 /// * `value` - Parameter value (range depends on parameter)
 ///
 /// # Parameter indices and ranges
-/// - 0 (FREQUENCY): 4000-16000 Hz - filter cutoff, lower values tame harshness
-/// - 1 (BRIGHTNESS): 0-1 - high-frequency emphasis
-/// - 2 (RESONANCE): 0-1 - filter resonance boost
-/// - 3 (DECAY): 0.01-3.0 seconds
-/// - 4 (ATTACK): 0.001-0.1 seconds
-/// - 5 (VOLUME): 0-1
+/// - 0 (PITCH): 0-1
+/// - 1 (DECAY): 0-1
+/// - 2 (ATTACK): 0-1
+/// - 3 (TONE): 0-1
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -885,12 +948,12 @@ pub unsafe extern "C" fn gooey_engine_set_hihat_param(
 
     let engine = &mut *engine;
 
-    // HiHat's setters now handle smoothing internally
+    // HiHat2's setters now handle smoothing internally
     match param {
-        HIHAT_PARAM_FILTER => engine.hihat.set_filter(value),
-        HIHAT_PARAM_FREQUENCY => engine.hihat.set_frequency(value),
+        HIHAT_PARAM_PITCH => engine.hihat.set_pitch(value),
         HIHAT_PARAM_DECAY => engine.hihat.set_decay(value),
-        HIHAT_PARAM_VOLUME => engine.hihat.set_volume(value),
+        HIHAT_PARAM_ATTACK => engine.hihat.set_attack(value),
+        HIHAT_PARAM_TONE => engine.hihat.set_tone(value),
         _ => {} // Unknown parameter, ignore
     }
 }
@@ -1924,10 +1987,7 @@ pub unsafe extern "C" fn gooey_engine_remove_lfo_route(
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
 #[no_mangle]
-pub unsafe extern "C" fn gooey_engine_clear_lfo_routes(
-    engine: *mut GooeyEngine,
-    lfo_index: u32,
-) {
+pub unsafe extern "C" fn gooey_engine_clear_lfo_routes(engine: *mut GooeyEngine, lfo_index: u32) {
     if engine.is_null() || lfo_index as usize >= LFO_COUNT {
         return;
     }
@@ -1967,10 +2027,7 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_route_count(
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
 #[no_mangle]
-pub unsafe extern "C" fn gooey_engine_reset_lfo_phase(
-    engine: *mut GooeyEngine,
-    lfo_index: u32,
-) {
+pub unsafe extern "C" fn gooey_engine_reset_lfo_phase(engine: *mut GooeyEngine, lfo_index: u32) {
     if engine.is_null() || lfo_index as usize >= LFO_COUNT {
         return;
     }
@@ -2244,15 +2301,27 @@ pub unsafe extern "C" fn gooey_engine_blend_set_position(
 
     match instrument {
         INSTRUMENT_KICK => {
-            let blended = engine.kick_blender.blend(engine.blend_x[idx], engine.blend_y[idx]);
+            let blended = engine
+                .kick_blender
+                .blend(engine.blend_x[idx], engine.blend_y[idx]);
             engine.kick.set_config(blended);
         }
         INSTRUMENT_SNARE => {
-            let blended = engine.snare_blender.blend(engine.blend_x[idx], engine.blend_y[idx]);
+            let blended = engine
+                .snare_blender
+                .blend(engine.blend_x[idx], engine.blend_y[idx]);
             engine.snare.set_config(blended);
         }
+        INSTRUMENT_HIHAT => {
+            let blended = engine
+                .hihat_blender
+                .blend(engine.blend_x[idx], engine.blend_y[idx]);
+            engine.hihat.set_config(blended);
+        }
         INSTRUMENT_TOM => {
-            let blended = engine.tom_blender.blend(engine.blend_x[idx], engine.blend_y[idx]);
+            let blended = engine
+                .tom_blender
+                .blend(engine.blend_x[idx], engine.blend_y[idx]);
             engine.tom.set_config(blended);
         }
         _ => {}
@@ -2376,6 +2445,17 @@ pub unsafe extern "C" fn gooey_engine_blend_set_corner_preset(
                 }
             }
         }
+        INSTRUMENT_HIHAT => {
+            if let Some(config) = GooeyEngine::hihat_preset_by_id(preset_id) {
+                match corner {
+                    BLEND_CORNER_BOTTOM_LEFT => engine.hihat_blender.set_bottom_left(config),
+                    BLEND_CORNER_BOTTOM_RIGHT => engine.hihat_blender.set_bottom_right(config),
+                    BLEND_CORNER_TOP_LEFT => engine.hihat_blender.set_top_left(config),
+                    BLEND_CORNER_TOP_RIGHT => engine.hihat_blender.set_top_right(config),
+                    _ => {}
+                }
+            }
+        }
         INSTRUMENT_TOM => {
             if let Some(config) = GooeyEngine::tom_preset_by_id(preset_id) {
                 match corner {
@@ -2460,8 +2540,12 @@ pub unsafe extern "C" fn gooey_engine_blend_reset_corners(
                 KickConfig::loose(),
                 KickConfig::dirt(),
             );
-            engine.blend_corner_presets[idx] =
-                [KICK_PRESET_TIGHT, KICK_PRESET_PUNCH, KICK_PRESET_LOOSE, KICK_PRESET_DIRT];
+            engine.blend_corner_presets[idx] = [
+                KICK_PRESET_TIGHT,
+                KICK_PRESET_PUNCH,
+                KICK_PRESET_LOOSE,
+                KICK_PRESET_DIRT,
+            ];
         }
         INSTRUMENT_SNARE => {
             engine.snare_blender = PresetBlender::new(
@@ -2470,8 +2554,26 @@ pub unsafe extern "C" fn gooey_engine_blend_reset_corners(
                 SnareConfig::hiss(),
                 SnareConfig::smack(),
             );
-            engine.blend_corner_presets[idx] =
-                [SNARE_PRESET_TIGHT, SNARE_PRESET_LOOSE, SNARE_PRESET_HISS, SNARE_PRESET_SMACK];
+            engine.blend_corner_presets[idx] = [
+                SNARE_PRESET_TIGHT,
+                SNARE_PRESET_LOOSE,
+                SNARE_PRESET_HISS,
+                SNARE_PRESET_SMACK,
+            ];
+        }
+        INSTRUMENT_HIHAT => {
+            engine.hihat_blender = PresetBlender::new(
+                HiHat2Config::short(),
+                HiHat2Config::loose(),
+                HiHat2Config::dark(),
+                HiHat2Config::soft(),
+            );
+            engine.blend_corner_presets[idx] = [
+                HIHAT_PRESET_SHORT,
+                HIHAT_PRESET_LOOSE,
+                HIHAT_PRESET_DARK,
+                HIHAT_PRESET_SOFT,
+            ];
         }
         INSTRUMENT_TOM => {
             engine.tom_blender = PresetBlender::new(
@@ -2480,8 +2582,12 @@ pub unsafe extern "C" fn gooey_engine_blend_reset_corners(
                 Tom2Config::brush(),
                 Tom2Config::void_preset(),
             );
-            engine.blend_corner_presets[idx] =
-                [TOM_PRESET_DERP, TOM_PRESET_RING, TOM_PRESET_BRUSH, TOM_PRESET_VOID];
+            engine.blend_corner_presets[idx] = [
+                TOM_PRESET_DERP,
+                TOM_PRESET_RING,
+                TOM_PRESET_BRUSH,
+                TOM_PRESET_VOID,
+            ];
         }
         _ => {}
     }

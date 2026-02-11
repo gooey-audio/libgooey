@@ -1,7 +1,7 @@
 //! Shared audio engine logic for native (CPAL) and iOS targets
 
-pub mod envelope;
 pub mod dsl;
+pub mod envelope;
 pub mod filters;
 pub mod max_curve;
 

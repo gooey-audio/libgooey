@@ -3,7 +3,7 @@
 bpm 120
 master 0.25
 
-inst hihat hihat closed
+inst hihat hihat short
 seq hihat x.x.x.x.|x.x.x.x.
 
 lfo 1bar hihat.decay amt=1
@@ -11,4 +11,3 @@ lfo 1bar hihat.decay amt=1
 fx clear
 fx lowpass 2000 0.3
 fx limiter 1.0
-

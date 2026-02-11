@@ -28,10 +28,10 @@ impl EnvelopeCurve {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ADSRConfig {
-    pub attack_time: f32,   // seconds
-    pub decay_time: f32,    // seconds
-    pub sustain_level: f32, // 0.0 to 1.0
-    pub release_time: f32,  // seconds
+    pub attack_time: f32,            // seconds
+    pub decay_time: f32,             // seconds
+    pub sustain_level: f32,          // 0.0 to 1.0
+    pub release_time: f32,           // seconds
     pub attack_curve: EnvelopeCurve, // Curve shape for attack phase
     pub decay_curve: EnvelopeCurve,  // Curve shape for decay phase
 }
@@ -42,7 +42,7 @@ impl ADSRConfig {
             attack_time: attack.max(0.001), // Minimum attack to avoid artifacts
             decay_time: decay.max(0.001),   // Minimum decay
             sustain_level: sustain.clamp(0.0, 1.0),
-            release_time: release.max(0.001), // Minimum release
+            release_time: release.max(0.001),    // Minimum release
             attack_curve: EnvelopeCurve::Linear, // Default to linear for backward compatibility
             decay_curve: EnvelopeCurve::Linear,  // Default to linear for backward compatibility
         }
@@ -66,13 +66,13 @@ impl ADSRConfig {
 }
 
 pub struct Envelope {
-    pub attack_time: f32,   // seconds
-    pub decay_time: f32,    // seconds
-    pub sustain_level: f32, // 0.0 to 1.0
-    pub release_time: f32,  // seconds
+    pub attack_time: f32,            // seconds
+    pub decay_time: f32,             // seconds
+    pub sustain_level: f32,          // 0.0 to 1.0
+    pub release_time: f32,           // seconds
     pub attack_curve: EnvelopeCurve, // Curve shape for attack phase
     pub decay_curve: EnvelopeCurve,  // Curve shape for decay phase
-    pub current_time: f32,  // current time in the envelope
+    pub current_time: f32,           // current time in the envelope
     pub is_active: bool,
     pub trigger_time: f32,               // when the envelope was triggered
     pub release_time_start: Option<f32>, // when release was triggered

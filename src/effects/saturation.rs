@@ -132,7 +132,8 @@ impl TubeSaturation {
     /// Set the drive amount (0.0-1.0)
     pub fn set_drive(&self, drive: f32) {
         let clamped = drive.clamp(0.0, 1.0);
-        self.drive_target.store(clamped.to_bits(), Ordering::Relaxed);
+        self.drive_target
+            .store(clamped.to_bits(), Ordering::Relaxed);
     }
 
     /// Set the warmth/even harmonics amount (0.0-1.0)

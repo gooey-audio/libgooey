@@ -7,7 +7,7 @@ fn parses_and_builds_basic_program() {
         bpm 120
         master 0.25
 
-        inst hihat hihat closed
+        inst hihat hihat short
         seq hihat x.x.x.x.|x.x.x.x.
 
         lfo 1bar hihat.decay amt=1

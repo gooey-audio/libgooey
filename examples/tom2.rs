@@ -30,13 +30,55 @@ struct ParamInfo {
 }
 
 const PARAM_INFO: [ParamInfo; 7] = [
-    ParamInfo { name: "tune", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
-    ParamInfo { name: "bend", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
-    ParamInfo { name: "tone", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
-    ParamInfo { name: "color", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
-    ParamInfo { name: "decay", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
-    ParamInfo { name: "membrane", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
-    ParamInfo { name: "membrane_q", coarse_step: 10.0, fine_step: 1.0, min: 0.0, max: 100.0 },
+    ParamInfo {
+        name: "tune",
+        coarse_step: 10.0,
+        fine_step: 1.0,
+        min: 0.0,
+        max: 100.0,
+    },
+    ParamInfo {
+        name: "bend",
+        coarse_step: 10.0,
+        fine_step: 1.0,
+        min: 0.0,
+        max: 100.0,
+    },
+    ParamInfo {
+        name: "tone",
+        coarse_step: 10.0,
+        fine_step: 1.0,
+        min: 0.0,
+        max: 100.0,
+    },
+    ParamInfo {
+        name: "color",
+        coarse_step: 10.0,
+        fine_step: 1.0,
+        min: 0.0,
+        max: 100.0,
+    },
+    ParamInfo {
+        name: "decay",
+        coarse_step: 10.0,
+        fine_step: 1.0,
+        min: 0.0,
+        max: 100.0,
+    },
+    ParamInfo {
+        name: "membrane",
+        coarse_step: 10.0,
+        fine_step: 1.0,
+        min: 0.0,
+        max: 100.0,
+    },
+    ParamInfo {
+        name: "membrane_q",
+        coarse_step: 10.0,
+        fine_step: 1.0,
+        min: 0.0,
+        max: 100.0,
+    },
 ];
 
 // Wrapper to share Tom2 between audio thread and main thread
@@ -141,7 +183,12 @@ fn render_display(tom: &Tom2, selected: usize, trigger_count: u32, velocity: f32
 
     print!("\r\n");
     let tri_state = if tom.triangle_enabled() { "ON" } else { "OFF" };
-    print!("Hits: {} | Vel: {:.0}% | Triangle: {}\r\n", trigger_count, velocity * 100.0, tri_state);
+    print!(
+        "Hits: {} | Vel: {:.0}% | Triangle: {}\r\n",
+        trigger_count,
+        velocity * 100.0,
+        tri_state
+    );
     print!("\r\n");
     print!("Ch1: sine+fixed190Hz | Ch2: triangle | Ch3: (empty)\r\n");
     print!("tone=0: Ch1 only | tone=50: Ch2 only | tone=100: silent\r\n");

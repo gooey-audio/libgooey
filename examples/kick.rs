@@ -38,22 +38,102 @@ struct ParamInfo {
 
 // Parameters in alphabetical order for display
 const PARAM_INFO: [ParamInfo; 16] = [
-    ParamInfo { name: "amp_decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 0.0-4.0s
-    ParamInfo { name: "amp_dcy_crv", coarse_step: 0.1, fine_step: 0.02, unit: "" },         // 0-1 → 0.1-10.0
-    ParamInfo { name: "click", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "frequency", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 30-120 Hz
-    ParamInfo { name: "noise_amount", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "noise_cutoff", coarse_step: 0.1, fine_step: 0.02, unit: "" },        // 0-1 → 20-10000 Hz
-    ParamInfo { name: "noise_res", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 0.0-5.0
-    ParamInfo { name: "osc_decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },           // 0-1 → 0.01-4.0s
-    ParamInfo { name: "overdrive", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "phase_mod_amt", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "pitch_env_amt", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "pitch_env_crv", coarse_step: 0.1, fine_step: 0.02, unit: "" },       // 0-1 → 0.1-4.0
-    ParamInfo { name: "pitch_ratio", coarse_step: 0.1, fine_step: 0.02, unit: "" },         // 0-1 → 1.0-10.0x
-    ParamInfo { name: "punch", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "sub", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "volume", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo {
+        name: "amp_decay",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 → 0.0-4.0s
+    ParamInfo {
+        name: "amp_dcy_crv",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 → 0.1-10.0
+    ParamInfo {
+        name: "click",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
+    ParamInfo {
+        name: "frequency",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 → 30-120 Hz
+    ParamInfo {
+        name: "noise_amount",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
+    ParamInfo {
+        name: "noise_cutoff",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 → 20-10000 Hz
+    ParamInfo {
+        name: "noise_res",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 → 0.0-5.0
+    ParamInfo {
+        name: "osc_decay",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 → 0.01-4.0s
+    ParamInfo {
+        name: "overdrive",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
+    ParamInfo {
+        name: "phase_mod_amt",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
+    ParamInfo {
+        name: "pitch_env_amt",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
+    ParamInfo {
+        name: "pitch_env_crv",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 → 0.1-4.0
+    ParamInfo {
+        name: "pitch_ratio",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 → 1.0-10.0x
+    ParamInfo {
+        name: "punch",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
+    ParamInfo {
+        name: "sub",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
+    ParamInfo {
+        name: "volume",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
 ];
 
 // Wrapper to share KickDrum between audio thread and main thread
@@ -159,10 +239,10 @@ impl BlendState {
             x: 0.5,
             y: 0.5,
             blender: PresetBlender::new(
-                KickConfig::tight(),  // Bottom-left (0,0)
-                KickConfig::punch(),  // Bottom-right (1,0)
-                KickConfig::loose(),  // Top-left (0,1)
-                KickConfig::dirt(),   // Top-right (1,1)
+                KickConfig::tight(), // Bottom-left (0,0)
+                KickConfig::punch(), // Bottom-right (1,0)
+                KickConfig::loose(), // Top-left (0,1)
+                KickConfig::dirt(),  // Top-right (1,1)
             ),
         }
     }
@@ -374,7 +454,14 @@ fn main() -> anyhow::Result<()> {
         // Render display if needed
         if needs_redraw {
             let k = kick.lock().unwrap();
-            render_display(&k, selected_param, trigger_count, current_velocity, current_preset, &blend);
+            render_display(
+                &k,
+                selected_param,
+                trigger_count,
+                current_velocity,
+                current_preset,
+                &blend,
+            );
             needs_redraw = false;
         }
 

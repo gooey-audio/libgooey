@@ -68,13 +68,13 @@ pub(crate) mod ranges {
 /// Use the `ranges` module to convert to/from actual values.
 #[derive(Clone, Copy, Debug)]
 pub struct SnareConfig {
-    pub frequency: f32,       // Base frequency (0-1 → 100-600Hz)
-    pub tonal_amount: f32,    // Tonal component presence (0.0-1.0)
-    pub noise_amount: f32,    // Noise component presence (0.0-1.0)
-    pub crack_amount: f32,    // High-frequency crack (0.0-1.0)
-    pub decay: f32,           // Overall decay length (0-1 → 0.05-3.5s)
-    pub pitch_drop: f32,      // Frequency sweep amount (0.0-1.0)
-    pub volume: f32,          // Overall volume (0.0-1.0)
+    pub frequency: f32,    // Base frequency (0-1 → 100-600Hz)
+    pub tonal_amount: f32, // Tonal component presence (0.0-1.0)
+    pub noise_amount: f32, // Noise component presence (0.0-1.0)
+    pub crack_amount: f32, // High-frequency crack (0.0-1.0)
+    pub decay: f32,        // Overall decay length (0-1 → 0.05-3.5s)
+    pub pitch_drop: f32,   // Frequency sweep amount (0.0-1.0)
+    pub volume: f32,       // Overall volume (0.0-1.0)
 
     // DS-style parameters (all normalized 0-1)
     pub tonal_decay: f32,       // Separate tonal decay (0-1 → 0-3.5s)
@@ -88,9 +88,9 @@ pub struct SnareConfig {
     pub phase_mod_amount: f32,  // Phase mod depth (0.0-1.0, 0 = disabled)
 
     // New parameters (matching kick design)
-    pub overdrive_amount: f32,  // Overdrive/saturation (0.0-1.0, 0.0 = bypass)
-    pub amp_decay: f32,         // Master amplitude decay (0-1 → 0-4.0s)
-    pub amp_decay_curve: f32,   // Decay curve shape (0-1 → 0.1-10.0)
+    pub overdrive_amount: f32, // Overdrive/saturation (0.0-1.0, 0.0 = bypass)
+    pub amp_decay: f32,        // Master amplitude decay (0-1 → 0-4.0s)
+    pub amp_decay_curve: f32,  // Decay curve shape (0-1 → 0.1-10.0)
 }
 
 impl SnareConfig {
@@ -115,7 +115,7 @@ impl SnareConfig {
             volume: volume.clamp(0.0, 1.0),
             // DS parameters with defaults
             tonal_decay: decay * 0.8,
-            tonal_decay_curve: 0.091,  // ~1.0 (linear)
+            tonal_decay_curve: 0.091, // ~1.0 (linear)
             noise_decay: decay * 0.6,
             noise_tail_decay: decay,
             filter_cutoff: 0.495,    // ~5000 Hz
@@ -125,8 +125,8 @@ impl SnareConfig {
             phase_mod_amount: 0.0,
             // New parameters
             overdrive_amount: 0.0,
-            amp_decay: 0.125,        // ~0.5s
-            amp_decay_curve: 0.02,   // ~0.3 (steep-then-long)
+            amp_decay: 0.125,      // ~0.5s
+            amp_decay_curve: 0.02, // ~0.3 (steep-then-long)
         }
     }
 
@@ -193,37 +193,61 @@ impl SnareConfig {
     /// Get actual tonal decay in seconds (0-3.5)
     #[inline]
     pub fn tonal_decay_secs(&self) -> f32 {
-        ranges::denormalize(self.tonal_decay, ranges::TONAL_DECAY_MIN, ranges::TONAL_DECAY_MAX)
+        ranges::denormalize(
+            self.tonal_decay,
+            ranges::TONAL_DECAY_MIN,
+            ranges::TONAL_DECAY_MAX,
+        )
     }
 
     /// Get actual tonal decay curve (0.1-10.0)
     #[inline]
     pub fn tonal_decay_curve_value(&self) -> f32 {
-        ranges::denormalize(self.tonal_decay_curve, ranges::TONAL_DECAY_CURVE_MIN, ranges::TONAL_DECAY_CURVE_MAX)
+        ranges::denormalize(
+            self.tonal_decay_curve,
+            ranges::TONAL_DECAY_CURVE_MIN,
+            ranges::TONAL_DECAY_CURVE_MAX,
+        )
     }
 
     /// Get actual noise decay in seconds (0-3.5)
     #[inline]
     pub fn noise_decay_secs(&self) -> f32 {
-        ranges::denormalize(self.noise_decay, ranges::NOISE_DECAY_MIN, ranges::NOISE_DECAY_MAX)
+        ranges::denormalize(
+            self.noise_decay,
+            ranges::NOISE_DECAY_MIN,
+            ranges::NOISE_DECAY_MAX,
+        )
     }
 
     /// Get actual noise tail decay in seconds (0-3.5)
     #[inline]
     pub fn noise_tail_decay_secs(&self) -> f32 {
-        ranges::denormalize(self.noise_tail_decay, ranges::NOISE_TAIL_DECAY_MIN, ranges::NOISE_TAIL_DECAY_MAX)
+        ranges::denormalize(
+            self.noise_tail_decay,
+            ranges::NOISE_TAIL_DECAY_MIN,
+            ranges::NOISE_TAIL_DECAY_MAX,
+        )
     }
 
     /// Get actual filter cutoff in Hz (100-10000)
     #[inline]
     pub fn filter_cutoff_hz(&self) -> f32 {
-        ranges::denormalize(self.filter_cutoff, ranges::FILTER_CUTOFF_MIN, ranges::FILTER_CUTOFF_MAX)
+        ranges::denormalize(
+            self.filter_cutoff,
+            ranges::FILTER_CUTOFF_MIN,
+            ranges::FILTER_CUTOFF_MAX,
+        )
     }
 
     /// Get actual filter resonance (0.5-10.0)
     #[inline]
     pub fn filter_resonance_value(&self) -> f32 {
-        ranges::denormalize(self.filter_resonance, ranges::FILTER_RES_MIN, ranges::FILTER_RES_MAX)
+        ranges::denormalize(
+            self.filter_resonance,
+            ranges::FILTER_RES_MIN,
+            ranges::FILTER_RES_MAX,
+        )
     }
 
     /// Get actual amp decay in seconds (0-4.0)
@@ -235,7 +259,11 @@ impl SnareConfig {
     /// Get actual amp decay curve (0.1-10.0)
     #[inline]
     pub fn amp_decay_curve_value(&self) -> f32 {
-        ranges::denormalize(self.amp_decay_curve, ranges::AMP_DECAY_CURVE_MIN, ranges::AMP_DECAY_CURVE_MAX)
+        ranges::denormalize(
+            self.amp_decay_curve,
+            ranges::AMP_DECAY_CURVE_MIN,
+            ranges::AMP_DECAY_CURVE_MAX,
+        )
     }
 
     /// Tight snare - short, punchy
@@ -248,50 +276,50 @@ impl SnareConfig {
     /// Loose snare - longer decay, more body
     pub fn loose() -> Self {
         Self::new_full(
-            0.16,  // frequency
-            0.80,  // tonal_amount
-            0.60,  // noise_amount
-            0.30,  // crack_amount (brightness)
-            0.79,  // decay
-            0.10,  // pitch_drop
-            0.90,  // volume
-            0.33,  // tonal_decay
-            0.20,  // tonal_decay_curve
-            0.23,  // noise_decay
-            0.34,  // noise_tail_decay
-            0.55,  // filter_cutoff
-            0.05,  // filter_resonance
-            1,     // filter_type: BP
-            0.50,  // xfade
-            0.00,  // phase_mod_amount
-            0.10,  // overdrive_amount
-            0.12,  // amp_decay
-            0.02,  // amp_decay_curve (steep-then-long)
+            0.16, // frequency
+            0.80, // tonal_amount
+            0.60, // noise_amount
+            0.30, // crack_amount (brightness)
+            0.79, // decay
+            0.10, // pitch_drop
+            0.90, // volume
+            0.33, // tonal_decay
+            0.20, // tonal_decay_curve
+            0.23, // noise_decay
+            0.34, // noise_tail_decay
+            0.55, // filter_cutoff
+            0.05, // filter_resonance
+            1,    // filter_type: BP
+            0.50, // xfade
+            0.00, // phase_mod_amount
+            0.10, // overdrive_amount
+            0.12, // amp_decay
+            0.02, // amp_decay_curve (steep-then-long)
         )
     }
 
     /// Hiss snare - noise-focused with phase modulation
     pub fn hiss() -> Self {
         Self::new_full(
-            0.16,  // frequency
-            0.00,  // tonal_amount (no tonal)
-            0.60,  // noise_amount
-            0.30,  // crack_amount (brightness)
-            0.04,  // decay
-            0.40,  // pitch_drop
-            0.90,  // volume
-            0.53,  // tonal_decay
-            0.09,  // tonal_decay_curve
-            0.38,  // noise_decay
-            0.29,  // noise_tail_decay
-            0.29,  // filter_cutoff
-            0.45,  // filter_resonance
-            1,     // filter_type: BP
-            0.50,  // xfade
-            1.00,  // phase_mod_amount
-            0.20,  // overdrive_amount
-            0.18,  // amp_decay
-            0.02,  // amp_decay_curve (steep-then-long)
+            0.16, // frequency
+            0.00, // tonal_amount (no tonal)
+            0.60, // noise_amount
+            0.30, // crack_amount (brightness)
+            0.04, // decay
+            0.40, // pitch_drop
+            0.90, // volume
+            0.53, // tonal_decay
+            0.09, // tonal_decay_curve
+            0.38, // noise_decay
+            0.29, // noise_tail_decay
+            0.29, // filter_cutoff
+            0.45, // filter_resonance
+            1,    // filter_type: BP
+            0.50, // xfade
+            1.00, // phase_mod_amount
+            0.20, // overdrive_amount
+            0.18, // amp_decay
+            0.02, // amp_decay_curve (steep-then-long)
         )
     }
 
@@ -299,26 +327,26 @@ impl SnareConfig {
     /// Features: phase modulation transient, SVF-filtered noise, tonal/noise crossfade
     pub fn smack() -> Self {
         Self::new_full(
-            0.2,    // frequency: 200 Hz
-            0.3,    // tonal_amount
-            0.8,    // noise_amount
-            0.0,    // crack_amount (using phase mod instead)
-            0.029,  // decay: ~0.15s
-            0.3,    // pitch_drop
-            0.85,   // volume
+            0.2,   // frequency: 200 Hz
+            0.3,   // tonal_amount
+            0.8,   // noise_amount
+            0.0,   // crack_amount (using phase mod instead)
+            0.029, // decay: ~0.15s
+            0.3,   // pitch_drop
+            0.85,  // volume
             // DS parameters (normalized):
-            0.014,  // tonal_decay: ~50ms
-            0.091,  // tonal_decay_curve: ~1.0 (linear)
-            0.034,  // noise_decay: ~120ms
-            0.086,  // noise_tail_decay: ~300ms
-            0.293,  // filter_cutoff: ~3000 Hz
-            0.158,  // filter_resonance: ~2.0
-            1,      // filter_type: Bandpass
-            0.4,    // xfade: 40% tonal / 60% noise
-            0.5,    // phase_mod_amount
-            0.0,    // overdrive_amount
-            0.125,  // amp_decay: ~0.5s
-            0.02,   // amp_decay_curve: ~0.3 (steep-then-long)
+            0.014, // tonal_decay: ~50ms
+            0.091, // tonal_decay_curve: ~1.0 (linear)
+            0.034, // noise_decay: ~120ms
+            0.086, // noise_tail_decay: ~300ms
+            0.293, // filter_cutoff: ~3000 Hz
+            0.158, // filter_resonance: ~2.0
+            1,     // filter_type: Bandpass
+            0.4,   // xfade: 40% tonal / 60% noise
+            0.5,   // phase_mod_amount
+            0.0,   // overdrive_amount
+            0.125, // amp_decay: ~0.5s
+            0.02,  // amp_decay_curve: ~0.3 (steep-then-long)
         )
     }
 }
@@ -341,7 +369,11 @@ impl Blendable for SnareConfig {
             noise_tail_decay: self.noise_tail_decay * inv_t + other.noise_tail_decay * t,
             filter_cutoff: self.filter_cutoff * inv_t + other.filter_cutoff * t,
             filter_resonance: self.filter_resonance * inv_t + other.filter_resonance * t,
-            filter_type: if t < 0.5 { self.filter_type } else { other.filter_type },
+            filter_type: if t < 0.5 {
+                self.filter_type
+            } else {
+                other.filter_type
+            },
             xfade: self.xfade * inv_t + other.xfade * t,
             phase_mod_amount: self.phase_mod_amount * inv_t + other.phase_mod_amount * t,
             overdrive_amount: self.overdrive_amount * inv_t + other.overdrive_amount * t,
@@ -355,29 +387,29 @@ impl Blendable for SnareConfig {
 /// These use one-pole smoothing to prevent clicks/pops during parameter changes
 /// All parameters use normalized 0-1 ranges for external interface
 pub struct SnareParams {
-    pub frequency: SmoothedParam,        // Base frequency (0-1 → 100-600 Hz)
-    pub decay: SmoothedParam,            // Decay time (0-1 → 0.05-3.5s)
-    pub brightness: SmoothedParam,       // Snap/crack tone amount (0-1)
-    pub volume: SmoothedParam,           // Overall volume (0-1)
-    pub tonal: SmoothedParam,            // Tonal component amount (0-1)
-    pub noise: SmoothedParam,            // Noise component amount (0-1)
-    pub pitch_drop: SmoothedParam,       // Pitch drop amount (0-1)
+    pub frequency: SmoothedParam,  // Base frequency (0-1 → 100-600 Hz)
+    pub decay: SmoothedParam,      // Decay time (0-1 → 0.05-3.5s)
+    pub brightness: SmoothedParam, // Snap/crack tone amount (0-1)
+    pub volume: SmoothedParam,     // Overall volume (0-1)
+    pub tonal: SmoothedParam,      // Tonal component amount (0-1)
+    pub noise: SmoothedParam,      // Noise component amount (0-1)
+    pub pitch_drop: SmoothedParam, // Pitch drop amount (0-1)
 
     // DS-style smoothed parameters (all normalized 0-1)
-    pub tonal_decay: SmoothedParam,      // Tonal envelope decay (0-1 → 0-3.5s)
+    pub tonal_decay: SmoothedParam, // Tonal envelope decay (0-1 → 0-3.5s)
     pub tonal_decay_curve: SmoothedParam, // Tonal decay curve shape (0-1 → 0.1-10.0)
-    pub noise_decay: SmoothedParam,      // Noise envelope decay (0-1 → 0-3.5s)
+    pub noise_decay: SmoothedParam, // Noise envelope decay (0-1 → 0-3.5s)
     pub noise_tail_decay: SmoothedParam, // Noise tail decay (0-1 → 0-3.5s)
-    pub filter_cutoff: SmoothedParam,    // SVF filter cutoff (0-1 → 100-10000 Hz)
+    pub filter_cutoff: SmoothedParam, // SVF filter cutoff (0-1 → 100-10000 Hz)
     pub filter_resonance: SmoothedParam, // SVF filter resonance (0-1 → 0.5-10.0)
-    pub filter_type: u8,                 // 0=LP, 1=BP, 2=HP, 3=notch (not smoothed)
-    pub xfade: SmoothedParam,            // Tonal/noise crossfade (0-1)
+    pub filter_type: u8,            // 0=LP, 1=BP, 2=HP, 3=notch (not smoothed)
+    pub xfade: SmoothedParam,       // Tonal/noise crossfade (0-1)
     pub phase_mod_amount: SmoothedParam, // Phase mod depth (0-1, 0 = disabled)
 
     // New parameters (matching kick design)
-    pub overdrive: SmoothedParam,        // Overdrive/saturation (0-1, 0 = bypass)
-    pub amp_decay: SmoothedParam,        // Master amplitude decay (0-1 → 0-4.0s)
-    pub amp_decay_curve: SmoothedParam,  // Decay curve shape (0-1 → 0.1-10.0)
+    pub overdrive: SmoothedParam, // Overdrive/saturation (0-1, 0 = bypass)
+    pub amp_decay: SmoothedParam, // Master amplitude decay (0-1 → 0-4.0s)
+    pub amp_decay_curve: SmoothedParam, // Decay curve shape (0-1 → 0.1-10.0)
 }
 
 impl SnareParams {
@@ -392,13 +424,7 @@ impl SnareParams {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
-            decay: SmoothedParam::new(
-                config.decay,
-                0.0,
-                1.0,
-                sample_rate,
-                DEFAULT_SMOOTH_TIME_MS,
-            ),
+            decay: SmoothedParam::new(config.decay, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
             brightness: SmoothedParam::new(
                 config.crack_amount,
                 0.0,
@@ -478,13 +504,7 @@ impl SnareParams {
                 DEFAULT_SMOOTH_TIME_MS,
             ),
             filter_type: config.filter_type,
-            xfade: SmoothedParam::new(
-                config.xfade,
-                0.0,
-                1.0,
-                sample_rate,
-                DEFAULT_SMOOTH_TIME_MS,
-            ),
+            xfade: SmoothedParam::new(config.xfade, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
             phase_mod_amount: SmoothedParam::new(
                 config.phase_mod_amount,
                 0.0,
@@ -534,49 +554,81 @@ impl SnareParams {
     /// Get actual tonal decay in seconds (0-3.5)
     #[inline]
     pub fn tonal_decay_secs(&self) -> f32 {
-        ranges::denormalize(self.tonal_decay.get(), ranges::TONAL_DECAY_MIN, ranges::TONAL_DECAY_MAX)
+        ranges::denormalize(
+            self.tonal_decay.get(),
+            ranges::TONAL_DECAY_MIN,
+            ranges::TONAL_DECAY_MAX,
+        )
     }
 
     /// Get actual tonal decay curve (0.1-10.0)
     #[inline]
     pub fn tonal_decay_curve_value(&self) -> f32 {
-        ranges::denormalize(self.tonal_decay_curve.get(), ranges::TONAL_DECAY_CURVE_MIN, ranges::TONAL_DECAY_CURVE_MAX)
+        ranges::denormalize(
+            self.tonal_decay_curve.get(),
+            ranges::TONAL_DECAY_CURVE_MIN,
+            ranges::TONAL_DECAY_CURVE_MAX,
+        )
     }
 
     /// Get actual noise decay in seconds (0-3.5)
     #[inline]
     pub fn noise_decay_secs(&self) -> f32 {
-        ranges::denormalize(self.noise_decay.get(), ranges::NOISE_DECAY_MIN, ranges::NOISE_DECAY_MAX)
+        ranges::denormalize(
+            self.noise_decay.get(),
+            ranges::NOISE_DECAY_MIN,
+            ranges::NOISE_DECAY_MAX,
+        )
     }
 
     /// Get actual noise tail decay in seconds (0-3.5)
     #[inline]
     pub fn noise_tail_decay_secs(&self) -> f32 {
-        ranges::denormalize(self.noise_tail_decay.get(), ranges::NOISE_TAIL_DECAY_MIN, ranges::NOISE_TAIL_DECAY_MAX)
+        ranges::denormalize(
+            self.noise_tail_decay.get(),
+            ranges::NOISE_TAIL_DECAY_MIN,
+            ranges::NOISE_TAIL_DECAY_MAX,
+        )
     }
 
     /// Get actual filter cutoff in Hz (100-10000)
     #[inline]
     pub fn filter_cutoff_hz(&self) -> f32 {
-        ranges::denormalize(self.filter_cutoff.get(), ranges::FILTER_CUTOFF_MIN, ranges::FILTER_CUTOFF_MAX)
+        ranges::denormalize(
+            self.filter_cutoff.get(),
+            ranges::FILTER_CUTOFF_MIN,
+            ranges::FILTER_CUTOFF_MAX,
+        )
     }
 
     /// Get actual filter resonance (0.5-10.0)
     #[inline]
     pub fn filter_resonance_value(&self) -> f32 {
-        ranges::denormalize(self.filter_resonance.get(), ranges::FILTER_RES_MIN, ranges::FILTER_RES_MAX)
+        ranges::denormalize(
+            self.filter_resonance.get(),
+            ranges::FILTER_RES_MIN,
+            ranges::FILTER_RES_MAX,
+        )
     }
 
     /// Get actual amp decay in seconds (0-4.0)
     #[inline]
     pub fn amp_decay_secs(&self) -> f32 {
-        ranges::denormalize(self.amp_decay.get(), ranges::AMP_DECAY_MIN, ranges::AMP_DECAY_MAX)
+        ranges::denormalize(
+            self.amp_decay.get(),
+            ranges::AMP_DECAY_MIN,
+            ranges::AMP_DECAY_MAX,
+        )
     }
 
     /// Get actual amp decay curve (0.1-10.0)
     #[inline]
     pub fn amp_decay_curve_value(&self) -> f32 {
-        ranges::denormalize(self.amp_decay_curve.get(), ranges::AMP_DECAY_CURVE_MIN, ranges::AMP_DECAY_CURVE_MAX)
+        ranges::denormalize(
+            self.amp_decay_curve.get(),
+            ranges::AMP_DECAY_CURVE_MIN,
+            ranges::AMP_DECAY_CURVE_MAX,
+        )
     }
 
     /// Tick all smoothers and return whether any are still smoothing
@@ -749,18 +801,28 @@ impl SnareDrum {
         self.params.pitch_drop.set_target(config.pitch_drop);
         // DS parameters (all normalized 0-1)
         self.params.tonal_decay.set_target(config.tonal_decay);
-        self.params.tonal_decay_curve.set_target(config.tonal_decay_curve);
+        self.params
+            .tonal_decay_curve
+            .set_target(config.tonal_decay_curve);
         self.params.noise_decay.set_target(config.noise_decay);
-        self.params.noise_tail_decay.set_target(config.noise_tail_decay);
+        self.params
+            .noise_tail_decay
+            .set_target(config.noise_tail_decay);
         self.params.filter_cutoff.set_target(config.filter_cutoff);
-        self.params.filter_resonance.set_target(config.filter_resonance);
+        self.params
+            .filter_resonance
+            .set_target(config.filter_resonance);
         self.params.filter_type = config.filter_type;
         self.params.xfade.set_target(config.xfade);
-        self.params.phase_mod_amount.set_target(config.phase_mod_amount);
+        self.params
+            .phase_mod_amount
+            .set_target(config.phase_mod_amount);
         // New parameters
         self.params.overdrive.set_target(config.overdrive_amount);
         self.params.amp_decay.set_target(config.amp_decay);
-        self.params.amp_decay_curve.set_target(config.amp_decay_curve);
+        self.params
+            .amp_decay_curve
+            .set_target(config.amp_decay_curve);
     }
 
     /// Trigger the snare drum at default velocity (0.5)
@@ -822,10 +884,10 @@ impl SnareDrum {
         // Clamped to max 25% to ensure pitch settles before tonal decays (avoids pitch artifacts)
         let pitch_decay_time = (scaled_decay * 0.3 * pitch_decay_scale).min(scaled_decay * 0.25);
         self.pitch_envelope.set_config(ADSRConfig::new(
-            0.001,                   // Instant attack
-            pitch_decay_time,        // Velocity-scaled pitch drop
-            0.0,                     // Drop to base frequency
-            pitch_decay_time * 0.1,  // Quick release
+            0.001,                  // Instant attack
+            pitch_decay_time,       // Velocity-scaled pitch drop
+            0.0,                    // Drop to base frequency
+            pitch_decay_time * 0.1, // Quick release
         ));
 
         // Configure tonal oscillator envelope to hold (sustain=1.0)
@@ -833,33 +895,35 @@ impl SnareDrum {
         self.tonal_oscillator.frequency_hz = base_freq;
         self.tonal_oscillator.set_volume(tonal_amount * volume);
         self.tonal_oscillator.set_adsr(ADSRConfig::new(
-            0.001,                  // Very fast attack
-            0.001,                  // Minimal decay (go straight to sustain)
-            1.0,                    // Full sustain - tonal_envelope controls amplitude
-            scaled_decay * 0.4,     // Medium release (when note releases)
+            0.001,              // Very fast attack
+            0.001,              // Minimal decay (go straight to sustain)
+            1.0,                // Full sustain - tonal_envelope controls amplitude
+            scaled_decay * 0.4, // Medium release (when note releases)
         ));
 
         // Configure noise oscillator envelope to hold (sustain=1.0)
         // The dedicated noise envelopes control the actual decay shape
         self.noise_oscillator.frequency_hz = base_freq * 8.0;
-        self.noise_oscillator.set_volume(noise_amount * volume * 0.8);
+        self.noise_oscillator
+            .set_volume(noise_amount * volume * 0.8);
         self.noise_oscillator.set_adsr(ADSRConfig::new(
-            0.001,                  // Very fast attack
-            0.001,                  // Minimal decay (go straight to sustain)
-            1.0,                    // Full sustain - noise envelopes control amplitude
-            scaled_decay * 0.3,     // Quick release (when note releases)
+            0.001,              // Very fast attack
+            0.001,              // Minimal decay (go straight to sustain)
+            1.0,                // Full sustain - noise envelopes control amplitude
+            scaled_decay * 0.3, // Quick release (when note releases)
         ));
 
         // Configure crack oscillator envelope with velocity-scaled decay
         // Crack gets velocity boost: range [0.7, 1.0] for more snap at high velocity
         let crack_vel_scale = 0.7 + 0.3 * vel;
         self.crack_oscillator.frequency_hz = base_freq * 25.0;
-        self.crack_oscillator.set_volume(brightness * volume * 0.4 * crack_vel_scale);
+        self.crack_oscillator
+            .set_volume(brightness * volume * 0.4 * crack_vel_scale);
         self.crack_oscillator.set_adsr(ADSRConfig::new(
-            0.001,                  // Very fast attack
-            scaled_decay * 0.2,     // Very short decay for crack (velocity-scaled)
-            0.0,                    // No sustain
-            scaled_decay * 0.1,     // Very short release
+            0.001,              // Very fast attack
+            scaled_decay * 0.2, // Very short decay for crack (velocity-scaled)
+            0.0,                // No sustain
+            scaled_decay * 0.1, // Very short release
         ));
 
         // --- DS Snare-style envelopes ---
@@ -867,10 +931,10 @@ impl SnareDrum {
         // Tonal envelope (DS-style separate decay with exponential curve)
         let scaled_tonal_decay = tonal_decay * decay_scale;
         let mut tonal_config = ADSRConfig::new(
-            0.001,                       // Fast attack
-            scaled_tonal_decay,          // DS-style tonal decay
-            0.0,                         // No sustain
-            scaled_tonal_decay * 0.2,    // Short release
+            0.001,                    // Fast attack
+            scaled_tonal_decay,       // DS-style tonal decay
+            0.0,                      // No sustain
+            scaled_tonal_decay * 0.2, // Short release
         );
         tonal_config.decay_curve = EnvelopeCurve::Exponential(tonal_decay_curve);
         self.tonal_envelope.set_config(tonal_config);
@@ -878,29 +942,29 @@ impl SnareDrum {
         // Main noise envelope (DS-style)
         let scaled_noise_decay = noise_decay * decay_scale;
         self.main_noise_envelope.set_config(ADSRConfig::new(
-            0.001,                       // Fast attack
-            scaled_noise_decay,          // DS-style noise decay
-            0.0,                         // No sustain
-            scaled_noise_decay * 0.2,    // Short release
+            0.001,                    // Fast attack
+            scaled_noise_decay,       // DS-style noise decay
+            0.0,                      // No sustain
+            scaled_noise_decay * 0.2, // Short release
         ));
 
         // Noise tail envelope (longer decay for snare ring)
         let scaled_tail_decay = noise_tail_decay * decay_scale;
         self.noise_tail_envelope.set_config(ADSRConfig::new(
-            0.001,                       // Fast attack
-            scaled_tail_decay,           // Longer tail decay
-            0.0,                         // No sustain
-            scaled_tail_decay * 0.3,     // Medium release
+            0.001,                   // Fast attack
+            scaled_tail_decay,       // Longer tail decay
+            0.0,                     // No sustain
+            scaled_tail_decay * 0.3, // Medium release
         ));
 
         // --- Master amplitude envelope ---
         // Scale amp decay by velocity (higher velocity = shorter decay)
         let scaled_amp_decay = amp_decay * decay_scale;
         let mut amp_config = ADSRConfig::new(
-            0.001,                       // Instant attack (like kick)
-            scaled_amp_decay,            // Velocity-scaled amplitude decay
-            0.0,                         // No sustain
-            scaled_amp_decay * 0.2,      // Short release
+            0.001,                  // Instant attack (like kick)
+            scaled_amp_decay,       // Velocity-scaled amplitude decay
+            0.0,                    // No sustain
+            scaled_amp_decay * 0.2, // Short release
         );
         amp_config.decay_curve = EnvelopeCurve::Exponential(amp_decay_curve);
         self.amplitude_envelope.set_config(amp_config);
@@ -982,7 +1046,8 @@ impl SnareDrum {
         // Update filter parameters (denormalized)
         let filter_cutoff = self.params.filter_cutoff_hz();
         let filter_resonance = self.params.filter_resonance_value();
-        self.noise_filter.set_params(filter_cutoff, filter_resonance);
+        self.noise_filter
+            .set_params(filter_cutoff, filter_resonance);
 
         // Get xfade parameter (0 = all tonal, 1 = all noise)
         let xfade = self.params.xfade.get();
@@ -1000,7 +1065,9 @@ impl SnareDrum {
 
         // Apply SVF filter to noise based on filter_type
         let filter_type = self.params.filter_type;
-        let filtered_noise = self.noise_filter.process_mode(raw_noise_output, filter_type);
+        let filtered_noise = self
+            .noise_filter
+            .process_mode(raw_noise_output, filter_type);
 
         // Apply DS-style noise envelopes (main + tail)
         let noise_env = self.main_noise_envelope.get_amplitude(current_time);
@@ -1064,8 +1131,10 @@ impl SnareDrum {
 
         // Update oscillator volumes with smoothed values
         self.tonal_oscillator.set_volume(tonal_amount * volume);
-        self.noise_oscillator.set_volume(noise_amount * volume * 0.8);
-        self.crack_oscillator.set_volume(brightness * volume * 0.4 * crack_vel_scale);
+        self.noise_oscillator
+            .set_volume(noise_amount * volume * 0.8);
+        self.crack_oscillator
+            .set_volume(brightness * volume * 0.4 * crack_vel_scale);
     }
 
     /// Set volume (smoothed, 0-1)
@@ -1086,7 +1155,9 @@ impl SnareDrum {
 
     /// Set brightness/snap amount (smoothed, 0-1)
     pub fn set_brightness(&mut self, brightness: f32) {
-        self.params.brightness.set_target(brightness.clamp(0.0, 1.0));
+        self.params
+            .brightness
+            .set_target(brightness.clamp(0.0, 1.0));
     }
 
     /// Set tonal amount (smoothed, 0-1)
@@ -1106,7 +1177,9 @@ impl SnareDrum {
 
     /// Set pitch drop amount (smoothed, 0-1)
     pub fn set_pitch_drop(&mut self, pitch_drop: f32) {
-        self.params.pitch_drop.set_target(pitch_drop.clamp(0.0, 1.0));
+        self.params
+            .pitch_drop
+            .set_target(pitch_drop.clamp(0.0, 1.0));
     }
 
     // --- DS-style parameter setters (all normalized 0-1) ---
@@ -1118,7 +1191,9 @@ impl SnareDrum {
 
     /// Set tonal decay curve shape (smoothed, normalized 0-1 → 0.1-10.0)
     pub fn set_tonal_decay_curve(&mut self, curve: f32) {
-        self.params.tonal_decay_curve.set_target(curve.clamp(0.0, 1.0));
+        self.params
+            .tonal_decay_curve
+            .set_target(curve.clamp(0.0, 1.0));
     }
 
     /// Set noise decay time (smoothed, normalized 0-1 → 0-3.5s)
@@ -1128,7 +1203,9 @@ impl SnareDrum {
 
     /// Set noise tail decay time (smoothed, normalized 0-1 → 0-3.5s)
     pub fn set_noise_tail_decay(&mut self, decay: f32) {
-        self.params.noise_tail_decay.set_target(decay.clamp(0.0, 1.0));
+        self.params
+            .noise_tail_decay
+            .set_target(decay.clamp(0.0, 1.0));
     }
 
     /// Set filter cutoff frequency (smoothed, normalized 0-1 → 100-10000 Hz)
@@ -1138,7 +1215,9 @@ impl SnareDrum {
 
     /// Set filter resonance (smoothed, normalized 0-1 → 0.5-10.0)
     pub fn set_filter_resonance(&mut self, resonance: f32) {
-        self.params.filter_resonance.set_target(resonance.clamp(0.0, 1.0));
+        self.params
+            .filter_resonance
+            .set_target(resonance.clamp(0.0, 1.0));
     }
 
     /// Set filter type (0=LP, 1=BP, 2=HP, 3=notch)
@@ -1154,7 +1233,9 @@ impl SnareDrum {
 
     /// Set phase modulation amount (smoothed, 0-1, 0 = disabled)
     pub fn set_phase_mod_amount(&mut self, amount: f32) {
-        self.params.phase_mod_amount.set_target(amount.clamp(0.0, 1.0));
+        self.params
+            .phase_mod_amount
+            .set_target(amount.clamp(0.0, 1.0));
     }
 
     // --- New parameter setters ---
@@ -1171,7 +1252,9 @@ impl SnareDrum {
 
     /// Set amplitude decay curve shape (smoothed, normalized 0-1 → 0.1-10.0)
     pub fn set_amp_decay_curve(&mut self, curve: f32) {
-        self.params.amp_decay_curve.set_target(curve.clamp(0.0, 1.0));
+        self.params
+            .amp_decay_curve
+            .set_target(curve.clamp(0.0, 1.0));
     }
 }
 

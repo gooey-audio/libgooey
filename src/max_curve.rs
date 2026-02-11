@@ -206,7 +206,10 @@ mod tests {
         // Negative curve = logarithmic = fast initial change
         // At 50% progress, the value should be > 0.5 (already most of the way there)
         let value = max_curve(0.5, -0.83);
-        assert!(value > 0.5, "Negative curve should be above midpoint at 50%");
+        assert!(
+            value > 0.5,
+            "Negative curve should be above midpoint at 50%"
+        );
     }
 
     #[test]
@@ -235,14 +238,23 @@ mod tests {
 
         // Midway through first segment (5ms = 0.005s)
         let v = env.get_value(0.005);
-        assert!((v - 0.5).abs() < 0.1, "Should be ~0.5 at midpoint of first segment");
+        assert!(
+            (v - 0.5).abs() < 0.1,
+            "Should be ~0.5 at midpoint of first segment"
+        );
 
         // End of first segment (10ms = 0.01s)
         let v = env.get_value(0.01);
-        assert!((v - 1.0).abs() < 0.1, "Should be ~1.0 at end of first segment");
+        assert!(
+            (v - 1.0).abs() < 0.1,
+            "Should be ~1.0 at end of first segment"
+        );
 
         // Midway through second segment (60ms = 0.06s)
         let v = env.get_value(0.06);
-        assert!((v - 0.5).abs() < 0.1, "Should be ~0.5 at midpoint of second segment");
+        assert!(
+            (v - 0.5).abs() < 0.1,
+            "Should be ~0.5 at midpoint of second segment"
+        );
     }
 }

@@ -100,11 +100,11 @@ impl StateVariableFilter {
         let (low, band, high) = self.process_all(input);
 
         match filter_type {
-            0 => low,              // Lowpass
-            1 => band,             // Bandpass
-            2 => high,             // Highpass
-            3 => low + high,       // Notch (reject band)
-            _ => band,             // Default to bandpass
+            0 => low,        // Lowpass
+            1 => band,       // Bandpass
+            2 => high,       // Highpass
+            3 => low + high, // Notch (reject band)
+            _ => band,       // Default to bandpass
         }
     }
 
