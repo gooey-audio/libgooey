@@ -3,6 +3,7 @@ use std::f32::consts::PI;
 use crate::filters::{BiquadHighpass, StateVariableFilterTpt};
 use crate::gen::pink_noise::PinkNoise;
 use crate::max_curve::MaxCurveEnvelope;
+use crate::utils::Blendable;
 use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 /// Normalization ranges for HiHat2 parameters
@@ -45,13 +46,12 @@ pub enum FilterSlope {
 
 #[derive(Clone, Copy, Debug)]
 pub struct HiHat2Config {
-    pub pitch: f32,        // 0-1 normalized (pow2 curve -> 3500-10000 Hz)
-    pub decay: f32,        // 0-1 normalized (0.5-4000 ms)
-    pub attack: f32,       // 0-1 normalized (0.5-200 ms)
+    pub pitch: f32,  // 0-1 normalized (pow2 curve -> 3500-10000 Hz)
+    pub decay: f32,  // 0-1 normalized (0.5-4000 ms)
+    pub attack: f32, // 0-1 normalized (0.5-200 ms)
     pub noise_color: NoiseColor,
     pub filter_slope: FilterSlope,
-    pub tone: f32,         // 0-1 normalized (500-10000 Hz)
-    pub volume: f32,       // 0-1 normalized
+    pub tone: f32, // 0-1 normalized (500-10000 Hz)
 }
 
 impl HiHat2Config {
@@ -62,7 +62,6 @@ impl HiHat2Config {
         noise_color: NoiseColor,
         filter_slope: FilterSlope,
         tone: f32,
-        volume: f32,
     ) -> Self {
         Self {
             pitch: pitch.clamp(0.0, 1.0),
@@ -71,8 +70,27 @@ impl HiHat2Config {
             noise_color,
             filter_slope,
             tone: tone.clamp(0.0, 1.0),
-            volume: volume.clamp(0.0, 1.0),
         }
+    }
+
+    /// Short preset
+    pub fn short() -> Self {
+        Self::new(0.76, 0.05, 0.00, NoiseColor::White, FilterSlope::Db24, 1.00)
+    }
+
+    /// Loose preset
+    pub fn loose() -> Self {
+        Self::new(0.76, 0.30, 0.00, NoiseColor::White, FilterSlope::Db24, 1.00)
+    }
+
+    /// Dark preset
+    pub fn dark() -> Self {
+        Self::new(0.41, 0.05, 0.00, NoiseColor::White, FilterSlope::Db24, 0.15)
+    }
+
+    /// Soft preset
+    pub fn soft() -> Self {
+        Self::new(0.41, 0.05, 0.15, NoiseColor::White, FilterSlope::Db24, 0.60)
     }
 
     #[inline]
@@ -99,15 +117,31 @@ impl HiHat2Config {
 
 impl Default for HiHat2Config {
     fn default() -> Self {
-        Self::new(
-            0.409,            // pitch (~40.9)
-            0.126,            // decay (~12.6)
-            0.0,              // attack
-            NoiseColor::White,
-            FilterSlope::Db12,
-            0.9055,           // tone (~90.6)
-            0.7,              // volume
-        )
+        Self::short()
+    }
+}
+
+impl Blendable for HiHat2Config {
+    fn lerp(&self, other: &Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        let inv_t = 1.0 - t;
+
+        Self {
+            pitch: self.pitch * inv_t + other.pitch * t,
+            decay: self.decay * inv_t + other.decay * t,
+            attack: self.attack * inv_t + other.attack * t,
+            noise_color: if t < 0.5 {
+                self.noise_color
+            } else {
+                other.noise_color
+            },
+            filter_slope: if t < 0.5 {
+                self.filter_slope
+            } else {
+                other.filter_slope
+            },
+            tone: self.tone * inv_t + other.tone * t,
+        }
     }
 }
 
@@ -117,26 +151,13 @@ pub struct HiHat2Params {
     pub decay: SmoothedParam,
     pub attack: SmoothedParam,
     pub tone: SmoothedParam,
-    pub volume: SmoothedParam,
 }
 
 impl HiHat2Params {
     pub fn from_config(config: &HiHat2Config, sample_rate: f32) -> Self {
         Self {
-            pitch: SmoothedParam::new(
-                config.pitch,
-                0.0,
-                1.0,
-                sample_rate,
-                DEFAULT_SMOOTH_TIME_MS,
-            ),
-            decay: SmoothedParam::new(
-                config.decay,
-                0.0,
-                1.0,
-                sample_rate,
-                DEFAULT_SMOOTH_TIME_MS,
-            ),
+            pitch: SmoothedParam::new(config.pitch, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            decay: SmoothedParam::new(config.decay, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
             attack: SmoothedParam::new(
                 config.attack,
                 0.0,
@@ -144,20 +165,7 @@ impl HiHat2Params {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
-            tone: SmoothedParam::new(
-                config.tone,
-                0.0,
-                1.0,
-                sample_rate,
-                DEFAULT_SMOOTH_TIME_MS,
-            ),
-            volume: SmoothedParam::new(
-                config.volume,
-                0.0,
-                1.0,
-                sample_rate,
-                DEFAULT_SMOOTH_TIME_MS,
-            ),
+            tone: SmoothedParam::new(config.tone, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
         }
     }
 
@@ -167,7 +175,6 @@ impl HiHat2Params {
         self.decay.tick();
         self.attack.tick();
         self.tone.tick();
-        self.volume.tick();
 
         !self.is_settled()
     }
@@ -177,7 +184,6 @@ impl HiHat2Params {
             && self.decay.is_settled()
             && self.attack.is_settled()
             && self.tone.is_settled()
-            && self.volume.is_settled()
     }
 
     #[inline]
@@ -188,7 +194,11 @@ impl HiHat2Params {
 
     #[inline]
     pub fn attack_ms(&self) -> f32 {
-        ranges::denormalize(self.attack.get(), ranges::ATTACK_MIN_MS, ranges::ATTACK_MAX_MS)
+        ranges::denormalize(
+            self.attack.get(),
+            ranges::ATTACK_MIN_MS,
+            ranges::ATTACK_MAX_MS,
+        )
     }
 
     #[inline]
@@ -209,7 +219,6 @@ impl HiHat2Params {
             noise_color,
             filter_slope,
             tone: self.tone.get(),
-            volume: self.volume.get(),
         }
     }
 }
@@ -346,7 +355,6 @@ impl HiHat2 {
         self.params.decay.set_target(config.decay);
         self.params.attack.set_target(config.attack);
         self.params.tone.set_target(config.tone);
-        self.params.volume.set_target(config.volume);
         self.noise_color = config.noise_color;
         self.filter_slope = config.filter_slope;
     }
@@ -365,10 +373,6 @@ impl HiHat2 {
 
     pub fn set_tone(&mut self, tone: f32) {
         self.params.tone.set_target(tone);
-    }
-
-    pub fn set_volume(&mut self, volume: f32) {
-        self.params.volume.set_target(volume);
     }
 
     pub fn set_noise_color(&mut self, noise_color: NoiseColor) {
@@ -436,8 +440,7 @@ impl HiHat2 {
         let env = self.envelope.get_value(current_time);
         let env = self.envelope_smoother.process(env);
 
-        let volume = self.params.volume.get();
-        let output = filtered * env * volume * self.current_velocity * 0.5;
+        let output = filtered * env * self.current_velocity * 0.35;
 
         let tone_hz = self.params.tone_hz();
         self.svf.set_params(tone_hz, 0.5);
@@ -489,7 +492,7 @@ impl crate::engine::Instrument for HiHat2 {
 
 impl crate::engine::Modulatable for HiHat2 {
     fn modulatable_parameters(&self) -> Vec<&'static str> {
-        vec!["attack", "decay", "pitch", "tone", "volume"]
+        vec!["attack", "decay", "pitch", "tone"]
     }
 
     fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
@@ -510,10 +513,6 @@ impl crate::engine::Modulatable for HiHat2 {
                 self.params.tone.set_bipolar(value);
                 Ok(())
             }
-            "volume" => {
-                self.params.volume.set_bipolar(value);
-                Ok(())
-            }
             _ => Err(format!("Unknown parameter: {}", parameter)),
         }
     }
@@ -524,7 +523,6 @@ impl crate::engine::Modulatable for HiHat2 {
             "decay" => Some(self.params.decay.range()),
             "pitch" => Some(self.params.pitch.range()),
             "tone" => Some(self.params.tone.range()),
-            "volume" => Some(self.params.volume.range()),
             _ => None,
         }
     }

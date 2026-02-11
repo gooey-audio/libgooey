@@ -11,7 +11,7 @@ use crossterm::{
 use std::io::{self, Write};
 
 use gooey::engine::{Engine, EngineOutput, Instrument};
-use gooey::instruments::{HiHatConfig, HiHat};
+use gooey::instruments::{HiHat, HiHatConfig};
 use std::sync::{Arc, Mutex};
 
 // Parameter metadata for the UI
@@ -25,12 +25,42 @@ struct ParamInfo {
 }
 
 const PARAM_INFO: [ParamInfo; 6] = [
-    ParamInfo { name: "amp_decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },      // 0-1 -> 0.0-4.0s
-    ParamInfo { name: "amp_dcy_crv", coarse_step: 0.1, fine_step: 0.02, unit: "" },    // 0-1 -> 0.1-10.0
-    ParamInfo { name: "decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },          // 0-1 -> 0.005-0.4s
-    ParamInfo { name: "filter", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "frequency", coarse_step: 0.1, fine_step: 0.02, unit: "" },      // 0-1 -> 4000-16000 Hz
-    ParamInfo { name: "volume", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo {
+        name: "amp_decay",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 -> 0.0-4.0s
+    ParamInfo {
+        name: "amp_dcy_crv",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 -> 0.1-10.0
+    ParamInfo {
+        name: "decay",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 -> 0.005-0.4s
+    ParamInfo {
+        name: "filter",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
+    ParamInfo {
+        name: "frequency",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 -> 4000-16000 Hz
+    ParamInfo {
+        name: "volume",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
 ];
 
 // Wrapper to share HiHat between audio thread and main thread
@@ -191,7 +221,14 @@ fn main() -> anyhow::Result<()> {
     // Initial display
     {
         let hihat_lock = hihat.lock().unwrap();
-        render_display(&hihat_lock, selected_param, trigger_count, velocity, preset_name, is_open);
+        render_display(
+            &hihat_lock,
+            selected_param,
+            trigger_count,
+            velocity,
+            preset_name,
+            is_open,
+        );
     }
 
     // Main input loop
@@ -242,21 +279,37 @@ fn main() -> anyhow::Result<()> {
                     // Parameter adjustment (coarse)
                     KeyCode::Left => {
                         let mut hihat_lock = hihat.lock().unwrap();
-                        adjust_param(&mut hihat_lock, selected_param, -PARAM_INFO[selected_param].coarse_step);
+                        adjust_param(
+                            &mut hihat_lock,
+                            selected_param,
+                            -PARAM_INFO[selected_param].coarse_step,
+                        );
                     }
                     KeyCode::Right => {
                         let mut hihat_lock = hihat.lock().unwrap();
-                        adjust_param(&mut hihat_lock, selected_param, PARAM_INFO[selected_param].coarse_step);
+                        adjust_param(
+                            &mut hihat_lock,
+                            selected_param,
+                            PARAM_INFO[selected_param].coarse_step,
+                        );
                     }
 
                     // Parameter adjustment (fine)
                     KeyCode::Char('[') => {
                         let mut hihat_lock = hihat.lock().unwrap();
-                        adjust_param(&mut hihat_lock, selected_param, -PARAM_INFO[selected_param].fine_step);
+                        adjust_param(
+                            &mut hihat_lock,
+                            selected_param,
+                            -PARAM_INFO[selected_param].fine_step,
+                        );
                     }
                     KeyCode::Char(']') => {
                         let mut hihat_lock = hihat.lock().unwrap();
-                        adjust_param(&mut hihat_lock, selected_param, PARAM_INFO[selected_param].fine_step);
+                        adjust_param(
+                            &mut hihat_lock,
+                            selected_param,
+                            PARAM_INFO[selected_param].fine_step,
+                        );
                     }
 
                     // Velocity control
@@ -300,7 +353,14 @@ fn main() -> anyhow::Result<()> {
 
                 if needs_redraw {
                     let hihat_lock = hihat.lock().unwrap();
-                    render_display(&hihat_lock, selected_param, trigger_count, velocity, preset_name, is_open);
+                    render_display(
+                        &hihat_lock,
+                        selected_param,
+                        trigger_count,
+                        velocity,
+                        preset_name,
+                        is_open,
+                    );
                 }
             }
         }

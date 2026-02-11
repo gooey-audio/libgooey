@@ -146,7 +146,10 @@ fn test_multiple_solos() {
 
         // Should have audio from both
         let has_audio = buffer.iter().any(|&s| s.abs() > 0.001);
-        assert!(has_audio, "Multiple soloed instruments should produce audio");
+        assert!(
+            has_audio,
+            "Multiple soloed instruments should produce audio"
+        );
 
         gooey_engine_free(engine);
     }

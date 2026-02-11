@@ -66,7 +66,7 @@ impl MembraneResonator {
         let mut resonator = Self {
             filters,
             filter_params: params,
-            q_scale: 0.01,    // Default: scales Max Q (100+) to BiquadBandpass range
+            q_scale: 0.01,      // Default: scales Max Q (100+) to BiquadBandpass range
             gain_scale: 0.0031, // Default: scales Max gain values down
             ring_level: 0.0,
         };
@@ -162,7 +162,7 @@ impl MembraneResonator {
     /// This prevents pops when the resonator stops.
     pub fn fade_multiplier(&self) -> f32 {
         const FADE_START: f32 = 0.005; // Start fading at this level
-        const FADE_END: f32 = 0.0001;  // Fully silent at this level
+        const FADE_END: f32 = 0.0001; // Fully silent at this level
 
         if self.ring_level >= FADE_START {
             1.0
@@ -245,7 +245,10 @@ mod tests {
                 break;
             }
         }
-        assert!(has_output, "Membrane should continue ringing after excitation");
+        assert!(
+            has_output,
+            "Membrane should continue ringing after excitation"
+        );
     }
 
     #[test]
