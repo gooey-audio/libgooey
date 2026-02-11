@@ -21,12 +21,31 @@ struct ParamInfo {
     unit: &'static str,
 }
 
-const PARAM_INFO: [ParamInfo; 5] = [
-    ParamInfo { name: "pitch", coarse_step: 0.05, fine_step: 0.01, unit: "" },
-    ParamInfo { name: "decay", coarse_step: 0.05, fine_step: 0.01, unit: "" },
-    ParamInfo { name: "attack", coarse_step: 0.05, fine_step: 0.01, unit: "" },
-    ParamInfo { name: "tone", coarse_step: 0.05, fine_step: 0.01, unit: "" },
-    ParamInfo { name: "volume", coarse_step: 0.05, fine_step: 0.01, unit: "" },
+const PARAM_INFO: [ParamInfo; 4] = [
+    ParamInfo {
+        name: "pitch",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        unit: "",
+    },
+    ParamInfo {
+        name: "decay",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        unit: "",
+    },
+    ParamInfo {
+        name: "attack",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        unit: "",
+    },
+    ParamInfo {
+        name: "tone",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        unit: "",
+    },
 ];
 
 struct SharedHiHat2(Arc<Mutex<HiHat2>>);
@@ -55,7 +74,6 @@ fn get_param_value(hihat: &HiHat2, index: usize) -> f32 {
         1 => hihat.params.decay.get(),
         2 => hihat.params.attack.get(),
         3 => hihat.params.tone.get(),
-        4 => hihat.params.volume.get(),
         _ => 0.0,
     }
 }
@@ -66,7 +84,6 @@ fn set_param_value(hihat: &mut HiHat2, index: usize, value: f32) {
         1 => hihat.set_decay(value),
         2 => hihat.set_attack(value),
         3 => hihat.set_tone(value),
-        4 => hihat.set_volume(value),
         _ => {}
     }
 }
@@ -101,7 +118,11 @@ fn render_display(
     print!(
         "Noise: {:?} | Slope: {}dB | Vel: {:.0}% | Hits: {}\r\n",
         noise_color,
-        if filter_slope == FilterSlope::Db24 { 24 } else { 12 },
+        if filter_slope == FilterSlope::Db24 {
+            24
+        } else {
+            12
+        },
         velocity * 100.0,
         trigger_count
     );
@@ -198,19 +219,35 @@ fn main() -> anyhow::Result<()> {
                     }
                     KeyCode::Left => {
                         let mut hihat_lock = hihat.lock().unwrap();
-                        adjust_param(&mut hihat_lock, selected_param, -PARAM_INFO[selected_param].coarse_step);
+                        adjust_param(
+                            &mut hihat_lock,
+                            selected_param,
+                            -PARAM_INFO[selected_param].coarse_step,
+                        );
                     }
                     KeyCode::Right => {
                         let mut hihat_lock = hihat.lock().unwrap();
-                        adjust_param(&mut hihat_lock, selected_param, PARAM_INFO[selected_param].coarse_step);
+                        adjust_param(
+                            &mut hihat_lock,
+                            selected_param,
+                            PARAM_INFO[selected_param].coarse_step,
+                        );
                     }
                     KeyCode::Char('[') => {
                         let mut hihat_lock = hihat.lock().unwrap();
-                        adjust_param(&mut hihat_lock, selected_param, -PARAM_INFO[selected_param].fine_step);
+                        adjust_param(
+                            &mut hihat_lock,
+                            selected_param,
+                            -PARAM_INFO[selected_param].fine_step,
+                        );
                     }
                     KeyCode::Char(']') => {
                         let mut hihat_lock = hihat.lock().unwrap();
-                        adjust_param(&mut hihat_lock, selected_param, PARAM_INFO[selected_param].fine_step);
+                        adjust_param(
+                            &mut hihat_lock,
+                            selected_param,
+                            PARAM_INFO[selected_param].fine_step,
+                        );
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') => {
                         noise_color = if noise_color == NoiseColor::White {

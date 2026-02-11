@@ -103,7 +103,10 @@ mod tests {
         for _ in 0..1000 {
             let sample = pink_noise.tick();
             assert!(sample.is_finite(), "Pink noise should be finite");
-            assert!(sample.abs() < 2.0, "Pink noise should be roughly in range [-1, 1]");
+            assert!(
+                sample.abs() < 2.0,
+                "Pink noise should be roughly in range [-1, 1]"
+            );
         }
     }
 

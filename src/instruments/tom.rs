@@ -67,7 +67,7 @@ impl TomConfig {
             pitch_drop: pitch_drop.clamp(0.0, 1.0),
             volume: volume.clamp(0.0, 1.0),
             // Default amp envelope settings
-            amp_decay: 0.2,       // ~0.8s
+            amp_decay: 0.2,        // ~0.8s
             amp_decay_curve: 0.02, // ~0.3 (steep-then-long)
         }
     }
@@ -118,7 +118,11 @@ impl TomConfig {
     /// Get actual amp decay curve value (0.1-10.0)
     #[inline]
     pub fn amp_decay_curve_value(&self) -> f32 {
-        ranges::denormalize(self.amp_decay_curve, ranges::AMP_DECAY_CURVE_MIN, ranges::AMP_DECAY_CURVE_MAX)
+        ranges::denormalize(
+            self.amp_decay_curve,
+            ranges::AMP_DECAY_CURVE_MIN,
+            ranges::AMP_DECAY_CURVE_MAX,
+        )
     }
 
     // Presets - using normalized 0-1 values
@@ -127,28 +131,28 @@ impl TomConfig {
     pub fn default() -> Self {
         // 120Hz mid tom
         Self::new_full(
-            0.25,  // frequency: 120Hz
-            0.8,   // tonal
-            0.4,   // punch
-            0.18,  // decay: ~0.4s
-            0.3,   // pitch_drop
-            0.8,   // volume
-            0.2,   // amp_decay: ~0.8s
-            0.02,  // amp_decay_curve: ~0.3 (steep-then-long)
+            0.25, // frequency: 120Hz
+            0.8,  // tonal
+            0.4,  // punch
+            0.18, // decay: ~0.4s
+            0.3,  // pitch_drop
+            0.8,  // volume
+            0.2,  // amp_decay: ~0.8s
+            0.02, // amp_decay_curve: ~0.3 (steep-then-long)
         )
     }
 
     pub fn high_tom() -> Self {
         // 180Hz high tom - brighter, shorter
         Self::new_full(
-            0.5,   // frequency: 180Hz
-            0.9,   // tonal
-            0.5,   // punch
-            0.13,  // decay: ~0.3s
-            0.4,   // pitch_drop
-            0.85,  // volume
-            0.15,  // amp_decay: ~0.6s
-            0.02,  // amp_decay_curve: ~0.3 (steep-then-long)
+            0.5,  // frequency: 180Hz
+            0.9,  // tonal
+            0.5,  // punch
+            0.13, // decay: ~0.3s
+            0.4,  // pitch_drop
+            0.85, // volume
+            0.15, // amp_decay: ~0.6s
+            0.02, // amp_decay_curve: ~0.3 (steep-then-long)
         )
     }
 
@@ -174,14 +178,14 @@ impl TomConfig {
     pub fn floor_tom() -> Self {
         // 70Hz floor tom - deepest, longest
         Self::new_full(
-            0.04,  // frequency: ~70Hz
-            0.6,   // tonal
-            0.2,   // punch
-            0.38,  // decay: ~0.8s
-            0.15,  // pitch_drop
-            0.9,   // volume
-            0.4,   // amp_decay: ~1.6s
-            0.02,  // amp_decay_curve: ~0.3 (steep-then-long)
+            0.04, // frequency: ~70Hz
+            0.6,  // tonal
+            0.2,  // punch
+            0.38, // decay: ~0.8s
+            0.15, // pitch_drop
+            0.9,  // volume
+            0.4,  // amp_decay: ~1.6s
+            0.02, // amp_decay_curve: ~0.3 (steep-then-long)
         )
     }
 }
@@ -210,14 +214,14 @@ impl TomParams {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
-            decay: SmoothedParam::new(
-                config.decay,
+            decay: SmoothedParam::new(config.decay, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            volume: SmoothedParam::new(
+                config.volume,
                 0.0,
                 1.0,
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
-            volume: SmoothedParam::new(config.volume, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
             tonal: SmoothedParam::new(
                 config.tonal_amount,
                 0.0,
@@ -286,13 +290,21 @@ impl TomParams {
     /// Get actual amp decay in seconds (0.0-4.0)
     #[inline]
     pub fn amp_decay_secs(&self) -> f32 {
-        ranges::denormalize(self.amp_decay.get(), ranges::AMP_DECAY_MIN, ranges::AMP_DECAY_MAX)
+        ranges::denormalize(
+            self.amp_decay.get(),
+            ranges::AMP_DECAY_MIN,
+            ranges::AMP_DECAY_MAX,
+        )
     }
 
     /// Get actual amp decay curve value (0.1-10.0)
     #[inline]
     pub fn amp_decay_curve_value(&self) -> f32 {
-        ranges::denormalize(self.amp_decay_curve.get(), ranges::AMP_DECAY_CURVE_MIN, ranges::AMP_DECAY_CURVE_MAX)
+        ranges::denormalize(
+            self.amp_decay_curve.get(),
+            ranges::AMP_DECAY_CURVE_MIN,
+            ranges::AMP_DECAY_CURVE_MAX,
+        )
     }
 }
 
@@ -361,29 +373,30 @@ impl TomDrum {
         self.tonal_oscillator.frequency_hz = freq_hz;
         self.tonal_oscillator.set_volume(tonal_amount * volume);
         self.tonal_oscillator.set_adsr(ADSRConfig::new(
-            0.001,               // Very fast attack
-            decay_secs * 0.9,    // Main decay
-            0.0,                 // No sustain - drums should decay to silence
-            decay_secs * 0.3,    // Medium release
+            0.001,            // Very fast attack
+            decay_secs * 0.9, // Main decay
+            0.0,              // No sustain - drums should decay to silence
+            decay_secs * 0.3, // Medium release
         ));
 
         // Punch oscillator: Triangle wave for attack character
         self.punch_oscillator.waveform = Waveform::Triangle;
         self.punch_oscillator.frequency_hz = freq_hz * 3.0;
-        self.punch_oscillator.set_volume(punch_amount * volume * 0.6);
+        self.punch_oscillator
+            .set_volume(punch_amount * volume * 0.6);
         self.punch_oscillator.set_adsr(ADSRConfig::new(
-            0.001,               // Very fast attack
-            decay_secs * 0.3,    // Short decay for punch
-            0.0,                 // No sustain for punch
-            decay_secs * 0.1,    // Quick release
+            0.001,            // Very fast attack
+            decay_secs * 0.3, // Short decay for punch
+            0.0,              // No sustain for punch
+            decay_secs * 0.1, // Quick release
         ));
 
         // Pitch envelope: Fast attack, medium decay for frequency sweeping
         self.pitch_envelope.set_config(ADSRConfig::new(
-            0.001,               // Instant attack
-            decay_secs * 0.4,    // Medium pitch drop
-            0.0,                 // Drop to base frequency
-            decay_secs * 0.2,    // Medium release
+            0.001,            // Instant attack
+            decay_secs * 0.4, // Medium pitch drop
+            0.0,              // Drop to base frequency
+            decay_secs * 0.2, // Medium release
         ));
 
         self.base_frequency = freq_hz;
@@ -401,7 +414,9 @@ impl TomDrum {
         self.params.pitch_drop.set_target(config.pitch_drop);
         self.params.volume.set_target(config.volume);
         self.params.amp_decay.set_target(config.amp_decay);
-        self.params.amp_decay_curve.set_target(config.amp_decay_curve);
+        self.params
+            .amp_decay_curve
+            .set_target(config.amp_decay_curve);
 
         let freq_hz = config.frequency_hz();
         let decay_secs = config.decay_secs();
@@ -494,7 +509,8 @@ impl TomDrum {
         // Punch oscillator gets a more subtle pitch modulation
         self.punch_oscillator.frequency_hz =
             frequency * 3.0 * (1.0 + (frequency_multiplier - 1.0) * 0.5);
-        self.punch_oscillator.set_volume(punch_amount * volume * 0.6);
+        self.punch_oscillator
+            .set_volume(punch_amount * volume * 0.6);
 
         // Sum oscillator outputs
         let tonal_output = self.tonal_oscillator.tick(current_time);
@@ -542,7 +558,9 @@ impl TomDrum {
     }
 
     pub fn set_pitch_drop(&mut self, pitch_drop: f32) {
-        self.params.pitch_drop.set_target(pitch_drop.clamp(0.0, 1.0));
+        self.params
+            .pitch_drop
+            .set_target(pitch_drop.clamp(0.0, 1.0));
     }
 
     pub fn set_amp_decay(&mut self, amp_decay: f32) {
@@ -550,7 +568,9 @@ impl TomDrum {
     }
 
     pub fn set_amp_decay_curve(&mut self, amp_decay_curve: f32) {
-        self.params.amp_decay_curve.set_target(amp_decay_curve.clamp(0.0, 1.0));
+        self.params
+            .amp_decay_curve
+            .set_target(amp_decay_curve.clamp(0.0, 1.0));
     }
 }
 
@@ -575,7 +595,16 @@ impl crate::engine::Instrument for TomDrum {
 // Implement modulation support for TomDrum
 impl crate::engine::Modulatable for TomDrum {
     fn modulatable_parameters(&self) -> Vec<&'static str> {
-        vec!["frequency", "tonal", "punch", "decay", "pitch_drop", "volume", "amp_decay", "amp_decay_curve"]
+        vec![
+            "frequency",
+            "tonal",
+            "punch",
+            "decay",
+            "pitch_drop",
+            "volume",
+            "amp_decay",
+            "amp_decay_curve",
+        ]
     }
 
     fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
@@ -620,9 +649,8 @@ impl crate::engine::Modulatable for TomDrum {
     fn parameter_range(&self, parameter: &str) -> Option<(f32, f32)> {
         // All parameters are normalized 0-1
         match parameter {
-            "frequency" | "tonal" | "punch" | "decay" | "pitch_drop" | "volume" | "amp_decay" | "amp_decay_curve" => {
-                Some((0.0, 1.0))
-            }
+            "frequency" | "tonal" | "punch" | "decay" | "pitch_drop" | "volume" | "amp_decay"
+            | "amp_decay_curve" => Some((0.0, 1.0)),
             _ => None,
         }
     }

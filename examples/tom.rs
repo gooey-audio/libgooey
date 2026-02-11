@@ -25,14 +25,54 @@ struct ParamInfo {
 
 // Parameters in alphabetical order for display
 const PARAM_INFO: [ParamInfo; 8] = [
-    ParamInfo { name: "amp_decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },      // 0-1 → 0.0-4.0s
-    ParamInfo { name: "amp_dcy_crv", coarse_step: 0.1, fine_step: 0.02, unit: "" },    // 0-1 → 0.1-10.0
-    ParamInfo { name: "decay", coarse_step: 0.1, fine_step: 0.02, unit: "" },          // 0-1 → 0.05-2.0s
-    ParamInfo { name: "frequency", coarse_step: 0.1, fine_step: 0.02, unit: "" },      // 0-1 → 60-300 Hz
-    ParamInfo { name: "pitch_drop", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "punch", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "tonal", coarse_step: 0.1, fine_step: 0.02, unit: "" },
-    ParamInfo { name: "volume", coarse_step: 0.1, fine_step: 0.02, unit: "" },
+    ParamInfo {
+        name: "amp_decay",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 → 0.0-4.0s
+    ParamInfo {
+        name: "amp_dcy_crv",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 → 0.1-10.0
+    ParamInfo {
+        name: "decay",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 → 0.05-2.0s
+    ParamInfo {
+        name: "frequency",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 → 60-300 Hz
+    ParamInfo {
+        name: "pitch_drop",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
+    ParamInfo {
+        name: "punch",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
+    ParamInfo {
+        name: "tonal",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
+    ParamInfo {
+        name: "volume",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
 ];
 
 // Wrapper to share TomDrum between audio thread and main thread
@@ -198,7 +238,13 @@ fn main() -> anyhow::Result<()> {
         // Render display if needed
         if needs_redraw {
             let t = tom.lock().unwrap();
-            render_display(&t, selected_param, trigger_count, current_velocity, current_preset);
+            render_display(
+                &t,
+                selected_param,
+                trigger_count,
+                current_velocity,
+                current_preset,
+            );
             needs_redraw = false;
         }
 

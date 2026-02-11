@@ -294,8 +294,7 @@ impl Sequencer {
     pub fn set_step_with_velocity(&mut self, step: usize, enabled: bool, velocity: f32) {
         if step < self.pattern.len() {
             let blend = self.pattern[step].blend;
-            self.pattern[step] =
-                SequencerStep::with_velocity_and_blend(enabled, velocity, blend);
+            self.pattern[step] = SequencerStep::with_velocity_and_blend(enabled, velocity, blend);
         }
     }
 

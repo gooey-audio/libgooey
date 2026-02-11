@@ -134,13 +134,7 @@ impl MorphOsc {
     /// * `mix_control` - Crossfade position (-1 to 1, from tone scaled)
     /// * `color_freq` - First-mtof result (~46-147 Hz), will be mtof'd again for rand~ rate
     /// * `tone` - Tone parameter (0-100), controls gated sine (gate open when < 99)
-    pub fn tick(
-        &mut self,
-        frequency: f32,
-        mix_control: f32,
-        color_freq: f32,
-        tone: f32,
-    ) -> f32 {
+    pub fn tick(&mut self, frequency: f32, mix_control: f32, color_freq: f32, tone: f32) -> f32 {
         // === Generate oscillator signals ===
 
         // Main sine: cycle~(freq) → *0.5
@@ -174,7 +168,8 @@ impl MorphOsc {
         }
 
         // Linear interpolation from current to target based on phase position
-        let rand_value = self.rand_current + (self.rand_target - self.rand_current) * self.rand_phase;
+        let rand_value =
+            self.rand_current + (self.rand_target - self.rand_current) * self.rand_phase;
 
         // Combined noise signal: (noise + rand_value) * 0.4
         let noise_combined = (noise + rand_value) * 0.4;
@@ -229,7 +224,12 @@ mod tests {
         for i in 0..1000 {
             let sample = osc.tick(440.0, 0.0, 60.0, 50.0);
             assert!(sample.is_finite(), "Sample {} should be finite", i);
-            assert!(sample.abs() < 2.0, "Sample {} should be in reasonable range: {}", i, sample);
+            assert!(
+                sample.abs() < 2.0,
+                "Sample {} should be in reasonable range: {}",
+                i,
+                sample
+            );
         }
     }
 
@@ -267,7 +267,10 @@ mod tests {
         // Both should have output (noise is always present)
         // but gate open should have more energy due to gated sine contribution
         assert!(sum_gate_open > 0.1, "Gate open should have output");
-        assert!(sum_gate_closed > 0.1, "Gate closed should still have noise output");
+        assert!(
+            sum_gate_closed > 0.1,
+            "Gate closed should still have noise output"
+        );
     }
 
     #[test]

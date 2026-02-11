@@ -125,7 +125,10 @@ mod tests {
 
         // With compensation, outputs should be similar (within 20% of each other)
         let ratio = output_high / output_low;
-        assert!(ratio > 0.8 && ratio < 1.2, "Outputs differ too much: {output_low} vs {output_high}");
+        assert!(
+            ratio > 0.8 && ratio < 1.2,
+            "Outputs differ too much: {output_low} vs {output_high}"
+        );
     }
 
     #[test]

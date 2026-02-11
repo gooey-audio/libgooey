@@ -83,7 +83,8 @@ impl StateVariableFilterTpt {
     pub fn set_params(&mut self, cutoff_freq: f32, resonance: f32) {
         let new_cutoff = cutoff_freq.clamp(20.0, self.sample_rate * 0.45);
         let new_res = resonance.max(0.5);
-        if (new_cutoff - self.cutoff_freq).abs() > 0.001 || (new_res - self.resonance).abs() > 0.001 {
+        if (new_cutoff - self.cutoff_freq).abs() > 0.001 || (new_res - self.resonance).abs() > 0.001
+        {
             self.cutoff_freq = new_cutoff;
             self.resonance = new_res;
             self.update_coefficients();
