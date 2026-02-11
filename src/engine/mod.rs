@@ -9,7 +9,9 @@ pub mod engine_output;
 pub use engine_output::EngineOutput;
 
 pub mod sequencer;
-pub use sequencer::{Sequencer, SequencerStep};
+pub use sequencer::{
+    Sequencer, SequencerBlendSetting, SequencerStep, SequencerStepSettings, SequencerTrigger,
+};
 
 pub mod lfo;
 pub use lfo::{Lfo, LfoSyncMode, MusicalDivision};
