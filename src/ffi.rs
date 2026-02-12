@@ -487,6 +487,7 @@ impl GooeyEngine {
                 HIHAT_PARAM_DECAY => self.hihat.params.decay.set_bipolar(value),
                 HIHAT_PARAM_ATTACK => self.hihat.params.attack.set_bipolar(value),
                 HIHAT_PARAM_TONE => self.hihat.params.tone.set_bipolar(value),
+                HIHAT_PARAM_VOLUME => self.hihat.params.volume.set_bipolar(value),
                 _ => {}
             },
             INSTRUMENT_TOM => {
@@ -500,6 +501,7 @@ impl GooeyEngine {
                     TOM_PARAM_DECAY => self.tom.set_decay(scaled),
                     TOM_PARAM_MEMBRANE => self.tom.set_membrane(scaled),
                     TOM_PARAM_MEMBRANE_Q => self.tom.set_membrane_q(scaled),
+                    TOM_PARAM_VOLUME => self.tom.set_volume(scaled),
                     _ => {}
                 }
             }
@@ -650,6 +652,8 @@ pub const HIHAT_PARAM_DECAY: u32 = 1;
 pub const HIHAT_PARAM_ATTACK: u32 = 2;
 /// Hi-hat parameter: tone (0-1 normalized)
 pub const HIHAT_PARAM_TONE: u32 = 3;
+/// Hi-hat parameter: volume (0-1 normalized)
+pub const HIHAT_PARAM_VOLUME: u32 = 4;
 
 // =============================================================================
 // Snare drum parameter indices (must match Swift SnareParam enum)
@@ -712,6 +716,8 @@ pub const TOM_PARAM_DECAY: u32 = 4;
 pub const TOM_PARAM_MEMBRANE: u32 = 5;
 /// Tom parameter: membrane Q (0-1 → 0-100, resonator Q scale)
 pub const TOM_PARAM_MEMBRANE_Q: u32 = 6;
+/// Tom parameter: volume (0-1 → 0-100, overall volume)
+pub const TOM_PARAM_VOLUME: u32 = 7;
 
 // =============================================================================
 // Instrument IDs (must match Swift/C enum if used)
@@ -1010,6 +1016,7 @@ pub unsafe extern "C" fn gooey_engine_set_hihat_param(
         HIHAT_PARAM_PITCH => engine.hihat.set_pitch(value),
         HIHAT_PARAM_DECAY => engine.hihat.set_decay(value),
         HIHAT_PARAM_ATTACK => engine.hihat.set_attack(value),
+        HIHAT_PARAM_VOLUME => engine.hihat.set_volume(value),
         HIHAT_PARAM_TONE => engine.hihat.set_tone(value),
         _ => {} // Unknown parameter, ignore
     }
@@ -1081,6 +1088,54 @@ pub unsafe extern "C" fn gooey_engine_set_snare_param(
         SNARE_PARAM_AMP_DECAY => engine.snare.set_amp_decay(value),
         SNARE_PARAM_AMP_DECAY_CURVE => engine.snare.set_amp_decay_curve(value),
         SNARE_PARAM_TONAL_DECAY_CURVE => engine.snare.set_tonal_decay_curve(value),
+        _ => {} // Unknown parameter, ignore
+    }
+}
+
+/// Set a tom drum parameter
+///
+/// All parameters use normalized 0-1 range. Values are internally scaled
+/// to Tom2's 0-100 range.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `param` - Parameter index (see TOM_PARAM_* constants)
+/// * `value` - Parameter value (0-1 normalized)
+///
+/// # Parameter indices and ranges (all 0-1 normalized → 0-100 internal)
+/// - 0 (TUNE): 0-1 → 0-100 (maps to 40-600 Hz)
+/// - 1 (BEND): 0-1 → 0-100 (pitch envelope depth)
+/// - 2 (TONE): 0-1 → 0-100 (mix control)
+/// - 3 (COLOR): 0-1 → 0-100 (noise rate / filter cutoff)
+/// - 4 (DECAY): 0-1 → 0-100 (maps to 0.5-4000ms)
+/// - 5 (MEMBRANE): 0-1 → 0-100 (resonator mix)
+/// - 6 (MEMBRANE_Q): 0-1 → 0-100 (resonator Q scale)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_tom_param(
+    engine: *mut GooeyEngine,
+    param: u32,
+    value: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+
+    // Tom2 uses 0-100 range internally, FFI uses 0-1 normalized
+    let scaled = value.clamp(0.0, 1.0) * 100.0;
+    match param {
+        TOM_PARAM_TUNE => engine.tom.set_tune(scaled),
+        TOM_PARAM_BEND => engine.tom.set_bend(scaled),
+        TOM_PARAM_TONE => engine.tom.set_tone(scaled),
+        TOM_PARAM_COLOR => engine.tom.set_color(scaled),
+        TOM_PARAM_DECAY => engine.tom.set_decay(scaled),
+        TOM_PARAM_MEMBRANE => engine.tom.set_membrane(scaled),
+        TOM_PARAM_MEMBRANE_Q => engine.tom.set_membrane_q(scaled),
+        TOM_PARAM_VOLUME => engine.tom.set_volume(scaled),
         _ => {} // Unknown parameter, ignore
     }
 }
@@ -1905,7 +1960,7 @@ pub extern "C" fn gooey_engine_kick_param_count() -> u32 {
 /// Get the number of hi-hat parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_hihat_param_count() -> u32 {
-    4
+    5
 }
 
 /// Get the number of sequencer steps
@@ -2332,7 +2387,7 @@ pub extern "C" fn gooey_engine_snare_param_count() -> u32 {
 /// Get the number of tom parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_tom_param_count() -> u32 {
-    7 // tune, bend, tone, color, decay, membrane, membrane_q (Tom2)
+    8 // tune, bend, tone, color, decay, membrane, membrane_q, volume (Tom2)
 }
 
 // =============================================================================

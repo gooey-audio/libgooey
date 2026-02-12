@@ -89,6 +89,9 @@ pub struct Tom2 {
     membrane: f32,   // 0-100: mix amount
     membrane_q: f32, // 0-100: Q scale (maps to 0.005-0.02, centered at 0.01)
 
+    // Overall volume (0-100)
+    volume: f32,
+
     // Track when main tom sound is done but membrane is still ringing
     main_sound_done: bool,
 }
@@ -104,6 +107,7 @@ pub struct Tom2Config {
     pub decay: f32,      // 0-100: maps to 0.5-4000ms
     pub membrane: f32,   // 0-100: membrane resonator mix
     pub membrane_q: f32, // 0-100: membrane Q scale (maps to 0.005-0.02)
+    pub volume: f32,     // 0-100: overall volume
 }
 
 impl Tom2Config {
@@ -117,6 +121,7 @@ impl Tom2Config {
             decay: 20.0,
             membrane: 0.0,
             membrane_q: 50.0,
+            volume: 100.0,
         }
     }
 
@@ -130,6 +135,7 @@ impl Tom2Config {
             decay: 100.0,
             membrane: 60.0,
             membrane_q: 70.0,
+            volume: 100.0,
         }
     }
 
@@ -143,6 +149,7 @@ impl Tom2Config {
             decay: 30.0,
             membrane: 0.0,
             membrane_q: 50.0,
+            volume: 100.0,
         }
     }
 
@@ -156,6 +163,7 @@ impl Tom2Config {
             decay: 90.0,
             membrane: 40.0,
             membrane_q: 80.0,
+            volume: 100.0,
         }
     }
 
@@ -177,6 +185,7 @@ impl Blendable for Tom2Config {
             decay: self.decay * inv_t + other.decay * t,
             membrane: self.membrane * inv_t + other.membrane * t,
             membrane_q: self.membrane_q * inv_t + other.membrane_q * t,
+            volume: self.volume * inv_t + other.volume * t,
         }
     }
 }
@@ -213,6 +222,7 @@ impl Tom2 {
             membrane_resonator: MembraneResonator::new(sample_rate),
             membrane: 0.0,    // Off by default
             membrane_q: 50.0, // Middle Q scale
+            volume: 100.0,    // Full volume by default
             main_sound_done: false,
         };
         tom.update_membrane_params();
@@ -352,6 +362,16 @@ impl Tom2 {
         self.membrane_q
     }
 
+    /// Set volume (0-100)
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 100.0);
+    }
+
+    /// Get volume (0-100)
+    pub fn volume(&self) -> f32 {
+        self.volume
+    }
+
     /// Update membrane resonator parameters based on current membrane_q setting
     fn update_membrane_params(&mut self) {
         // Map 0-100 to Q scale range 0.005-0.02 (centered at 0.01 which matches membrane example)
@@ -370,6 +390,7 @@ impl Tom2 {
         self.decay = config.decay;
         self.membrane = config.membrane;
         self.membrane_q = config.membrane_q;
+        self.volume = config.volume;
         self.update_membrane_params();
     }
 
@@ -383,6 +404,7 @@ impl Tom2 {
             decay: self.decay,
             membrane: self.membrane,
             membrane_q: self.membrane_q,
+            volume: self.volume,
         }
     }
 }
@@ -531,7 +553,7 @@ impl Instrument for Tom2 {
         if self.main_sound_done {
             let membrane_mix = self.membrane / 100.0;
             let fade = self.membrane_resonator.fade_multiplier();
-            return membrane_output * membrane_mix * fade * 0.7;
+            return membrane_output * membrane_mix * fade * 0.7 * (self.volume / 100.0);
         }
 
         // Mix membrane with main signal
@@ -544,7 +566,7 @@ impl Instrument for Tom2 {
 
         // === Output gain stages ===
         // Combined gain: 0.5 * 1.4 = 0.7
-        final_signal * fade_factor * 0.7
+        final_signal * fade_factor * 0.7 * (self.volume / 100.0)
     }
 
     fn is_active(&self) -> bool {
