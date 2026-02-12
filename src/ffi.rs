@@ -87,6 +87,7 @@ pub struct GooeyEngine {
     // Engine state
     sample_rate: f32,
     bpm: f32,
+    swing: f32,
     current_time: f32,
 
     // Per-instrument manual trigger flags and velocities
@@ -209,6 +210,7 @@ impl GooeyEngine {
             limiter: BrickWallLimiter::new(1.0),
             sample_rate,
             bpm,
+            swing: 0.5,
             current_time: 0.0,
             kick_trigger_pending: AtomicBool::new(false),
             kick_trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
@@ -1347,6 +1349,39 @@ pub unsafe extern "C" fn gooey_engine_set_bpm(engine: *mut GooeyEngine, bpm: f32
     for lfo in &mut engine.lfos {
         lfo.set_bpm(bpm);
     }
+}
+
+/// Set the global swing amount for all sequencers (0.0-1.0, where 0.5 = no swing)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_swing(engine: *mut GooeyEngine, swing: f32) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+    let clamped = swing.clamp(0.0, 1.0);
+    engine.swing = clamped;
+    engine.kick_sequencer.set_swing(clamped);
+    engine.snare_sequencer.set_swing(clamped);
+    engine.hihat_sequencer.set_swing(clamped);
+    engine.tom_sequencer.set_swing(clamped);
+}
+
+/// Get the current global swing amount
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_swing(engine: *mut GooeyEngine) -> f32 {
+    if engine.is_null() {
+        return 0.5;
+    }
+
+    let engine = &*engine;
+    engine.swing
 }
 
 // =============================================================================
