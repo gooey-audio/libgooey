@@ -46,12 +46,13 @@ pub enum FilterSlope {
 
 #[derive(Clone, Copy, Debug)]
 pub struct HiHat2Config {
-    pub pitch: f32,  // 0-1 normalized (pow2 curve -> 3500-10000 Hz)
-    pub decay: f32,  // 0-1 normalized (0.5-4000 ms)
-    pub attack: f32, // 0-1 normalized (0.5-200 ms)
+    pub pitch: f32,   // 0-1 normalized (pow2 curve -> 3500-10000 Hz)
+    pub decay: f32,   // 0-1 normalized (0.5-4000 ms)
+    pub attack: f32,  // 0-1 normalized (0.5-200 ms)
     pub noise_color: NoiseColor,
     pub filter_slope: FilterSlope,
-    pub tone: f32, // 0-1 normalized (500-10000 Hz)
+    pub tone: f32,    // 0-1 normalized (500-10000 Hz)
+    pub volume: f32,  // 0-1 overall volume
 }
 
 impl HiHat2Config {
@@ -70,6 +71,7 @@ impl HiHat2Config {
             noise_color,
             filter_slope,
             tone: tone.clamp(0.0, 1.0),
+            volume: 1.0,
         }
     }
 
@@ -141,6 +143,7 @@ impl Blendable for HiHat2Config {
                 other.filter_slope
             },
             tone: self.tone * inv_t + other.tone * t,
+            volume: self.volume * inv_t + other.volume * t,
         }
     }
 }
@@ -151,6 +154,7 @@ pub struct HiHat2Params {
     pub decay: SmoothedParam,
     pub attack: SmoothedParam,
     pub tone: SmoothedParam,
+    pub volume: SmoothedParam,
 }
 
 impl HiHat2Params {
@@ -166,6 +170,7 @@ impl HiHat2Params {
                 DEFAULT_SMOOTH_TIME_MS,
             ),
             tone: SmoothedParam::new(config.tone, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            volume: SmoothedParam::new(config.volume, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
         }
     }
 
@@ -175,6 +180,7 @@ impl HiHat2Params {
         self.decay.tick();
         self.attack.tick();
         self.tone.tick();
+        self.volume.tick();
 
         !self.is_settled()
     }
@@ -184,6 +190,7 @@ impl HiHat2Params {
             && self.decay.is_settled()
             && self.attack.is_settled()
             && self.tone.is_settled()
+            && self.volume.is_settled()
     }
 
     #[inline]
@@ -219,6 +226,7 @@ impl HiHat2Params {
             noise_color,
             filter_slope,
             tone: self.tone.get(),
+            volume: self.volume.get(),
         }
     }
 }
@@ -355,6 +363,7 @@ impl HiHat2 {
         self.params.decay.set_target(config.decay);
         self.params.attack.set_target(config.attack);
         self.params.tone.set_target(config.tone);
+        self.params.volume.set_target(config.volume);
         self.noise_color = config.noise_color;
         self.filter_slope = config.filter_slope;
     }
@@ -373,6 +382,10 @@ impl HiHat2 {
 
     pub fn set_tone(&mut self, tone: f32) {
         self.params.tone.set_target(tone);
+    }
+
+    pub fn set_volume(&mut self, volume: f32) {
+        self.params.volume.set_target(volume.clamp(0.0, 1.0));
     }
 
     pub fn set_noise_color(&mut self, noise_color: NoiseColor) {
@@ -440,7 +453,8 @@ impl HiHat2 {
         let env = self.envelope.get_value(current_time);
         let env = self.envelope_smoother.process(env);
 
-        let output = filtered * env * self.current_velocity * 0.35;
+        let volume = self.params.volume.get();
+        let output = filtered * env * self.current_velocity * volume * 0.35;
 
         let tone_hz = self.params.tone_hz();
         self.svf.set_params(tone_hz, 0.5);
@@ -492,7 +506,7 @@ impl crate::engine::Instrument for HiHat2 {
 
 impl crate::engine::Modulatable for HiHat2 {
     fn modulatable_parameters(&self) -> Vec<&'static str> {
-        vec!["attack", "decay", "pitch", "tone"]
+        vec!["attack", "decay", "pitch", "tone", "volume"]
     }
 
     fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
@@ -513,6 +527,10 @@ impl crate::engine::Modulatable for HiHat2 {
                 self.params.tone.set_bipolar(value);
                 Ok(())
             }
+            "volume" => {
+                self.params.volume.set_bipolar(value);
+                Ok(())
+            }
             _ => Err(format!("Unknown parameter: {}", parameter)),
         }
     }
@@ -523,6 +541,7 @@ impl crate::engine::Modulatable for HiHat2 {
             "decay" => Some(self.params.decay.range()),
             "pitch" => Some(self.params.pitch.range()),
             "tone" => Some(self.params.tone.range()),
+            "volume" => Some(self.params.volume.range()),
             _ => None,
         }
     }
