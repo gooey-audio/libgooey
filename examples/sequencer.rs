@@ -1,243 +1,354 @@
-/* CLI example for sequencer testing.
-Demonstrates sample-accurate sequencing with the new Engine.
+/* Sequencer Lab - Interactive CLI for sequencer parameter experimentation.
+Demonstrates sample-accurate sequencing with swing, LFO modulation, and filtering.
 */
 
 use crossterm::{
+    cursor,
     event::{self, Event, KeyCode, KeyEvent},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
-// Import the engine and instruments
-use libgooey::effects::LowpassFilterEffect;
-use libgooey::engine::{Engine, EngineOutput, Lfo, MusicalDivision, Sequencer};
-use libgooey::instruments::HiHat;
+use gooey::effects::LowpassFilterEffect;
+use gooey::engine::{Engine, EngineOutput, Instrument, Lfo, Modulatable, MusicalDivision, Sequencer};
+use gooey::instruments::HiHat;
 
-// CLI example for sequencer
+const LFO_DIVISIONS: [MusicalDivision; 8] = [
+    MusicalDivision::FourBars,
+    MusicalDivision::TwoBars,
+    MusicalDivision::OneBar,
+    MusicalDivision::Half,
+    MusicalDivision::Quarter,
+    MusicalDivision::Eighth,
+    MusicalDivision::Sixteenth,
+    MusicalDivision::ThirtySecond,
+];
+
+fn division_name(div: MusicalDivision) -> &'static str {
+    match div {
+        MusicalDivision::FourBars => "4 bars",
+        MusicalDivision::TwoBars => "2 bars",
+        MusicalDivision::OneBar => "1 bar",
+        MusicalDivision::Half => "1/2",
+        MusicalDivision::Quarter => "1/4",
+        MusicalDivision::Eighth => "1/8",
+        MusicalDivision::Sixteenth => "1/16",
+        MusicalDivision::ThirtySecond => "1/32",
+    }
+}
+
+fn division_index(div: MusicalDivision) -> usize {
+    LFO_DIVISIONS.iter().position(|&d| d == div).unwrap_or(2)
+}
+
+// Parameter indices
+const PARAM_BPM: usize = 0;
+const PARAM_SWING: usize = 1;
+const PARAM_DECAY: usize = 2;
+const PARAM_CUTOFF: usize = 3;
+const PARAM_RESONANCE: usize = 4;
+const PARAM_LFO_ENABLED: usize = 5;
+const PARAM_LFO_DIVISION: usize = 6;
+const PARAM_COUNT: usize = 7;
+
+// Wrapper to share HiHat between audio thread and main thread
+struct SharedHiHat(Arc<Mutex<HiHat>>);
+
+impl Instrument for SharedHiHat {
+    fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+        self.0.lock().unwrap().trigger_with_velocity(time, velocity);
+    }
+
+    fn tick(&mut self, current_time: f32) -> f32 {
+        self.0.lock().unwrap().tick(current_time)
+    }
+
+    fn is_active(&self) -> bool {
+        self.0.lock().unwrap().is_active()
+    }
+
+    fn as_modulatable(&mut self) -> Option<&mut dyn Modulatable> {
+        Some(self)
+    }
+}
+
+impl Modulatable for SharedHiHat {
+    fn modulatable_parameters(&self) -> Vec<&'static str> {
+        self.0.lock().unwrap().modulatable_parameters()
+    }
+
+    fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
+        self.0.lock().unwrap().apply_modulation(parameter, value)
+    }
+
+    fn parameter_range(&self, parameter: &str) -> Option<(f32, f32)> {
+        self.0.lock().unwrap().parameter_range(parameter)
+    }
+}
+
+struct SeqState {
+    bpm: f32,
+    swing: f32,
+    decay: f32,
+    cutoff: f32,
+    resonance: f32,
+    lfo_enabled: bool,
+    lfo_division_idx: usize,
+    running: bool,
+}
+
+fn make_bar(normalized: f32, width: usize) -> String {
+    let filled = (normalized * width as f32).round() as usize;
+    let filled = filled.min(width);
+    let empty = width - filled;
+    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+}
+
+fn render_display(state: &SeqState, selected: usize) {
+    print!("\x1b[2J\x1b[H\x1b[?7l");
+
+    print!("=== Sequencer Lab ===\r\n");
+    print!("SPACE=start/stop Q=quit ↑↓=sel ←→=adj []=fine\r\n");
+    let status = if state.running { "RUNNING" } else { "STOPPED" };
+    print!("Status: {}\r\n", status);
+    print!("\r\n");
+
+    // BPM
+    let ind = if selected == PARAM_BPM { ">" } else { " " };
+    let bpm_norm = (state.bpm - 60.0) / 140.0;
+    print!(
+        "{} {:<18} [{}] {:>6.0} BPM\r\n",
+        ind,
+        "bpm",
+        make_bar(bpm_norm, 10),
+        state.bpm
+    );
+
+    // Swing (display as 0-100 where 50 = neutral)
+    let ind = if selected == PARAM_SWING { ">" } else { " " };
+    print!(
+        "{} {:<18} [{}] {:>6.0}\r\n",
+        ind,
+        "swing",
+        make_bar(state.swing, 10),
+        state.swing * 100.0
+    );
+
+    // Decay (0-1 normalized)
+    let ind = if selected == PARAM_DECAY { ">" } else { " " };
+    print!(
+        "{} {:<18} [{}] {:>6.2}\r\n",
+        ind,
+        "decay",
+        make_bar(state.decay, 10),
+        state.decay
+    );
+
+    // Filter cutoff
+    let ind = if selected == PARAM_CUTOFF { ">" } else { " " };
+    let cutoff_norm = (state.cutoff - 100.0) / 19900.0;
+    print!(
+        "{} {:<18} [{}] {:>6.0} Hz\r\n",
+        ind,
+        "filter cutoff",
+        make_bar(cutoff_norm, 10),
+        state.cutoff
+    );
+
+    // Filter resonance
+    let ind = if selected == PARAM_RESONANCE { ">" } else { " " };
+    let res_norm = state.resonance / 0.95;
+    print!(
+        "{} {:<18} [{}] {:>6.2}\r\n",
+        ind,
+        "filter resonance",
+        make_bar(res_norm, 10),
+        state.resonance
+    );
+
+    // LFO enabled
+    let ind = if selected == PARAM_LFO_ENABLED { ">" } else { " " };
+    let on_off = if state.lfo_enabled { "ON" } else { "OFF" };
+    print!(
+        "{} {:<18} [{}] {:>6}\r\n",
+        ind,
+        "lfo enabled",
+        if state.lfo_enabled {
+            "██████████"
+        } else {
+            "░░░░░░░░░░"
+        },
+        on_off
+    );
+
+    // LFO division
+    let ind = if selected == PARAM_LFO_DIVISION { ">" } else { " " };
+    let div = LFO_DIVISIONS[state.lfo_division_idx];
+    let div_norm = state.lfo_division_idx as f32 / 7.0;
+    print!(
+        "{} {:<18} [{}] {:>6}\r\n",
+        ind,
+        "lfo division",
+        make_bar(div_norm, 10),
+        division_name(div)
+    );
+
+    io::stdout().flush().unwrap();
+}
+
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
     let sample_rate = 44100.0;
 
-    // Create the audio engine
     let mut engine = Engine::new(sample_rate);
 
-    // Add a hi-hat instrument
-    let hihat = HiHat::new(sample_rate);
-    engine.add_instrument("hihat", Box::new(hihat));
+    let hihat = Arc::new(Mutex::new(HiHat::new(sample_rate)));
+    // Start with a tight decay so individual hits are distinct and swing is audible
+    hihat.lock().unwrap().set_decay(0.05);
+    engine.add_instrument("hihat", Box::new(SharedHiHat(hihat.clone())));
 
-    // Set the global BPM
     let bpm = 120.0;
     engine.set_bpm(bpm);
 
-    // Create a sequencer with a simple 8-step pattern (16th notes at 120 BPM)
-    let pattern = vec![true, false, true, false, true, false, true, false];
+    let pattern = vec![true; 8];
     let sequencer = Sequencer::with_pattern(bpm, sample_rate, pattern, "hihat");
     engine.add_sequencer(sequencer);
 
-    // Add a BPM-synced LFO to modulate the hi-hat decay time
-    // Start with 1 bar = one cycle every 4 beats
+    // LFO for hi-hat decay modulation
     let lfo = Lfo::new_synced(MusicalDivision::OneBar, bpm, sample_rate);
     let lfo_index = engine.add_lfo(lfo);
-
-    // Map the LFO to the hi-hat's decay parameter
-    // Amount of 1.0 means the LFO will use full modulation range
     engine
         .map_lfo_to_parameter(lfo_index, "hihat", "decay", 1.0)
-        .expect("Failed to map LFO to hi-hat decay");
+        .expect("Failed to map LFO");
 
-    println!("✓ LFO mapped to hi-hat decay");
-    println!("  Synced to: 1 bar (4 beats)");
-    println!("  Range: 20ms to 500ms decay time");
+    // Set master gain higher for hi-hat (default 0.25 is too quiet)
+    engine.set_master_gain(1.0);
 
-    // Add a lowpass filter effect to the engine
-    let filter = LowpassFilterEffect::new(sample_rate, 2000.0, 0.3);
+    // Lowpass filter (start above hi-hat's base frequency range)
+    // Must Box first, then get_control - raw pointers would dangle if filter moves after get_control
+    let filter = Box::new(LowpassFilterEffect::new(sample_rate, 10000.0, 0.3));
     let filter_control = filter.get_control();
-    engine.add_global_effect(Box::new(filter));
+    engine.add_global_effect(filter);
 
-    println!("✓ Lowpass filter added to output");
-    println!("  Initial cutoff: 2000 Hz");
-    println!("  Resonance: 0.3");
-
-    // Wrap in Arc<Mutex> for thread-safe access
     let audio_engine = Arc::new(Mutex::new(engine));
 
-    // Enable raw mode for immediate key detection (MUST be before GLFW window creation)
-    enable_raw_mode()?;
-
-    // Create and configure the Engine output
     let mut engine_output = EngineOutput::new();
     engine_output.initialize(sample_rate)?;
 
-    // Enable visualization (optional - comment out to disable)
     #[cfg(feature = "visualization")]
     engine_output.enable_visualization(1200, 600, 2.0)?;
 
     engine_output.create_stream_with_engine(audio_engine.clone())?;
-
-    // Start the audio stream
     engine_output.start()?;
 
-    println!("=== Sequencer + LFO + Filter Example ===");
-    println!("Press SPACE to start/stop sequencer");
-    println!("Press UP/DOWN to adjust BPM");
-    println!("Press LEFT/RIGHT to cycle LFO division");
-    println!("Press W/S to adjust filter cutoff frequency");
-    println!("Press A/D to adjust filter resonance");
-    println!("Press 'q' to quit");
-    #[cfg(feature = "visualization")]
-    println!("\nVisualization window shows:");
-    #[cfg(feature = "visualization")]
-    println!("  Top: Waveform | Bottom: Spectrogram (0-10kHz)");
-    println!("");
+    let mut state = SeqState {
+        bpm,
+        swing: 0.5,
+        decay: 0.05,
+        cutoff: 10000.0,
+        resonance: 0.3,
+        lfo_enabled: true,
+        lfo_division_idx: division_index(MusicalDivision::OneBar),
+        running: false,
+    };
+    let mut selected: usize = 0;
+    let mut needs_redraw = true;
 
-    // Main input loop
+    execute!(io::stdout(), Clear(ClearType::All), cursor::Hide)?;
+    enable_raw_mode()?;
+
     let result = loop {
-        // Update visualization if enabled (no-op if disabled)
         if engine_output.update_visualization() {
-            println!("\rVisualization window closed");
             break Ok(());
         }
 
-        // Poll for key events (non-blocking with short timeout for smooth visualization)
+        if needs_redraw {
+            render_display(&state, selected);
+            needs_redraw = false;
+        }
+
         if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(KeyEvent { code, .. }) = event::read()? {
                 match code {
-                    KeyCode::Char(' ') => {
-                        io::stdout().flush().unwrap();
-                        let mut engine = audio_engine.lock().unwrap();
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        needs_redraw = true;
+                    }
+                    KeyCode::Down => {
+                        selected = (selected + 1).min(PARAM_COUNT - 1);
+                        needs_redraw = true;
+                    }
 
-                        // Toggle the first sequencer
+                    // Coarse adjust
+                    KeyCode::Right => {
+                        adjust_param(
+                            &audio_engine,
+                            &hihat,
+                            &filter_control,
+                            &mut state,
+                            selected,
+                            1.0,
+                            false,
+                        );
+                        needs_redraw = true;
+                    }
+                    KeyCode::Left => {
+                        adjust_param(
+                            &audio_engine,
+                            &hihat,
+                            &filter_control,
+                            &mut state,
+                            selected,
+                            -1.0,
+                            false,
+                        );
+                        needs_redraw = true;
+                    }
+
+                    // Fine adjust
+                    KeyCode::Char(']') => {
+                        adjust_param(
+                            &audio_engine,
+                            &hihat,
+                            &filter_control,
+                            &mut state,
+                            selected,
+                            1.0,
+                            true,
+                        );
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('[') => {
+                        adjust_param(
+                            &audio_engine,
+                            &hihat,
+                            &filter_control,
+                            &mut state,
+                            selected,
+                            -1.0,
+                            true,
+                        );
+                        needs_redraw = true;
+                    }
+
+                    // Start/stop
+                    KeyCode::Char(' ') => {
+                        let mut engine = audio_engine.lock().unwrap();
                         if let Some(seq) = engine.sequencer_mut(0) {
                             if seq.is_running() {
                                 seq.stop();
-                                println!("\rSequencer stopped          ");
+                                state.running = false;
                             } else {
                                 seq.start();
-                                println!("\rSequencer started at {} BPM", seq.bpm());
+                                state.running = true;
                             }
                         }
+                        needs_redraw = true;
                     }
-                    KeyCode::Up => {
-                        let mut engine = audio_engine.lock().unwrap();
-                        let new_bpm = (engine.bpm() + 5.0).min(200.0);
-                        engine.set_bpm(new_bpm);
 
-                        // Also update sequencer BPM
-                        if let Some(seq) = engine.sequencer_mut(0) {
-                            seq.set_bpm(new_bpm);
-                        }
-                        println!("\rBPM: {}  ", new_bpm);
-                        io::stdout().flush().unwrap();
-                    }
-                    KeyCode::Down => {
-                        let mut engine = audio_engine.lock().unwrap();
-                        let new_bpm = (engine.bpm() - 5.0).max(60.0);
-                        engine.set_bpm(new_bpm);
-
-                        // Also update sequencer BPM
-                        if let Some(seq) = engine.sequencer_mut(0) {
-                            seq.set_bpm(new_bpm);
-                        }
-                        println!("\rBPM: {}  ", new_bpm);
-                        io::stdout().flush().unwrap();
-                    }
-                    KeyCode::Right => {
-                        let mut engine = audio_engine.lock().unwrap();
-                        if let Some(lfo) = engine.lfo_mut(0) {
-                            use libgooey::engine::LfoSyncMode;
-                            // Cycle to next division
-                            let next_division = match lfo.sync_mode() {
-                                LfoSyncMode::BpmSync(div) => match div {
-                                    MusicalDivision::FourBars => MusicalDivision::TwoBars,
-                                    MusicalDivision::TwoBars => MusicalDivision::OneBar,
-                                    MusicalDivision::OneBar => MusicalDivision::Half,
-                                    MusicalDivision::Half => MusicalDivision::Quarter,
-                                    MusicalDivision::Quarter => MusicalDivision::Eighth,
-                                    MusicalDivision::Eighth => MusicalDivision::Sixteenth,
-                                    MusicalDivision::Sixteenth => MusicalDivision::ThirtySecond,
-                                    MusicalDivision::ThirtySecond => MusicalDivision::ThirtySecond, // Stay at fastest
-                                },
-                                LfoSyncMode::Hz(_) => MusicalDivision::OneBar, // Default to 1 bar if in Hz mode
-                            };
-                            lfo.set_sync_mode(next_division);
-                            let div_name = match next_division {
-                                MusicalDivision::FourBars => "4 bars",
-                                MusicalDivision::TwoBars => "2 bars",
-                                MusicalDivision::OneBar => "1 bar",
-                                MusicalDivision::Half => "1/2 note",
-                                MusicalDivision::Quarter => "1/4 note",
-                                MusicalDivision::Eighth => "1/8 note",
-                                MusicalDivision::Sixteenth => "1/16 note",
-                                MusicalDivision::ThirtySecond => "1/32 note",
-                            };
-                            println!("\rLFO Division: {} ({:.2} Hz)  ", div_name, lfo.frequency());
-                        }
-                        io::stdout().flush().unwrap();
-                    }
-                    KeyCode::Left => {
-                        let mut engine = audio_engine.lock().unwrap();
-                        if let Some(lfo) = engine.lfo_mut(0) {
-                            use libgooey::engine::LfoSyncMode;
-                            // Cycle to previous division
-                            let prev_division = match lfo.sync_mode() {
-                                LfoSyncMode::BpmSync(div) => match div {
-                                    MusicalDivision::FourBars => MusicalDivision::FourBars, // Stay at slowest
-                                    MusicalDivision::TwoBars => MusicalDivision::FourBars,
-                                    MusicalDivision::OneBar => MusicalDivision::TwoBars,
-                                    MusicalDivision::Half => MusicalDivision::OneBar,
-                                    MusicalDivision::Quarter => MusicalDivision::Half,
-                                    MusicalDivision::Eighth => MusicalDivision::Quarter,
-                                    MusicalDivision::Sixteenth => MusicalDivision::Eighth,
-                                    MusicalDivision::ThirtySecond => MusicalDivision::Sixteenth,
-                                },
-                                LfoSyncMode::Hz(_) => MusicalDivision::OneBar, // Default to 1 bar if in Hz mode
-                            };
-                            lfo.set_sync_mode(prev_division);
-                            let div_name = match prev_division {
-                                MusicalDivision::FourBars => "4 bars",
-                                MusicalDivision::TwoBars => "2 bars",
-                                MusicalDivision::OneBar => "1 bar",
-                                MusicalDivision::Half => "1/2 note",
-                                MusicalDivision::Quarter => "1/4 note",
-                                MusicalDivision::Eighth => "1/8 note",
-                                MusicalDivision::Sixteenth => "1/16 note",
-                                MusicalDivision::ThirtySecond => "1/32 note",
-                            };
-                            println!("\rLFO Division: {} ({:.2} Hz)  ", div_name, lfo.frequency());
-                        }
-                        io::stdout().flush().unwrap();
-                    }
-                    KeyCode::Char('w') | KeyCode::Char('W') => {
-                        let current = filter_control.get_cutoff_freq();
-                        let new_cutoff = (current + 200.0).min(20000.0);
-                        filter_control.set_cutoff_freq(new_cutoff);
-                        println!("\rFilter Cutoff: {:.0} Hz  ", new_cutoff);
-                        io::stdout().flush().unwrap();
-                    }
-                    KeyCode::Char('s') | KeyCode::Char('S') => {
-                        let current = filter_control.get_cutoff_freq();
-                        let new_cutoff = (current - 200.0).max(100.0);
-                        filter_control.set_cutoff_freq(new_cutoff);
-                        println!("\rFilter Cutoff: {:.0} Hz  ", new_cutoff);
-                        io::stdout().flush().unwrap();
-                    }
-                    KeyCode::Char('a') | KeyCode::Char('A') => {
-                        let current = filter_control.get_resonance();
-                        let new_resonance = (current - 0.05).max(0.0);
-                        filter_control.set_resonance(new_resonance);
-                        println!("\rFilter Resonance: {:.2}  ", new_resonance);
-                        io::stdout().flush().unwrap();
-                    }
-                    KeyCode::Char('d') | KeyCode::Char('D') => {
-                        let current = filter_control.get_resonance();
-                        let new_resonance = (current + 0.05).min(0.95);
-                        filter_control.set_resonance(new_resonance);
-                        println!("\rFilter Resonance: {:.2}  ", new_resonance);
-                        io::stdout().flush().unwrap();
-                    }
                     KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                        println!("\rQuitting...           ");
                         break Ok(());
                     }
                     _ => {}
@@ -246,10 +357,85 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Restore terminal to normal mode
+    print!("\x1b[?7h");
+    execute!(io::stdout(), cursor::Show)?;
     disable_raw_mode()?;
+    println!("\nQuitting...");
 
     result
+}
+
+fn adjust_param(
+    audio_engine: &Arc<Mutex<Engine>>,
+    hihat: &Arc<Mutex<HiHat>>,
+    filter_control: &gooey::effects::LowpassFilterControl,
+    state: &mut SeqState,
+    param: usize,
+    direction: f32,
+    fine: bool,
+) {
+    match param {
+        PARAM_BPM => {
+            let step = if fine { 1.0 } else { 5.0 };
+            state.bpm = (state.bpm + step * direction).clamp(60.0, 200.0);
+            let mut engine = audio_engine.lock().unwrap();
+            engine.set_bpm(state.bpm);
+            if let Some(seq) = engine.sequencer_mut(0) {
+                seq.set_bpm(state.bpm);
+            }
+        }
+        PARAM_SWING => {
+            let step = if fine { 0.01 } else { 0.05 };
+            state.swing = (state.swing + step * direction).clamp(0.0, 1.0);
+            let mut engine = audio_engine.lock().unwrap();
+            if let Some(seq) = engine.sequencer_mut(0) {
+                seq.set_swing(state.swing);
+            }
+        }
+        PARAM_DECAY => {
+            let step = if fine { 0.01 } else { 0.05 };
+            state.decay = (state.decay + step * direction).clamp(0.0, 1.0);
+            hihat.lock().unwrap().set_decay(state.decay);
+        }
+        PARAM_CUTOFF => {
+            let step = if fine { 50.0 } else { 200.0 };
+            state.cutoff = (state.cutoff + step * direction).clamp(100.0, 20000.0);
+            filter_control.set_cutoff_freq(state.cutoff);
+        }
+        PARAM_RESONANCE => {
+            let step = if fine { 0.01 } else { 0.05 };
+            state.resonance = (state.resonance + step * direction).clamp(0.0, 0.95);
+            filter_control.set_resonance(state.resonance);
+        }
+        PARAM_LFO_ENABLED => {
+            state.lfo_enabled = !state.lfo_enabled;
+            let mut engine = audio_engine.lock().unwrap();
+            if state.lfo_enabled {
+                let _ = engine.map_lfo_to_parameter(0, "hihat", "decay", 1.0);
+            } else {
+                // Clear target so the LFO stops overriding the decay parameter
+                if let Some(lfo) = engine.lfo_mut(0) {
+                    lfo.target_instrument.clear();
+                    lfo.target_parameter.clear();
+                }
+                // Restore manual decay value
+                hihat.lock().unwrap().set_decay(state.decay);
+            }
+        }
+        PARAM_LFO_DIVISION => {
+            let new_idx = if direction > 0.0 {
+                (state.lfo_division_idx + 1).min(LFO_DIVISIONS.len() - 1)
+            } else {
+                state.lfo_division_idx.saturating_sub(1)
+            };
+            state.lfo_division_idx = new_idx;
+            let mut engine = audio_engine.lock().unwrap();
+            if let Some(lfo) = engine.lfo_mut(0) {
+                lfo.set_sync_mode(LFO_DIVISIONS[new_idx]);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(not(feature = "native"))]
