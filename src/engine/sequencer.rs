@@ -221,6 +221,58 @@ mod tests {
             swing_gap,
             straight_gap
         );
+
+        let swing_gap_2 = triggers_swing[2] - triggers_swing[1];
+        assert!(
+            swing_gap_2 < straight_gap,
+            "Step after swung off-beat should be shorter (gap {} vs {})",
+            swing_gap_2,
+            straight_gap
+        );
+    }
+
+    #[test]
+    fn test_swing_preserves_average_tempo() {
+        let mut seq_straight = Sequencer::with_pattern(120.0, 44100.0, vec![true; 4], "test");
+        let mut seq_swing = Sequencer::with_pattern(120.0, 44100.0, vec![true; 4], "test");
+
+        seq_swing.swing.set_immediate(0.75);
+
+        seq_straight.start();
+        seq_swing.start();
+
+        let mut triggers_straight: Vec<u64> = Vec::new();
+        let mut triggers_swing: Vec<u64> = Vec::new();
+
+        for _ in 0..100000 {
+            if seq_straight.tick().is_some() {
+                triggers_straight.push(seq_straight.sample_count());
+            }
+            if seq_swing.tick().is_some() {
+                triggers_swing.push(seq_swing.sample_count());
+            }
+            if triggers_straight.len() >= 5 && triggers_swing.len() >= 5 {
+                break;
+            }
+        }
+
+        let straight_two_step_span = triggers_straight[2] - triggers_straight[0];
+        let swing_two_step_span = triggers_swing[2] - triggers_swing[0];
+        let straight_bar_span = triggers_straight[4] - triggers_straight[0];
+        let swing_bar_span = triggers_swing[4] - triggers_swing[0];
+
+        assert!(
+            straight_two_step_span.abs_diff(swing_two_step_span) <= 2,
+            "Two-step span should remain constant (straight {} vs swing {})",
+            straight_two_step_span,
+            swing_two_step_span
+        );
+        assert!(
+            straight_bar_span.abs_diff(swing_bar_span) <= 4,
+            "Bar span should remain constant (straight {} vs swing {})",
+            straight_bar_span,
+            swing_bar_span
+        );
     }
 }
 
@@ -527,19 +579,19 @@ impl Sequencer {
             // Advance to the next step (internal tracking)
             self.current_step = (self.current_step + 1) % self.pattern.len();
 
-            // Calculate swing offset for the next step
-            // Swing delays off-beat steps (odd-numbered) by a percentage of the step length
-            let swing_offset = if self.is_swing_step(self.current_step) {
-                (self.swing.get() - 0.5) * 2.0 * self.samples_per_step
+            // Swing delays off-beat steps and advances the following on-beats by the same amount.
+            // This keeps the average tempo constant while changing only relative timing.
+            let swing_offset = (self.swing.get() - 0.5) * 2.0 * self.samples_per_step;
+            let signed_swing_offset = if self.is_swing_step(self.current_step) {
+                swing_offset
             } else {
-                0.0
+                -swing_offset
             };
 
             // Calculate the next trigger sample (accumulate fractional samples for accuracy)
-            self.next_trigger_sample = (self.next_trigger_sample as f32
-                + self.samples_per_step
-                + swing_offset)
-                .round() as u64;
+            self.next_trigger_sample =
+                (self.next_trigger_sample as f32 + self.samples_per_step + signed_swing_offset)
+                    .round() as u64;
         }
 
         self.sample_count += 1;
