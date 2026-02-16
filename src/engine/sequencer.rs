@@ -222,6 +222,76 @@ mod tests {
             straight_gap
         );
     }
+
+    #[test]
+    fn test_set_beat_position_exact_beats() {
+        // 16-step pattern at 120 BPM, 44100 Hz
+        let mut seq = Sequencer::new(120.0, 44100.0, 16, "kick");
+
+        // Beat 0.0 → step 0
+        seq.set_beat_position(0.0);
+        assert_eq!(seq.current_step, 0);
+        assert_eq!(seq.playhead_step, 0);
+        assert_eq!(seq.sample_count, 0);
+
+        // Beat 1.0 → step 4 (4 sixteenth notes per beat)
+        seq.set_beat_position(1.0);
+        assert_eq!(seq.current_step, 4);
+        assert_eq!(seq.playhead_step, 4);
+        assert_eq!(seq.sample_count, 0);
+
+        // Beat 2.5 → step 10
+        seq.set_beat_position(2.5);
+        assert_eq!(seq.current_step, 10);
+        assert_eq!(seq.playhead_step, 10);
+        assert_eq!(seq.sample_count, 0);
+    }
+
+    #[test]
+    fn test_set_beat_position_fractional() {
+        // 16-step pattern at 120 BPM, 44100 Hz
+        // samples_per_step = (60/120)/4 * 44100 = 5512.5
+        let mut seq = Sequencer::new(120.0, 44100.0, 16, "kick");
+
+        // Beat 0.125 = half of a 16th note → step 0, halfway through
+        seq.set_beat_position(0.125);
+        assert_eq!(seq.current_step, 0);
+        assert_eq!(seq.playhead_step, 0);
+        // offset should be ~half of samples_per_step
+        let expected_offset = (0.5 * 5512.5) as u64;
+        assert_eq!(seq.sample_count, expected_offset);
+        // next_trigger should fire after remaining half
+        let expected_next = (5512.5_f64 - 0.5 * 5512.5_f64).round() as u64;
+        assert_eq!(seq.next_trigger_sample, expected_next);
+    }
+
+    #[test]
+    fn test_set_beat_position_wraps_around_pattern() {
+        // 4-step pattern (1 beat long)
+        let mut seq = Sequencer::with_pattern(120.0, 44100.0, vec![true; 4], "kick");
+
+        // Beat 1.0 = step 4 → wraps to step 0
+        seq.set_beat_position(1.0);
+        assert_eq!(seq.current_step, 0);
+
+        // Beat 2.75 = step 11 → 11 % 4 = 3
+        seq.set_beat_position(2.75);
+        assert_eq!(seq.current_step, 3);
+    }
+
+    #[test]
+    fn test_set_beat_position_then_start_triggers_correctly() {
+        let mut seq = Sequencer::with_pattern(120.0, 44100.0, vec![true; 16], "kick");
+
+        // Position at beat 1.0 (step 4), then start
+        seq.set_beat_position(1.0);
+        seq.start();
+
+        // First tick should trigger at step 4
+        let trigger = seq.tick();
+        assert!(trigger.is_some());
+        assert_eq!(seq.current_step(), 4); // playhead_step
+    }
 }
 
 impl Sequencer {
@@ -333,6 +403,36 @@ impl Sequencer {
         self.next_trigger_sample = 0;
         self.current_step = 0;
         self.playhead_step = 0;
+    }
+
+    /// Set the sequencer to a specific beat position in quarter notes.
+    ///
+    /// This is used for AUv3 host transport sync: the host provides
+    /// `currentBeatPosition` and we jump to the correct step/sub-step.
+    /// Each step is a 16th note (4 steps per quarter-note beat).
+    ///
+    /// Call this before `start()` when an AUv3 host resumes transport.
+    pub fn set_beat_position(&mut self, beat_position: f64) {
+        let step_count = self.pattern.len();
+        if step_count == 0 {
+            return;
+        }
+
+        // Each step is a 16th note = 1/4 of a beat
+        let step_f64 = beat_position * 4.0;
+        let step_index = (step_f64.floor() as usize) % step_count;
+        let fractional_step = step_f64 - step_f64.floor();
+
+        // Set position
+        self.current_step = step_index;
+        self.playhead_step = step_index;
+
+        // Compute sample offset: how far into the current step we are
+        let offset_samples = (fractional_step * self.samples_per_step as f64) as u64;
+        self.sample_count = offset_samples;
+        self.next_trigger_sample = (self.samples_per_step as f64
+            - fractional_step * self.samples_per_step as f64)
+            .round() as u64;
     }
 
     /// Set the BPM and recalculate timing

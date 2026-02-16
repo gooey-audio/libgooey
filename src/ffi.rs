@@ -1439,6 +1439,37 @@ pub unsafe extern "C" fn gooey_engine_sequencer_reset(engine: *mut GooeyEngine) 
     engine.tom_sequencer.reset();
 }
 
+/// Set all sequencers to a specific beat position in quarter notes.
+///
+/// This is used for AUv3 host transport sync. The host provides
+/// `currentBeatPosition` and all sequencers jump to the correct
+/// step and sub-step offset. Call this before `sequencer_start()`
+/// when the host resumes transport.
+///
+/// Each step is a 16th note (4 steps per quarter-note beat).
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `beat_position` - Position in quarter notes (e.g. 0.0 = bar start, 1.0 = second beat)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_set_beat_position(
+    engine: *mut GooeyEngine,
+    beat_position: f64,
+) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+    engine.kick_sequencer.set_beat_position(beat_position);
+    engine.snare_sequencer.set_beat_position(beat_position);
+    engine.hihat_sequencer.set_beat_position(beat_position);
+    engine.tom_sequencer.set_beat_position(beat_position);
+}
+
 /// Set a sequencer step on or off for the kick drum (legacy, prefer per-instrument functions)
 ///
 /// # Arguments
