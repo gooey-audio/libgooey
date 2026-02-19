@@ -2,6 +2,7 @@ use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
 use crate::gen::oscillator::Oscillator;
 use crate::gen::waveform::Waveform;
 use crate::utils::smoother::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
+use crate::utils::velocity::{shape_velocity_default, shape_velocity_pitch};
 
 /// Normalization ranges for tom drum parameters
 /// All external-facing parameters use 0.0-1.0 normalized values
@@ -329,6 +330,8 @@ pub struct TomDrum {
 
     // Velocity tracking
     pub current_velocity: f32,
+    velocity_to_decay: f32,
+    velocity_to_pitch: f32,
 
     pub is_active: bool,
 }
@@ -356,6 +359,11 @@ impl TomDrum {
             pitch_start_multiplier: 1.0 + pitch_drop * 1.0,
             amplitude_envelope: Envelope::new(),
             current_velocity: 1.0,
+            // Velocity scaling: 0.5 means velocity can reduce decay by up to 50%
+            velocity_to_decay: 0.5,
+            // Pitch velocity scaling: 0.8 for very strong pitch response
+            // Toms are highly pitch-sensitive - striking harder stretches the head more
+            velocity_to_pitch: 0.8,
             is_active: false,
         };
 
@@ -436,12 +444,25 @@ impl TomDrum {
         let decay_secs = self.params.decay_secs();
         let pitch_drop = self.params.pitch_drop.get();
 
-        // Velocity affects decay time (softer hits = shorter decay)
-        let decay_scale = 0.5 + 0.5 * self.current_velocity;
+        let vel = self.current_velocity;
+
+        // Non-linear velocity curves with soft-knee saturation at the top ~10%
+        let vel_shaped = shape_velocity_default(vel);
+        let vel_pitch = shape_velocity_pitch(vel);
+
+        // --- Decay time scaling ---
+        // Higher velocity = shorter decay (tighter, punchier sound)
+        let decay_scale = 1.0 - (self.velocity_to_decay * vel_shaped);
         let scaled_decay = decay_secs * decay_scale;
 
-        // Configure oscillators with current parameters
-        self.configure_oscillators(freq_hz, scaled_decay, pitch_drop);
+        // --- Pitch scaling ---
+        // Velocity scales pitch sweep depth - toms are very pitch-sensitive
+        // Harder hits = more pitch drop (like a real drum head deforming more)
+        // velocity_to_pitch controls the range: e.g. 0.8 means vel=0 gets 20% sweep, vel=1 gets 100%
+        let vel_pitch_amount = (1.0 - self.velocity_to_pitch) + self.velocity_to_pitch * vel_pitch;
+
+        // Configure oscillators with velocity-scaled parameters
+        self.configure_oscillators(freq_hz, scaled_decay, pitch_drop * vel_pitch_amount);
 
         // Trigger both oscillators
         self.tonal_oscillator.trigger(time);
@@ -450,10 +471,10 @@ impl TomDrum {
         // Trigger pitch envelope
         self.pitch_envelope.trigger(time);
 
-        // Configure and trigger master amplitude envelope
+        // Configure and trigger master amplitude envelope with velocity-scaled decay
         const AMP_ATTACK: f32 = 0.001;
         const AMP_ATTACK_CURVE: f32 = 0.5;
-        let amp_decay = self.params.amp_decay_secs() * decay_scale;
+        let amp_decay = self.params.amp_decay_secs() * decay_scale; // Same velocity scaling
         let amp_decay_curve_val = self.params.amp_decay_curve_value();
 
         let amp_attack_curve = EnvelopeCurve::Exponential(AMP_ATTACK_CURVE);
@@ -521,8 +542,8 @@ impl TomDrum {
         // Apply master amplitude envelope
         let amp_env = self.amplitude_envelope.get_amplitude(current_time);
 
-        // Apply velocity amplitude scaling (sqrt for perceptually linear loudness)
-        let velocity_amplitude = self.current_velocity.sqrt();
+        // Apply velocity amplitude scaling with soft-knee curve
+        let velocity_amplitude = shape_velocity_default(self.current_velocity).sqrt();
         let final_output = total_output * amp_env * velocity_amplitude;
 
         // Check if tom is still active (use amplitude envelope as master)

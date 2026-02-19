@@ -2,6 +2,7 @@
 
 pub mod blendable;
 pub mod smoother;
+pub mod velocity;
 
 pub use blendable::{Blendable, PresetBlender};
 pub use smoother::{ParamSmoother, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
