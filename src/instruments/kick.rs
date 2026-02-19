@@ -5,6 +5,7 @@ use crate::gen::oscillator::Oscillator;
 use crate::gen::pink_noise::PinkNoise;
 use crate::gen::waveform::Waveform;
 use crate::instruments::fm_snap::PhaseModulator;
+use crate::utils::velocity::{shape_velocity_default, shape_velocity_pitch};
 use crate::utils::{Blendable, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 /// Normalization ranges for kick drum parameters
@@ -809,7 +810,7 @@ impl KickDrum {
 
         // Light velocity scaling for click: range [0.6, 1.0]
         // Higher velocity = more click, lower velocity = less click
-        let click_vel_scale = 0.6 + 0.4 * self.current_velocity;
+        let click_vel_scale = 0.6 + 0.4 * shape_velocity_default(self.current_velocity);
 
         // Update oscillator volumes (these can change smoothly without pops)
         self.sub_oscillator.set_volume(sub * volume);
@@ -881,20 +882,18 @@ impl KickDrum {
 
         let vel = self.current_velocity;
 
-        // Quadratic curve for natural acoustic-like response
-        let vel_squared = vel * vel;
+        // Non-linear velocity curves with soft-knee saturation at the top ~10%
+        let vel_shaped = shape_velocity_default(vel);
+        let vel_pitch = shape_velocity_pitch(vel);
 
         // --- Decay time scaling ---
         // Higher velocity = shorter decay (tighter, punchier sound)
-        // Scale factor: 1.0 at vel=0, down to 0.5 at vel=1 (50% reduction)
-        let decay_scale = 1.0 - (self.velocity_to_decay * vel_squared);
+        let decay_scale = 1.0 - (self.velocity_to_decay * vel_shaped);
 
         // --- Pitch envelope scaling ---
-        // Higher velocity = faster/sharper pitch decay (more aggressive pitch drop)
-        // Lower velocity = slower pitch decay (gentler, more subtle sweep)
-        // Use a more aggressive scaling for pitch to make high velocity hits snappy
-        // NOTE: Currently unused - pitch envelope duration matches amplitude to prevent pops
-        let _pitch_decay_scale = 1.0 - (self.velocity_to_pitch * vel_squared);
+        // Higher velocity = more pitch sweep (like a harder-struck drum head)
+        // Uses steeper pitch curve for physically realistic response
+        let pitch_vel_scale = vel_pitch;
 
         // Get base parameters (denormalized to actual values)
         let base_decay = self.params.oscillator_decay_secs() * decay_scale;
@@ -905,7 +904,12 @@ impl KickDrum {
         self.triggered_frequency = base_freq;
         let pitch_envelope_amount = self.params.pitch_envelope_amount.get();
         let pitch_start_ratio = self.params.pitch_start_ratio_value();
-        self.triggered_pitch_multiplier = 1.0 + (pitch_start_ratio - 1.0) * pitch_envelope_amount;
+        // Velocity scales pitch sweep depth - harder hits = more pitch drop (like a real drum head)
+        // At low velocity, pitch sweep is reduced; at high velocity, full sweep
+        // velocity_to_pitch controls the range: e.g. 0.7 means vel=0 gets 30% sweep, vel=1 gets 100%
+        let vel_pitch_amount = (1.0 - self.velocity_to_pitch) + self.velocity_to_pitch * pitch_vel_scale;
+        self.triggered_pitch_multiplier =
+            1.0 + (pitch_start_ratio - 1.0) * pitch_envelope_amount * vel_pitch_amount;
 
         // Configure pitch envelope with same duration as amplitude envelope
         // The exponential curve will make the pitch sweep complete early,
@@ -1082,8 +1086,8 @@ impl KickDrum {
         // Multiplicative with existing oscillator envelopes
         let amp_env = self.amplitude_envelope.get_amplitude(current_time);
 
-        // Apply velocity amplitude scaling (sqrt for perceptually linear loudness)
-        let velocity_amplitude = self.current_velocity.sqrt();
+        // Apply velocity amplitude scaling with soft-knee curve
+        let velocity_amplitude = shape_velocity_default(self.current_velocity).sqrt();
         let final_output = overdriven_output * amp_env * velocity_amplitude;
 
         // Check if kick is still active

@@ -4,6 +4,7 @@ use crate::filters::StateVariableFilter;
 use crate::gen::oscillator::Oscillator;
 use crate::gen::waveform::Waveform;
 use crate::instruments::fm_snap::PhaseModulator;
+use crate::utils::velocity::{shape_velocity_default, shape_velocity_pitch};
 use crate::utils::{Blendable, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 /// Normalization ranges for snare drum parameters
@@ -757,8 +758,8 @@ impl SnareDrum {
             current_velocity: 0.5,
             // Velocity scaling: 0.45 means velocity can reduce decay by up to 45%
             velocity_to_decay: 0.45,
-            // Pitch velocity scaling: 0.5 for moderate pitch response
-            velocity_to_pitch: 0.5,
+            // Pitch velocity scaling: 0.65 for strong pitch response (real drum heads are very pitch-sensitive)
+            velocity_to_pitch: 0.65,
 
             // DS Snare-style components
             noise_filter: StateVariableFilter::new(
@@ -843,16 +844,18 @@ impl SnareDrum {
 
         let vel = self.current_velocity;
 
-        // Quadratic curve for natural acoustic-like response
-        let vel_squared = vel * vel;
+        // Non-linear velocity curves with soft-knee saturation at the top ~10%
+        let vel_shaped = shape_velocity_default(vel);
+        let vel_pitch = shape_velocity_pitch(vel);
 
         // --- Decay time scaling ---
         // Higher velocity = shorter decay (tighter, punchier sound)
-        let decay_scale = 1.0 - (self.velocity_to_decay * vel_squared);
+        let decay_scale = 1.0 - (self.velocity_to_decay * vel_shaped);
 
         // --- Pitch envelope scaling ---
         // Higher velocity = faster pitch decay (sharper attack)
-        let pitch_decay_scale = 1.0 - (self.velocity_to_pitch * vel_squared);
+        // Uses steeper pitch curve for physically realistic snare response
+        let pitch_decay_scale = 1.0 - (self.velocity_to_pitch * vel_pitch);
 
         // Get current smoothed parameter values (use helper methods for denormalized values)
         let base_freq = self.params.frequency_hz();
@@ -877,7 +880,9 @@ impl SnareDrum {
         let scaled_decay = base_decay * decay_scale;
 
         // Update pitch start multiplier from smoothed value
-        self.pitch_start_multiplier = 1.0 + pitch_drop * 1.5;
+        // Velocity scales pitch sweep depth - harder hits = more pitch drop
+        let vel_pitch_amount = 0.3 + 0.7 * vel_pitch;
+        self.pitch_start_multiplier = 1.0 + pitch_drop * 1.5 * vel_pitch_amount;
 
         // Configure pitch envelope with velocity-scaled decay
         // Base: 30% of amplitude decay, scaled by velocity
@@ -915,7 +920,7 @@ impl SnareDrum {
 
         // Configure crack oscillator envelope with velocity-scaled decay
         // Crack gets velocity boost: range [0.7, 1.0] for more snap at high velocity
-        let crack_vel_scale = 0.7 + 0.3 * vel;
+        let crack_vel_scale = 0.7 + 0.3 * vel_shaped;
         self.crack_oscillator.frequency_hz = base_freq * 25.0;
         self.crack_oscillator
             .set_volume(brightness * volume * 0.4 * crack_vel_scale);
@@ -1093,8 +1098,8 @@ impl SnareDrum {
         // Apply master amplitude envelope (after overdrive, like kick)
         let amp_env = self.amplitude_envelope.get_amplitude(current_time);
 
-        // Apply velocity amplitude scaling (sqrt for perceptually linear loudness)
-        let velocity_amplitude = self.current_velocity.sqrt();
+        // Apply velocity amplitude scaling with soft-knee curve
+        let velocity_amplitude = shape_velocity_default(self.current_velocity).sqrt();
         let final_output = overdriven_output * amp_env * velocity_amplitude;
 
         // Check if snare is still active

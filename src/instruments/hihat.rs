@@ -1,6 +1,7 @@
 use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
 use crate::gen::oscillator::Oscillator;
 use crate::gen::waveform::Waveform;
+use crate::utils::velocity::{shape_velocity_default, shape_velocity_pitch};
 use crate::utils::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 /// Normalization ranges for hi-hat parameters
@@ -403,7 +404,7 @@ impl HiHat {
             // Velocity sensitivity
             current_velocity: 1.0,
             velocity_to_decay: 0.4, // Decay shortened by up to 40% at high velocity
-            velocity_to_pitch: 0.3, // Frequency boosted by up to 30% at high velocity
+            velocity_to_pitch: 0.5, // Frequency boosted by up to 50% at high velocity (cymbals are pitch-sensitive)
             velocity_freq_boost: 1.0, // No boost initially
         };
 
@@ -520,9 +521,10 @@ impl HiHat {
         self.is_active = true;
         self.current_velocity = velocity.clamp(0.0, 1.0);
 
-        // Quadratic curve for natural acoustic-like response
+        // Non-linear velocity curves with soft-knee saturation at the top ~10%
         let vel = self.current_velocity;
-        let vel_squared = vel * vel;
+        let vel_shaped = shape_velocity_default(vel);
+        let vel_pitch = shape_velocity_pitch(vel);
 
         // Read base parameters (denormalized)
         let base_decay = self.params.decay_secs();
@@ -532,13 +534,13 @@ impl HiHat {
         const ATTACK: f32 = 0.001;
 
         // High velocity = shorter decay (tighter, snappier sound)
-        let decay_scale = 1.0 - (self.velocity_to_decay * vel_squared);
+        let decay_scale = 1.0 - (self.velocity_to_decay * vel_shaped);
         let scaled_decay = base_decay * decay_scale;
         let scaled_amp_decay = amp_decay * decay_scale;
 
         // High velocity = higher frequency (brighter, more cutting sound)
-        // Store the boost factor - it will be applied transiently in tick() via filter envelope
-        self.velocity_freq_boost = 1.0 + (self.velocity_to_pitch * vel_squared);
+        // Uses steeper pitch curve for dramatic brightness response
+        self.velocity_freq_boost = 1.0 + (self.velocity_to_pitch * vel_pitch);
 
         // Configure and trigger noise oscillator envelope based on open/closed
         if self.is_open {
@@ -669,8 +671,8 @@ impl HiHat {
         // Apply final volume control for direct, audible effect
         let volume = self.params.volume.get();
 
-        // Apply velocity amplitude scaling (sqrt for perceptually linear loudness)
-        let velocity_amplitude = self.current_velocity.sqrt();
+        // Apply velocity amplitude scaling with soft-knee curve
+        let velocity_amplitude = shape_velocity_default(self.current_velocity).sqrt();
         let final_output = self.filter_state * volume * velocity_amplitude;
 
         // Check if hi-hat is still active
