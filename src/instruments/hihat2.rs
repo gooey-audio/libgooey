@@ -453,13 +453,16 @@ impl HiHat2 {
         let env = self.envelope.get_value(current_time);
         let env = self.envelope_smoother.process(env);
 
-        let volume = self.params.volume.get();
-        let output = filtered * env * self.current_velocity * volume * 0.35;
+        let output = filtered * env * self.current_velocity * 0.35;
 
         let tone_hz = self.params.tone_hz();
         self.svf.set_params(tone_hz, 0.5);
         let (_, _, high) = self.svf.process_all(output);
-        let output = high;
+
+        // Apply volume after SVF to guarantee silence at volume=0
+        // (SVF has internal state that can ring out even with zero input)
+        let volume = self.params.volume.get();
+        let output = high * volume;
 
         if self.envelope.is_complete() && self.envelope_smoother.current() < 1e-4 {
             self.is_active = false;

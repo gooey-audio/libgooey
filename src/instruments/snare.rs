@@ -1095,7 +1095,10 @@ impl SnareDrum {
 
         // Apply velocity amplitude scaling (sqrt for perceptually linear loudness)
         let velocity_amplitude = self.current_velocity.sqrt();
-        let final_output = overdriven_output * amp_env * velocity_amplitude;
+
+        // Gate by volume to guarantee silence at volume=0
+        let volume = self.params.volume.get();
+        let final_output = overdriven_output * amp_env * velocity_amplitude * volume;
 
         // Check if snare is still active
         let classic_active = self.tonal_oscillator.envelope.is_active
