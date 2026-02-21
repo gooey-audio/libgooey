@@ -10,6 +10,7 @@ use crate::instruments::{
     HiHat2, HiHat2Config, KickConfig, KickDrum, SnareConfig, SnareDrum, Tom2, Tom2Config,
 };
 use crate::utils::{PresetBlender, SmoothedParam};
+use std::ffi::{c_char, c_void, CString};
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -122,6 +123,12 @@ pub struct GooeyEngine {
     blend_x: [f32; INSTRUMENT_COUNT as usize],
     blend_y: [f32; INSTRUMENT_COUNT as usize],
     blend_corner_presets: [[u32; 4]; INSTRUMENT_COUNT as usize],
+
+    // Error state (set after a panic in render, checked on every render call)
+    error_occurred: AtomicBool,
+    error_message: Option<CString>,
+    error_callback: Option<extern "C" fn(*mut c_void, *const c_char)>,
+    error_callback_context: *mut c_void,
 }
 
 impl GooeyEngine {
@@ -266,6 +273,11 @@ impl GooeyEngine {
                     TOM_PRESET_VOID,
                 ],
             ],
+            // Error state
+            error_occurred: AtomicBool::new(false),
+            error_message: None,
+            error_callback: None,
+            error_callback_context: std::ptr::null_mut(),
         }
     }
 
@@ -846,9 +858,122 @@ pub unsafe extern "C" fn gooey_engine_render(
         return;
     }
 
+    let engine_ref = &mut *engine;
+    let buffer_slice = slice::from_raw_parts_mut(buffer, frames as usize);
+
+    // If engine is already in error state, output silence
+    if engine_ref.error_occurred.load(Ordering::Relaxed) {
+        for sample in buffer_slice.iter_mut() {
+            *sample = 0.0;
+        }
+        return;
+    }
+
+    // Wrap render in catch_unwind to prevent panics from crossing the FFI boundary.
+    // AssertUnwindSafe is sound here: after a panic we mark the engine as permanently
+    // errored and never call render() on it again.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine_ref.render(buffer_slice);
+    }));
+
+    if let Err(panic_payload) = result {
+        let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+            format!("gooey: render panic: {}", s)
+        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+            format!("gooey: render panic: {}", s)
+        } else {
+            "gooey: render panic (unknown cause)".to_string()
+        };
+
+        let c_msg = CString::new(msg).unwrap_or_else(|_| {
+            CString::new("gooey: render panic (message contained null byte)").unwrap()
+        });
+        let msg_ptr = c_msg.as_ptr();
+
+        engine_ref.error_message = Some(c_msg);
+        engine_ref.error_occurred.store(true, Ordering::Release);
+
+        // Zero the output buffer
+        let buffer_slice = slice::from_raw_parts_mut(buffer, frames as usize);
+        for sample in buffer_slice.iter_mut() {
+            *sample = 0.0;
+        }
+
+        // Invoke error callback if registered
+        if let Some(callback) = engine_ref.error_callback {
+            callback(engine_ref.error_callback_context, msg_ptr);
+        }
+    }
+}
+
+// =============================================================================
+// Error handling
+// =============================================================================
+
+/// Register an error callback
+///
+/// The callback will be invoked if a fatal error (e.g., panic) occurs during rendering.
+/// It is called at most once, from the audio thread, immediately after the error.
+/// After the callback fires, the engine is in a terminal error state and must be freed
+/// with `gooey_engine_free` and recreated with `gooey_engine_new`.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `context` - Opaque user pointer passed back to the callback (can be null)
+/// * `callback` - C function pointer, or null to unregister
+///
+/// # Safety
+/// - `engine` must be a valid pointer returned by `gooey_engine_new`
+/// - `context` must remain valid for the lifetime of the engine
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_error_callback(
+    engine: *mut GooeyEngine,
+    context: *mut c_void,
+    callback: Option<extern "C" fn(*mut c_void, *const c_char)>,
+) {
+    if engine.is_null() {
+        return;
+    }
     let engine = &mut *engine;
-    let buffer = slice::from_raw_parts_mut(buffer, frames as usize);
-    engine.render(buffer);
+    engine.error_callback = callback;
+    engine.error_callback_context = context;
+}
+
+/// Check if the engine is in an error state
+///
+/// Returns true if a fatal error has occurred during rendering.
+/// Once in an error state, the engine outputs silence and must be freed and recreated.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_has_error(engine: *const GooeyEngine) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    (*engine).error_occurred.load(Ordering::Relaxed)
+}
+
+/// Get the error message if the engine is in an error state
+///
+/// Returns a pointer to a null-terminated C string describing the error,
+/// or null if no error has occurred. The string is owned by the engine
+/// and remains valid until `gooey_engine_free` is called.
+///
+/// # Safety
+/// - `engine` must be a valid pointer returned by `gooey_engine_new`
+/// - The returned string must not be freed by the caller
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_error_message(
+    engine: *const GooeyEngine,
+) -> *const c_char {
+    if engine.is_null() {
+        return std::ptr::null();
+    }
+    match &(*engine).error_message {
+        Some(msg) => msg.as_ptr(),
+        None => std::ptr::null(),
+    }
 }
 
 // =============================================================================
