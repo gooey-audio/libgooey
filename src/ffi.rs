@@ -143,6 +143,10 @@ pub struct GooeyEngine {
     // Pending MIDI events from the most recent render pass (pre-allocated, no audio-thread alloc)
     pending_midi_events: Vec<GooeyMidiEvent>,
 
+    // When false, sequencers still advance position but don't trigger instruments or emit MIDI events.
+    // Used to let host MIDI input drive instruments instead of the internal sequencer.
+    sequencer_triggers_enabled: bool,
+
     // Error state (set after a panic in render, checked on every render call)
     error_occurred: AtomicBool,
     error_message: Option<CString>,
@@ -294,6 +298,8 @@ impl GooeyEngine {
             ],
             // MIDI event buffer (pre-allocated for audio thread safety)
             pending_midi_events: Vec::with_capacity(MIDI_EVENT_CAPACITY),
+            // Sequencer triggers enabled by default (internal sequencer drives instruments)
+            sequencer_triggers_enabled: true,
             // Error state
             error_occurred: AtomicBool::new(false),
             error_message: None,
@@ -381,28 +387,32 @@ impl GooeyEngine {
                 .tick_with_settings()
                 .map(|trigger| (trigger.velocity, trigger.blend));
 
-            // Apply triggers with velocity after all sequencers have been ticked
-            if let Some((velocity, blend)) = kick_trigger {
-                self.apply_sequencer_blend_setting(INSTRUMENT_KICK, blend);
-                self.kick.trigger_with_velocity(self.current_time, velocity);
-                self.push_midi_event(INSTRUMENT_KICK, velocity, sample_offset);
-            }
-            if let Some((velocity, blend)) = snare_trigger {
-                self.apply_sequencer_blend_setting(INSTRUMENT_SNARE, blend);
-                self.snare
-                    .trigger_with_velocity(self.current_time, velocity);
-                self.push_midi_event(INSTRUMENT_SNARE, velocity, sample_offset);
-            }
-            if let Some((velocity, blend)) = hihat_trigger {
-                self.apply_sequencer_blend_setting(INSTRUMENT_HIHAT, blend);
-                self.hihat
-                    .trigger_with_velocity(self.current_time, velocity);
-                self.push_midi_event(INSTRUMENT_HIHAT, velocity, sample_offset);
-            }
-            if let Some((velocity, blend)) = tom_trigger {
-                self.apply_sequencer_blend_setting(INSTRUMENT_TOM, blend);
-                self.tom.trigger_with_velocity(self.current_time, velocity);
-                self.push_midi_event(INSTRUMENT_TOM, velocity, sample_offset);
+            // Apply triggers with velocity after all sequencers have been ticked.
+            // When sequencer triggers are disabled, skip instrument triggers and MIDI events
+            // so external host MIDI can drive the instruments instead.
+            if self.sequencer_triggers_enabled {
+                if let Some((velocity, blend)) = kick_trigger {
+                    self.apply_sequencer_blend_setting(INSTRUMENT_KICK, blend);
+                    self.kick.trigger_with_velocity(self.current_time, velocity);
+                    self.push_midi_event(INSTRUMENT_KICK, velocity, sample_offset);
+                }
+                if let Some((velocity, blend)) = snare_trigger {
+                    self.apply_sequencer_blend_setting(INSTRUMENT_SNARE, blend);
+                    self.snare
+                        .trigger_with_velocity(self.current_time, velocity);
+                    self.push_midi_event(INSTRUMENT_SNARE, velocity, sample_offset);
+                }
+                if let Some((velocity, blend)) = hihat_trigger {
+                    self.apply_sequencer_blend_setting(INSTRUMENT_HIHAT, blend);
+                    self.hihat
+                        .trigger_with_velocity(self.current_time, velocity);
+                    self.push_midi_event(INSTRUMENT_HIHAT, velocity, sample_offset);
+                }
+                if let Some((velocity, blend)) = tom_trigger {
+                    self.apply_sequencer_blend_setting(INSTRUMENT_TOM, blend);
+                    self.tom.trigger_with_velocity(self.current_time, velocity);
+                    self.push_midi_event(INSTRUMENT_TOM, velocity, sample_offset);
+                }
             }
 
             // Process LFOs and apply modulation to routed parameters
@@ -997,6 +1007,51 @@ pub unsafe extern "C" fn gooey_engine_drain_midi_events(
     }
 
     count as u32
+}
+
+// =============================================================================
+// Sequencer trigger control
+// =============================================================================
+
+/// Enable or disable note triggering from the internal sequencer.
+///
+/// When disabled (`enabled = false`):
+/// - The sequencer still advances its position each render cycle (step tracking works)
+/// - But the sequencer does NOT call instrument trigger functions or emit MIDI events
+///
+/// When enabled (`enabled = true`, the default):
+/// - Normal behavior — sequencer triggers instruments on active steps
+///
+/// Use this to let the host's MIDI input drive the instruments instead
+/// of the internal sequencer, while keeping position tracking intact.
+///
+/// # Safety
+/// - `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_sequencer_triggers_enabled(
+    engine: *mut GooeyEngine,
+    enabled: bool,
+) {
+    if engine.is_null() {
+        return;
+    }
+    (*engine).sequencer_triggers_enabled = enabled;
+}
+
+/// Query whether sequencer triggers are currently enabled.
+///
+/// Returns `true` if the engine pointer is null (safe default).
+///
+/// # Safety
+/// - `engine` must be a valid pointer returned by `gooey_engine_new`, or null
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_sequencer_triggers_enabled(
+    engine: *const GooeyEngine,
+) -> bool {
+    if engine.is_null() {
+        return true;
+    }
+    (*engine).sequencer_triggers_enabled
 }
 
 // =============================================================================
