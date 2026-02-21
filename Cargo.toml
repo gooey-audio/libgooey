@@ -16,6 +16,9 @@ crossterm = ["dep:crossterm"]
 visualization = ["glfw", "gl", "rustfft"]
 midi = ["midir"]  # MIDI input support for examples
 
+[profile.release]
+panic = "unwind"
+
 [build-dependencies]
 cbindgen = "0.26"
 
