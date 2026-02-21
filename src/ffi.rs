@@ -55,6 +55,10 @@ struct LfoRoute {
     depth: f32,
 }
 
+/// Maximum number of MIDI events buffered per render pass.
+/// Events beyond this limit are silently dropped to avoid audio-thread allocation.
+const MIDI_EVENT_CAPACITY: usize = 64;
+
 /// A MIDI event produced by the sequencer during render.
 ///
 /// Used to export note-on events to the host (e.g., AUv3 MIDI output).
@@ -289,12 +293,24 @@ impl GooeyEngine {
                 ],
             ],
             // MIDI event buffer (pre-allocated for audio thread safety)
-            pending_midi_events: Vec::with_capacity(64),
+            pending_midi_events: Vec::with_capacity(MIDI_EVENT_CAPACITY),
             // Error state
             error_occurred: AtomicBool::new(false),
             error_message: None,
             error_callback: None,
             error_callback_context: std::ptr::null_mut(),
+        }
+    }
+
+    /// Push a MIDI event without growing the buffer. Drops the event if at capacity.
+    #[inline]
+    fn push_midi_event(&mut self, instrument_index: u32, velocity: f32, sample_offset: u32) {
+        if self.pending_midi_events.len() < MIDI_EVENT_CAPACITY {
+            self.pending_midi_events.push(GooeyMidiEvent {
+                instrument_index,
+                velocity,
+                sample_offset,
+            });
         }
     }
 
@@ -306,40 +322,24 @@ impl GooeyEngine {
         // Manual triggers fire at sample_offset 0 (start of buffer)
         if self.kick_trigger_pending.swap(false, Ordering::Acquire) {
             let velocity = f32::from_bits(self.kick_trigger_velocity.load(Ordering::Acquire));
-            self.pending_midi_events.push(GooeyMidiEvent {
-                instrument_index: INSTRUMENT_KICK,
-                velocity,
-                sample_offset: 0,
-            });
+            self.push_midi_event(INSTRUMENT_KICK, velocity, 0);
             self.kick.trigger_with_velocity(self.current_time, velocity);
         }
         if self.snare_trigger_pending.swap(false, Ordering::Acquire) {
             let velocity = f32::from_bits(self.snare_trigger_velocity.load(Ordering::Acquire));
-            self.pending_midi_events.push(GooeyMidiEvent {
-                instrument_index: INSTRUMENT_SNARE,
-                velocity,
-                sample_offset: 0,
-            });
+            self.push_midi_event(INSTRUMENT_SNARE, velocity, 0);
             self.snare
                 .trigger_with_velocity(self.current_time, velocity);
         }
         if self.hihat_trigger_pending.swap(false, Ordering::Acquire) {
             let velocity = f32::from_bits(self.hihat_trigger_velocity.load(Ordering::Acquire));
-            self.pending_midi_events.push(GooeyMidiEvent {
-                instrument_index: INSTRUMENT_HIHAT,
-                velocity,
-                sample_offset: 0,
-            });
+            self.push_midi_event(INSTRUMENT_HIHAT, velocity, 0);
             self.hihat
                 .trigger_with_velocity(self.current_time, velocity);
         }
         if self.tom_trigger_pending.swap(false, Ordering::Acquire) {
             let velocity = f32::from_bits(self.tom_trigger_velocity.load(Ordering::Acquire));
-            self.pending_midi_events.push(GooeyMidiEvent {
-                instrument_index: INSTRUMENT_TOM,
-                velocity,
-                sample_offset: 0,
-            });
+            self.push_midi_event(INSTRUMENT_TOM, velocity, 0);
             self.tom.trigger_with_velocity(self.current_time, velocity);
         }
 
@@ -385,40 +385,24 @@ impl GooeyEngine {
             if let Some((velocity, blend)) = kick_trigger {
                 self.apply_sequencer_blend_setting(INSTRUMENT_KICK, blend);
                 self.kick.trigger_with_velocity(self.current_time, velocity);
-                self.pending_midi_events.push(GooeyMidiEvent {
-                    instrument_index: INSTRUMENT_KICK,
-                    velocity,
-                    sample_offset,
-                });
+                self.push_midi_event(INSTRUMENT_KICK, velocity, sample_offset);
             }
             if let Some((velocity, blend)) = snare_trigger {
                 self.apply_sequencer_blend_setting(INSTRUMENT_SNARE, blend);
                 self.snare
                     .trigger_with_velocity(self.current_time, velocity);
-                self.pending_midi_events.push(GooeyMidiEvent {
-                    instrument_index: INSTRUMENT_SNARE,
-                    velocity,
-                    sample_offset,
-                });
+                self.push_midi_event(INSTRUMENT_SNARE, velocity, sample_offset);
             }
             if let Some((velocity, blend)) = hihat_trigger {
                 self.apply_sequencer_blend_setting(INSTRUMENT_HIHAT, blend);
                 self.hihat
                     .trigger_with_velocity(self.current_time, velocity);
-                self.pending_midi_events.push(GooeyMidiEvent {
-                    instrument_index: INSTRUMENT_HIHAT,
-                    velocity,
-                    sample_offset,
-                });
+                self.push_midi_event(INSTRUMENT_HIHAT, velocity, sample_offset);
             }
             if let Some((velocity, blend)) = tom_trigger {
                 self.apply_sequencer_blend_setting(INSTRUMENT_TOM, blend);
                 self.tom.trigger_with_velocity(self.current_time, velocity);
-                self.pending_midi_events.push(GooeyMidiEvent {
-                    instrument_index: INSTRUMENT_TOM,
-                    velocity,
-                    sample_offset,
-                });
+                self.push_midi_event(INSTRUMENT_TOM, velocity, sample_offset);
             }
 
             // Process LFOs and apply modulation to routed parameters
@@ -1008,9 +992,10 @@ pub unsafe extern "C" fn gooey_engine_drain_midi_events(
             out_events,
             count,
         );
+        // Remove only the events that were copied; retain any overflow
+        engine_ref.pending_midi_events.drain(..count);
     }
 
-    engine_ref.pending_midi_events.clear();
     count as u32
 }
 
