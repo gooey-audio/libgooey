@@ -130,6 +130,10 @@ pub struct GooeyEngine {
     // Smoothed gain multipliers for click-free mute/solo transitions
     instrument_gains: [SmoothedParam; NUM_INSTRUMENTS],
 
+    // Per-instrument channel gain (0.0–1.0), applied after synthesis and blending.
+    // Acts as a mixer fader that the blend system cannot override.
+    instrument_channel_gains: [SmoothedParam; NUM_INSTRUMENTS],
+
     // Per-instrument preset blend state (2D X/Y pad interpolation)
     kick_blender: PresetBlender<KickConfig>,
     snare_blender: PresetBlender<SnareConfig>,
@@ -260,6 +264,10 @@ impl GooeyEngine {
             instrument_soloed: std::array::from_fn(|_| AtomicBool::new(false)),
             // Smoothed gains for click-free mute/solo transitions (10ms smoothing)
             instrument_gains: std::array::from_fn(|_| {
+                SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0)
+            }),
+            // Per-instrument channel gains (default 1.0 = unity, 10ms smoothing)
+            instrument_channel_gains: std::array::from_fn(|_| {
                 SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0)
             }),
             // Preset blend state
@@ -433,14 +441,18 @@ impl GooeyEngine {
                 }
             }
 
-            // Generate and mix audio from all instruments with mute/solo gains
+            // Generate and mix audio from all instruments with channel gains and mute/solo gains
             let mut output = self.kick.tick(self.current_time)
+                * self.instrument_channel_gains[INSTRUMENT_KICK as usize].tick()
                 * self.instrument_gains[INSTRUMENT_KICK as usize].tick()
                 + self.snare.tick(self.current_time)
+                    * self.instrument_channel_gains[INSTRUMENT_SNARE as usize].tick()
                     * self.instrument_gains[INSTRUMENT_SNARE as usize].tick()
                 + self.hihat.tick(self.current_time)
+                    * self.instrument_channel_gains[INSTRUMENT_HIHAT as usize].tick()
                     * self.instrument_gains[INSTRUMENT_HIHAT as usize].tick()
                 + self.tom.tick(self.current_time)
+                    * self.instrument_channel_gains[INSTRUMENT_TOM as usize].tick()
                     * self.instrument_gains[INSTRUMENT_TOM as usize].tick();
 
             // Apply global effects chain
@@ -2824,6 +2836,58 @@ pub unsafe extern "C" fn gooey_engine_get_instrument_solo(
         return false;
     }
     (*engine).instrument_soloed[instrument as usize].load(Ordering::Acquire)
+}
+
+// =============================================================================
+// Per-instrument channel gain (mixer fader, independent of blend system)
+// =============================================================================
+
+/// Set the channel gain for an instrument (0.0–1.0)
+///
+/// This gain is applied after synthesis and blending, so it acts as a mixer
+/// fader that the blend system cannot override. Smoothed over 10ms to prevent
+/// clicks.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+/// * `gain` - Gain level, clamped to 0.0–1.0
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_instrument_gain(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    gain: f32,
+) {
+    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+        return;
+    }
+    let gain = gain.clamp(0.0, 1.0);
+    (*engine).instrument_channel_gains[instrument as usize].set_target(gain);
+}
+
+/// Get the channel gain for an instrument
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+///
+/// # Returns
+/// The current gain target (0.0–1.0), or 1.0 if invalid instrument
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_instrument_gain(
+    engine: *const GooeyEngine,
+    instrument: u32,
+) -> f32 {
+    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+        return 1.0;
+    }
+    (*engine).instrument_channel_gains[instrument as usize].target()
 }
 
 // =============================================================================
