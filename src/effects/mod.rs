@@ -1,9 +1,11 @@
+pub mod compressor;
 pub mod delay;
 pub mod limiter;
 pub mod lowpass_filter;
 pub mod saturation;
 pub mod waveshaper;
 
+pub use self::compressor::*;
 pub use self::delay::*;
 pub use self::limiter::*;
 pub use self::lowpass_filter::*;

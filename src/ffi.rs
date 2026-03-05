@@ -3,7 +3,9 @@
 //! This module exposes the audio engine to C/Swift via C-compatible functions.
 //! Designed for integration with iOS (and other platforms in the future).
 
-use crate::effects::{BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect, TubeSaturation};
+use crate::effects::{
+    BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect, TubeCompressor, TubeSaturation,
+};
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
 use crate::instruments::{
@@ -372,13 +374,16 @@ pub struct GooeyEngine {
     // Per-channel sequencers (sample-accurate, synchronized)
     sequencers: [Sequencer; NUM_INSTRUMENTS],
 
-    // Global effects (applied in order: delay -> lowpass filter -> saturation -> limiter)
+    // Global effects (applied in order: delay -> lowpass filter -> saturation -> compressor -> limiter)
     delay: DelayEffect,
     delay_enabled: bool,
     lowpass_filter: LowpassFilterEffect,
     lowpass_filter_enabled: bool,
     saturation: TubeSaturation,
     saturation_enabled: bool,
+    compressor: TubeCompressor,
+    compressor_enabled: bool,
+    compressor_sidechain: u32,
     limiter: BrickWallLimiter,
 
     // Engine state
@@ -458,6 +463,10 @@ impl GooeyEngine {
         // Create saturation with default light warmth settings
         let saturation = TubeSaturation::new(sample_rate, 0.3, 0.4, 0.5);
 
+        // Create compressor with drum-friendly defaults
+        // threshold: -12 dB, ratio: 4:1, attack: 5ms, release: 100ms, mix: 0.5
+        let compressor = TubeCompressor::new(sample_rate, -12.0, 4.0, 5.0, 100.0, 0.5);
+
         // Create LFO pool (8 LFOs, all disabled by default with quarter note timing)
         let lfos = std::array::from_fn(|_| Lfo::with_sample_rate(sample_rate));
         let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] = std::array::from_fn(|_| Vec::new());
@@ -479,6 +488,9 @@ impl GooeyEngine {
             lowpass_filter_enabled: false,
             saturation,
             saturation_enabled: true,
+            compressor,
+            compressor_enabled: true,
+            compressor_sidechain: COMPRESSOR_SIDECHAIN_NONE,
             limiter: BrickWallLimiter::new(1.0),
             sample_rate,
             bpm,
@@ -605,12 +617,15 @@ impl GooeyEngine {
                 }
             }
 
-            // Generate and mix audio from all channels with gains and mute/solo
+            // Generate audio from each channel with gains and mute/solo
+            let mut channel_outs = [0.0_f32; NUM_INSTRUMENTS];
             let mut output = 0.0;
             for ch in 0..NUM_INSTRUMENTS {
-                output += self.channels[ch].tick(self.current_time)
+                let ch_out = self.channels[ch].tick(self.current_time)
                     * self.instrument_channel_gains[ch].tick()
                     * self.instrument_gains[ch].tick();
+                channel_outs[ch] = ch_out;
+                output += ch_out;
             }
 
             // Apply global effects chain
@@ -622,6 +637,17 @@ impl GooeyEngine {
             }
             if self.saturation_enabled {
                 output = self.saturation.process(output);
+            }
+
+            // Compressor (if enabled), with optional sidechain from individual channel
+            if self.compressor_enabled {
+                let sc = self.compressor_sidechain as usize;
+                output = if sc < NUM_INSTRUMENTS {
+                    self.compressor
+                        .process_with_sidechain(output, channel_outs[sc])
+                } else {
+                    self.compressor.process(output)
+                };
             }
 
             // Limiter (always on - protects output from clipping)
@@ -750,8 +776,10 @@ pub const EFFECT_LOWPASS_FILTER: u32 = 0;
 pub const EFFECT_DELAY: u32 = 1;
 /// Global effect: Saturation
 pub const EFFECT_SATURATION: u32 = 2;
+/// Global effect: Compressor
+pub const EFFECT_COMPRESSOR: u32 = 3;
 /// Total number of global effects
-pub const EFFECT_COUNT: u32 = 3;
+pub const EFFECT_COUNT: u32 = 4;
 
 // =============================================================================
 // Lowpass filter parameter indices (must match Swift FilterParam enum)
@@ -783,6 +811,24 @@ pub const SATURATION_PARAM_DRIVE: u32 = 0;
 pub const SATURATION_PARAM_WARMTH: u32 = 1;
 /// Saturation parameter: wet/dry mix (0.0-1.0)
 pub const SATURATION_PARAM_MIX: u32 = 2;
+
+// =============================================================================
+// Compressor parameter indices (must match Swift CompressorParam enum)
+// =============================================================================
+
+/// Compressor parameter: threshold in dB (-60.0 to 0.0)
+pub const COMPRESSOR_PARAM_THRESHOLD: u32 = 0;
+/// Compressor parameter: ratio (1.0 to 20.0)
+pub const COMPRESSOR_PARAM_RATIO: u32 = 1;
+/// Compressor parameter: attack time in ms (0.1 to 100.0)
+pub const COMPRESSOR_PARAM_ATTACK: u32 = 2;
+/// Compressor parameter: release time in ms (5.0 to 1000.0)
+pub const COMPRESSOR_PARAM_RELEASE: u32 = 3;
+/// Compressor parameter: wet/dry mix (0.0 to 1.0)
+pub const COMPRESSOR_PARAM_MIX: u32 = 4;
+
+/// No sidechain — compressor uses main mix as input (default)
+pub const COMPRESSOR_SIDECHAIN_NONE: u32 = 0xFFFFFFFF;
 
 // =============================================================================
 // Kick drum parameter indices (must match Swift KickParam enum)
@@ -1627,6 +1673,12 @@ pub unsafe extern "C" fn gooey_engine_set_tom_param(
 ///   - SATURATION_PARAM_DRIVE (0): 0.0-1.0
 ///   - SATURATION_PARAM_WARMTH (1): 0.0-1.0
 ///   - SATURATION_PARAM_MIX (2): 0.0-1.0
+/// - EFFECT_COMPRESSOR (3):
+///   - COMPRESSOR_PARAM_THRESHOLD (0): -60.0 to 0.0 dB
+///   - COMPRESSOR_PARAM_RATIO (1): 1.0-20.0
+///   - COMPRESSOR_PARAM_ATTACK (2): 0.1-100.0 ms
+///   - COMPRESSOR_PARAM_RELEASE (3): 5.0-1000.0 ms
+///   - COMPRESSOR_PARAM_MIX (4): 0.0-1.0
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -1659,6 +1711,14 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
             SATURATION_PARAM_DRIVE => engine.saturation.set_drive(value),
             SATURATION_PARAM_WARMTH => engine.saturation.set_warmth(value),
             SATURATION_PARAM_MIX => engine.saturation.set_mix(value),
+            _ => {} // Unknown parameter, ignore
+        },
+        EFFECT_COMPRESSOR => match param {
+            COMPRESSOR_PARAM_THRESHOLD => engine.compressor.set_threshold(value),
+            COMPRESSOR_PARAM_RATIO => engine.compressor.set_ratio(value),
+            COMPRESSOR_PARAM_ATTACK => engine.compressor.set_attack(value),
+            COMPRESSOR_PARAM_RELEASE => engine.compressor.set_release(value),
+            COMPRESSOR_PARAM_MIX => engine.compressor.set_mix(value),
             _ => {} // Unknown parameter, ignore
         },
         _ => {} // Unknown effect, ignore
@@ -1709,6 +1769,14 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
             SATURATION_PARAM_MIX => engine.saturation.get_mix(),
             _ => -1.0, // Unknown parameter
         },
+        EFFECT_COMPRESSOR => match param {
+            COMPRESSOR_PARAM_THRESHOLD => engine.compressor.get_threshold(),
+            COMPRESSOR_PARAM_RATIO => engine.compressor.get_ratio(),
+            COMPRESSOR_PARAM_ATTACK => engine.compressor.get_attack(),
+            COMPRESSOR_PARAM_RELEASE => engine.compressor.get_release(),
+            COMPRESSOR_PARAM_MIX => engine.compressor.get_mix(),
+            _ => -1.0, // Unknown parameter
+        },
         _ => -1.0, // Unknown effect
     }
 }
@@ -1741,6 +1809,7 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_enabled(
         EFFECT_LOWPASS_FILTER => engine.lowpass_filter_enabled = enabled,
         EFFECT_DELAY => engine.delay_enabled = enabled,
         EFFECT_SATURATION => engine.saturation_enabled = enabled,
+        EFFECT_COMPRESSOR => engine.compressor_enabled = enabled,
         _ => {} // Unknown effect, ignore
     }
 }
@@ -1771,8 +1840,56 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_enabled(
         EFFECT_LOWPASS_FILTER => engine.lowpass_filter_enabled,
         EFFECT_DELAY => engine.delay_enabled,
         EFFECT_SATURATION => engine.saturation_enabled,
+        EFFECT_COMPRESSOR => engine.compressor_enabled,
         _ => false, // Unknown effect
     }
+}
+
+// =============================================================================
+// Compressor sidechain control
+// =============================================================================
+
+/// Set the compressor sidechain source instrument
+///
+/// When set to an instrument (INSTRUMENT_KICK, INSTRUMENT_SNARE, INSTRUMENT_HIHAT,
+/// INSTRUMENT_TOM), the compressor's envelope follower tracks that instrument's output
+/// while gain reduction is applied to the full mix. This enables techniques like
+/// kick-driven ducking.
+///
+/// Use COMPRESSOR_SIDECHAIN_NONE (0xFFFFFFFF) to use the main mix as input (default).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_compressor_sidechain(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+    engine.compressor_sidechain = instrument;
+}
+
+/// Get the current compressor sidechain source
+///
+/// # Returns
+/// An INSTRUMENT_* constant, or COMPRESSOR_SIDECHAIN_NONE if using the main mix
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_compressor_sidechain(
+    engine: *mut GooeyEngine,
+) -> u32 {
+    if engine.is_null() {
+        return COMPRESSOR_SIDECHAIN_NONE;
+    }
+
+    let engine = &*engine;
+    engine.compressor_sidechain
 }
 
 // =============================================================================
