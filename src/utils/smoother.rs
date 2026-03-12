@@ -93,6 +93,14 @@ impl SmoothedParam {
         self.settled = true;
     }
 
+    /// Snap current value to target without smoothing.
+    /// Use when parameters were set via set_target() but the transition
+    /// should complete instantly (e.g., per-step sequencer blend overrides).
+    pub fn snap(&mut self) {
+        self.current = self.target;
+        self.settled = true;
+    }
+
     /// Set target from a normalized 0-1 value (maps to parameter range)
     pub fn set_normalized(&mut self, normalized: f32) {
         let value = self.min + normalized.clamp(0.0, 1.0) * (self.max - self.min);
@@ -258,5 +266,16 @@ mod tests {
 
         smoother.set_bipolar(1.0); // Max
         assert_eq!(smoother.target(), 100.0);
+    }
+
+    #[test]
+    fn test_snap() {
+        let mut smoother = SmoothedParam::new(0.0, 0.0, 1.0, 44100.0, 10.0);
+        smoother.set_target(0.75);
+        assert!(!smoother.is_settled());
+        assert_eq!(smoother.get(), 0.0); // current still at initial value
+        smoother.snap();
+        assert_eq!(smoother.get(), 0.75);
+        assert!(smoother.is_settled());
     }
 }

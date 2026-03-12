@@ -676,6 +676,28 @@ impl SnareParams {
             && self.amp_decay.is_settled()
             && self.amp_decay_curve.is_settled()
     }
+
+    /// Snap all smoothed parameters to their targets instantly.
+    pub fn snap_all(&mut self) {
+        self.frequency.snap();
+        self.decay.snap();
+        self.brightness.snap();
+        self.volume.snap();
+        self.tonal.snap();
+        self.noise.snap();
+        self.pitch_drop.snap();
+        self.tonal_decay.snap();
+        self.tonal_decay_curve.snap();
+        self.noise_decay.snap();
+        self.noise_tail_decay.snap();
+        self.filter_cutoff.snap();
+        self.filter_resonance.snap();
+        self.xfade.snap();
+        self.phase_mod_amount.snap();
+        self.overdrive.snap();
+        self.amp_decay.snap();
+        self.amp_decay_curve.snap();
+    }
 }
 
 pub struct SnareDrum {
@@ -823,6 +845,11 @@ impl SnareDrum {
         self.params
             .amp_decay_curve
             .set_target(config.amp_decay_curve);
+    }
+
+    /// Snap all smoothed parameters to their targets instantly.
+    pub fn snap_params(&mut self) {
+        self.params.snap_all();
     }
 
     /// Trigger the snare drum at default velocity (0.5)
