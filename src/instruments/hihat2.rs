@@ -218,6 +218,15 @@ impl HiHat2Params {
         ranges::denormalize(self.tone.get(), ranges::TONE_MIN, ranges::TONE_MAX)
     }
 
+    /// Snap all smoothed parameters to their targets instantly.
+    pub fn snap_all(&mut self) {
+        self.pitch.snap();
+        self.decay.snap();
+        self.attack.snap();
+        self.tone.snap();
+        self.volume.snap();
+    }
+
     pub fn to_config(&self, noise_color: NoiseColor, filter_slope: FilterSlope) -> HiHat2Config {
         HiHat2Config {
             pitch: self.pitch.get(),
@@ -366,6 +375,11 @@ impl HiHat2 {
         self.params.volume.set_target(config.volume);
         self.noise_color = config.noise_color;
         self.filter_slope = config.filter_slope;
+    }
+
+    /// Snap all smoothed parameters to their targets instantly.
+    pub fn snap_params(&mut self) {
+        self.params.snap_all();
     }
 
     pub fn set_pitch(&mut self, pitch: f32) {

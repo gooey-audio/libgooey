@@ -535,6 +535,26 @@ impl KickParams {
             && self.amp_decay_curve.is_settled()
     }
 
+    /// Snap all smoothed parameters to their targets instantly.
+    pub fn snap_all(&mut self) {
+        self.frequency.snap();
+        self.punch.snap();
+        self.sub.snap();
+        self.click.snap();
+        self.oscillator_decay.snap();
+        self.pitch_envelope_amount.snap();
+        self.pitch_envelope_curve.snap();
+        self.volume.snap();
+        self.pitch_start_ratio.snap();
+        self.phase_mod_amount.snap();
+        self.noise_amount.snap();
+        self.noise_cutoff.snap();
+        self.noise_resonance.snap();
+        self.overdrive.snap();
+        self.amp_decay.snap();
+        self.amp_decay_curve.snap();
+    }
+
     /// Get a snapshot of current normalized values as a KickConfig
     pub fn to_config(&self) -> KickConfig {
         KickConfig {
@@ -858,6 +878,11 @@ impl KickDrum {
         // not during parameter changes. This prevents pops/discontinuities when
         // parameters change while a sound is still decaying.
         // Smoothable params (volume, filter, mix) update in real-time via apply_params().
+    }
+
+    /// Snap all smoothed parameters to their targets instantly.
+    pub fn snap_params(&mut self) {
+        self.params.snap_all();
     }
 
     /// Get current config snapshot (reads current smoothed values)
