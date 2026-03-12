@@ -606,9 +606,10 @@ impl GooeyEngine {
                 for ch in 0..NUM_INSTRUMENTS {
                     if let Some((velocity, blend)) = seq_triggers[ch] {
                         self.apply_sequencer_blend_setting(ch as u32, blend);
-                        if blend.is_some() {
-                            self.channels[ch].snap_params();
-                        }
+                        // Snap params so the blend position takes effect
+                        // immediately at note attack, whether it's a per-step
+                        // override or a return to the global blend position.
+                        self.channels[ch].snap_params();
                         self.channels[ch].trigger_with_velocity(self.current_time, velocity);
                         self.push_midi_event(ch as u32, velocity, sample_offset);
                     }
