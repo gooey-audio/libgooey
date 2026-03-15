@@ -891,7 +891,7 @@ impl KickDrum {
     }
 
     /// Trigger at full velocity (convenience method)
-    pub fn trigger(&mut self, time: f32) {
+    pub fn trigger(&mut self, time: f64) {
         self.trigger_with_velocity(time, 0.5);
     }
 
@@ -900,7 +900,7 @@ impl KickDrum {
     /// Velocity affects the amplitude envelope decay time:
     /// - Higher velocity = shorter decay (tighter, punchier sound)
     /// - Lower velocity = longer decay (deeper, more sustained sound)
-    pub fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+    pub fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         self.current_velocity = velocity.clamp(0.0, 1.0);
         self.is_active = true;
 
@@ -1016,7 +1016,7 @@ impl KickDrum {
         self.pink_noise.reset();
     }
 
-    pub fn release(&mut self, time: f32) {
+    pub fn release(&mut self, time: f64) {
         if self.is_active {
             self.sub_oscillator.release(time);
             self.punch_oscillator.release(time);
@@ -1025,7 +1025,7 @@ impl KickDrum {
         }
     }
 
-    pub fn tick(&mut self, current_time: f32) -> f32 {
+    pub fn tick(&mut self, current_time: f64) -> f32 {
         // Always tick smoothers (even when not active, to settle values)
         self.params.tick();
 
@@ -1231,11 +1231,11 @@ impl KickDrum {
 }
 
 impl crate::engine::Instrument for KickDrum {
-    fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         KickDrum::trigger_with_velocity(self, time, velocity);
     }
 
-    fn tick(&mut self, current_time: f32) -> f32 {
+    fn tick(&mut self, current_time: f64) -> f32 {
         self.tick(current_time)
     }
 

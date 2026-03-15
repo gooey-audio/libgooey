@@ -410,11 +410,11 @@ impl HiHat2 {
         self.filter_slope = filter_slope;
     }
 
-    pub fn trigger(&mut self, time: f32) {
+    pub fn trigger(&mut self, time: f64) {
         self.trigger_with_velocity(time, 1.0);
     }
 
-    pub fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+    pub fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         self.is_active = true;
         self.current_velocity = velocity.clamp(0.0, 1.0);
 
@@ -433,7 +433,7 @@ impl HiHat2 {
         self.svf.reset();
     }
 
-    pub fn tick(&mut self, current_time: f32) -> f32 {
+    pub fn tick(&mut self, current_time: f64) -> f32 {
         self.params.tick();
 
         if !self.is_active {
@@ -504,11 +504,11 @@ impl HiHat2 {
 }
 
 impl crate::engine::Instrument for HiHat2 {
-    fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         HiHat2::trigger_with_velocity(self, time, velocity);
     }
 
-    fn tick(&mut self, current_time: f32) -> f32 {
+    fn tick(&mut self, current_time: f64) -> f32 {
         self.tick(current_time)
     }
 

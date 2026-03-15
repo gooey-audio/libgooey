@@ -98,7 +98,7 @@ impl ChannelInstrument {
     }
 
     /// Trigger the instrument with a given velocity.
-    fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         match self {
             Self::Kick(k) => k.trigger_with_velocity(time, velocity),
             Self::Snare(s) => s.trigger_with_velocity(time, velocity),
@@ -119,7 +119,7 @@ impl ChannelInstrument {
     }
 
     /// Generate the next audio sample.
-    fn tick(&mut self, current_time: f32) -> f32 {
+    fn tick(&mut self, current_time: f64) -> f32 {
         match self {
             Self::Kick(k) => k.tick(current_time),
             Self::Snare(s) => s.tick(current_time),
@@ -401,7 +401,7 @@ pub struct GooeyEngine {
     sample_rate: f32,
     bpm: f32,
     swing: f32,
-    current_time: f32,
+    current_time: f64,
 
     // Per-channel manual trigger flags and velocities
     trigger_pending: [AtomicBool; NUM_INSTRUMENTS],
@@ -574,7 +574,7 @@ impl GooeyEngine {
             }
         }
 
-        let sample_period = 1.0 / self.sample_rate;
+        let sample_period = 1.0 / self.sample_rate as f64;
 
         // Update mute/solo gain targets (check once per buffer for efficiency)
         let any_soloed = self

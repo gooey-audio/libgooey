@@ -423,11 +423,11 @@ impl TomDrum {
         self.configure_oscillators(freq_hz, decay_secs, config.pitch_drop);
     }
 
-    pub fn trigger(&mut self, time: f32) {
+    pub fn trigger(&mut self, time: f64) {
         self.trigger_with_velocity_internal(time, 1.0);
     }
 
-    fn trigger_with_velocity_internal(&mut self, time: f32, velocity: f32) {
+    fn trigger_with_velocity_internal(&mut self, time: f64, velocity: f32) {
         self.is_active = true;
         self.current_velocity = velocity.clamp(0.0, 1.0);
 
@@ -471,7 +471,7 @@ impl TomDrum {
         self.amplitude_envelope.trigger(time);
     }
 
-    pub fn release(&mut self, time: f32) {
+    pub fn release(&mut self, time: f64) {
         if self.is_active {
             self.tonal_oscillator.release(time);
             self.punch_oscillator.release(time);
@@ -480,7 +480,7 @@ impl TomDrum {
         }
     }
 
-    pub fn tick(&mut self, current_time: f32) -> f32 {
+    pub fn tick(&mut self, current_time: f64) -> f32 {
         // Tick smoothed parameters for click-free modulation
         self.params.tick();
 
@@ -575,11 +575,11 @@ impl TomDrum {
 }
 
 impl crate::engine::Instrument for TomDrum {
-    fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         self.trigger_with_velocity_internal(time, velocity);
     }
 
-    fn tick(&mut self, current_time: f32) -> f32 {
+    fn tick(&mut self, current_time: f64) -> f32 {
         self.tick(current_time)
     }
 

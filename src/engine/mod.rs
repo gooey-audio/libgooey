@@ -28,15 +28,15 @@ pub trait Instrument: Send {
     /// # Arguments
     /// * `time` - The current audio time in seconds
     /// * `velocity` - Trigger velocity from 0.0 (softest) to 1.0 (hardest)
-    fn trigger_with_velocity(&mut self, time: f32, velocity: f32);
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32);
 
     /// Trigger the instrument at full velocity (convenience method)
-    fn trigger(&mut self, time: f32) {
+    fn trigger(&mut self, time: f64) {
         self.trigger_with_velocity(time, 1.0);
     }
 
     /// Generate one sample of audio at the current time
-    fn tick(&mut self, current_time: f32) -> f32;
+    fn tick(&mut self, current_time: f64) -> f32;
 
     /// Check if the instrument is currently active
     fn is_active(&self) -> bool;
@@ -253,7 +253,7 @@ impl Engine {
 
     /// Generate one sample of audio at the given time
     /// This is called by the audio output on every sample
-    pub fn tick(&mut self, current_time: f32) -> f32 {
+    pub fn tick(&mut self, current_time: f64) -> f32 {
         // Process LFOs and apply modulation
         for lfo in &mut self.lfos {
             let lfo_value = lfo.tick();

@@ -66,7 +66,7 @@ pub struct Tom2 {
     envelope: MaxCurveEnvelope,
     is_active: bool,
     #[allow(dead_code)]
-    trigger_time: f32,
+    trigger_time: f64,
 
     // Standalone triangle oscillator phase (matches Max's tri~ outside morphoscillator)
     tri_phase: f32,
@@ -410,7 +410,7 @@ impl Tom2 {
 }
 
 impl Instrument for Tom2 {
-    fn trigger_with_velocity(&mut self, time: f32, _velocity: f32) {
+    fn trigger_with_velocity(&mut self, time: f64, _velocity: f32) {
         self.is_active = true;
         self.trigger_time = time;
         self.past_attack = false; // Reset attack phase tracking
@@ -432,7 +432,7 @@ impl Instrument for Tom2 {
         self.envelope.trigger(time);
     }
 
-    fn tick(&mut self, current_time: f32) -> f32 {
+    fn tick(&mut self, current_time: f64) -> f32 {
         if !self.is_active {
             return 0.0;
         }
