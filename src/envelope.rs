@@ -74,8 +74,8 @@ pub struct Envelope {
     pub decay_curve: EnvelopeCurve,  // Curve shape for decay phase
     pub current_time: f32,           // current time in the envelope
     pub is_active: bool,
-    pub trigger_time: f32,               // when the envelope was triggered
-    pub release_time_start: Option<f32>, // when release was triggered
+    pub trigger_time: f64,               // when the envelope was triggered
+    pub release_time_start: Option<f64>, // when release was triggered
 }
 
 impl Envelope {
@@ -138,30 +138,30 @@ impl Envelope {
         self.release_time = release_time;
     }
 
-    pub fn trigger(&mut self, time: f32) {
+    pub fn trigger(&mut self, time: f64) {
         self.is_active = true;
         self.trigger_time = time;
         self.current_time = 0.0;
         self.release_time_start = None;
     }
 
-    pub fn release(&mut self, time: f32) {
+    pub fn release(&mut self, time: f64) {
         if self.is_active && self.release_time_start.is_none() {
             self.release_time_start = Some(time);
         }
     }
 
-    pub fn get_amplitude(&mut self, current_time: f32) -> f32 {
+    pub fn get_amplitude(&mut self, current_time: f64) -> f32 {
         if !self.is_active {
             return 0.0;
         }
 
-        let elapsed = current_time - self.trigger_time;
+        let elapsed = (current_time - self.trigger_time) as f32;
         self.current_time = elapsed;
 
         // Check if we're in release phase
         if let Some(release_start) = self.release_time_start {
-            let release_elapsed = current_time - release_start;
+            let release_elapsed = (current_time - release_start) as f32;
             if release_elapsed < self.release_time {
                 // Calculate amplitude at release start
                 let release_amplitude = if elapsed < self.attack_time {

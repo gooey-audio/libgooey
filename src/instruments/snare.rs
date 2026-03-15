@@ -853,7 +853,7 @@ impl SnareDrum {
     }
 
     /// Trigger the snare drum at default velocity (0.5)
-    pub fn trigger(&mut self, time: f32) {
+    pub fn trigger(&mut self, time: f64) {
         self.trigger_with_velocity(time, 0.5);
     }
 
@@ -864,7 +864,7 @@ impl SnareDrum {
     /// - Pitch envelope: Higher velocity = faster pitch decay (sharper attack)
     /// - Crack volume: Higher velocity = more crack (brighter, snappier)
     /// - Amplitude: Perceptually linear scaling via sqrt
-    pub fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+    pub fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         self.current_velocity = velocity.clamp(0.0, 1.0);
         self.is_active = true;
 
@@ -1022,7 +1022,7 @@ impl SnareDrum {
         self.noise_filter.reset();
     }
 
-    pub fn release(&mut self, time: f32) {
+    pub fn release(&mut self, time: f64) {
         if self.is_active {
             self.tonal_oscillator.release(time);
             self.noise_oscillator.release(time);
@@ -1037,7 +1037,7 @@ impl SnareDrum {
         }
     }
 
-    pub fn tick(&mut self, current_time: f32) -> f32 {
+    pub fn tick(&mut self, current_time: f64) -> f32 {
         // Always tick smoothers (even when not active, to settle values)
         // Returns true if any params are still changing
         let params_changing = self.params.tick();
@@ -1289,11 +1289,11 @@ impl SnareDrum {
 }
 
 impl crate::engine::Instrument for SnareDrum {
-    fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         SnareDrum::trigger_with_velocity(self, time, velocity);
     }
 
-    fn tick(&mut self, current_time: f32) -> f32 {
+    fn tick(&mut self, current_time: f64) -> f32 {
         self.tick(current_time)
     }
 

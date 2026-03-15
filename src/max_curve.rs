@@ -76,11 +76,11 @@ impl EnvelopeSegment {
 pub struct MaxCurveEnvelope {
     segments: Vec<EnvelopeSegment>,
     current_segment: usize,
-    segment_start_time: f32,
+    segment_start_time: f64,
     segment_start_value: f32,
     current_value: f32,
     pub is_active: bool,
-    trigger_time: f32,
+    trigger_time: f64,
     initial_value: f32,
 }
 
@@ -113,7 +113,7 @@ impl MaxCurveEnvelope {
     }
 
     /// Trigger the envelope at the given time
-    pub fn trigger(&mut self, time: f32) {
+    pub fn trigger(&mut self, time: f64) {
         self.is_active = true;
         self.trigger_time = time;
         self.current_segment = 0;
@@ -123,7 +123,7 @@ impl MaxCurveEnvelope {
     }
 
     /// Get the current envelope value at the given time
-    pub fn get_value(&mut self, current_time: f32) -> f32 {
+    pub fn get_value(&mut self, current_time: f64) -> f32 {
         if !self.is_active {
             return self.current_value;
         }
@@ -137,13 +137,13 @@ impl MaxCurveEnvelope {
             }
 
             let segment = &self.segments[self.current_segment];
-            let elapsed_in_segment = current_time - self.segment_start_time;
+            let elapsed_in_segment = (current_time - self.segment_start_time) as f32;
 
             if elapsed_in_segment >= segment.duration_secs {
                 // Move to next segment
                 self.segment_start_value = segment.target_value;
                 self.current_value = segment.target_value;
-                self.segment_start_time += segment.duration_secs;
+                self.segment_start_time += segment.duration_secs as f64;
                 self.current_segment += 1;
                 continue;
             }

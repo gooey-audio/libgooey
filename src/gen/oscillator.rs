@@ -143,13 +143,13 @@ impl Oscillator {
         (normalized * 2.0) - 1.0
     }
 
-    pub fn trigger(&mut self, time: f32) {
+    pub fn trigger(&mut self, time: f64) {
         self.envelope.trigger(time);
         // Reset phase for consistent sound on each trigger
         self.current_sample_index = 0.0;
     }
 
-    pub fn release(&mut self, time: f32) {
+    pub fn release(&mut self, time: f64) {
         self.envelope.release(time);
     }
 
@@ -177,14 +177,14 @@ impl Oscillator {
         self.enabled
     }
 
-    pub fn tick(&mut self, current_time: f32) -> f32 {
+    pub fn tick(&mut self, current_time: f64) -> f32 {
         if !self.enabled {
             return 0.0;
         }
 
         // Update phase based on time elapsed since trigger
         let elapsed_since_trigger = if self.envelope.is_active {
-            current_time - self.envelope.trigger_time
+            (current_time - self.envelope.trigger_time) as f32
         } else {
             0.0
         };
