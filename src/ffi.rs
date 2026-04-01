@@ -9,7 +9,8 @@ use crate::effects::{
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
 use crate::instruments::{
-    HiHat2, HiHat2Config, KickConfig, KickDrum, SnareConfig, SnareDrum, Tom2, Tom2Config,
+    BassConfig, BassSynth, HiHat2, HiHat2Config, KickConfig, KickDrum, SnareConfig, SnareDrum,
+    Tom2, Tom2Config,
 };
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CString};
@@ -84,6 +85,7 @@ enum ChannelInstrument {
     Snare(SnareDrum),
     HiHat(HiHat2),
     Tom(Tom2),
+    Bass(BassSynth),
 }
 
 impl ChannelInstrument {
@@ -94,6 +96,7 @@ impl ChannelInstrument {
             Self::Snare(_) => INSTRUMENT_SNARE,
             Self::HiHat(_) => INSTRUMENT_HIHAT,
             Self::Tom(_) => INSTRUMENT_TOM,
+            Self::Bass(_) => INSTRUMENT_BASS,
         }
     }
 
@@ -104,6 +107,7 @@ impl ChannelInstrument {
             Self::Snare(s) => s.trigger_with_velocity(time, velocity),
             Self::HiHat(h) => h.trigger_with_velocity(time, velocity),
             Self::Tom(t) => t.trigger_with_velocity(time, velocity),
+            Self::Bass(b) => b.trigger_with_velocity(time, velocity),
         }
     }
 
@@ -115,6 +119,7 @@ impl ChannelInstrument {
             Self::Snare(s) => s.snap_params(),
             Self::HiHat(h) => h.snap_params(),
             Self::Tom(_) => {} // Tom2 uses plain f32, already immediate
+            Self::Bass(b) => b.snap_params(),
         }
     }
 
@@ -125,6 +130,7 @@ impl ChannelInstrument {
             Self::Snare(s) => s.tick(current_time),
             Self::HiHat(h) => h.tick(current_time),
             Self::Tom(t) => t.tick(current_time),
+            Self::Bass(b) => b.tick(current_time),
         }
     }
 
@@ -187,6 +193,24 @@ impl ChannelInstrument {
                     _ => {}
                 }
             }
+            Self::Bass(b) => match param {
+                BASS_PARAM_FREQUENCY => b.set_frequency(value),
+                BASS_PARAM_SUB_LEVEL => b.set_sub_level(value),
+                BASS_PARAM_OSC_LEVEL => b.set_osc_level(value),
+                BASS_PARAM_DETUNE_LEVEL => b.set_detune_level(value),
+                BASS_PARAM_DETUNE_AMOUNT => b.set_detune_amount(value),
+                BASS_PARAM_OSC_SHAPE => b.set_osc_shape(value),
+                BASS_PARAM_FILTER_CUTOFF => b.set_filter_cutoff(value),
+                BASS_PARAM_FILTER_RESONANCE => b.set_filter_resonance(value),
+                BASS_PARAM_FILTER_ENV_AMOUNT => b.set_filter_env_amount(value),
+                BASS_PARAM_FILTER_ENV_DECAY => b.set_filter_env_decay(value),
+                BASS_PARAM_FILTER_ENV_CURVE => b.set_filter_env_curve(value),
+                BASS_PARAM_AMP_DECAY => b.set_amp_decay(value),
+                BASS_PARAM_AMP_DECAY_CURVE => b.set_amp_decay_curve(value),
+                BASS_PARAM_OVERDRIVE => b.set_overdrive(value),
+                BASS_PARAM_VOLUME => b.set_volume(value),
+                _ => {}
+            },
         }
     }
 
@@ -247,6 +271,24 @@ impl ChannelInstrument {
                     _ => {}
                 }
             }
+            Self::Bass(b) => match param {
+                BASS_PARAM_FREQUENCY => b.params.frequency.set_bipolar(value),
+                BASS_PARAM_SUB_LEVEL => b.params.sub_level.set_bipolar(value),
+                BASS_PARAM_OSC_LEVEL => b.params.osc_level.set_bipolar(value),
+                BASS_PARAM_DETUNE_LEVEL => b.params.detune_level.set_bipolar(value),
+                BASS_PARAM_DETUNE_AMOUNT => b.params.detune_amount.set_bipolar(value),
+                BASS_PARAM_OSC_SHAPE => b.params.osc_shape.set_bipolar(value),
+                BASS_PARAM_FILTER_CUTOFF => b.params.filter_cutoff.set_bipolar(value),
+                BASS_PARAM_FILTER_RESONANCE => b.params.filter_resonance.set_bipolar(value),
+                BASS_PARAM_FILTER_ENV_AMOUNT => b.params.filter_env_amount.set_bipolar(value),
+                BASS_PARAM_FILTER_ENV_DECAY => b.params.filter_env_decay.set_bipolar(value),
+                BASS_PARAM_FILTER_ENV_CURVE => b.params.filter_env_curve.set_bipolar(value),
+                BASS_PARAM_AMP_DECAY => b.params.amp_decay.set_bipolar(value),
+                BASS_PARAM_AMP_DECAY_CURVE => b.params.amp_decay_curve.set_bipolar(value),
+                BASS_PARAM_OVERDRIVE => b.params.overdrive.set_bipolar(value),
+                BASS_PARAM_VOLUME => b.params.volume.set_bipolar(value),
+                _ => {}
+            },
         }
     }
 }
@@ -257,6 +299,7 @@ enum ChannelBlender {
     Snare(PresetBlender<SnareConfig>),
     HiHat(PresetBlender<HiHat2Config>),
     Tom(PresetBlender<Tom2Config>),
+    Bass(PresetBlender<BassConfig>),
 }
 
 impl ChannelBlender {
@@ -267,6 +310,7 @@ impl ChannelBlender {
             (Self::Snare(b), ChannelInstrument::Snare(s)) => s.set_config(b.blend(x, y)),
             (Self::HiHat(b), ChannelInstrument::HiHat(h)) => h.set_config(b.blend(x, y)),
             (Self::Tom(b), ChannelInstrument::Tom(t)) => t.set_config(b.blend(x, y)),
+            (Self::Bass(b), ChannelInstrument::Bass(bs)) => bs.set_config(b.blend(x, y)),
             _ => {} // type mismatch — should not happen if blender/instrument are kept in sync
         }
     }
@@ -318,6 +362,17 @@ impl ChannelBlender {
                     }
                 }
             }
+            Self::Bass(b) => {
+                if let Some(config) = GooeyEngine::bass_preset_by_id(preset_id) {
+                    match corner {
+                        BLEND_CORNER_BOTTOM_LEFT => b.set_bottom_left(config),
+                        BLEND_CORNER_BOTTOM_RIGHT => b.set_bottom_right(config),
+                        BLEND_CORNER_TOP_LEFT => b.set_top_left(config),
+                        BLEND_CORNER_TOP_RIGHT => b.set_top_right(config),
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 
@@ -348,6 +403,12 @@ impl ChannelBlender {
                 Tom2Config::brush(),
                 Tom2Config::void_preset(),
             )),
+            INSTRUMENT_BASS => Self::Bass(PresetBlender::new(
+                BassConfig::acid(),
+                BassConfig::sub(),
+                BassConfig::reese(),
+                BassConfig::stab(),
+            )),
             _ => Self::Kick(PresetBlender::new(
                 KickConfig::tight(),
                 KickConfig::punch(),
@@ -364,6 +425,7 @@ impl ChannelBlender {
             INSTRUMENT_SNARE => [SNARE_PRESET_TIGHT, SNARE_PRESET_LOOSE, SNARE_PRESET_HISS, SNARE_PRESET_SMACK],
             INSTRUMENT_HIHAT => [HIHAT_PRESET_SHORT, HIHAT_PRESET_LOOSE, HIHAT_PRESET_DARK, HIHAT_PRESET_SOFT],
             INSTRUMENT_TOM => [TOM_PRESET_DERP, TOM_PRESET_RING, TOM_PRESET_BRUSH, TOM_PRESET_VOID],
+            INSTRUMENT_BASS => [BASS_PRESET_ACID, BASS_PRESET_SUB, BASS_PRESET_REESE, BASS_PRESET_STAB],
             _ => [0, 1, 2, 3],
         }
     }
@@ -372,7 +434,7 @@ impl ChannelBlender {
 /// Opaque wrapper around the audio engine for FFI
 ///
 /// This struct provides a simplified C-compatible interface for iOS integration.
-/// It manages 4 channels, each with a drum instrument and its own
+/// It manages 5 channels, each with an instrument and its own
 /// 16-step sequencer with sample-accurate timing. Channels can be reassigned
 /// to any instrument type at runtime.
 ///
@@ -449,12 +511,13 @@ impl GooeyEngine {
     fn new(sample_rate: f32) -> Self {
         let bpm = 120.0;
 
-        // Create channel instruments (default: ch0=kick, ch1=snare, ch2=hihat, ch3=tom)
+        // Create channel instruments (default: ch0=kick, ch1=snare, ch2=hihat, ch3=tom, ch4=bass)
         let channels = [
             ChannelInstrument::Kick(KickDrum::new(sample_rate)),
             ChannelInstrument::Snare(SnareDrum::new(sample_rate)),
             ChannelInstrument::HiHat(HiHat2::new(sample_rate)),
             ChannelInstrument::Tom(Tom2::new(sample_rate)),
+            ChannelInstrument::Bass(BassSynth::new(sample_rate)),
         ];
 
         // Create a 16-step sequencer for each channel
@@ -463,6 +526,7 @@ impl GooeyEngine {
             Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "snare"),
             Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "hihat"),
             Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "tom"),
+            Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "bass"),
         ];
 
         // Create delay with default settings (0.25s delay, no feedback, no mix)
@@ -488,6 +552,7 @@ impl GooeyEngine {
             ChannelBlender::default_for_type(INSTRUMENT_SNARE),
             ChannelBlender::default_for_type(INSTRUMENT_HIHAT),
             ChannelBlender::default_for_type(INSTRUMENT_TOM),
+            ChannelBlender::default_for_type(INSTRUMENT_BASS),
         ];
 
         Self {
@@ -535,6 +600,7 @@ impl GooeyEngine {
                 ChannelBlender::default_corner_preset_ids(INSTRUMENT_SNARE),
                 ChannelBlender::default_corner_preset_ids(INSTRUMENT_HIHAT),
                 ChannelBlender::default_corner_preset_ids(INSTRUMENT_TOM),
+                ChannelBlender::default_corner_preset_ids(INSTRUMENT_BASS),
             ],
             // MIDI event buffer (pre-allocated for audio thread safety)
             pending_midi_events: Vec::with_capacity(MIDI_EVENT_CAPACITY),
@@ -594,7 +660,7 @@ impl GooeyEngine {
         for sample in buffer.iter_mut() {
             // Tick ALL sequencers first to ensure sample-accurate synchronization
             let mut seq_triggers: [Option<(f32, Option<SequencerBlendSetting>)>; NUM_INSTRUMENTS] =
-                [None, None, None, None];
+                [None; NUM_INSTRUMENTS];
             for ch in 0..NUM_INSTRUMENTS {
                 seq_triggers[ch] = self.sequencers[ch]
                     .tick_with_settings()
@@ -755,6 +821,17 @@ impl GooeyEngine {
             TOM_PRESET_RING => Some(Tom2Config::ring()),
             TOM_PRESET_BRUSH => Some(Tom2Config::brush()),
             TOM_PRESET_VOID => Some(Tom2Config::void_preset()),
+            _ => None,
+        }
+    }
+
+    /// Get a BassConfig preset by ID
+    fn bass_preset_by_id(id: u32) -> Option<BassConfig> {
+        match id {
+            BASS_PRESET_ACID => Some(BassConfig::acid()),
+            BASS_PRESET_SUB => Some(BassConfig::sub()),
+            BASS_PRESET_REESE => Some(BassConfig::reese()),
+            BASS_PRESET_STAB => Some(BassConfig::stab()),
             _ => None,
         }
     }
@@ -956,8 +1033,10 @@ pub const INSTRUMENT_SNARE: u32 = 1;
 pub const INSTRUMENT_HIHAT: u32 = 2;
 /// Instrument ID: tom drum
 pub const INSTRUMENT_TOM: u32 = 3;
+/// Instrument ID: bass synth
+pub const INSTRUMENT_BASS: u32 = 4;
 /// Total number of instruments
-pub const INSTRUMENT_COUNT: u32 = 4;
+pub const INSTRUMENT_COUNT: u32 = 5;
 /// Internal usize version for array indexing
 const NUM_INSTRUMENTS: usize = INSTRUMENT_COUNT as usize;
 
@@ -982,6 +1061,50 @@ pub const TOM_PRESET_RING: u32 = 1;
 pub const TOM_PRESET_BRUSH: u32 = 2;
 /// Tom preset: Void - atmospheric, long
 pub const TOM_PRESET_VOID: u32 = 3;
+
+// =============================================================================
+// Bass synth parameter constants
+// =============================================================================
+
+/// Bass parameter: base frequency (0-1 -> 30-200 Hz)
+pub const BASS_PARAM_FREQUENCY: u32 = 0;
+/// Bass parameter: sub sine level (0-1)
+pub const BASS_PARAM_SUB_LEVEL: u32 = 1;
+/// Bass parameter: main saw/square level (0-1)
+pub const BASS_PARAM_OSC_LEVEL: u32 = 2;
+/// Bass parameter: detuned layer level (0-1)
+pub const BASS_PARAM_DETUNE_LEVEL: u32 = 3;
+/// Bass parameter: detune spread (0-1 -> 0-30 cents)
+pub const BASS_PARAM_DETUNE_AMOUNT: u32 = 4;
+/// Bass parameter: oscillator shape - saw(0) to square(1)
+pub const BASS_PARAM_OSC_SHAPE: u32 = 5;
+/// Bass parameter: filter cutoff (0-1 -> 20-18000 Hz exp)
+pub const BASS_PARAM_FILTER_CUTOFF: u32 = 6;
+/// Bass parameter: filter resonance (0-1 -> 0.5-15.0 Q)
+pub const BASS_PARAM_FILTER_RESONANCE: u32 = 7;
+/// Bass parameter: filter envelope depth (0-1)
+pub const BASS_PARAM_FILTER_ENV_AMOUNT: u32 = 8;
+/// Bass parameter: filter envelope decay (0-1 -> 0.01-2.0s)
+pub const BASS_PARAM_FILTER_ENV_DECAY: u32 = 9;
+/// Bass parameter: filter envelope curve (0-1 -> 0.1-8.0)
+pub const BASS_PARAM_FILTER_ENV_CURVE: u32 = 10;
+/// Bass parameter: amplitude decay (0-1 -> 0.05-4.0s)
+pub const BASS_PARAM_AMP_DECAY: u32 = 11;
+/// Bass parameter: amplitude decay curve (0-1 -> 0.1-10.0)
+pub const BASS_PARAM_AMP_DECAY_CURVE: u32 = 12;
+/// Bass parameter: pre-filter overdrive/saturation (0-1)
+pub const BASS_PARAM_OVERDRIVE: u32 = 13;
+/// Bass parameter: master volume (0-1)
+pub const BASS_PARAM_VOLUME: u32 = 14;
+
+/// Bass preset: Acid - TB-303-style, high resonance, short filter sweep
+pub const BASS_PRESET_ACID: u32 = 0;
+/// Bass preset: Sub - clean sub-bass, sine dominant
+pub const BASS_PRESET_SUB: u32 = 1;
+/// Bass preset: Reese - detuned saws, heavy overdrive
+pub const BASS_PRESET_REESE: u32 = 2;
+/// Bass preset: Stab - square wave, sharp filter, short decay
+pub const BASS_PRESET_STAB: u32 = 3;
 
 /// Snare preset: Tight - short, punchy snare
 pub const SNARE_PRESET_TIGHT: u32 = 0;
@@ -1320,6 +1443,7 @@ pub unsafe extern "C" fn gooey_engine_set_channel_instrument_type(
         INSTRUMENT_SNARE => ChannelInstrument::Snare(SnareDrum::new(engine.sample_rate)),
         INSTRUMENT_HIHAT => ChannelInstrument::HiHat(HiHat2::new(engine.sample_rate)),
         INSTRUMENT_TOM => ChannelInstrument::Tom(Tom2::new(engine.sample_rate)),
+        INSTRUMENT_BASS => ChannelInstrument::Bass(BassSynth::new(engine.sample_rate)),
         _ => return,
     };
 
