@@ -134,6 +134,16 @@ impl ChannelInstrument {
         }
     }
 
+    /// Get the current normalized frequency parameter (0-1) for pitched instruments.
+    fn get_freq_param(&self) -> Option<f32> {
+        match self {
+            Self::Kick(k) => Some(k.params.frequency.get()),
+            Self::Tom(t) => Some(t.tune()),
+            Self::Bass(b) => Some(b.params.frequency.get()),
+            _ => None,
+        }
+    }
+
     /// Set a parameter by index. Dispatches to the correct setter for the current instrument type.
     /// All parameters use normalized 0-1 range from the FFI.
     fn set_param(&mut self, param: u32, value: f32) {
@@ -493,6 +503,11 @@ pub struct GooeyEngine {
     blend_y: [f32; INSTRUMENT_COUNT as usize],
     blend_corner_presets: [[u32; 4]; INSTRUMENT_COUNT as usize],
 
+    // Per-channel saved global frequency for restoring after per-step MIDI note overrides.
+    // When a step with a note fires, the instrument's current frequency param is saved here.
+    // When a step without a note fires, the saved value is restored and cleared.
+    saved_global_freq: [Option<f32>; NUM_INSTRUMENTS],
+
     // Pending MIDI events from the most recent render pass (pre-allocated, no audio-thread alloc)
     pending_midi_events: Vec<GooeyMidiEvent>,
 
@@ -602,6 +617,8 @@ impl GooeyEngine {
                 ChannelBlender::default_corner_preset_ids(INSTRUMENT_TOM),
                 ChannelBlender::default_corner_preset_ids(INSTRUMENT_BASS),
             ],
+            // Per-step note override: saved global frequency for restore
+            saved_global_freq: [None; NUM_INSTRUMENTS],
             // MIDI event buffer (pre-allocated for audio thread safety)
             pending_midi_events: Vec::with_capacity(MIDI_EVENT_CAPACITY),
             // Sequencer triggers enabled by default (internal sequencer drives instruments)
@@ -677,18 +694,27 @@ impl GooeyEngine {
                         if blend.is_some() || self.blend_enabled[ch] {
                             self.channels[ch].snap_params();
                         }
-                        // Apply per-step MIDI note frequency override (sample-accurate)
+                        // Apply per-step MIDI note frequency override (sample-accurate).
+                        // When a step has a note, save the global freq and override.
+                        // When a step has no note, restore the saved global freq.
                         if let Some(midi_note) = note {
                             let instr_type = self.channels[ch].instrument_type();
                             if let Some((freq_min, freq_max)) =
                                 Self::freq_range_for_instrument(instr_type)
                             {
+                                if self.saved_global_freq[ch].is_none() {
+                                    self.saved_global_freq[ch] =
+                                        self.channels[ch].get_freq_param();
+                                }
                                 let normalized = Self::midi_note_to_normalized_freq(
                                     midi_note, freq_min, freq_max,
                                 );
                                 self.channels[ch].set_param(0, normalized);
                                 self.channels[ch].snap_params();
                             }
+                        } else if let Some(saved) = self.saved_global_freq[ch].take() {
+                            self.channels[ch].set_param(0, saved);
+                            self.channels[ch].snap_params();
                         }
                         self.channels[ch].trigger_with_velocity(self.current_time, velocity);
                         self.push_midi_event(ch as u32, velocity, sample_offset);
