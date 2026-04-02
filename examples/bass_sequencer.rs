@@ -360,11 +360,6 @@ fn main() -> anyhow::Result<()> {
                         if let Some(seq) = engine.sequencer_mut(0) {
                             seq.set_step_note(step, new_note);
                         }
-                        // Also update the bass frequency for immediate feedback
-                        {
-                            let mut b = bass.lock().unwrap();
-                            b.set_frequency(freq_to_bass_normalized(midi_to_hz(new_note)));
-                        }
                         needs_redraw = true;
                     }
                     KeyCode::Down if state.edit_mode == EditMode::NoteEdit => {
@@ -381,10 +376,6 @@ fn main() -> anyhow::Result<()> {
                             let mut engine = audio_engine.lock().unwrap();
                             if let Some(seq) = engine.sequencer_mut(0) {
                                 seq.set_step_note(step, new_note);
-                            }
-                            {
-                                let mut b = bass.lock().unwrap();
-                                b.set_frequency(freq_to_bass_normalized(midi_to_hz(new_note)));
                             }
                         }
                         needs_redraw = true;
