@@ -71,3 +71,7 @@ required-features = ["native", "crossterm"]
 [[example]]
 name = "bass"
 required-features = ["native", "crossterm"]
+
+[[example]]
+name = "bass_sequencer"
+required-features = ["native", "crossterm"]

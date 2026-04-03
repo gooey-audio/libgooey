@@ -134,6 +134,16 @@ impl ChannelInstrument {
         }
     }
 
+    /// Get the current normalized frequency parameter (0-1) for pitched instruments.
+    fn get_freq_param(&self) -> Option<f32> {
+        match self {
+            Self::Kick(k) => Some(k.params.frequency.get()),
+            Self::Tom(t) => Some(t.tune()),
+            Self::Bass(b) => Some(b.params.frequency.get()),
+            _ => None,
+        }
+    }
+
     /// Set a parameter by index. Dispatches to the correct setter for the current instrument type.
     /// All parameters use normalized 0-1 range from the FFI.
     fn set_param(&mut self, param: u32, value: f32) {
@@ -493,6 +503,11 @@ pub struct GooeyEngine {
     blend_y: [f32; INSTRUMENT_COUNT as usize],
     blend_corner_presets: [[u32; 4]; INSTRUMENT_COUNT as usize],
 
+    // Per-channel saved global frequency for restoring after per-step MIDI note overrides.
+    // When a step with a note fires, the instrument's current frequency param is saved here.
+    // When a step without a note fires, the saved value is restored and cleared.
+    saved_global_freq: [Option<f32>; NUM_INSTRUMENTS],
+
     // Pending MIDI events from the most recent render pass (pre-allocated, no audio-thread alloc)
     pending_midi_events: Vec<GooeyMidiEvent>,
 
@@ -602,6 +617,8 @@ impl GooeyEngine {
                 ChannelBlender::default_corner_preset_ids(INSTRUMENT_TOM),
                 ChannelBlender::default_corner_preset_ids(INSTRUMENT_BASS),
             ],
+            // Per-step note override: saved global frequency for restore
+            saved_global_freq: [None; NUM_INSTRUMENTS],
             // MIDI event buffer (pre-allocated for audio thread safety)
             pending_midi_events: Vec::with_capacity(MIDI_EVENT_CAPACITY),
             // Sequencer triggers enabled by default (internal sequencer drives instruments)
@@ -659,22 +676,44 @@ impl GooeyEngine {
         let mut sample_offset: u32 = 0;
         for sample in buffer.iter_mut() {
             // Tick ALL sequencers first to ensure sample-accurate synchronization
-            let mut seq_triggers: [Option<(f32, Option<SequencerBlendSetting>)>; NUM_INSTRUMENTS] =
-                [None; NUM_INSTRUMENTS];
+            let mut seq_triggers: [Option<(f32, Option<SequencerBlendSetting>, Option<u8>)>;
+                NUM_INSTRUMENTS] = [None; NUM_INSTRUMENTS];
             for ch in 0..NUM_INSTRUMENTS {
                 seq_triggers[ch] = self.sequencers[ch]
                     .tick_with_settings()
-                    .map(|trigger| (trigger.velocity, trigger.blend));
+                    .map(|trigger| (trigger.velocity, trigger.blend, trigger.note));
             }
 
             // Apply triggers with velocity after all sequencers have been ticked.
             if self.sequencer_triggers_enabled {
                 for ch in 0..NUM_INSTRUMENTS {
-                    if let Some((velocity, blend)) = seq_triggers[ch] {
+                    if let Some((velocity, blend, note)) = seq_triggers[ch] {
                         self.apply_sequencer_blend_setting(ch as u32, blend);
                         // Snap params only when a blend was actually applied,
                         // so we don't clobber in-flight UI/LFO smoothing.
                         if blend.is_some() || self.blend_enabled[ch] {
+                            self.channels[ch].snap_params();
+                        }
+                        // Apply per-step MIDI note frequency override (sample-accurate).
+                        // When a step has a note, save the global freq and override.
+                        // When a step has no note, restore the saved global freq.
+                        if let Some(midi_note) = note {
+                            let instr_type = self.channels[ch].instrument_type();
+                            if let Some((freq_min, freq_max)) =
+                                Self::freq_range_for_instrument(instr_type)
+                            {
+                                if self.saved_global_freq[ch].is_none() {
+                                    self.saved_global_freq[ch] =
+                                        self.channels[ch].get_freq_param();
+                                }
+                                let normalized = Self::midi_note_to_normalized_freq(
+                                    midi_note, freq_min, freq_max,
+                                );
+                                self.channels[ch].set_param(0, normalized);
+                                self.channels[ch].snap_params();
+                            }
+                        } else if let Some(saved) = self.saved_global_freq[ch].take() {
+                            self.channels[ch].set_param(0, saved);
                             self.channels[ch].snap_params();
                         }
                         self.channels[ch].trigger_with_velocity(self.current_time, velocity);
@@ -832,6 +871,22 @@ impl GooeyEngine {
             BASS_PRESET_SUB => Some(BassConfig::sub()),
             BASS_PRESET_REESE => Some(BassConfig::reese()),
             BASS_PRESET_STAB => Some(BassConfig::stab()),
+            _ => None,
+        }
+    }
+
+    /// Convert a MIDI note number to a normalized frequency value for an instrument's range.
+    fn midi_note_to_normalized_freq(note: u8, freq_min: f32, freq_max: f32) -> f32 {
+        let hz = 440.0 * 2f32.powf((note as f32 - 69.0) / 12.0);
+        ((hz - freq_min) / (freq_max - freq_min)).clamp(0.0, 1.0)
+    }
+
+    /// Get the frequency range (min, max) for a pitched instrument type.
+    fn freq_range_for_instrument(instrument_type: u32) -> Option<(f32, f32)> {
+        match instrument_type {
+            INSTRUMENT_BASS => Some((30.0, 200.0)),
+            INSTRUMENT_KICK => Some((30.0, 120.0)),
+            INSTRUMENT_TOM => Some((40.0, 600.0)),
             _ => None,
         }
     }
@@ -1105,6 +1160,9 @@ pub const BASS_PRESET_SUB: u32 = 1;
 pub const BASS_PRESET_REESE: u32 = 2;
 /// Bass preset: Stab - square wave, sharp filter, short decay
 pub const BASS_PRESET_STAB: u32 = 3;
+
+/// Sentinel value indicating no MIDI note is set for a step (use instrument's global frequency)
+pub const STEP_NOTE_NONE: u8 = 255;
 
 /// Snare preset: Tight - short, punchy snare
 pub const SNARE_PRESET_TIGHT: u32 = 0;
@@ -1785,6 +1843,78 @@ pub unsafe extern "C" fn gooey_engine_set_tom_param(
     }
 }
 
+/// Set a bass synth parameter
+///
+/// All parameters use normalized 0-1 range. Values are internally scaled.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `param` - Parameter index (see BASS_PARAM_* constants)
+/// * `value` - Parameter value (0.0-1.0 normalized)
+///
+/// # Parameter indices and ranges
+/// - 0 (FREQUENCY): 0-1 → 30-200 Hz
+/// - 1 (SUB_LEVEL): 0-1
+/// - 2 (OSC_LEVEL): 0-1
+/// - 3 (DETUNE_LEVEL): 0-1
+/// - 4 (DETUNE_AMOUNT): 0-1 → 0-30 cents
+/// - 5 (OSC_SHAPE): 0-1 (saw to square)
+/// - 6 (FILTER_CUTOFF): 0-1 → 20-18000 Hz exp
+/// - 7 (FILTER_RESONANCE): 0-1 → 0.5-15.0 Q
+/// - 8 (FILTER_ENV_AMOUNT): 0-1
+/// - 9 (FILTER_ENV_DECAY): 0-1 → 0.01-2.0s
+/// - 10 (FILTER_ENV_CURVE): 0-1 → 0.1-8.0
+/// - 11 (AMP_DECAY): 0-1 → 0.05-4.0s
+/// - 12 (AMP_DECAY_CURVE): 0-1 → 0.1-10.0
+/// - 13 (OVERDRIVE): 0-1
+/// - 14 (VOLUME): 0-1
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_bass_param(
+    engine: *mut GooeyEngine,
+    param: u32,
+    value: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_BASS) {
+        engine.channels[ch].set_param(param, value);
+    }
+}
+
+/// Load a bass preset, setting all bass parameters to the preset's values.
+///
+/// This directly applies the preset's parameter values to the bass instrument
+/// without requiring the blend system.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `preset_id` - Preset ID (BASS_PRESET_ACID, BASS_PRESET_SUB, etc.)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_load_bass_preset(
+    engine: *mut GooeyEngine,
+    preset_id: u32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    if let Some(config) = GooeyEngine::bass_preset_by_id(preset_id) {
+        if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_BASS) {
+            if let ChannelInstrument::Bass(ref mut bass) = engine.channels[ch] {
+                bass.set_config(config);
+            }
+        }
+    }
+}
+
 // =============================================================================
 // Global effects control
 // =============================================================================
@@ -2364,7 +2494,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_with_velocit
     }
 }
 
-/// Set a step with optional velocity and optional blend setting.
+/// Set a step with optional velocity, optional blend setting, and optional MIDI note.
 ///
 /// Omitted settings are left unchanged.
 ///
@@ -2378,6 +2508,8 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_with_velocit
 /// * `set_blend` - Whether to apply blend X/Y
 /// * `blend_x` - Blend X position (0.0-1.0, used only when `set_blend` is true)
 /// * `blend_y` - Blend Y position (0.0-1.0, used only when `set_blend` is true)
+/// * `set_note` - Whether to apply the `midi_note` value
+/// * `midi_note` - MIDI note number (0-127, or STEP_NOTE_NONE); only applied when `set_note` is true
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -2392,6 +2524,8 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_settings(
     set_blend: bool,
     blend_x: f32,
     blend_y: f32,
+    set_note: bool,
+    midi_note: u8,
 ) {
     if engine.is_null() {
         return;
@@ -2406,8 +2540,18 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_settings(
             } else {
                 None
             },
+            note: None,
         };
         sequencer.set_step_with_settings(step as usize, enabled, settings);
+        // Handle note separately: set_note=true with STEP_NOTE_NONE clears the note
+        if set_note {
+            let step_idx = step as usize;
+            if midi_note == STEP_NOTE_NONE {
+                sequencer.clear_step_note(step_idx);
+            } else {
+                sequencer.set_step_note(step_idx, midi_note);
+            }
+        }
     }
 }
 
@@ -2485,6 +2629,111 @@ pub unsafe extern "C" fn gooey_engine_sequencer_clear_instrument_step_blend_over
     step: u32,
 ) {
     gooey_engine_sequencer_clear_instrument_step_blend(engine, instrument, step);
+}
+
+/// Set the MIDI note for a specific step in an instrument's sequencer.
+///
+/// When a step with a note triggers, the engine sets the instrument's
+/// frequency parameter to the note's frequency at the exact trigger sample.
+/// Steps without a note (STEP_NOTE_NONE) use the instrument's global
+/// frequency parameter as before (backward compatible).
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_BASS, etc.)
+/// * `step` - Step index (0-15)
+/// * `midi_note` - MIDI note number (0-127), or STEP_NOTE_NONE to clear
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_note(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+    midi_note: u8,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    if let Some(sequencer) = engine.sequencer_for_instrument(instrument) {
+        if midi_note == STEP_NOTE_NONE {
+            sequencer.clear_step_note(step as usize);
+        } else {
+            sequencer.set_step_note(step as usize, midi_note);
+        }
+    }
+}
+
+/// Get the MIDI note for a specific step.
+///
+/// # Returns
+/// The MIDI note number (0-127), or STEP_NOTE_NONE (255) if no note is set.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_note(
+    engine: *const GooeyEngine,
+    instrument: u32,
+    step: u32,
+) -> u8 {
+    if engine.is_null() {
+        return STEP_NOTE_NONE;
+    }
+    let engine = &*engine;
+    if let Some(sequencer) = engine.sequencer_for_instrument_ref(instrument) {
+        sequencer.get_step_note(step as usize).unwrap_or(STEP_NOTE_NONE)
+    } else {
+        STEP_NOTE_NONE
+    }
+}
+
+/// Clear the MIDI note for a step (reverts to global frequency).
+/// Equivalent to set_step_note(..., STEP_NOTE_NONE).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_clear_instrument_step_note(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    if let Some(sequencer) = engine.sequencer_for_instrument(instrument) {
+        sequencer.clear_step_note(step as usize);
+    }
+}
+
+/// Set MIDI notes for all 16 steps of an instrument's sequencer.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID
+/// * `notes` - Pointer to 16 uint8_t values (MIDI notes, or STEP_NOTE_NONE)
+///
+/// # Safety
+/// - `engine` must be a valid pointer returned by `gooey_engine_new`
+/// - `notes` must point to at least 16 bytes of allocated memory
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_note_pattern(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    notes: *const u8,
+) {
+    if engine.is_null() || notes.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let notes_slice = slice::from_raw_parts(notes, 16);
+    if let Some(sequencer) = engine.sequencer_for_instrument(instrument) {
+        sequencer.set_note_pattern(notes_slice);
+    }
 }
 
 /// Set the entire 16-step pattern for an instrument's sequencer
