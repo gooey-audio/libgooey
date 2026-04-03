@@ -33,6 +33,24 @@ impl Instrument for SharedBass {
         self.0.lock().unwrap().is_active()
     }
 
+    fn set_midi_note(&mut self, note: u8) {
+        let hz = midi_to_hz(note);
+        let normalized = freq_to_bass_normalized(hz);
+        let mut b = self.0.lock().unwrap();
+        b.set_frequency(normalized);
+        b.snap_params();
+    }
+
+    fn set_frequency_normalized(&mut self, value: f32) {
+        let mut b = self.0.lock().unwrap();
+        b.set_frequency(value);
+        b.snap_params();
+    }
+
+    fn get_frequency(&self) -> Option<f32> {
+        Some(self.0.lock().unwrap().params.frequency.get())
+    }
+
     fn as_modulatable(&mut self) -> Option<&mut dyn Modulatable> {
         None
     }
