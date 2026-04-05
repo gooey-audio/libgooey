@@ -479,6 +479,9 @@ pub struct GooeyEngine {
     trigger_pending: [AtomicBool; NUM_INSTRUMENTS],
     trigger_velocity: [AtomicU32; NUM_INSTRUMENTS], // f32 bits stored atomically
 
+    // Per-channel peak amplitude since last read (f32 bits stored atomically, read-and-reset by UI)
+    channel_peaks: [AtomicU32; NUM_INSTRUMENTS],
+
     // LFO pool (8 LFOs with multi-target routing)
     lfos: [Lfo; LFO_COUNT],
     lfo_enabled: [bool; LFO_COUNT],
@@ -589,6 +592,7 @@ impl GooeyEngine {
             current_time: 0.0,
             trigger_pending: std::array::from_fn(|_| AtomicBool::new(false)),
             trigger_velocity: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
+            channel_peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             // LFO pool
             lfos,
             lfo_enabled: [false; LFO_COUNT],
@@ -747,6 +751,13 @@ impl GooeyEngine {
                     * self.instrument_gains[ch].tick();
                 channel_outs[ch] = ch_out;
                 output += ch_out;
+
+                // Track per-channel peak for UI metering
+                let abs_out = ch_out.abs();
+                let prev_peak = f32::from_bits(self.channel_peaks[ch].load(Ordering::Relaxed));
+                if abs_out > prev_peak {
+                    self.channel_peaks[ch].store(abs_out.to_bits(), Ordering::Relaxed);
+                }
             }
 
             // Apply global effects chain
@@ -1677,6 +1688,38 @@ pub unsafe extern "C" fn gooey_engine_trigger_instrument(
     instrument: u32,
 ) {
     gooey_engine_trigger_instrument_with_velocity(engine, instrument, 1.0);
+}
+
+// =============================================================================
+// Per-channel peak metering
+// =============================================================================
+
+/// Read per-channel peak amplitudes since the last call and reset them to zero.
+///
+/// Each value represents the maximum absolute amplitude seen on that channel
+/// since the previous call. Useful for driving UI level meters.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `out_peaks` - Pointer to a float buffer to receive peak values (0.0–1.0+)
+/// * `count` - Number of channels to read (clamped to NUM_INSTRUMENTS)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+/// `out_peaks` must point to a buffer of at least `count` floats.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_channel_peaks(
+    engine: *mut GooeyEngine,
+    out_peaks: *mut f32,
+    count: u32,
+) {
+    if let Some(engine) = engine.as_ref() {
+        let n = (count as usize).min(NUM_INSTRUMENTS);
+        for i in 0..n {
+            let bits = engine.channel_peaks[i].swap(0.0_f32.to_bits(), Ordering::Relaxed);
+            *out_peaks.add(i) = f32::from_bits(bits);
+        }
+    }
 }
 
 /// Trigger the kick drum manually (legacy function, prefer `gooey_engine_trigger_instrument`)
