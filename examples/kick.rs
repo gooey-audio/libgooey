@@ -37,7 +37,7 @@ struct ParamInfo {
 }
 
 // Parameters in alphabetical order for display
-const PARAM_INFO: [ParamInfo; 16] = [
+const PARAM_INFO: [ParamInfo; 18] = [
     ParamInfo {
         name: "amp_decay",
         coarse_step: 0.1,
@@ -56,6 +56,18 @@ const PARAM_INFO: [ParamInfo; 16] = [
         fine_step: 0.02,
         unit: "",
     },
+    ParamInfo {
+        name: "fb_cutoff",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 → 200-4000 Hz
+    ParamInfo {
+        name: "feedback",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    }, // 0-1 → 0.0-0.9
     ParamInfo {
         name: "frequency",
         coarse_step: 0.1,
@@ -140,11 +152,11 @@ const PARAM_INFO: [ParamInfo; 16] = [
 struct SharedKick(Arc<Mutex<KickDrum>>);
 
 impl Instrument for SharedKick {
-    fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         self.0.lock().unwrap().trigger_with_velocity(time, velocity);
     }
 
-    fn tick(&mut self, current_time: f32) -> f32 {
+    fn tick(&mut self, current_time: f64) -> f32 {
         self.0.lock().unwrap().tick(current_time)
     }
 
@@ -165,19 +177,21 @@ fn get_param_value(kick: &KickDrum, index: usize) -> f32 {
         0 => kick.params.amp_decay.get(),
         1 => kick.params.amp_decay_curve.get(),
         2 => kick.params.click.get(),
-        3 => kick.params.frequency.get(),
-        4 => kick.params.noise_amount.get(),
-        5 => kick.params.noise_cutoff.get(),
-        6 => kick.params.noise_resonance.get(),
-        7 => kick.params.oscillator_decay.get(),
-        8 => kick.params.overdrive.get(),
-        9 => kick.params.phase_mod_amount.get(),
-        10 => kick.params.pitch_envelope_amount.get(),
-        11 => kick.params.pitch_envelope_curve.get(),
-        12 => kick.params.pitch_start_ratio.get(),
-        13 => kick.params.punch.get(),
-        14 => kick.params.sub.get(),
-        15 => kick.params.volume.get(),
+        3 => kick.params.feedback_cutoff.get(),
+        4 => kick.params.feedback.get(),
+        5 => kick.params.frequency.get(),
+        6 => kick.params.noise_amount.get(),
+        7 => kick.params.noise_cutoff.get(),
+        8 => kick.params.noise_resonance.get(),
+        9 => kick.params.oscillator_decay.get(),
+        10 => kick.params.overdrive.get(),
+        11 => kick.params.phase_mod_amount.get(),
+        12 => kick.params.pitch_envelope_amount.get(),
+        13 => kick.params.pitch_envelope_curve.get(),
+        14 => kick.params.pitch_start_ratio.get(),
+        15 => kick.params.punch.get(),
+        16 => kick.params.sub.get(),
+        17 => kick.params.volume.get(),
         _ => 0.0,
     }
 }
@@ -192,19 +206,21 @@ fn set_param_value(kick: &mut KickDrum, index: usize, value: f32) {
         0 => kick.set_amp_decay(value),
         1 => kick.set_amp_decay_curve(value),
         2 => kick.set_click(value),
-        3 => kick.set_frequency(value),
-        4 => kick.set_noise_amount(value),
-        5 => kick.set_noise_cutoff(value),
-        6 => kick.set_noise_resonance(value),
-        7 => kick.set_oscillator_decay(value),
-        8 => kick.set_overdrive(value),
-        9 => kick.set_phase_mod_amount(value),
-        10 => kick.set_pitch_envelope_amount(value),
-        11 => kick.set_pitch_envelope_curve(value),
-        12 => kick.set_pitch_start_ratio(value),
-        13 => kick.set_punch(value),
-        14 => kick.set_sub(value),
-        15 => kick.set_volume(value),
+        3 => kick.set_feedback_cutoff(value),
+        4 => kick.set_feedback(value),
+        5 => kick.set_frequency(value),
+        6 => kick.set_noise_amount(value),
+        7 => kick.set_noise_cutoff(value),
+        8 => kick.set_noise_resonance(value),
+        9 => kick.set_oscillator_decay(value),
+        10 => kick.set_overdrive(value),
+        11 => kick.set_phase_mod_amount(value),
+        12 => kick.set_pitch_envelope_amount(value),
+        13 => kick.set_pitch_envelope_curve(value),
+        14 => kick.set_pitch_start_ratio(value),
+        15 => kick.set_punch(value),
+        16 => kick.set_sub(value),
+        17 => kick.set_volume(value),
         _ => {}
     }
 }
