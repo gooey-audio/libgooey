@@ -67,3 +67,7 @@ required-features = ["native", "crossterm"]
 [[example]]
 name = "membrane"
 required-features = ["native", "crossterm"]
+
+[[example]]
+name = "delay"
+required-features = ["native", "crossterm"]

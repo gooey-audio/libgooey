@@ -23,7 +23,9 @@
 
 use std::collections::HashSet;
 
-use crate::effects::{BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect, TubeSaturation};
+use crate::effects::{
+    BrickWallLimiter, DelayEffect, DelayTiming, Effect, LowpassFilterEffect, TubeSaturation,
+};
 use crate::engine::{Engine, Instrument, Lfo, MusicalDivision, Sequencer, SequencerStep};
 use crate::instruments::{
     HiHat, HiHatConfig, KickConfig, KickDrum, SnareConfig, SnareDrum, Tom2, Tom2Config, TomConfig,
@@ -521,9 +523,10 @@ enum EffectDef {
         resonance: f32,
     },
     Delay {
-        time_s: f32,
+        timing: DelayTiming,
         feedback: f32,
         mix: f32,
+        filter_cutoff: f32,
     },
     Saturation {
         drive: f32,
@@ -548,13 +551,65 @@ impl EffectDef {
                 })
             }
             "delay" => {
-                let (time_s, feedback, mix) =
-                    parse_three_f32_args_named(line_number, &tokens[1..], "time", "fb", "mix")?;
-                Ok(Self::Delay {
-                    time_s,
-                    feedback,
-                    mix,
-                })
+                let mut timing: Option<DelayTiming> = None;
+                let mut feedback: Option<f32> = None;
+                let mut mix: Option<f32> = None;
+                let mut filter_cutoff: Option<f32> = None;
+                let mut positional: Vec<&str> = Vec::new();
+
+                for arg in &tokens[1..] {
+                    if let Some((k, v)) = arg.split_once('=') {
+                        match k.to_ascii_lowercase().as_str() {
+                            "timing" | "time" | "t" => {
+                                timing = Some(parse_delay_timing(line_number, v)?);
+                            }
+                            "fb" | "feedback" => {
+                                feedback = Some(parse_f32(line_number, "feedback", v)?);
+                            }
+                            "mix" => {
+                                mix = Some(parse_f32(line_number, "mix", v)?);
+                            }
+                            "cutoff" | "filter" => {
+                                filter_cutoff = Some(parse_f32(line_number, "cutoff", v)?);
+                            }
+                            other => {
+                                return Err(format!(
+                                    "line {}: unknown delay argument '{}'",
+                                    line_number, other
+                                ));
+                            }
+                        }
+                    } else {
+                        positional.push(*arg);
+                    }
+                }
+
+                // Positional: timing feedback mix [cutoff]
+                if timing.is_none() && !positional.is_empty() {
+                    timing = Some(parse_delay_timing(line_number, positional[0])?);
+                }
+                if feedback.is_none() && positional.len() >= 2 {
+                    feedback = Some(parse_f32(line_number, "feedback", positional[1])?);
+                }
+                if mix.is_none() && positional.len() >= 3 {
+                    mix = Some(parse_f32(line_number, "mix", positional[2])?);
+                }
+                if filter_cutoff.is_none() && positional.len() >= 4 {
+                    filter_cutoff = Some(parse_f32(line_number, "cutoff", positional[3])?);
+                }
+
+                match (timing, feedback, mix) {
+                    (Some(t), Some(fb), Some(m)) => Ok(Self::Delay {
+                        timing: t,
+                        feedback: fb,
+                        mix: m,
+                        filter_cutoff: filter_cutoff.unwrap_or(20000.0),
+                    }),
+                    _ => Err(format!(
+                        "line {}: delay expects timing, fb, mix (positional or key=value)",
+                        line_number
+                    )),
+                }
             }
             "saturation" | "sat" => {
                 let (drive, warmth, mix) = parse_three_f32_args_named(
@@ -588,14 +643,17 @@ impl EffectDef {
                 resonance,
             ))),
             Self::Delay {
-                time_s,
+                timing,
                 feedback,
                 mix,
+                filter_cutoff,
             } => Ok(Box::new(DelayEffect::new(
                 sample_rate,
-                time_s,
+                timing,
+                120.0, // Default BPM; engine will update via set_bpm after construction
                 feedback,
                 mix,
+                filter_cutoff,
             ))),
             Self::Saturation { drive, warmth, mix } => Ok(Box::new(TubeSaturation::new(
                 sample_rate,
@@ -883,6 +941,24 @@ fn parse_three_f32_args_named(
         _ => Err(format!(
             "line {}: expected {}, {}, {} (positional or key=value)",
             line_number, key1, key2, key3
+        )),
+    }
+}
+
+fn parse_delay_timing(line_number: usize, s: &str) -> Result<DelayTiming, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "whole" | "1" => Ok(DelayTiming::Whole),
+        "half" | "1/2" => Ok(DelayTiming::Half),
+        "quarter" | "1/4" => Ok(DelayTiming::Quarter),
+        "eighth" | "1/8" => Ok(DelayTiming::Eighth),
+        "sixteenth" | "1/16" => Ok(DelayTiming::Sixteenth),
+        "half_triplet" | "1/2t" => Ok(DelayTiming::HalfTriplet),
+        "quarter_triplet" | "1/4t" => Ok(DelayTiming::QuarterTriplet),
+        "eighth_triplet" | "1/8t" => Ok(DelayTiming::EighthTriplet),
+        "sixteenth_triplet" | "1/16t" => Ok(DelayTiming::SixteenthTriplet),
+        other => Err(format!(
+            "line {}: unknown delay timing '{}' (use whole, half, quarter, eighth, sixteenth, or triplet variants like 1/4t)",
+            line_number, other
         )),
     }
 }
