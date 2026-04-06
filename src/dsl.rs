@@ -289,7 +289,7 @@ impl Program {
             .collect::<std::collections::HashMap<_, _>>();
 
         for effect in &self.effects {
-            engine.add_global_effect(effect.build(sample_rate)?);
+            engine.add_global_effect(effect.build(sample_rate, engine.bpm())?);
         }
 
         // Sequencers often imply "play"; default to started unless explicitly stopped.
@@ -632,7 +632,7 @@ impl EffectDef {
         }
     }
 
-    fn build(&self, sample_rate: f32) -> Result<Box<dyn Effect>, String> {
+    fn build(&self, sample_rate: f32, bpm: f32) -> Result<Box<dyn Effect>, String> {
         match *self {
             Self::Lowpass {
                 cutoff_hz,
@@ -650,7 +650,7 @@ impl EffectDef {
             } => Ok(Box::new(DelayEffect::new(
                 sample_rate,
                 timing,
-                120.0, // Default BPM; engine will update via set_bpm after construction
+                bpm,
                 feedback,
                 mix,
                 filter_cutoff,
