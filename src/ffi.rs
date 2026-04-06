@@ -4,7 +4,8 @@
 //! Designed for integration with iOS (and other platforms in the future).
 
 use crate::effects::{
-    BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect, TubeCompressor, TubeSaturation,
+    BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect, TiltFilterEffect, TubeCompressor,
+    TubeSaturation,
 };
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
@@ -462,6 +463,8 @@ pub struct GooeyEngine {
     delay_enabled: bool,
     lowpass_filter: LowpassFilterEffect,
     lowpass_filter_enabled: bool,
+    tilt_filter: TiltFilterEffect,
+    tilt_filter_enabled: bool,
     saturation: TubeSaturation,
     saturation_enabled: bool,
     compressor: TubeCompressor,
@@ -553,6 +556,9 @@ impl GooeyEngine {
         // Create lowpass filter with default settings (fully open, no resonance)
         let lowpass_filter = LowpassFilterEffect::new(sample_rate, 20000.0, 0.0);
 
+        // Create tilt filter with default settings (center = passthrough)
+        let tilt_filter = TiltFilterEffect::new(sample_rate);
+
         // Create saturation with default light warmth settings
         let saturation = TubeSaturation::new(sample_rate, 0.3, 0.4, 0.5);
 
@@ -580,6 +586,8 @@ impl GooeyEngine {
             delay_enabled: false,
             lowpass_filter,
             lowpass_filter_enabled: false,
+            tilt_filter,
+            tilt_filter_enabled: false,
             saturation,
             saturation_enabled: true,
             compressor,
@@ -767,6 +775,9 @@ impl GooeyEngine {
             if self.lowpass_filter_enabled {
                 output = self.lowpass_filter.process(output);
             }
+            if self.tilt_filter_enabled {
+                output = self.tilt_filter.process(output);
+            }
             if self.saturation_enabled {
                 output = self.saturation.process(output);
             }
@@ -937,8 +948,10 @@ pub const EFFECT_DELAY: u32 = 1;
 pub const EFFECT_SATURATION: u32 = 2;
 /// Global effect: Compressor
 pub const EFFECT_COMPRESSOR: u32 = 3;
+/// Global effect: Tilt filter (unified lowpass/highpass)
+pub const EFFECT_TILT_FILTER: u32 = 4;
 /// Total number of global effects
-pub const EFFECT_COUNT: u32 = 4;
+pub const EFFECT_COUNT: u32 = 5;
 
 // =============================================================================
 // Lowpass filter parameter indices (must match Swift FilterParam enum)
@@ -988,6 +1001,15 @@ pub const COMPRESSOR_PARAM_MIX: u32 = 4;
 
 /// No sidechain — compressor uses main mix as input (default)
 pub const COMPRESSOR_SIDECHAIN_NONE: u32 = 0xFFFFFFFF;
+
+// =============================================================================
+// Tilt filter parameter indices
+// =============================================================================
+
+/// Tilt filter parameter: cutoff position (0.0-1.0, 0.5 = center/passthrough)
+pub const TILT_PARAM_CUTOFF: u32 = 0;
+/// Tilt filter parameter: resonance (0.0-1.0)
+pub const TILT_PARAM_RESONANCE: u32 = 1;
 
 // =============================================================================
 // Kick drum parameter indices (must match Swift KickParam enum)
@@ -2034,6 +2056,11 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
             COMPRESSOR_PARAM_MIX => engine.compressor.set_mix(value),
             _ => {} // Unknown parameter, ignore
         },
+        EFFECT_TILT_FILTER => match param {
+            TILT_PARAM_CUTOFF => engine.tilt_filter.set_cutoff(value),
+            TILT_PARAM_RESONANCE => engine.tilt_filter.set_resonance(value),
+            _ => {} // Unknown parameter, ignore
+        },
         _ => {} // Unknown effect, ignore
     }
 }
@@ -2090,6 +2117,11 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
             COMPRESSOR_PARAM_MIX => engine.compressor.get_mix(),
             _ => -1.0, // Unknown parameter
         },
+        EFFECT_TILT_FILTER => match param {
+            TILT_PARAM_CUTOFF => engine.tilt_filter.get_cutoff(),
+            TILT_PARAM_RESONANCE => engine.tilt_filter.get_resonance(),
+            _ => -1.0, // Unknown parameter
+        },
         _ => -1.0, // Unknown effect
     }
 }
@@ -2123,6 +2155,7 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_enabled(
         EFFECT_DELAY => engine.delay_enabled = enabled,
         EFFECT_SATURATION => engine.saturation_enabled = enabled,
         EFFECT_COMPRESSOR => engine.compressor_enabled = enabled,
+        EFFECT_TILT_FILTER => engine.tilt_filter_enabled = enabled,
         _ => {} // Unknown effect, ignore
     }
 }
@@ -2154,6 +2187,7 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_enabled(
         EFFECT_DELAY => engine.delay_enabled,
         EFFECT_SATURATION => engine.saturation_enabled,
         EFFECT_COMPRESSOR => engine.compressor_enabled,
+        EFFECT_TILT_FILTER => engine.tilt_filter_enabled,
         _ => false, // Unknown effect
     }
 }
