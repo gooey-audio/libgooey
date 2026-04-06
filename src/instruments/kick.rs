@@ -1,4 +1,4 @@
-use crate::effects::waveshaper::Waveshaper;
+use crate::effects::feedback_waveshaper::FeedbackWaveshaper;
 use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
 use crate::filters::{ResonantHighpassFilter, ResonantLowpassFilter};
 use crate::gen::oscillator::Oscillator;
@@ -75,6 +75,8 @@ pub struct KickConfig {
     pub noise_cutoff: f32,          // Noise lowpass filter cutoff (0-1 → 20-10000Hz)
     pub noise_resonance: f32,       // Noise lowpass filter resonance (0-1 → 0.0-5.0)
     pub overdrive_amount: f32,      // Overdrive/saturation amount (0.0-1.0, 0.0 = bypass)
+    pub feedback_amount: f32,       // Feedback waveshaper amount (0.0-1.0 → 0.0-0.9)
+    pub feedback_cutoff: f32,       // Feedback filter cutoff (0.0-1.0 → 200-4000 Hz)
     // Master amplitude envelope parameters
     // Note: amp_attack is hardcoded to instant (0.001s) for kick transients
     pub amp_decay: f32,       // Amplitude decay time (0-1 → 0.0-4.0s)
@@ -110,6 +112,8 @@ impl KickConfig {
             noise_cutoff: 0.198,  // ~2000 Hz
             noise_resonance: 0.2, // ~2.0
             overdrive_amount: 0.0,
+            feedback_amount: 0.0,
+            feedback_cutoff: 0.474, // ~2000 Hz (normalized in 200-4000 range)
             amp_decay: 0.125,       // ~0.5s
             amp_decay_curve: 0.091, // ~1.0 (linear)
         }
@@ -131,6 +135,8 @@ impl KickConfig {
         noise_cutoff: f32,
         noise_resonance: f32,
         overdrive_amount: f32,
+        feedback_amount: f32,
+        feedback_cutoff: f32,
         amp_decay: f32,
         amp_decay_curve: f32,
     ) -> Self {
@@ -149,6 +155,8 @@ impl KickConfig {
             noise_cutoff: noise_cutoff.clamp(0.0, 1.0),
             noise_resonance: noise_resonance.clamp(0.0, 1.0),
             overdrive_amount: overdrive_amount.clamp(0.0, 1.0),
+            feedback_amount: feedback_amount.clamp(0.0, 1.0),
+            feedback_cutoff: feedback_cutoff.clamp(0.0, 1.0),
             amp_decay: amp_decay.clamp(0.0, 1.0),
             amp_decay_curve: amp_decay_curve.clamp(0.0, 1.0),
         }
@@ -249,6 +257,8 @@ impl KickConfig {
             0.01, // noise_cutoff
             0.02, // noise_res
             0.20, // overdrive
+            0.00, // feedback
+            0.47, // fb_cutoff
             0.12, // amp_decay
             0.02, // amp_dcy_crv
         )
@@ -271,6 +281,8 @@ impl KickConfig {
             0.11, // noise_cutoff
             0.42, // noise_res
             0.20, // overdrive
+            0.00, // feedback
+            0.47, // fb_cutoff
             0.12, // amp_decay
             0.02, // amp_dcy_crv
         )
@@ -293,6 +305,8 @@ impl KickConfig {
             0.01, // noise_cutoff
             0.02, // noise_res
             0.30, // overdrive
+            0.00, // feedback
+            0.47, // fb_cutoff
             0.12, // amp_decay
             0.12, // amp_dcy_crv
         )
@@ -315,6 +329,8 @@ impl KickConfig {
             0.10, // noise_cutoff
             0.82, // noise_res
             0.20, // overdrive
+            0.00, // feedback
+            0.47, // fb_cutoff
             0.10, // amp_decay
             0.10, // amp_dcy_crv
         )
@@ -342,6 +358,8 @@ impl Blendable for KickConfig {
             noise_cutoff: self.noise_cutoff * inv_t + other.noise_cutoff * t,
             noise_resonance: self.noise_resonance * inv_t + other.noise_resonance * t,
             overdrive_amount: self.overdrive_amount * inv_t + other.overdrive_amount * t,
+            feedback_amount: self.feedback_amount * inv_t + other.feedback_amount * t,
+            feedback_cutoff: self.feedback_cutoff * inv_t + other.feedback_cutoff * t,
             amp_decay: self.amp_decay * inv_t + other.amp_decay * t,
             amp_decay_curve: self.amp_decay_curve * inv_t + other.amp_decay_curve * t,
         }
@@ -366,6 +384,8 @@ pub struct KickParams {
     pub noise_cutoff: SmoothedParam,     // Noise filter cutoff (0-1 → 20-10000 Hz)
     pub noise_resonance: SmoothedParam,  // Noise filter resonance (0-1 → 0.0-5.0)
     pub overdrive: SmoothedParam,        // Overdrive/saturation amount (0-1, 0 = bypass)
+    pub feedback: SmoothedParam,         // Feedback waveshaper amount (0-1 → 0.0-0.9)
+    pub feedback_cutoff: SmoothedParam,  // Feedback filter cutoff (0-1 → 200-4000 Hz)
     // Master amplitude envelope parameters (amp_attack hardcoded to instant)
     pub amp_decay: SmoothedParam, // Amplitude decay time (0-1 → 0.0-4.0s)
     pub amp_decay_curve: SmoothedParam, // Decay curve (0-1 → 0.1-10.0)
@@ -474,6 +494,20 @@ impl KickParams {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
+            feedback: SmoothedParam::new(
+                config.feedback_amount,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
+            feedback_cutoff: SmoothedParam::new(
+                config.feedback_cutoff,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
             amp_decay: SmoothedParam::new(
                 config.amp_decay,
                 0.0,
@@ -508,6 +542,8 @@ impl KickParams {
         self.noise_cutoff.tick();
         self.noise_resonance.tick();
         self.overdrive.tick();
+        self.feedback.tick();
+        self.feedback_cutoff.tick();
         self.amp_decay.tick();
         self.amp_decay_curve.tick();
 
@@ -531,6 +567,8 @@ impl KickParams {
             && self.noise_cutoff.is_settled()
             && self.noise_resonance.is_settled()
             && self.overdrive.is_settled()
+            && self.feedback.is_settled()
+            && self.feedback_cutoff.is_settled()
             && self.amp_decay.is_settled()
             && self.amp_decay_curve.is_settled()
     }
@@ -551,6 +589,8 @@ impl KickParams {
         self.noise_cutoff.snap();
         self.noise_resonance.snap();
         self.overdrive.snap();
+        self.feedback.snap();
+        self.feedback_cutoff.snap();
         self.amp_decay.snap();
         self.amp_decay_curve.snap();
     }
@@ -572,6 +612,8 @@ impl KickParams {
             noise_cutoff: self.noise_cutoff.get(),
             noise_resonance: self.noise_resonance.get(),
             overdrive_amount: self.overdrive.get(),
+            feedback_amount: self.feedback.get(),
+            feedback_cutoff: self.feedback_cutoff.get(),
             amp_decay: self.amp_decay.get(),
             amp_decay_curve: self.amp_decay_curve.get(),
         }
@@ -685,8 +727,8 @@ pub struct KickDrum {
     pub noise_filter: ResonantLowpassFilter,
     pub noise_envelope: Envelope,
 
-    // Overdrive/saturation effect (Max MSP overdrive~ style)
-    pub waveshaper: Waveshaper,
+    // Overdrive/saturation with optional feedback waveshaping
+    pub waveshaper: FeedbackWaveshaper,
 
     // Master amplitude envelope (DS Kick "p curvey" style)
     // Applied multiplicatively on top of oscillator envelopes
@@ -742,7 +784,13 @@ impl KickDrum {
             pink_noise: PinkNoise::new(),
             noise_filter: ResonantLowpassFilter::new(sample_rate, noise_cutoff_hz, noise_res),
             noise_envelope: Envelope::new(),
-            waveshaper: Waveshaper::new(config.overdrive_amount, 1.0), // Full wet mix
+            waveshaper: FeedbackWaveshaper::new(
+                sample_rate,
+                1.0 + config.overdrive_amount * 9.0,
+                config.feedback_amount * 0.9,
+                200.0 + config.feedback_cutoff * 3800.0,
+                1.0,
+            ),
             amplitude_envelope: Envelope::new(),
             is_active: false,
 
@@ -868,6 +916,10 @@ impl KickDrum {
             .noise_resonance
             .set_target(config.noise_resonance);
         self.params.overdrive.set_target(config.overdrive_amount);
+        self.params.feedback.set_target(config.feedback_amount);
+        self.params
+            .feedback_cutoff
+            .set_target(config.feedback_cutoff);
         self.params.amp_decay.set_target(config.amp_decay);
         self.params
             .amp_decay_curve
@@ -1095,12 +1147,20 @@ impl KickDrum {
         let total_output = sub_output + punch_output + filtered_click_output + noise_output;
 
         // Map overdrive amount (0.0-1.0) to drive (1.0-10.0)
-        // 0.0 = bypass (drive 1.0), 1.0 = maximum saturation (drive 10.0)
         let overdrive_amount = self.params.overdrive.get();
         let drive = 1.0 + (overdrive_amount * 9.0);
         self.waveshaper.set_drive(drive);
 
-        // Apply overdrive/saturation effect (Max MSP overdrive~ style)
+        // Map feedback amount (0.0-1.0) to feedback gain (0.0-0.9)
+        let feedback_amount = self.params.feedback.get();
+        self.waveshaper.set_feedback(feedback_amount * 0.9);
+
+        // Map feedback cutoff (0.0-1.0) to Hz (200-4000)
+        let fb_cutoff = self.params.feedback_cutoff.get();
+        self.waveshaper
+            .set_filter_cutoff(200.0 + fb_cutoff * 3800.0);
+
+        // Apply overdrive/saturation with feedback waveshaping
         let overdriven_output = self.waveshaper.process(total_output);
 
         // Apply master amplitude envelope (DS Kick "p curvey" style)
@@ -1214,6 +1274,18 @@ impl KickDrum {
         self.params.overdrive.set_target(amount.clamp(0.0, 1.0));
     }
 
+    /// Set feedback waveshaper amount (smoothed, 0-1 → 0.0-0.9 gain)
+    pub fn set_feedback(&mut self, amount: f32) {
+        self.params.feedback.set_target(amount.clamp(0.0, 1.0));
+    }
+
+    /// Set feedback filter cutoff (smoothed, normalized 0-1 → 200-4000 Hz)
+    pub fn set_feedback_cutoff(&mut self, cutoff: f32) {
+        self.params
+            .feedback_cutoff
+            .set_target(cutoff.clamp(0.0, 1.0));
+    }
+
     /// Set amplitude envelope decay time (smoothed, normalized 0-1 → 0.0-4.0s)
     pub fn set_amp_decay(&mut self, decay: f32) {
         self.params.amp_decay.set_target(decay.clamp(0.0, 1.0));
@@ -1267,6 +1339,8 @@ impl crate::engine::Modulatable for KickDrum {
             "noise_cutoff",
             "noise_resonance",
             "overdrive",
+            "feedback",
+            "feedback_cutoff",
             "amp_decay",
             "amp_decay_curve",
         ]
@@ -1331,6 +1405,14 @@ impl crate::engine::Modulatable for KickDrum {
                 self.params.overdrive.set_bipolar(value);
                 Ok(())
             }
+            "feedback" => {
+                self.params.feedback.set_bipolar(value);
+                Ok(())
+            }
+            "feedback_cutoff" => {
+                self.params.feedback_cutoff.set_bipolar(value);
+                Ok(())
+            }
             "amp_decay" => {
                 self.params.amp_decay.set_bipolar(value);
                 Ok(())
@@ -1360,6 +1442,8 @@ impl crate::engine::Modulatable for KickDrum {
             "noise_cutoff" => Some(self.params.noise_cutoff.range()),
             "noise_resonance" => Some(self.params.noise_resonance.range()),
             "overdrive" => Some(self.params.overdrive.range()),
+            "feedback" => Some(self.params.feedback.range()),
+            "feedback_cutoff" => Some(self.params.feedback_cutoff.range()),
             "amp_decay" => Some(self.params.amp_decay.range()),
             "amp_decay_curve" => Some(self.params.amp_decay_curve.range()),
             _ => None,
