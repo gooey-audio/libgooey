@@ -79,3 +79,7 @@ required-features = ["native", "crossterm"]
 [[example]]
 name = "tilt_filter"
 required-features = ["native", "crossterm"]
+
+[[example]]
+name = "delay"
+required-features = ["native", "crossterm"]

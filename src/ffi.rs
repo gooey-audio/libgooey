@@ -4,8 +4,8 @@
 //! Designed for integration with iOS (and other platforms in the future).
 
 use crate::effects::{
-    BrickWallLimiter, DelayEffect, Effect, LowpassFilterEffect, TiltFilterEffect, TubeCompressor,
-    TubeSaturation,
+    BrickWallLimiter, DelayEffect, DelayTiming, Effect, LowpassFilterEffect, TiltFilterEffect,
+    TubeCompressor, TubeSaturation,
 };
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
@@ -550,8 +550,8 @@ impl GooeyEngine {
             Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "bass"),
         ];
 
-        // Create delay with default settings (0.25s delay, no feedback, no mix)
-        let delay = DelayEffect::new(sample_rate, 0.25, 0.0, 0.0);
+        // Create delay with default settings (quarter note timing, no feedback, no mix, filter open)
+        let delay = DelayEffect::new(sample_rate, DelayTiming::Quarter, bpm, 0.0, 0.0, 20000.0);
 
         // Create lowpass filter with default settings (fully open, no resonance)
         let lowpass_filter = LowpassFilterEffect::new(sample_rate, 20000.0, 0.0);
@@ -966,12 +966,37 @@ pub const FILTER_PARAM_RESONANCE: u32 = 1;
 // Delay parameter indices (must match Swift DelayParam enum)
 // =============================================================================
 
-/// Delay parameter: time in seconds (0.0-5.0)
-pub const DELAY_PARAM_TIME: u32 = 0;
+/// Delay parameter: timing division (see DELAY_TIMING_* constants)
+pub const DELAY_PARAM_TIMING: u32 = 0;
 /// Delay parameter: feedback amount (0.0-0.95)
 pub const DELAY_PARAM_FEEDBACK: u32 = 1;
 /// Delay parameter: wet/dry mix (0.0-1.0)
 pub const DELAY_PARAM_MIX: u32 = 2;
+/// Delay parameter: filter cutoff in Hz (20-20000)
+pub const DELAY_PARAM_FILTER_CUTOFF: u32 = 3;
+
+// =============================================================================
+// Delay timing constants (must match Swift DelayTiming enum)
+// =============================================================================
+
+/// Delay timing: whole note (4 beats)
+pub const DELAY_TIMING_WHOLE: u32 = 0;
+/// Delay timing: half note (2 beats)
+pub const DELAY_TIMING_HALF: u32 = 1;
+/// Delay timing: quarter note (1 beat)
+pub const DELAY_TIMING_QUARTER: u32 = 2;
+/// Delay timing: eighth note (1/2 beat)
+pub const DELAY_TIMING_EIGHTH: u32 = 3;
+/// Delay timing: sixteenth note (1/4 beat)
+pub const DELAY_TIMING_SIXTEENTH: u32 = 4;
+/// Delay timing: half note triplet (4/3 beats)
+pub const DELAY_TIMING_HALF_TRIPLET: u32 = 5;
+/// Delay timing: quarter note triplet (2/3 beat)
+pub const DELAY_TIMING_QUARTER_TRIPLET: u32 = 6;
+/// Delay timing: eighth note triplet (1/3 beat)
+pub const DELAY_TIMING_EIGHTH_TRIPLET: u32 = 7;
+/// Delay timing: sixteenth note triplet (1/6 beat)
+pub const DELAY_TIMING_SIXTEENTH_TRIPLET: u32 = 8;
 
 // =============================================================================
 // Saturation parameter indices (must match Swift SaturationParam enum)
@@ -2001,9 +2026,10 @@ pub unsafe extern "C" fn gooey_engine_load_bass_preset(
 ///   - FILTER_PARAM_CUTOFF (0): 20-20000 Hz
 ///   - FILTER_PARAM_RESONANCE (1): 0.0-0.95
 /// - EFFECT_DELAY (1):
-///   - DELAY_PARAM_TIME (0): 0.0-5.0 seconds
+///   - DELAY_PARAM_TIMING (0): DELAY_TIMING_* constant (0-8)
 ///   - DELAY_PARAM_FEEDBACK (1): 0.0-0.95
 ///   - DELAY_PARAM_MIX (2): 0.0-1.0
+///   - DELAY_PARAM_FILTER_CUTOFF (3): 20-20000 Hz
 /// - EFFECT_SATURATION (2):
 ///   - SATURATION_PARAM_DRIVE (0): 0.0-1.0
 ///   - SATURATION_PARAM_WARMTH (1): 0.0-1.0
@@ -2037,9 +2063,14 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
             _ => {} // Unknown parameter, ignore
         },
         EFFECT_DELAY => match param {
-            DELAY_PARAM_TIME => engine.delay.set_time(value),
+            DELAY_PARAM_TIMING => {
+                if let Some(timing) = DelayTiming::from_timing_constant(value as u32) {
+                    engine.delay.set_timing(timing);
+                }
+            }
             DELAY_PARAM_FEEDBACK => engine.delay.set_feedback(value),
             DELAY_PARAM_MIX => engine.delay.set_mix(value),
+            DELAY_PARAM_FILTER_CUTOFF => engine.delay.set_filter_cutoff(value),
             _ => {} // Unknown parameter, ignore
         },
         EFFECT_SATURATION => match param {
@@ -2098,9 +2129,10 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
             _ => -1.0, // Unknown parameter
         },
         EFFECT_DELAY => match param {
-            DELAY_PARAM_TIME => engine.delay.get_time(),
+            DELAY_PARAM_TIMING => engine.delay.get_timing() as f32,
             DELAY_PARAM_FEEDBACK => engine.delay.get_feedback(),
             DELAY_PARAM_MIX => engine.delay.get_mix(),
+            DELAY_PARAM_FILTER_CUTOFF => engine.delay.get_filter_cutoff(),
             _ => -1.0, // Unknown parameter
         },
         EFFECT_SATURATION => match param {
@@ -2264,6 +2296,9 @@ pub unsafe extern "C" fn gooey_engine_set_bpm(engine: *mut GooeyEngine, bpm: f32
     for seq in &mut engine.sequencers {
         seq.set_bpm(bpm);
     }
+
+    // Update delay BPM for clocked timing
+    engine.delay.set_bpm(bpm);
 
     // Update LFO BPM values for BPM-synced LFOs
     for lfo in &mut engine.lfos {
