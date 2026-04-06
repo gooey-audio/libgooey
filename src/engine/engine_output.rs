@@ -389,7 +389,7 @@ impl EngineOutput {
             let current_time = current_sample as f64 / sample_rate;
 
             // Call engine.tick() to generate audio
-            let audio_sample = engine_guard.tick(current_time as f32);
+            let audio_sample = engine_guard.tick(current_time);
             let value: SampleType = SampleType::from_sample(audio_sample);
 
             // Capture audio sample for visualization
@@ -434,7 +434,7 @@ impl EngineOutput {
             let current_time = current_sample as f64 / sample_rate;
 
             // Call engine.tick() to generate audio
-            let audio_sample = engine_guard.tick(current_time as f32);
+            let audio_sample = engine_guard.tick(current_time);
             let value: SampleType = SampleType::from_sample(audio_sample);
 
             // Copy the same value to all channels

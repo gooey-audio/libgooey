@@ -69,5 +69,17 @@ name = "membrane"
 required-features = ["native", "crossterm"]
 
 [[example]]
+name = "bass"
+required-features = ["native", "crossterm"]
+
+[[example]]
+name = "bass_sequencer"
+required-features = ["native", "crossterm"]
+
+[[example]]
+name = "tilt_filter"
+required-features = ["native", "crossterm"]
+
+[[example]]
 name = "delay"
 required-features = ["native", "crossterm"]

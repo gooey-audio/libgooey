@@ -1,6 +1,5 @@
-/* Kick Drum Lab - Interactive CLI for kick drum parameter experimentation.
-Supports real-time parameter adjustment, presets, and velocity control.
-Also supports MIDI input (if available).
+/* Bass Synth Lab - Interactive CLI for bass synth parameter experimentation.
+Supports real-time parameter adjustment, presets, velocity control, and blend mode.
 */
 
 use crossterm::{
@@ -12,23 +11,10 @@ use crossterm::{
 use std::io::{self, Write};
 
 use gooey::engine::{Engine, EngineOutput, Instrument};
-use gooey::instruments::{KickConfig, KickDrum};
+use gooey::instruments::{BassConfig, BassSynth};
 use gooey::utils::PresetBlender;
 use std::sync::{Arc, Mutex};
 
-#[cfg(feature = "midi")]
-use midir::{MidiInput, MidiInputConnection};
-#[cfg(feature = "midi")]
-use std::sync::mpsc::{channel, Receiver};
-
-// GM drum note numbers for kick
-#[cfg(feature = "midi")]
-const KICK_NOTE: u8 = 36;
-#[cfg(feature = "midi")]
-const KICK_NOTE_ALT: u8 = 35;
-
-// Parameter metadata for the UI
-// All parameters now use normalized 0-1 values
 struct ParamInfo {
     name: &'static str,
     coarse_step: f32,
@@ -36,68 +22,79 @@ struct ParamInfo {
     unit: &'static str,
 }
 
-// Parameters in alphabetical order for display
-const PARAM_INFO: [ParamInfo; 18] = [
+const PARAM_INFO: [ParamInfo; 15] = [
     ParamInfo {
         name: "amp_decay",
         coarse_step: 0.1,
         fine_step: 0.02,
         unit: "",
-    }, // 0-1 → 0.0-4.0s
+    },
     ParamInfo {
         name: "amp_dcy_crv",
         coarse_step: 0.1,
         fine_step: 0.02,
         unit: "",
-    }, // 0-1 → 0.1-10.0
+    },
     ParamInfo {
-        name: "click",
+        name: "detune_amt",
         coarse_step: 0.1,
         fine_step: 0.02,
         unit: "",
     },
     ParamInfo {
-        name: "fb_cutoff",
+        name: "detune_lvl",
         coarse_step: 0.1,
         fine_step: 0.02,
         unit: "",
-    }, // 0-1 → 200-4000 Hz
+    },
     ParamInfo {
-        name: "feedback",
+        name: "filt_cutoff",
         coarse_step: 0.1,
         fine_step: 0.02,
         unit: "",
-    }, // 0-1 → 0.0-0.9
+    },
+    ParamInfo {
+        name: "filt_env_amt",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
+    ParamInfo {
+        name: "filt_env_crv",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
+    ParamInfo {
+        name: "filt_env_dcy",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
+    ParamInfo {
+        name: "filt_reso",
+        coarse_step: 0.1,
+        fine_step: 0.02,
+        unit: "",
+    },
     ParamInfo {
         name: "frequency",
         coarse_step: 0.1,
         fine_step: 0.02,
         unit: "",
-    }, // 0-1 → 30-120 Hz
+    },
     ParamInfo {
-        name: "noise_amount",
+        name: "osc_level",
         coarse_step: 0.1,
         fine_step: 0.02,
         unit: "",
     },
     ParamInfo {
-        name: "noise_cutoff",
+        name: "osc_shape",
         coarse_step: 0.1,
         fine_step: 0.02,
         unit: "",
-    }, // 0-1 → 20-10000 Hz
-    ParamInfo {
-        name: "noise_res",
-        coarse_step: 0.1,
-        fine_step: 0.02,
-        unit: "",
-    }, // 0-1 → 0.0-5.0
-    ParamInfo {
-        name: "osc_decay",
-        coarse_step: 0.1,
-        fine_step: 0.02,
-        unit: "",
-    }, // 0-1 → 0.01-4.0s
+    },
     ParamInfo {
         name: "overdrive",
         coarse_step: 0.1,
@@ -105,37 +102,7 @@ const PARAM_INFO: [ParamInfo; 18] = [
         unit: "",
     },
     ParamInfo {
-        name: "phase_mod_amt",
-        coarse_step: 0.1,
-        fine_step: 0.02,
-        unit: "",
-    },
-    ParamInfo {
-        name: "pitch_env_amt",
-        coarse_step: 0.1,
-        fine_step: 0.02,
-        unit: "",
-    },
-    ParamInfo {
-        name: "pitch_env_crv",
-        coarse_step: 0.1,
-        fine_step: 0.02,
-        unit: "",
-    }, // 0-1 → 0.1-4.0
-    ParamInfo {
-        name: "pitch_ratio",
-        coarse_step: 0.1,
-        fine_step: 0.02,
-        unit: "",
-    }, // 0-1 → 1.0-10.0x
-    ParamInfo {
-        name: "punch",
-        coarse_step: 0.1,
-        fine_step: 0.02,
-        unit: "",
-    },
-    ParamInfo {
-        name: "sub",
+        name: "sub_level",
         coarse_step: 0.1,
         fine_step: 0.02,
         unit: "",
@@ -148,12 +115,15 @@ const PARAM_INFO: [ParamInfo; 18] = [
     },
 ];
 
-// Wrapper to share KickDrum between audio thread and main thread
-struct SharedKick(Arc<Mutex<KickDrum>>);
+// Wrapper to share BassSynth between audio thread and main thread
+struct SharedBass(Arc<Mutex<BassSynth>>);
 
-impl Instrument for SharedKick {
+impl Instrument for SharedBass {
     fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
-        self.0.lock().unwrap().trigger_with_velocity(time, velocity);
+        self.0
+            .lock()
+            .unwrap()
+            .trigger_with_velocity(time, velocity);
     }
 
     fn tick(&mut self, current_time: f64) -> f32 {
@@ -165,74 +135,59 @@ impl Instrument for SharedKick {
     }
 
     fn as_modulatable(&mut self) -> Option<&mut dyn gooey::engine::Modulatable> {
-        None // We control params directly, not through modulation
+        None
     }
 }
 
-// Helper functions for parameter access
-// All parameters use normalized 0-1 values
-// Indices match alphabetical PARAM_INFO order
-fn get_param_value(kick: &KickDrum, index: usize) -> f32 {
+// Parameter accessors (alphabetical order matching PARAM_INFO)
+fn get_param_value(bass: &BassSynth, index: usize) -> f32 {
     match index {
-        0 => kick.params.amp_decay.get(),
-        1 => kick.params.amp_decay_curve.get(),
-        2 => kick.params.click.get(),
-        3 => kick.params.feedback_cutoff.get(),
-        4 => kick.params.feedback.get(),
-        5 => kick.params.frequency.get(),
-        6 => kick.params.noise_amount.get(),
-        7 => kick.params.noise_cutoff.get(),
-        8 => kick.params.noise_resonance.get(),
-        9 => kick.params.oscillator_decay.get(),
-        10 => kick.params.overdrive.get(),
-        11 => kick.params.phase_mod_amount.get(),
-        12 => kick.params.pitch_envelope_amount.get(),
-        13 => kick.params.pitch_envelope_curve.get(),
-        14 => kick.params.pitch_start_ratio.get(),
-        15 => kick.params.punch.get(),
-        16 => kick.params.sub.get(),
-        17 => kick.params.volume.get(),
+        0 => bass.params.amp_decay.get(),
+        1 => bass.params.amp_decay_curve.get(),
+        2 => bass.params.detune_amount.get(),
+        3 => bass.params.detune_level.get(),
+        4 => bass.params.filter_cutoff.get(),
+        5 => bass.params.filter_env_amount.get(),
+        6 => bass.params.filter_env_curve.get(),
+        7 => bass.params.filter_env_decay.get(),
+        8 => bass.params.filter_resonance.get(),
+        9 => bass.params.frequency.get(),
+        10 => bass.params.osc_level.get(),
+        11 => bass.params.osc_shape.get(),
+        12 => bass.params.overdrive.get(),
+        13 => bass.params.sub_level.get(),
+        14 => bass.params.volume.get(),
         _ => 0.0,
     }
 }
 
-fn get_param_range(_kick: &KickDrum, _index: usize) -> (f32, f32) {
-    // All parameters now use normalized 0-1 range
-    (0.0, 1.0)
-}
-
-fn set_param_value(kick: &mut KickDrum, index: usize, value: f32) {
+fn set_param_value(bass: &mut BassSynth, index: usize, value: f32) {
     match index {
-        0 => kick.set_amp_decay(value),
-        1 => kick.set_amp_decay_curve(value),
-        2 => kick.set_click(value),
-        3 => kick.set_feedback_cutoff(value),
-        4 => kick.set_feedback(value),
-        5 => kick.set_frequency(value),
-        6 => kick.set_noise_amount(value),
-        7 => kick.set_noise_cutoff(value),
-        8 => kick.set_noise_resonance(value),
-        9 => kick.set_oscillator_decay(value),
-        10 => kick.set_overdrive(value),
-        11 => kick.set_phase_mod_amount(value),
-        12 => kick.set_pitch_envelope_amount(value),
-        13 => kick.set_pitch_envelope_curve(value),
-        14 => kick.set_pitch_start_ratio(value),
-        15 => kick.set_punch(value),
-        16 => kick.set_sub(value),
-        17 => kick.set_volume(value),
+        0 => bass.set_amp_decay(value),
+        1 => bass.set_amp_decay_curve(value),
+        2 => bass.set_detune_amount(value),
+        3 => bass.set_detune_level(value),
+        4 => bass.set_filter_cutoff(value),
+        5 => bass.set_filter_env_amount(value),
+        6 => bass.set_filter_env_curve(value),
+        7 => bass.set_filter_env_decay(value),
+        8 => bass.set_filter_resonance(value),
+        9 => bass.set_frequency(value),
+        10 => bass.set_osc_level(value),
+        11 => bass.set_osc_shape(value),
+        12 => bass.set_overdrive(value),
+        13 => bass.set_sub_level(value),
+        14 => bass.set_volume(value),
         _ => {}
     }
 }
 
-fn adjust_param(kick: &mut KickDrum, index: usize, delta: f32) {
-    let current = get_param_value(kick, index);
-    let (min, max) = get_param_range(kick, index);
-    let new_value = (current + delta).clamp(min, max);
-    set_param_value(kick, index, new_value);
+fn adjust_param(bass: &mut BassSynth, index: usize, delta: f32) {
+    let current = get_param_value(bass, index);
+    let new_value = (current + delta).clamp(0.0, 1.0);
+    set_param_value(bass, index, new_value);
 }
 
-// Create a visual bar for normalized value
 fn make_bar(normalized: f32, width: usize) -> String {
     let filled = (normalized * width as f32).round() as usize;
     let filled = filled.min(width);
@@ -240,12 +195,11 @@ fn make_bar(normalized: f32, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
 }
 
-// Blend mode state
 struct BlendState {
     enabled: bool,
     x: f32,
     y: f32,
-    blender: PresetBlender<KickConfig>,
+    blender: PresetBlender<BassConfig>,
 }
 
 impl BlendState {
@@ -255,28 +209,26 @@ impl BlendState {
             x: 0.5,
             y: 0.5,
             blender: PresetBlender::new(
-                KickConfig::tight(), // Bottom-left (0,0)
-                KickConfig::punch(), // Bottom-right (1,0)
-                KickConfig::loose(), // Top-left (0,1)
-                KickConfig::dirt(),  // Top-right (1,1)
+                BassConfig::acid(),  // Bottom-left (0,0)
+                BassConfig::sub(),   // Bottom-right (1,0)
+                BassConfig::reese(), // Top-left (0,1)
+                BassConfig::stab(),  // Top-right (1,1)
             ),
         }
     }
 }
 
-// Render the parameter display
 fn render_display(
-    kick: &KickDrum,
+    bass: &BassSynth,
     selected: usize,
     trigger_count: u32,
     velocity: f32,
     preset_name: &str,
     blend: &BlendState,
 ) {
-    // Clear screen, move cursor to home, and disable line wrapping
     print!("\x1b[2J\x1b[H\x1b[?7l");
 
-    print!("=== Kick Drum Lab ===\r\n");
+    print!("=== Bass Synth Lab ===\r\n");
     if blend.enabled {
         print!("SPACE=hit Q=quit WASD=blend B=exit blend mode\r\n");
         print!("Z/X/C/V=vel 25/50/75/100%\r\n");
@@ -286,13 +238,11 @@ fn render_display(
     }
     print!("Preset: {}\r\n", preset_name);
 
-    // Show blend X/Y pad visualization when in blend mode
     if blend.enabled {
         print!("\r\n");
         print!("  X/Y Blend Pad (WASD to move)\r\n");
         print!("  ┌──────────────────────┐\r\n");
 
-        // Render 8x8 pad with cursor
         let pad_w = 20;
         let pad_h = 8;
         let cursor_x = (blend.x * (pad_w - 1) as f32).round() as usize;
@@ -303,19 +253,16 @@ fn render_display(
             for col in 0..pad_w {
                 if row == cursor_y && col == cursor_x {
                     print!("●");
+                } else if row == 0 && col == 0 {
+                    print!("R"); // Reese (top-left)
+                } else if row == 0 && col == pad_w - 1 {
+                    print!("S"); // Stab (top-right)
+                } else if row == pad_h - 1 && col == 0 {
+                    print!("A"); // Acid (bottom-left)
+                } else if row == pad_h - 1 && col == pad_w - 1 {
+                    print!("B"); // suB (bottom-right)
                 } else {
-                    // Show corner labels
-                    if row == 0 && col == 0 {
-                        print!("L"); // Loose (top-left)
-                    } else if row == 0 && col == pad_w - 1 {
-                        print!("D"); // Dirt (top-right)
-                    } else if row == pad_h - 1 && col == 0 {
-                        print!("T"); // Tight (bottom-left)
-                    } else if row == pad_h - 1 && col == pad_w - 1 {
-                        print!("P"); // Punch (bottom-right)
-                    } else {
-                        print!("·");
-                    }
+                    print!("·");
                 }
             }
             print!("│\r\n");
@@ -327,10 +274,8 @@ fn render_display(
     print!("\r\n");
 
     for (i, info) in PARAM_INFO.iter().enumerate() {
-        let value = get_param_value(kick, i);
-        let (min, max) = get_param_range(kick, i);
-        let normalized = (value - min) / (max - min);
-        let bar = make_bar(normalized, 10);
+        let value = get_param_value(bass, i);
+        let bar = make_bar(value, 10);
 
         let indicator = if i == selected { ">" } else { " " };
         print!(
@@ -342,136 +287,49 @@ fn render_display(
     print!("\r\n");
     print!("Hits: {} | Vel: {:.0}%", trigger_count, velocity * 100.0);
 
-    // Flush to ensure display updates
     io::stdout().flush().unwrap();
-}
-
-#[cfg(feature = "midi")]
-struct MidiHandler {
-    _connection: MidiInputConnection<()>,
-    receiver: Receiver<(u8, u8)>, // (note, velocity)
-}
-
-#[cfg(feature = "midi")]
-impl MidiHandler {
-    fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let midi_in = MidiInput::new("libgooey-kick")?;
-        let ports = midi_in.ports();
-        if ports.is_empty() {
-            return Err("No MIDI input devices found".into());
-        }
-
-        let port = &ports[0];
-        let port_name = midi_in.port_name(port)?;
-        println!("Connecting to MIDI: {}", port_name);
-
-        let (tx, rx) = channel();
-        let connection = midi_in.connect(
-            port,
-            "kick-midi",
-            move |_, msg, _| {
-                // Note On with velocity > 0
-                if msg.len() >= 3 && (msg[0] & 0xF0) == 0x90 && msg[2] > 0 {
-                    let _ = tx.send((msg[1], msg[2]));
-                }
-            },
-            (),
-        )?;
-
-        Ok(Self {
-            _connection: connection,
-            receiver: rx,
-        })
-    }
-
-    fn list_ports() -> Vec<String> {
-        MidiInput::new("list")
-            .map(|m| {
-                m.ports()
-                    .iter()
-                    .filter_map(|p| m.port_name(p).ok())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
 }
 
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
     let sample_rate = 44100.0;
 
-    // Create shared kick drum that both audio thread and main thread can access
-    let kick = Arc::new(Mutex::new(KickDrum::new(sample_rate)));
+    let bass = Arc::new(Mutex::new(BassSynth::new(sample_rate)));
 
-    // Create the audio engine
     let mut engine = Engine::new(sample_rate);
+    engine.add_instrument("bass", Box::new(SharedBass(bass.clone())));
 
-    // Add the shared kick drum wrapper to the engine
-    engine.add_instrument("kick", Box::new(SharedKick(kick.clone())));
-
-    // Wrap engine in Arc<Mutex> for thread-safe access
     let audio_engine = Arc::new(Mutex::new(engine));
 
-    // Create and configure the Engine output
     let mut engine_output = EngineOutput::new();
     engine_output.initialize(sample_rate)?;
 
-    // Enable visualization (optional - comment out to disable)
     #[cfg(feature = "visualization")]
     engine_output.enable_visualization(1200, 400, 2.0)?;
 
     engine_output.create_stream_with_engine(audio_engine.clone())?;
-
-    // Start the audio stream
     engine_output.start()?;
 
-    // Try to initialize MIDI input (optional, fails gracefully)
-    #[cfg(feature = "midi")]
-    let midi = {
-        println!("Available MIDI ports: {:?}", MidiHandler::list_ports());
-        match MidiHandler::new() {
-            Ok(handler) => {
-                println!(
-                    "MIDI connected! Hit drum pad (note {} or {}).",
-                    KICK_NOTE, KICK_NOTE_ALT
-                );
-                Some(handler)
-            }
-            Err(e) => {
-                println!("No MIDI device: {} (keyboard only)", e);
-                None
-            }
-        }
-    };
-
-    #[cfg(feature = "visualization")]
-    println!("Waveform visualization enabled");
-
-    // UI state
     let mut selected_param: usize = 0;
     let mut trigger_count: u32 = 0;
     let mut current_velocity: f32 = 0.75;
-    let mut current_preset = "Tight";
+    let mut current_preset = "Acid";
     let mut needs_redraw = true;
     let mut blend = BlendState::new();
 
-    // Clear screen and enable raw mode
     execute!(io::stdout(), Clear(ClearType::All), cursor::Hide)?;
     enable_raw_mode()?;
 
-    // Main input loop
     let result = loop {
-        // Update visualization if enabled (no-op if disabled)
         if engine_output.update_visualization() {
             println!("\rVisualization window closed");
             break Ok(());
         }
 
-        // Render display if needed
         if needs_redraw {
-            let k = kick.lock().unwrap();
+            let b = bass.lock().unwrap();
             render_display(
-                &k,
+                &b,
                 selected_param,
                 trigger_count,
                 current_velocity,
@@ -481,27 +339,10 @@ fn main() -> anyhow::Result<()> {
             needs_redraw = false;
         }
 
-        // Poll for MIDI events (if available)
-        #[cfg(feature = "midi")]
-        if let Some(ref midi_handler) = midi {
-            while let Ok((note, velocity)) = midi_handler.receiver.try_recv() {
-                if note == KICK_NOTE || note == KICK_NOTE_ALT {
-                    let mut engine = audio_engine.lock().unwrap();
-                    // Convert MIDI velocity (0-127) to normalized (0.0-1.0)
-                    let vel_normalized = velocity as f32 / 127.0;
-                    engine.trigger_instrument_with_velocity("kick", vel_normalized);
-                    trigger_count += 1;
-                    current_velocity = vel_normalized;
-                    needs_redraw = true;
-                }
-            }
-        }
-
-        // Poll for key events (non-blocking with short timeout)
         if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(KeyEvent { code, .. }) = event::read()? {
                 match code {
-                    // Parameter navigation (only when not in blend mode)
+                    // Parameter navigation
                     KeyCode::Up if !blend.enabled => {
                         selected_param = selected_param.saturating_sub(1);
                         needs_redraw = true;
@@ -511,34 +352,34 @@ fn main() -> anyhow::Result<()> {
                         needs_redraw = true;
                     }
 
-                    // Coarse adjustment (only when not in blend mode)
+                    // Coarse adjustment
                     KeyCode::Left if !blend.enabled => {
                         let step = PARAM_INFO[selected_param].coarse_step;
-                        let mut k = kick.lock().unwrap();
-                        adjust_param(&mut k, selected_param, -step);
+                        let mut b = bass.lock().unwrap();
+                        adjust_param(&mut b, selected_param, -step);
                         current_preset = "Custom";
                         needs_redraw = true;
                     }
                     KeyCode::Right if !blend.enabled => {
                         let step = PARAM_INFO[selected_param].coarse_step;
-                        let mut k = kick.lock().unwrap();
-                        adjust_param(&mut k, selected_param, step);
+                        let mut b = bass.lock().unwrap();
+                        adjust_param(&mut b, selected_param, step);
                         current_preset = "Custom";
                         needs_redraw = true;
                     }
 
-                    // Fine adjustment (only when not in blend mode)
+                    // Fine adjustment
                     KeyCode::Char('[') if !blend.enabled => {
                         let step = PARAM_INFO[selected_param].fine_step;
-                        let mut k = kick.lock().unwrap();
-                        adjust_param(&mut k, selected_param, -step);
+                        let mut b = bass.lock().unwrap();
+                        adjust_param(&mut b, selected_param, -step);
                         current_preset = "Custom";
                         needs_redraw = true;
                     }
                     KeyCode::Char(']') if !blend.enabled => {
                         let step = PARAM_INFO[selected_param].fine_step;
-                        let mut k = kick.lock().unwrap();
-                        adjust_param(&mut k, selected_param, step);
+                        let mut b = bass.lock().unwrap();
+                        adjust_param(&mut b, selected_param, step);
                         current_preset = "Custom";
                         needs_redraw = true;
                     }
@@ -547,108 +388,107 @@ fn main() -> anyhow::Result<()> {
                     KeyCode::Char('b') | KeyCode::Char('B') => {
                         blend.enabled = !blend.enabled;
                         if blend.enabled {
-                            // Apply current blend position
                             let blended = blend.blender.blend(blend.x, blend.y);
-                            let mut k = kick.lock().unwrap();
-                            k.set_config(blended);
+                            let mut b = bass.lock().unwrap();
+                            b.set_config(blended);
                             current_preset = "Blended";
                         }
                         needs_redraw = true;
                     }
 
-                    // Blend mode WASD controls
+                    // Blend mode WASD
                     KeyCode::Char('w') | KeyCode::Char('W') if blend.enabled => {
                         blend.y = (blend.y + 0.05).min(1.0);
                         let blended = blend.blender.blend(blend.x, blend.y);
-                        let mut k = kick.lock().unwrap();
-                        k.set_config(blended);
+                        let mut b = bass.lock().unwrap();
+                        b.set_config(blended);
                         current_preset = "Blended";
                         needs_redraw = true;
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') if blend.enabled => {
                         blend.y = (blend.y - 0.05).max(0.0);
                         let blended = blend.blender.blend(blend.x, blend.y);
-                        let mut k = kick.lock().unwrap();
-                        k.set_config(blended);
+                        let mut b = bass.lock().unwrap();
+                        b.set_config(blended);
                         current_preset = "Blended";
                         needs_redraw = true;
                     }
                     KeyCode::Char('a') | KeyCode::Char('A') if blend.enabled => {
                         blend.x = (blend.x - 0.05).max(0.0);
                         let blended = blend.blender.blend(blend.x, blend.y);
-                        let mut k = kick.lock().unwrap();
-                        k.set_config(blended);
+                        let mut b = bass.lock().unwrap();
+                        b.set_config(blended);
                         current_preset = "Blended";
                         needs_redraw = true;
                     }
                     KeyCode::Char('d') | KeyCode::Char('D') if blend.enabled => {
                         blend.x = (blend.x + 0.05).min(1.0);
                         let blended = blend.blender.blend(blend.x, blend.y);
-                        let mut k = kick.lock().unwrap();
-                        k.set_config(blended);
+                        let mut b = bass.lock().unwrap();
+                        b.set_config(blended);
                         current_preset = "Blended";
                         needs_redraw = true;
                     }
 
-                    // Presets (only when not in blend mode)
+                    // Presets
                     KeyCode::Char('1') if !blend.enabled => {
-                        let mut k = kick.lock().unwrap();
-                        k.set_config(KickConfig::tight());
-                        current_preset = "Tight";
+                        let mut b = bass.lock().unwrap();
+                        b.set_config(BassConfig::acid());
+                        current_preset = "Acid";
                         needs_redraw = true;
                     }
                     KeyCode::Char('2') if !blend.enabled => {
-                        let mut k = kick.lock().unwrap();
-                        k.set_config(KickConfig::punch());
-                        current_preset = "Punch";
+                        let mut b = bass.lock().unwrap();
+                        b.set_config(BassConfig::sub());
+                        current_preset = "Sub";
                         needs_redraw = true;
                     }
                     KeyCode::Char('3') if !blend.enabled => {
-                        let mut k = kick.lock().unwrap();
-                        k.set_config(KickConfig::loose());
-                        current_preset = "Loose";
+                        let mut b = bass.lock().unwrap();
+                        b.set_config(BassConfig::reese());
+                        current_preset = "Reese";
                         needs_redraw = true;
                     }
                     KeyCode::Char('4') if !blend.enabled => {
-                        let mut k = kick.lock().unwrap();
-                        k.set_config(KickConfig::dirt());
-                        current_preset = "Dirt";
+                        let mut b = bass.lock().unwrap();
+                        b.set_config(BassConfig::stab());
+                        current_preset = "Stab";
                         needs_redraw = true;
                     }
 
-                    // Trigger at current velocity
+                    // Trigger
                     KeyCode::Char(' ') => {
                         let mut engine = audio_engine.lock().unwrap();
-                        engine.trigger_instrument_with_velocity("kick", current_velocity);
+                        engine.trigger_instrument_with_velocity("bass", current_velocity);
                         trigger_count += 1;
                         needs_redraw = true;
                     }
 
-                    // Velocity-specific triggers
+                    // Velocity triggers
                     KeyCode::Char('z') | KeyCode::Char('Z') => {
                         let mut engine = audio_engine.lock().unwrap();
-                        engine.trigger_instrument_with_velocity("kick", 0.25);
+                        engine.trigger_instrument_with_velocity("bass", 0.25);
                         trigger_count += 1;
                         current_velocity = 0.25;
                         needs_redraw = true;
                     }
                     KeyCode::Char('x') | KeyCode::Char('X') => {
                         let mut engine = audio_engine.lock().unwrap();
-                        engine.trigger_instrument_with_velocity("kick", 0.50);
+                        engine.trigger_instrument_with_velocity("bass", 0.50);
                         trigger_count += 1;
                         current_velocity = 0.50;
                         needs_redraw = true;
                     }
                     KeyCode::Char('c') | KeyCode::Char('C') => {
                         let mut engine = audio_engine.lock().unwrap();
-                        engine.trigger_instrument_with_velocity("kick", 0.75);
+                        engine.trigger_instrument_with_velocity("bass", 0.75);
                         trigger_count += 1;
                         current_velocity = 0.75;
                         needs_redraw = true;
                     }
                     KeyCode::Char('v') | KeyCode::Char('V') => {
                         let mut engine = audio_engine.lock().unwrap();
-                        engine.trigger_instrument_with_velocity("kick", 1.0);
+                        engine.trigger_instrument_with_velocity("bass", 1.0);
                         trigger_count += 1;
                         current_velocity = 1.0;
                         needs_redraw = true;
@@ -674,8 +514,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Restore terminal to normal mode and re-enable line wrapping
-    print!("\x1b[?7h"); // Re-enable line wrapping
+    print!("\x1b[?7h");
     execute!(io::stdout(), cursor::Show)?;
     disable_raw_mode()?;
     println!("\nQuitting...");

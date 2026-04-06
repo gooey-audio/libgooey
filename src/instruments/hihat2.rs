@@ -218,6 +218,15 @@ impl HiHat2Params {
         ranges::denormalize(self.tone.get(), ranges::TONE_MIN, ranges::TONE_MAX)
     }
 
+    /// Snap all smoothed parameters to their targets instantly.
+    pub fn snap_all(&mut self) {
+        self.pitch.snap();
+        self.decay.snap();
+        self.attack.snap();
+        self.tone.snap();
+        self.volume.snap();
+    }
+
     pub fn to_config(&self, noise_color: NoiseColor, filter_slope: FilterSlope) -> HiHat2Config {
         HiHat2Config {
             pitch: self.pitch.get(),
@@ -368,6 +377,11 @@ impl HiHat2 {
         self.filter_slope = config.filter_slope;
     }
 
+    /// Snap all smoothed parameters to their targets instantly.
+    pub fn snap_params(&mut self) {
+        self.params.snap_all();
+    }
+
     pub fn set_pitch(&mut self, pitch: f32) {
         self.params.pitch.set_target(pitch);
     }
@@ -396,11 +410,11 @@ impl HiHat2 {
         self.filter_slope = filter_slope;
     }
 
-    pub fn trigger(&mut self, time: f32) {
+    pub fn trigger(&mut self, time: f64) {
         self.trigger_with_velocity(time, 1.0);
     }
 
-    pub fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+    pub fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         self.is_active = true;
         self.current_velocity = velocity.clamp(0.0, 1.0);
 
@@ -419,7 +433,7 @@ impl HiHat2 {
         self.svf.reset();
     }
 
-    pub fn tick(&mut self, current_time: f32) -> f32 {
+    pub fn tick(&mut self, current_time: f64) -> f32 {
         self.params.tick();
 
         if !self.is_active {
@@ -490,11 +504,11 @@ impl HiHat2 {
 }
 
 impl crate::engine::Instrument for HiHat2 {
-    fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         HiHat2::trigger_with_velocity(self, time, velocity);
     }
 
-    fn tick(&mut self, current_time: f32) -> f32 {
+    fn tick(&mut self, current_time: f64) -> f32 {
         self.tick(current_time)
     }
 

@@ -28,18 +28,34 @@ pub trait Instrument: Send {
     /// # Arguments
     /// * `time` - The current audio time in seconds
     /// * `velocity` - Trigger velocity from 0.0 (softest) to 1.0 (hardest)
-    fn trigger_with_velocity(&mut self, time: f32, velocity: f32);
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32);
 
     /// Trigger the instrument at full velocity (convenience method)
-    fn trigger(&mut self, time: f32) {
+    fn trigger(&mut self, time: f64) {
         self.trigger_with_velocity(time, 1.0);
     }
 
     /// Generate one sample of audio at the current time
-    fn tick(&mut self, current_time: f32) -> f32;
+    fn tick(&mut self, current_time: f64) -> f32;
 
     /// Check if the instrument is currently active
     fn is_active(&self) -> bool;
+
+    /// Set the instrument's frequency from a MIDI note number (0-127).
+    /// Called by the sequencer when a step has a per-step note set.
+    /// Default implementation does nothing (instrument is not pitched).
+    fn set_midi_note(&mut self, _note: u8) {}
+
+    /// Set the instrument's normalized frequency parameter (0-1).
+    /// Used to restore the global frequency after per-step note overrides.
+    /// Default implementation does nothing (instrument is not pitched).
+    fn set_frequency_normalized(&mut self, _value: f32) {}
+
+    /// Get the current normalized frequency parameter (0-1), if the instrument is pitched.
+    /// Used by the sequencer to save/restore the global frequency around per-step note overrides.
+    fn get_frequency(&self) -> Option<f32> {
+        None
+    }
 
     /// Try to cast to Modulatable trait object
     /// Override this if the instrument supports modulation
@@ -77,6 +93,8 @@ pub struct Engine {
     global_effects: Vec<Box<dyn Effect>>,
     // Master gain applied to the summed output before effects
     master_gain: SmoothedParam,
+    // Saved global frequency per instrument for restoring after per-step note overrides
+    saved_global_freq: HashMap<String, f32>,
 }
 
 impl Engine {
@@ -95,6 +113,7 @@ impl Engine {
             global_effects,
             // Default of 0.25 provides headroom for mixing multiple instruments
             master_gain: SmoothedParam::new(0.25, 0.0, 2.0, sample_rate, 30.0),
+            saved_global_freq: HashMap::new(),
         }
     }
 
@@ -253,7 +272,7 @@ impl Engine {
 
     /// Generate one sample of audio at the given time
     /// This is called by the audio output on every sample
-    pub fn tick(&mut self, current_time: f32) -> f32 {
+    pub fn tick(&mut self, current_time: f64) -> f32 {
         // Process LFOs and apply modulation
         for lfo in &mut self.lfos {
             let lfo_value = lfo.tick();
@@ -268,11 +287,29 @@ impl Engine {
             }
         }
 
-        // Process all sequencers (sample-accurate triggering with velocity)
+        // Process all sequencers (sample-accurate triggering with velocity and per-step notes)
         for sequencer in &mut self.sequencers {
-            if let Some((instrument_name, velocity)) = sequencer.tick() {
-                // Sequencer says to trigger this instrument with velocity
+            if let Some(trigger) = sequencer.tick_with_settings() {
+                let instrument_name = trigger.instrument_name;
+                let velocity = trigger.velocity;
+                let note = trigger.note;
+
                 if let Some(instrument) = self.instruments.get_mut(instrument_name) {
+                    if let Some(midi_note) = note {
+                        // Save global frequency before overriding (only on first note step)
+                        let key = instrument_name.to_string();
+                        if !self.saved_global_freq.contains_key(&key) {
+                            if let Some(freq) = instrument.get_frequency() {
+                                self.saved_global_freq.insert(key, freq);
+                            }
+                        }
+                        instrument.set_midi_note(midi_note);
+                    } else if let Some(saved) =
+                        self.saved_global_freq.remove(instrument_name)
+                    {
+                        // Restore global frequency when step has no note
+                        instrument.set_frequency_normalized(saved);
+                    }
                     instrument.trigger_with_velocity(current_time, velocity);
                 }
             }

@@ -8,7 +8,7 @@ pub struct FMSnapSynthesizer {
     pub modulator_freq: f32,
     pub modulation_index: f32,
     pub phase: f32,
-    pub trigger_time: f32,
+    pub trigger_time: f64,
     pub is_active: bool,
 }
 
@@ -27,18 +27,18 @@ impl FMSnapSynthesizer {
         }
     }
 
-    pub fn trigger(&mut self, time: f32) {
+    pub fn trigger(&mut self, time: f64) {
         self.trigger_time = time;
         self.phase = 0.0;
         self.is_active = true;
     }
 
-    pub fn tick(&mut self, current_time: f32) -> f32 {
+    pub fn tick(&mut self, current_time: f64) -> f32 {
         if !self.is_active {
             return 0.0;
         }
 
-        let t = current_time - self.trigger_time;
+        let t = (current_time - self.trigger_time) as f32;
 
         // Check if we're past the envelope duration
         if t > self.attack_time + self.decay_time {
@@ -105,7 +105,7 @@ pub struct PhaseModulator {
     pub decay_time: f32,   // Time from peak to zero (default 0.005s = 5ms)
     pub attack_curve: f32, // Curve for attack (0.3 approximates Max's -0.8)
     pub decay_curve: f32,  // Curve for decay (0.4 approximates Max's -0.6)
-    pub trigger_time: f32,
+    pub trigger_time: f64,
     pub is_active: bool,
 }
 
@@ -122,19 +122,19 @@ impl PhaseModulator {
         }
     }
 
-    pub fn trigger(&mut self, time: f32) {
+    pub fn trigger(&mut self, time: f64) {
         self.trigger_time = time;
         self.is_active = true;
     }
 
     /// Returns phase modulation value (0.0-1.0)
     /// This value can be used to modulate oscillator frequency
-    pub fn tick(&mut self, current_time: f32) -> f32 {
+    pub fn tick(&mut self, current_time: f64) -> f32 {
         if !self.is_active {
             return 0.0;
         }
 
-        let elapsed = current_time - self.trigger_time;
+        let elapsed = (current_time - self.trigger_time) as f32;
         let total_time = self.attack_time + self.decay_time;
 
         if elapsed > total_time {

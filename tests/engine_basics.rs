@@ -43,7 +43,7 @@ fn test_trigger_instrument() {
     // Tick the engine and verify we get non-zero audio
     let mut found_audio = false;
     for i in 0..1000 {
-        let sample = engine.tick(i as f32 / sample_rate);
+        let sample = engine.tick(i as f64 / sample_rate as f64);
         if sample.abs() > 0.001 {
             found_audio = true;
             break;
@@ -129,7 +129,7 @@ fn test_multiple_instruments_mix() {
     // Both should produce audio when mixed
     let mut found_audio = false;
     for i in 0..1000 {
-        let sample = engine.tick(i as f32 / sample_rate);
+        let sample = engine.tick(i as f64 / sample_rate as f64);
         if sample.abs() > 0.001 {
             found_audio = true;
             break;

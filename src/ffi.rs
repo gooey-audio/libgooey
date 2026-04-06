@@ -4,12 +4,14 @@
 //! Designed for integration with iOS (and other platforms in the future).
 
 use crate::effects::{
-    BrickWallLimiter, DelayEffect, DelayTiming, Effect, LowpassFilterEffect, TubeSaturation,
+    BrickWallLimiter, DelayEffect, DelayTiming, Effect, LowpassFilterEffect, TiltFilterEffect,
+    TubeCompressor, TubeSaturation,
 };
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
 use crate::instruments::{
-    HiHat2, HiHat2Config, KickConfig, KickDrum, SnareConfig, SnareDrum, Tom2, Tom2Config,
+    BassConfig, BassSynth, HiHat2, HiHat2Config, KickConfig, KickDrum, SnareConfig, SnareDrum,
+    Tom2, Tom2Config,
 };
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CString};
@@ -73,51 +75,415 @@ pub struct GooeyMidiEvent {
     pub sample_offset: u32,
 }
 
+// =============================================================================
+// Channel instrument and blender enums
+// =============================================================================
+
+/// A polymorphic instrument that can be any drum synth type.
+/// Each channel holds one of these, enabling runtime instrument reassignment.
+enum ChannelInstrument {
+    Kick(KickDrum),
+    Snare(SnareDrum),
+    HiHat(HiHat2),
+    Tom(Tom2),
+    Bass(BassSynth),
+}
+
+impl ChannelInstrument {
+    /// Returns the instrument type constant for this variant.
+    fn instrument_type(&self) -> u32 {
+        match self {
+            Self::Kick(_) => INSTRUMENT_KICK,
+            Self::Snare(_) => INSTRUMENT_SNARE,
+            Self::HiHat(_) => INSTRUMENT_HIHAT,
+            Self::Tom(_) => INSTRUMENT_TOM,
+            Self::Bass(_) => INSTRUMENT_BASS,
+        }
+    }
+
+    /// Trigger the instrument with a given velocity.
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
+        match self {
+            Self::Kick(k) => k.trigger_with_velocity(time, velocity),
+            Self::Snare(s) => s.trigger_with_velocity(time, velocity),
+            Self::HiHat(h) => h.trigger_with_velocity(time, velocity),
+            Self::Tom(t) => t.trigger_with_velocity(time, velocity),
+            Self::Bass(b) => b.trigger_with_velocity(time, velocity),
+        }
+    }
+
+    /// Snap all smoothed parameters to their targets instantly.
+    /// Used for per-step sequencer blend overrides to avoid off-by-one latency.
+    fn snap_params(&mut self) {
+        match self {
+            Self::Kick(k) => k.snap_params(),
+            Self::Snare(s) => s.snap_params(),
+            Self::HiHat(h) => h.snap_params(),
+            Self::Tom(_) => {} // Tom2 uses plain f32, already immediate
+            Self::Bass(b) => b.snap_params(),
+        }
+    }
+
+    /// Generate the next audio sample.
+    fn tick(&mut self, current_time: f64) -> f32 {
+        match self {
+            Self::Kick(k) => k.tick(current_time),
+            Self::Snare(s) => s.tick(current_time),
+            Self::HiHat(h) => h.tick(current_time),
+            Self::Tom(t) => t.tick(current_time),
+            Self::Bass(b) => b.tick(current_time),
+        }
+    }
+
+    /// Get the current normalized frequency parameter (0-1) for pitched instruments.
+    fn get_freq_param(&self) -> Option<f32> {
+        match self {
+            Self::Kick(k) => Some(k.params.frequency.get()),
+            Self::Tom(t) => Some(t.tune()),
+            Self::Bass(b) => Some(b.params.frequency.get()),
+            _ => None,
+        }
+    }
+
+    /// Set a parameter by index. Dispatches to the correct setter for the current instrument type.
+    /// All parameters use normalized 0-1 range from the FFI.
+    fn set_param(&mut self, param: u32, value: f32) {
+        match self {
+            Self::Kick(k) => match param {
+                KICK_PARAM_FREQUENCY => k.set_frequency(value),
+                KICK_PARAM_PUNCH => k.set_punch(value),
+                KICK_PARAM_SUB => k.set_sub(value),
+                KICK_PARAM_CLICK => k.set_click(value),
+                KICK_PARAM_DECAY => k.set_oscillator_decay(value),
+                KICK_PARAM_PITCH_ENVELOPE => k.set_pitch_envelope_amount(value),
+                KICK_PARAM_VOLUME => k.set_volume(value),
+                _ => {}
+            },
+            Self::Snare(s) => match param {
+                SNARE_PARAM_FREQUENCY => s.set_frequency(value),
+                SNARE_PARAM_DECAY => s.set_decay(value),
+                SNARE_PARAM_BRIGHTNESS => s.set_brightness(value),
+                SNARE_PARAM_VOLUME => s.set_volume(value),
+                SNARE_PARAM_TONAL => s.set_tonal(value),
+                SNARE_PARAM_NOISE => s.set_noise(value),
+                SNARE_PARAM_PITCH_DROP => s.set_pitch_drop(value),
+                SNARE_PARAM_TONAL_DECAY => s.set_tonal_decay(value),
+                SNARE_PARAM_NOISE_DECAY => s.set_noise_decay(value),
+                SNARE_PARAM_NOISE_TAIL_DECAY => s.set_noise_tail_decay(value),
+                SNARE_PARAM_FILTER_CUTOFF => s.set_filter_cutoff(value),
+                SNARE_PARAM_FILTER_RESONANCE => s.set_filter_resonance(value),
+                SNARE_PARAM_FILTER_TYPE => s.set_filter_type(value as u8),
+                SNARE_PARAM_XFADE => s.set_xfade(value),
+                SNARE_PARAM_PHASE_MOD_AMOUNT => s.set_phase_mod_amount(value),
+                SNARE_PARAM_OVERDRIVE => s.set_overdrive(value),
+                SNARE_PARAM_AMP_DECAY => s.set_amp_decay(value),
+                SNARE_PARAM_AMP_DECAY_CURVE => s.set_amp_decay_curve(value),
+                SNARE_PARAM_TONAL_DECAY_CURVE => s.set_tonal_decay_curve(value),
+                _ => {}
+            },
+            Self::HiHat(h) => match param {
+                HIHAT_PARAM_PITCH => h.set_pitch(value),
+                HIHAT_PARAM_DECAY => h.set_decay(value),
+                HIHAT_PARAM_ATTACK => h.set_attack(value),
+                HIHAT_PARAM_VOLUME => h.set_volume(value),
+                HIHAT_PARAM_TONE => h.set_tone(value),
+                _ => {}
+            },
+            Self::Tom(t) => {
+                // Tom2 uses 0-100 range internally, FFI uses 0-1 normalized
+                let scaled = value.clamp(0.0, 1.0) * 100.0;
+                match param {
+                    TOM_PARAM_TUNE => t.set_tune(scaled),
+                    TOM_PARAM_BEND => t.set_bend(scaled),
+                    TOM_PARAM_TONE => t.set_tone(scaled),
+                    TOM_PARAM_COLOR => t.set_color(scaled),
+                    TOM_PARAM_DECAY => t.set_decay(scaled),
+                    TOM_PARAM_MEMBRANE => t.set_membrane(scaled),
+                    TOM_PARAM_MEMBRANE_Q => t.set_membrane_q(scaled),
+                    TOM_PARAM_VOLUME => t.set_volume(scaled),
+                    _ => {}
+                }
+            }
+            Self::Bass(b) => match param {
+                BASS_PARAM_FREQUENCY => b.set_frequency(value),
+                BASS_PARAM_SUB_LEVEL => b.set_sub_level(value),
+                BASS_PARAM_OSC_LEVEL => b.set_osc_level(value),
+                BASS_PARAM_DETUNE_LEVEL => b.set_detune_level(value),
+                BASS_PARAM_DETUNE_AMOUNT => b.set_detune_amount(value),
+                BASS_PARAM_OSC_SHAPE => b.set_osc_shape(value),
+                BASS_PARAM_FILTER_CUTOFF => b.set_filter_cutoff(value),
+                BASS_PARAM_FILTER_RESONANCE => b.set_filter_resonance(value),
+                BASS_PARAM_FILTER_ENV_AMOUNT => b.set_filter_env_amount(value),
+                BASS_PARAM_FILTER_ENV_DECAY => b.set_filter_env_decay(value),
+                BASS_PARAM_FILTER_ENV_CURVE => b.set_filter_env_curve(value),
+                BASS_PARAM_AMP_DECAY => b.set_amp_decay(value),
+                BASS_PARAM_AMP_DECAY_CURVE => b.set_amp_decay_curve(value),
+                BASS_PARAM_OVERDRIVE => b.set_overdrive(value),
+                BASS_PARAM_VOLUME => b.set_volume(value),
+                _ => {}
+            },
+        }
+    }
+
+    /// Apply LFO modulation to a parameter. Uses bipolar modulation for smoothed params.
+    fn apply_modulation(&mut self, param: u32, value: f32) {
+        match self {
+            Self::Kick(k) => match param {
+                KICK_PARAM_FREQUENCY => k.params.frequency.set_bipolar(value),
+                KICK_PARAM_PUNCH => k.params.punch.set_bipolar(value),
+                KICK_PARAM_SUB => k.params.sub.set_bipolar(value),
+                KICK_PARAM_CLICK => k.params.click.set_bipolar(value),
+                KICK_PARAM_DECAY => k.params.oscillator_decay.set_bipolar(value),
+                KICK_PARAM_PITCH_ENVELOPE => k.params.pitch_envelope_amount.set_bipolar(value),
+                KICK_PARAM_VOLUME => k.params.volume.set_bipolar(value),
+                _ => {}
+            },
+            Self::Snare(s) => match param {
+                SNARE_PARAM_FREQUENCY => s.params.frequency.set_bipolar(value),
+                SNARE_PARAM_DECAY => s.params.decay.set_bipolar(value),
+                SNARE_PARAM_BRIGHTNESS => s.params.brightness.set_bipolar(value),
+                SNARE_PARAM_VOLUME => s.params.volume.set_bipolar(value),
+                SNARE_PARAM_TONAL => s.params.tonal.set_bipolar(value),
+                SNARE_PARAM_NOISE => s.params.noise.set_bipolar(value),
+                SNARE_PARAM_PITCH_DROP => s.params.pitch_drop.set_bipolar(value),
+                SNARE_PARAM_TONAL_DECAY => s.params.tonal_decay.set_bipolar(value),
+                SNARE_PARAM_NOISE_DECAY => s.params.noise_decay.set_bipolar(value),
+                SNARE_PARAM_NOISE_TAIL_DECAY => s.params.noise_tail_decay.set_bipolar(value),
+                SNARE_PARAM_FILTER_CUTOFF => s.params.filter_cutoff.set_bipolar(value),
+                SNARE_PARAM_FILTER_RESONANCE => s.params.filter_resonance.set_bipolar(value),
+                SNARE_PARAM_XFADE => s.params.xfade.set_bipolar(value),
+                SNARE_PARAM_PHASE_MOD_AMOUNT => s.params.phase_mod_amount.set_bipolar(value),
+                SNARE_PARAM_OVERDRIVE => s.params.overdrive.set_bipolar(value),
+                SNARE_PARAM_AMP_DECAY => s.params.amp_decay.set_bipolar(value),
+                SNARE_PARAM_AMP_DECAY_CURVE => s.params.amp_decay_curve.set_bipolar(value),
+                SNARE_PARAM_TONAL_DECAY_CURVE => s.params.tonal_decay_curve.set_bipolar(value),
+                _ => {}
+            },
+            Self::HiHat(h) => match param {
+                HIHAT_PARAM_PITCH => h.params.pitch.set_bipolar(value),
+                HIHAT_PARAM_DECAY => h.params.decay.set_bipolar(value),
+                HIHAT_PARAM_ATTACK => h.params.attack.set_bipolar(value),
+                HIHAT_PARAM_TONE => h.params.tone.set_bipolar(value),
+                HIHAT_PARAM_VOLUME => h.params.volume.set_bipolar(value),
+                _ => {}
+            },
+            Self::Tom(t) => {
+                // Tom2 uses 0-100 range, scale modulation accordingly
+                let scaled = value * 100.0;
+                match param {
+                    TOM_PARAM_TUNE => t.set_tune(scaled),
+                    TOM_PARAM_BEND => t.set_bend(scaled),
+                    TOM_PARAM_TONE => t.set_tone(scaled),
+                    TOM_PARAM_COLOR => t.set_color(scaled),
+                    TOM_PARAM_DECAY => t.set_decay(scaled),
+                    TOM_PARAM_MEMBRANE => t.set_membrane(scaled),
+                    TOM_PARAM_MEMBRANE_Q => t.set_membrane_q(scaled),
+                    TOM_PARAM_VOLUME => t.set_volume(scaled),
+                    _ => {}
+                }
+            }
+            Self::Bass(b) => match param {
+                BASS_PARAM_FREQUENCY => b.params.frequency.set_bipolar(value),
+                BASS_PARAM_SUB_LEVEL => b.params.sub_level.set_bipolar(value),
+                BASS_PARAM_OSC_LEVEL => b.params.osc_level.set_bipolar(value),
+                BASS_PARAM_DETUNE_LEVEL => b.params.detune_level.set_bipolar(value),
+                BASS_PARAM_DETUNE_AMOUNT => b.params.detune_amount.set_bipolar(value),
+                BASS_PARAM_OSC_SHAPE => b.params.osc_shape.set_bipolar(value),
+                BASS_PARAM_FILTER_CUTOFF => b.params.filter_cutoff.set_bipolar(value),
+                BASS_PARAM_FILTER_RESONANCE => b.params.filter_resonance.set_bipolar(value),
+                BASS_PARAM_FILTER_ENV_AMOUNT => b.params.filter_env_amount.set_bipolar(value),
+                BASS_PARAM_FILTER_ENV_DECAY => b.params.filter_env_decay.set_bipolar(value),
+                BASS_PARAM_FILTER_ENV_CURVE => b.params.filter_env_curve.set_bipolar(value),
+                BASS_PARAM_AMP_DECAY => b.params.amp_decay.set_bipolar(value),
+                BASS_PARAM_AMP_DECAY_CURVE => b.params.amp_decay_curve.set_bipolar(value),
+                BASS_PARAM_OVERDRIVE => b.params.overdrive.set_bipolar(value),
+                BASS_PARAM_VOLUME => b.params.volume.set_bipolar(value),
+                _ => {}
+            },
+        }
+    }
+}
+
+/// A polymorphic preset blender matching the instrument type on a channel.
+enum ChannelBlender {
+    Kick(PresetBlender<KickConfig>),
+    Snare(PresetBlender<SnareConfig>),
+    HiHat(PresetBlender<HiHat2Config>),
+    Tom(PresetBlender<Tom2Config>),
+    Bass(PresetBlender<BassConfig>),
+}
+
+impl ChannelBlender {
+    /// Blend at position (x,y) and apply the result to the instrument.
+    fn blend_and_apply(&self, instrument: &mut ChannelInstrument, x: f32, y: f32) {
+        match (self, instrument) {
+            (Self::Kick(b), ChannelInstrument::Kick(k)) => k.set_config(b.blend(x, y)),
+            (Self::Snare(b), ChannelInstrument::Snare(s)) => s.set_config(b.blend(x, y)),
+            (Self::HiHat(b), ChannelInstrument::HiHat(h)) => h.set_config(b.blend(x, y)),
+            (Self::Tom(b), ChannelInstrument::Tom(t)) => t.set_config(b.blend(x, y)),
+            (Self::Bass(b), ChannelInstrument::Bass(bs)) => bs.set_config(b.blend(x, y)),
+            _ => {} // type mismatch — should not happen if blender/instrument are kept in sync
+        }
+    }
+
+    /// Set a corner preset by corner index and preset ID.
+    fn set_corner_preset(&mut self, corner: u32, preset_id: u32) {
+        match self {
+            Self::Kick(b) => {
+                if let Some(config) = GooeyEngine::kick_preset_by_id(preset_id) {
+                    match corner {
+                        BLEND_CORNER_BOTTOM_LEFT => b.set_bottom_left(config),
+                        BLEND_CORNER_BOTTOM_RIGHT => b.set_bottom_right(config),
+                        BLEND_CORNER_TOP_LEFT => b.set_top_left(config),
+                        BLEND_CORNER_TOP_RIGHT => b.set_top_right(config),
+                        _ => {}
+                    }
+                }
+            }
+            Self::Snare(b) => {
+                if let Some(config) = GooeyEngine::snare_preset_by_id(preset_id) {
+                    match corner {
+                        BLEND_CORNER_BOTTOM_LEFT => b.set_bottom_left(config),
+                        BLEND_CORNER_BOTTOM_RIGHT => b.set_bottom_right(config),
+                        BLEND_CORNER_TOP_LEFT => b.set_top_left(config),
+                        BLEND_CORNER_TOP_RIGHT => b.set_top_right(config),
+                        _ => {}
+                    }
+                }
+            }
+            Self::HiHat(b) => {
+                if let Some(config) = GooeyEngine::hihat_preset_by_id(preset_id) {
+                    match corner {
+                        BLEND_CORNER_BOTTOM_LEFT => b.set_bottom_left(config),
+                        BLEND_CORNER_BOTTOM_RIGHT => b.set_bottom_right(config),
+                        BLEND_CORNER_TOP_LEFT => b.set_top_left(config),
+                        BLEND_CORNER_TOP_RIGHT => b.set_top_right(config),
+                        _ => {}
+                    }
+                }
+            }
+            Self::Tom(b) => {
+                if let Some(config) = GooeyEngine::tom_preset_by_id(preset_id) {
+                    match corner {
+                        BLEND_CORNER_BOTTOM_LEFT => b.set_bottom_left(config),
+                        BLEND_CORNER_BOTTOM_RIGHT => b.set_bottom_right(config),
+                        BLEND_CORNER_TOP_LEFT => b.set_top_left(config),
+                        BLEND_CORNER_TOP_RIGHT => b.set_top_right(config),
+                        _ => {}
+                    }
+                }
+            }
+            Self::Bass(b) => {
+                if let Some(config) = GooeyEngine::bass_preset_by_id(preset_id) {
+                    match corner {
+                        BLEND_CORNER_BOTTOM_LEFT => b.set_bottom_left(config),
+                        BLEND_CORNER_BOTTOM_RIGHT => b.set_bottom_right(config),
+                        BLEND_CORNER_TOP_LEFT => b.set_top_left(config),
+                        BLEND_CORNER_TOP_RIGHT => b.set_top_right(config),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Create a default blender with standard corner presets for the given instrument type.
+    fn default_for_type(instrument_type: u32) -> Self {
+        match instrument_type {
+            INSTRUMENT_KICK => Self::Kick(PresetBlender::new(
+                KickConfig::tight(),
+                KickConfig::punch(),
+                KickConfig::loose(),
+                KickConfig::dirt(),
+            )),
+            INSTRUMENT_SNARE => Self::Snare(PresetBlender::new(
+                SnareConfig::tight(),
+                SnareConfig::loose(),
+                SnareConfig::hiss(),
+                SnareConfig::smack(),
+            )),
+            INSTRUMENT_HIHAT => Self::HiHat(PresetBlender::new(
+                HiHat2Config::short(),
+                HiHat2Config::loose(),
+                HiHat2Config::dark(),
+                HiHat2Config::soft(),
+            )),
+            INSTRUMENT_TOM => Self::Tom(PresetBlender::new(
+                Tom2Config::derp(),
+                Tom2Config::ring(),
+                Tom2Config::brush(),
+                Tom2Config::void_preset(),
+            )),
+            INSTRUMENT_BASS => Self::Bass(PresetBlender::new(
+                BassConfig::acid(),
+                BassConfig::sub(),
+                BassConfig::reese(),
+                BassConfig::stab(),
+            )),
+            _ => Self::Kick(PresetBlender::new(
+                KickConfig::tight(),
+                KickConfig::punch(),
+                KickConfig::loose(),
+                KickConfig::dirt(),
+            )),
+        }
+    }
+
+    /// Returns the default corner preset IDs for a given instrument type.
+    fn default_corner_preset_ids(instrument_type: u32) -> [u32; 4] {
+        match instrument_type {
+            INSTRUMENT_KICK => [KICK_PRESET_TIGHT, KICK_PRESET_PUNCH, KICK_PRESET_LOOSE, KICK_PRESET_DIRT],
+            INSTRUMENT_SNARE => [SNARE_PRESET_TIGHT, SNARE_PRESET_LOOSE, SNARE_PRESET_HISS, SNARE_PRESET_SMACK],
+            INSTRUMENT_HIHAT => [HIHAT_PRESET_SHORT, HIHAT_PRESET_LOOSE, HIHAT_PRESET_DARK, HIHAT_PRESET_SOFT],
+            INSTRUMENT_TOM => [TOM_PRESET_DERP, TOM_PRESET_RING, TOM_PRESET_BRUSH, TOM_PRESET_VOID],
+            INSTRUMENT_BASS => [BASS_PRESET_ACID, BASS_PRESET_SUB, BASS_PRESET_REESE, BASS_PRESET_STAB],
+            _ => [0, 1, 2, 3],
+        }
+    }
+}
+
 /// Opaque wrapper around the audio engine for FFI
 ///
 /// This struct provides a simplified C-compatible interface for iOS integration.
-/// It manages 4 drum instruments (kick, snare, hihat, tom), each with its own
-/// 16-step sequencer with sample-accurate timing.
+/// It manages 5 channels, each with an instrument and its own
+/// 16-step sequencer with sample-accurate timing. Channels can be reassigned
+/// to any instrument type at runtime.
 ///
 /// Parameter smoothing is handled internally by each instrument,
 /// so all parameter changes are automatically smoothed to prevent clicks/pops.
 pub struct GooeyEngine {
-    // Instruments
-    kick: KickDrum,
-    snare: SnareDrum,
-    hihat: HiHat2,
-    tom: Tom2,
+    // Per-channel instruments (each can hold any synth type)
+    channels: [ChannelInstrument; NUM_INSTRUMENTS],
 
-    // Per-instrument sequencers (sample-accurate, synchronized)
-    kick_sequencer: Sequencer,
-    snare_sequencer: Sequencer,
-    hihat_sequencer: Sequencer,
-    tom_sequencer: Sequencer,
+    // Per-channel sequencers (sample-accurate, synchronized)
+    sequencers: [Sequencer; NUM_INSTRUMENTS],
 
-    // Global effects (applied in order: delay -> lowpass filter -> saturation -> limiter)
+    // Global effects (applied in order: delay -> lowpass filter -> saturation -> compressor -> limiter)
     delay: DelayEffect,
     delay_enabled: bool,
     lowpass_filter: LowpassFilterEffect,
     lowpass_filter_enabled: bool,
+    tilt_filter: TiltFilterEffect,
+    tilt_filter_enabled: bool,
     saturation: TubeSaturation,
     saturation_enabled: bool,
+    compressor: TubeCompressor,
+    compressor_enabled: bool,
+    compressor_sidechain: u32,
     limiter: BrickWallLimiter,
 
     // Engine state
     sample_rate: f32,
     bpm: f32,
     swing: f32,
-    current_time: f32,
+    current_time: f64,
 
-    // Per-instrument manual trigger flags and velocities
-    kick_trigger_pending: AtomicBool,
-    kick_trigger_velocity: AtomicU32, // f32 bits stored atomically
-    snare_trigger_pending: AtomicBool,
-    snare_trigger_velocity: AtomicU32,
-    hihat_trigger_pending: AtomicBool,
-    hihat_trigger_velocity: AtomicU32,
-    tom_trigger_pending: AtomicBool,
-    tom_trigger_velocity: AtomicU32,
+    // Per-channel manual trigger flags and velocities
+    trigger_pending: [AtomicBool; NUM_INSTRUMENTS],
+    trigger_velocity: [AtomicU32; NUM_INSTRUMENTS], // f32 bits stored atomically
+
+    // Per-channel peak amplitude since last read (f32 bits stored atomically, read-and-reset by UI)
+    channel_peaks: [AtomicU32; NUM_INSTRUMENTS],
 
     // LFO pool (8 LFOs with multi-target routing)
     lfos: [Lfo; LFO_COUNT],
@@ -125,26 +491,28 @@ pub struct GooeyEngine {
     lfo_routes: [Vec<LfoRoute>; LFO_COUNT],
     lfo_next_route_id: [u32; LFO_COUNT],
 
-    // Per-instrument mute/solo state (indexed by INSTRUMENT_* constants)
+    // Per-channel mute/solo state
     instrument_muted: [AtomicBool; NUM_INSTRUMENTS],
     instrument_soloed: [AtomicBool; NUM_INSTRUMENTS],
 
     // Smoothed gain multipliers for click-free mute/solo transitions
     instrument_gains: [SmoothedParam; NUM_INSTRUMENTS],
 
-    // Per-instrument channel gain (0.0–1.0), applied after synthesis and blending.
+    // Per-channel gain (0.0–1.0), applied after synthesis and blending.
     // Acts as a mixer fader that the blend system cannot override.
     instrument_channel_gains: [SmoothedParam; NUM_INSTRUMENTS],
 
-    // Per-instrument preset blend state (2D X/Y pad interpolation)
-    kick_blender: PresetBlender<KickConfig>,
-    snare_blender: PresetBlender<SnareConfig>,
-    hihat_blender: PresetBlender<HiHat2Config>,
-    tom_blender: PresetBlender<Tom2Config>,
+    // Per-channel preset blend state (2D X/Y pad interpolation)
+    blenders: [ChannelBlender; NUM_INSTRUMENTS],
     blend_enabled: [bool; INSTRUMENT_COUNT as usize],
     blend_x: [f32; INSTRUMENT_COUNT as usize],
     blend_y: [f32; INSTRUMENT_COUNT as usize],
     blend_corner_presets: [[u32; 4]; INSTRUMENT_COUNT as usize],
+
+    // Per-channel saved global frequency for restoring after per-step MIDI note overrides.
+    // When a step with a note fires, the instrument's current frequency param is saved here.
+    // When a step without a note fires, the saved value is restored and cleared.
+    saved_global_freq: [Option<f32>; NUM_INSTRUMENTS],
 
     // Pending MIDI events from the most recent render pass (pre-allocated, no audio-thread alloc)
     pending_midi_events: Vec<GooeyMidiEvent>,
@@ -164,98 +532,75 @@ impl GooeyEngine {
     fn new(sample_rate: f32) -> Self {
         let bpm = 120.0;
 
-        // Create all instruments
-        let kick = KickDrum::new(sample_rate);
-        let snare = SnareDrum::new(sample_rate);
-        let hihat = HiHat2::new(sample_rate);
-        let tom = Tom2::new(sample_rate);
+        // Create channel instruments (default: ch0=kick, ch1=snare, ch2=hihat, ch3=tom, ch4=bass)
+        let channels = [
+            ChannelInstrument::Kick(KickDrum::new(sample_rate)),
+            ChannelInstrument::Snare(SnareDrum::new(sample_rate)),
+            ChannelInstrument::HiHat(HiHat2::new(sample_rate)),
+            ChannelInstrument::Tom(Tom2::new(sample_rate)),
+            ChannelInstrument::Bass(BassSynth::new(sample_rate)),
+        ];
 
-        // Create a 16-step sequencer for each instrument
-        // All use 16th notes at default 120 BPM, starting with all steps off
-        let kick_sequencer = Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "kick");
-        let snare_sequencer = Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "snare");
-        let hihat_sequencer = Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "hihat");
-        let tom_sequencer = Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "tom");
+        // Create a 16-step sequencer for each channel
+        let sequencers = [
+            Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "kick"),
+            Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "snare"),
+            Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "hihat"),
+            Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "tom"),
+            Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "bass"),
+        ];
 
         // Create delay with default settings (quarter note timing, no feedback, no mix, filter open)
         let delay = DelayEffect::new(sample_rate, DelayTiming::Quarter, bpm, 0.0, 0.0, 20000.0);
 
         // Create lowpass filter with default settings (fully open, no resonance)
-        // Default cutoff at 20kHz means filter is effectively bypassed when enabled
         let lowpass_filter = LowpassFilterEffect::new(sample_rate, 20000.0, 0.0);
 
+        // Create tilt filter with default settings (center = passthrough)
+        let tilt_filter = TiltFilterEffect::new(sample_rate);
+
         // Create saturation with default light warmth settings
-        // drive: 0.3, warmth: 0.4, mix: 0.5 for subtle analog warmth
         let saturation = TubeSaturation::new(sample_rate, 0.3, 0.4, 0.5);
+
+        // Create compressor with drum-friendly defaults
+        // threshold: -12 dB, ratio: 4:1, attack: 5ms, release: 100ms, mix: 0.5
+        let compressor = TubeCompressor::new(sample_rate, -12.0, 4.0, 5.0, 100.0, 0.5);
 
         // Create LFO pool (8 LFOs, all disabled by default with quarter note timing)
         let lfos = std::array::from_fn(|_| Lfo::with_sample_rate(sample_rate));
         let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] = std::array::from_fn(|_| Vec::new());
 
-        // Create kick preset blender with default corner presets
-        // BL(0,0)=Tight, BR(1,0)=Punch, TL(0,1)=Loose, TR(1,1)=Dirt
-        let kick_blender = PresetBlender::new(
-            KickConfig::tight(),
-            KickConfig::punch(),
-            KickConfig::loose(),
-            KickConfig::dirt(),
-        );
-
-        // Create snare preset blender with default corner presets
-        // BL(0,0)=Tight, BR(1,0)=Loose, TL(0,1)=Hiss, TR(1,1)=Smack
-        let snare_blender = PresetBlender::new(
-            SnareConfig::tight(),
-            SnareConfig::loose(),
-            SnareConfig::hiss(),
-            SnareConfig::smack(),
-        );
-
-        // Create hi-hat preset blender with default corner presets
-        // BL(0,0)=Short, BR(1,0)=Loose, TL(0,1)=Dark, TR(1,1)=Soft
-        let hihat_blender = PresetBlender::new(
-            HiHat2Config::short(),
-            HiHat2Config::loose(),
-            HiHat2Config::dark(),
-            HiHat2Config::soft(),
-        );
-
-        // Create tom preset blender with default corner presets
-        // BL(0,0)=Derp, BR(1,0)=Ring, TL(0,1)=Brush, TR(1,1)=Void
-        let tom_blender = PresetBlender::new(
-            Tom2Config::derp(),
-            Tom2Config::ring(),
-            Tom2Config::brush(),
-            Tom2Config::void_preset(),
-        );
+        // Create per-channel preset blenders with default corner presets
+        let blenders = [
+            ChannelBlender::default_for_type(INSTRUMENT_KICK),
+            ChannelBlender::default_for_type(INSTRUMENT_SNARE),
+            ChannelBlender::default_for_type(INSTRUMENT_HIHAT),
+            ChannelBlender::default_for_type(INSTRUMENT_TOM),
+            ChannelBlender::default_for_type(INSTRUMENT_BASS),
+        ];
 
         Self {
-            kick,
-            snare,
-            hihat,
-            tom,
-            kick_sequencer,
-            snare_sequencer,
-            hihat_sequencer,
-            tom_sequencer,
+            channels,
+            sequencers,
             delay,
-            delay_enabled: false, // Disabled by default
+            delay_enabled: false,
             lowpass_filter,
-            lowpass_filter_enabled: false, // Disabled by default
+            lowpass_filter_enabled: false,
+            tilt_filter,
+            tilt_filter_enabled: false,
             saturation,
-            saturation_enabled: true, // Enabled by default for light warmth
+            saturation_enabled: true,
+            compressor,
+            compressor_enabled: true,
+            compressor_sidechain: COMPRESSOR_SIDECHAIN_NONE,
             limiter: BrickWallLimiter::new(1.0),
             sample_rate,
             bpm,
             swing: 0.5,
             current_time: 0.0,
-            kick_trigger_pending: AtomicBool::new(false),
-            kick_trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
-            snare_trigger_pending: AtomicBool::new(false),
-            snare_trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
-            hihat_trigger_pending: AtomicBool::new(false),
-            hihat_trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
-            tom_trigger_pending: AtomicBool::new(false),
-            tom_trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
+            trigger_pending: std::array::from_fn(|_| AtomicBool::new(false)),
+            trigger_velocity: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
+            channel_peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             // LFO pool
             lfos,
             lfo_enabled: [false; LFO_COUNT],
@@ -273,39 +618,19 @@ impl GooeyEngine {
                 SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0)
             }),
             // Preset blend state
-            kick_blender,
-            snare_blender,
-            hihat_blender,
-            tom_blender,
+            blenders,
             blend_enabled: [false; INSTRUMENT_COUNT as usize],
             blend_x: [0.5; INSTRUMENT_COUNT as usize],
             blend_y: [0.5; INSTRUMENT_COUNT as usize],
             blend_corner_presets: [
-                [
-                    KICK_PRESET_TIGHT,
-                    KICK_PRESET_PUNCH,
-                    KICK_PRESET_LOOSE,
-                    KICK_PRESET_DIRT,
-                ],
-                [
-                    SNARE_PRESET_TIGHT,
-                    SNARE_PRESET_LOOSE,
-                    SNARE_PRESET_HISS,
-                    SNARE_PRESET_SMACK,
-                ],
-                [
-                    HIHAT_PRESET_SHORT,
-                    HIHAT_PRESET_LOOSE,
-                    HIHAT_PRESET_DARK,
-                    HIHAT_PRESET_SOFT,
-                ],
-                [
-                    TOM_PRESET_DERP,
-                    TOM_PRESET_RING,
-                    TOM_PRESET_BRUSH,
-                    TOM_PRESET_VOID,
-                ],
+                ChannelBlender::default_corner_preset_ids(INSTRUMENT_KICK),
+                ChannelBlender::default_corner_preset_ids(INSTRUMENT_SNARE),
+                ChannelBlender::default_corner_preset_ids(INSTRUMENT_HIHAT),
+                ChannelBlender::default_corner_preset_ids(INSTRUMENT_TOM),
+                ChannelBlender::default_corner_preset_ids(INSTRUMENT_BASS),
             ],
+            // Per-step note override: saved global frequency for restore
+            saved_global_freq: [None; NUM_INSTRUMENTS],
             // MIDI event buffer (pre-allocated for audio thread safety)
             pending_midi_events: Vec::with_capacity(MIDI_EVENT_CAPACITY),
             // Sequencer triggers enabled by default (internal sequencer drives instruments)
@@ -334,32 +659,17 @@ impl GooeyEngine {
         // Clear pending MIDI events from previous render pass
         self.pending_midi_events.clear();
 
-        // Check for pending manual triggers with velocity (all instruments)
+        // Check for pending manual triggers with velocity (all channels)
         // Manual triggers fire at sample_offset 0 (start of buffer)
-        if self.kick_trigger_pending.swap(false, Ordering::Acquire) {
-            let velocity = f32::from_bits(self.kick_trigger_velocity.load(Ordering::Acquire));
-            self.push_midi_event(INSTRUMENT_KICK, velocity, 0);
-            self.kick.trigger_with_velocity(self.current_time, velocity);
-        }
-        if self.snare_trigger_pending.swap(false, Ordering::Acquire) {
-            let velocity = f32::from_bits(self.snare_trigger_velocity.load(Ordering::Acquire));
-            self.push_midi_event(INSTRUMENT_SNARE, velocity, 0);
-            self.snare
-                .trigger_with_velocity(self.current_time, velocity);
-        }
-        if self.hihat_trigger_pending.swap(false, Ordering::Acquire) {
-            let velocity = f32::from_bits(self.hihat_trigger_velocity.load(Ordering::Acquire));
-            self.push_midi_event(INSTRUMENT_HIHAT, velocity, 0);
-            self.hihat
-                .trigger_with_velocity(self.current_time, velocity);
-        }
-        if self.tom_trigger_pending.swap(false, Ordering::Acquire) {
-            let velocity = f32::from_bits(self.tom_trigger_velocity.load(Ordering::Acquire));
-            self.push_midi_event(INSTRUMENT_TOM, velocity, 0);
-            self.tom.trigger_with_velocity(self.current_time, velocity);
+        for ch in 0..NUM_INSTRUMENTS {
+            if self.trigger_pending[ch].swap(false, Ordering::Acquire) {
+                let velocity = f32::from_bits(self.trigger_velocity[ch].load(Ordering::Acquire));
+                self.push_midi_event(ch as u32, velocity, 0);
+                self.channels[ch].trigger_with_velocity(self.current_time, velocity);
+            }
         }
 
-        let sample_period = 1.0 / self.sample_rate;
+        let sample_period = 1.0 / self.sample_rate as f64;
 
         // Update mute/solo gain targets (check once per buffer for efficiency)
         let any_soloed = self
@@ -378,102 +688,112 @@ impl GooeyEngine {
         let mut sample_offset: u32 = 0;
         for sample in buffer.iter_mut() {
             // Tick ALL sequencers first to ensure sample-accurate synchronization
-            // (if two instruments trigger on the same step, they fire at exactly the same sample)
-            // Returns SequencerTrigger with velocity + optional blend setting
-            let kick_trigger = self
-                .kick_sequencer
-                .tick_with_settings()
-                .map(|trigger| (trigger.velocity, trigger.blend));
-            let snare_trigger = self
-                .snare_sequencer
-                .tick_with_settings()
-                .map(|trigger| (trigger.velocity, trigger.blend));
-            let hihat_trigger = self
-                .hihat_sequencer
-                .tick_with_settings()
-                .map(|trigger| (trigger.velocity, trigger.blend));
-            let tom_trigger = self
-                .tom_sequencer
-                .tick_with_settings()
-                .map(|trigger| (trigger.velocity, trigger.blend));
+            let mut seq_triggers: [Option<(f32, Option<SequencerBlendSetting>, Option<u8>)>;
+                NUM_INSTRUMENTS] = [None; NUM_INSTRUMENTS];
+            for ch in 0..NUM_INSTRUMENTS {
+                seq_triggers[ch] = self.sequencers[ch]
+                    .tick_with_settings()
+                    .map(|trigger| (trigger.velocity, trigger.blend, trigger.note));
+            }
 
             // Apply triggers with velocity after all sequencers have been ticked.
-            // When sequencer triggers are disabled, skip instrument triggers and MIDI events
-            // so external host MIDI can drive the instruments instead.
             if self.sequencer_triggers_enabled {
-                if let Some((velocity, blend)) = kick_trigger {
-                    self.apply_sequencer_blend_setting(INSTRUMENT_KICK, blend);
-                    self.kick.trigger_with_velocity(self.current_time, velocity);
-                    self.push_midi_event(INSTRUMENT_KICK, velocity, sample_offset);
-                }
-                if let Some((velocity, blend)) = snare_trigger {
-                    self.apply_sequencer_blend_setting(INSTRUMENT_SNARE, blend);
-                    self.snare
-                        .trigger_with_velocity(self.current_time, velocity);
-                    self.push_midi_event(INSTRUMENT_SNARE, velocity, sample_offset);
-                }
-                if let Some((velocity, blend)) = hihat_trigger {
-                    self.apply_sequencer_blend_setting(INSTRUMENT_HIHAT, blend);
-                    self.hihat
-                        .trigger_with_velocity(self.current_time, velocity);
-                    self.push_midi_event(INSTRUMENT_HIHAT, velocity, sample_offset);
-                }
-                if let Some((velocity, blend)) = tom_trigger {
-                    self.apply_sequencer_blend_setting(INSTRUMENT_TOM, blend);
-                    self.tom.trigger_with_velocity(self.current_time, velocity);
-                    self.push_midi_event(INSTRUMENT_TOM, velocity, sample_offset);
+                for ch in 0..NUM_INSTRUMENTS {
+                    if let Some((velocity, blend, note)) = seq_triggers[ch] {
+                        self.apply_sequencer_blend_setting(ch as u32, blend);
+                        // Snap params only when a blend was actually applied,
+                        // so we don't clobber in-flight UI/LFO smoothing.
+                        if blend.is_some() || self.blend_enabled[ch] {
+                            self.channels[ch].snap_params();
+                        }
+                        // Apply per-step MIDI note frequency override (sample-accurate).
+                        // When a step has a note, save the global freq and override.
+                        // When a step has no note, restore the saved global freq.
+                        if let Some(midi_note) = note {
+                            let instr_type = self.channels[ch].instrument_type();
+                            if let Some((freq_min, freq_max)) =
+                                Self::freq_range_for_instrument(instr_type)
+                            {
+                                if self.saved_global_freq[ch].is_none() {
+                                    self.saved_global_freq[ch] =
+                                        self.channels[ch].get_freq_param();
+                                }
+                                let normalized = Self::midi_note_to_normalized_freq(
+                                    midi_note, freq_min, freq_max,
+                                );
+                                self.channels[ch].set_param(0, normalized);
+                                self.channels[ch].snap_params();
+                            }
+                        } else if let Some(saved) = self.saved_global_freq[ch].take() {
+                            self.channels[ch].set_param(0, saved);
+                            self.channels[ch].snap_params();
+                        }
+                        self.channels[ch].trigger_with_velocity(self.current_time, velocity);
+                        self.push_midi_event(ch as u32, velocity, sample_offset);
+                    }
                 }
             }
 
             // Process LFOs and apply modulation to routed parameters
-            // Use index-based iteration to avoid allocation on audio thread
             for lfo_idx in 0..LFO_COUNT {
                 if self.lfo_enabled[lfo_idx] {
                     let lfo_value = self.lfos[lfo_idx].tick();
                     let route_count = self.lfo_routes[lfo_idx].len();
 
                     for route_idx in 0..route_count {
-                        // Access route data with short-lived borrows
-                        let instrument = self.lfo_routes[lfo_idx][route_idx].instrument;
+                        let channel = self.lfo_routes[lfo_idx][route_idx].instrument;
                         let param = self.lfo_routes[lfo_idx][route_idx].param;
                         let depth = self.lfo_routes[lfo_idx][route_idx].depth;
                         let modulation = lfo_value * depth;
-                        self.apply_modulation_by_index(instrument, param, modulation);
+                        self.apply_modulation_by_index(channel, param, modulation);
                     }
                 }
             }
 
-            // Generate and mix audio from all instruments with channel gains and mute/solo gains
-            let mut output = self.kick.tick(self.current_time)
-                * self.instrument_channel_gains[INSTRUMENT_KICK as usize].tick()
-                * self.instrument_gains[INSTRUMENT_KICK as usize].tick()
-                + self.snare.tick(self.current_time)
-                    * self.instrument_channel_gains[INSTRUMENT_SNARE as usize].tick()
-                    * self.instrument_gains[INSTRUMENT_SNARE as usize].tick()
-                + self.hihat.tick(self.current_time)
-                    * self.instrument_channel_gains[INSTRUMENT_HIHAT as usize].tick()
-                    * self.instrument_gains[INSTRUMENT_HIHAT as usize].tick()
-                + self.tom.tick(self.current_time)
-                    * self.instrument_channel_gains[INSTRUMENT_TOM as usize].tick()
-                    * self.instrument_gains[INSTRUMENT_TOM as usize].tick();
+            // Generate audio from each channel with gains and mute/solo
+            let mut channel_outs = [0.0_f32; NUM_INSTRUMENTS];
+            let mut output = 0.0;
+            for ch in 0..NUM_INSTRUMENTS {
+                let ch_out = self.channels[ch].tick(self.current_time)
+                    * self.instrument_channel_gains[ch].tick()
+                    * self.instrument_gains[ch].tick();
+                channel_outs[ch] = ch_out;
+                output += ch_out;
+
+                // Track per-channel peak for UI metering
+                let abs_out = ch_out.abs();
+                let prev_peak = f32::from_bits(self.channel_peaks[ch].load(Ordering::Relaxed));
+                if abs_out > prev_peak {
+                    self.channel_peaks[ch].store(abs_out.to_bits(), Ordering::Relaxed);
+                }
+            }
 
             // Apply global effects chain
-            // 1. Delay (if enabled)
             if self.delay_enabled {
                 output = self.delay.process(output);
             }
-
-            // 2. Lowpass filter (if enabled)
             if self.lowpass_filter_enabled {
                 output = self.lowpass_filter.process(output);
             }
-
-            // 3. Saturation (if enabled)
+            if self.tilt_filter_enabled {
+                output = self.tilt_filter.process(output);
+            }
             if self.saturation_enabled {
                 output = self.saturation.process(output);
             }
 
-            // 4. Limiter (always on - protects output from clipping)
+            // Compressor (if enabled), with optional sidechain from individual channel
+            if self.compressor_enabled {
+                let sc = self.compressor_sidechain as usize;
+                output = if sc < NUM_INSTRUMENTS {
+                    self.compressor
+                        .process_with_sidechain(output, channel_outs[sc])
+                } else {
+                    self.compressor.process(output)
+                };
+            }
+
+            // Limiter (always on - protects output from clipping)
             *sample = self.limiter.process(output);
 
             self.current_time += sample_period;
@@ -483,114 +803,34 @@ impl GooeyEngine {
 
     fn apply_sequencer_blend_setting(
         &mut self,
-        instrument: u32,
+        channel: u32,
         blend: Option<SequencerBlendSetting>,
     ) {
         if let Some(blend_setting) = blend {
-            self.apply_blend_position(instrument, blend_setting.x, blend_setting.y);
+            self.apply_blend_position(channel, blend_setting.x, blend_setting.y);
             return;
         }
 
-        let idx = instrument as usize;
-        if idx < INSTRUMENT_COUNT as usize && self.blend_enabled[idx] {
-            self.apply_blend_position(instrument, self.blend_x[idx], self.blend_y[idx]);
+        let idx = channel as usize;
+        if idx < NUM_INSTRUMENTS && self.blend_enabled[idx] {
+            self.apply_blend_position(channel, self.blend_x[idx], self.blend_y[idx]);
         }
     }
 
-    fn apply_blend_position(&mut self, instrument: u32, x: f32, y: f32) {
+    fn apply_blend_position(&mut self, channel: u32, x: f32, y: f32) {
         let x = x.clamp(0.0, 1.0);
         let y = y.clamp(0.0, 1.0);
-
-        match instrument {
-            INSTRUMENT_KICK => {
-                let blended = self.kick_blender.blend(x, y);
-                self.kick.set_config(blended);
-            }
-            INSTRUMENT_SNARE => {
-                let blended = self.snare_blender.blend(x, y);
-                self.snare.set_config(blended);
-            }
-            INSTRUMENT_HIHAT => {
-                let blended = self.hihat_blender.blend(x, y);
-                self.hihat.set_config(blended);
-            }
-            INSTRUMENT_TOM => {
-                let blended = self.tom_blender.blend(x, y);
-                self.tom.set_config(blended);
-            }
-            _ => {}
+        let idx = channel as usize;
+        if idx < NUM_INSTRUMENTS {
+            self.blenders[idx].blend_and_apply(&mut self.channels[idx], x, y);
         }
     }
 
-    /// Apply LFO modulation to an instrument parameter by index
-    /// This is used internally by the render loop to apply LFO values to routed parameters
-    fn apply_modulation_by_index(&mut self, instrument: u32, param: u32, value: f32) {
-        match instrument {
-            INSTRUMENT_KICK => match param {
-                KICK_PARAM_FREQUENCY => self.kick.params.frequency.set_bipolar(value),
-                KICK_PARAM_PUNCH => self.kick.params.punch.set_bipolar(value),
-                KICK_PARAM_SUB => self.kick.params.sub.set_bipolar(value),
-                KICK_PARAM_CLICK => self.kick.params.click.set_bipolar(value),
-                KICK_PARAM_DECAY => self.kick.params.oscillator_decay.set_bipolar(value),
-                KICK_PARAM_PITCH_ENVELOPE => {
-                    self.kick.params.pitch_envelope_amount.set_bipolar(value)
-                }
-                KICK_PARAM_VOLUME => self.kick.params.volume.set_bipolar(value),
-                _ => {}
-            },
-            INSTRUMENT_SNARE => match param {
-                SNARE_PARAM_FREQUENCY => self.snare.params.frequency.set_bipolar(value),
-                SNARE_PARAM_DECAY => self.snare.params.decay.set_bipolar(value),
-                SNARE_PARAM_BRIGHTNESS => self.snare.params.brightness.set_bipolar(value),
-                SNARE_PARAM_VOLUME => self.snare.params.volume.set_bipolar(value),
-                SNARE_PARAM_TONAL => self.snare.params.tonal.set_bipolar(value),
-                SNARE_PARAM_NOISE => self.snare.params.noise.set_bipolar(value),
-                SNARE_PARAM_PITCH_DROP => self.snare.params.pitch_drop.set_bipolar(value),
-                SNARE_PARAM_TONAL_DECAY => self.snare.params.tonal_decay.set_bipolar(value),
-                SNARE_PARAM_NOISE_DECAY => self.snare.params.noise_decay.set_bipolar(value),
-                SNARE_PARAM_NOISE_TAIL_DECAY => {
-                    self.snare.params.noise_tail_decay.set_bipolar(value)
-                }
-                SNARE_PARAM_FILTER_CUTOFF => self.snare.params.filter_cutoff.set_bipolar(value),
-                SNARE_PARAM_FILTER_RESONANCE => {
-                    self.snare.params.filter_resonance.set_bipolar(value)
-                }
-                SNARE_PARAM_XFADE => self.snare.params.xfade.set_bipolar(value),
-                SNARE_PARAM_PHASE_MOD_AMOUNT => {
-                    self.snare.params.phase_mod_amount.set_bipolar(value)
-                }
-                SNARE_PARAM_OVERDRIVE => self.snare.params.overdrive.set_bipolar(value),
-                SNARE_PARAM_AMP_DECAY => self.snare.params.amp_decay.set_bipolar(value),
-                SNARE_PARAM_AMP_DECAY_CURVE => self.snare.params.amp_decay_curve.set_bipolar(value),
-                SNARE_PARAM_TONAL_DECAY_CURVE => {
-                    self.snare.params.tonal_decay_curve.set_bipolar(value)
-                }
-                _ => {}
-            },
-            INSTRUMENT_HIHAT => match param {
-                HIHAT_PARAM_PITCH => self.hihat.params.pitch.set_bipolar(value),
-                HIHAT_PARAM_DECAY => self.hihat.params.decay.set_bipolar(value),
-                HIHAT_PARAM_ATTACK => self.hihat.params.attack.set_bipolar(value),
-                HIHAT_PARAM_TONE => self.hihat.params.tone.set_bipolar(value),
-                HIHAT_PARAM_VOLUME => self.hihat.params.volume.set_bipolar(value),
-                _ => {}
-            },
-            INSTRUMENT_TOM => {
-                // Tom2 uses 0-100 range, FFI uses 0-1, so scale by 100
-                let scaled = value * 100.0;
-                match param {
-                    TOM_PARAM_TUNE => self.tom.set_tune(scaled),
-                    TOM_PARAM_BEND => self.tom.set_bend(scaled),
-                    TOM_PARAM_TONE => self.tom.set_tone(scaled),
-                    TOM_PARAM_COLOR => self.tom.set_color(scaled),
-                    TOM_PARAM_DECAY => self.tom.set_decay(scaled),
-                    TOM_PARAM_MEMBRANE => self.tom.set_membrane(scaled),
-                    TOM_PARAM_MEMBRANE_Q => self.tom.set_membrane_q(scaled),
-                    TOM_PARAM_VOLUME => self.tom.set_volume(scaled),
-                    _ => {}
-                }
-            }
-            _ => {}
+    /// Apply LFO modulation to a channel's instrument parameter by index
+    fn apply_modulation_by_index(&mut self, channel: u32, param: u32, value: f32) {
+        let idx = channel as usize;
+        if idx < NUM_INSTRUMENTS {
+            self.channels[idx].apply_modulation(param, value);
         }
     }
 
@@ -617,6 +857,13 @@ impl GooeyEngine {
         1.0
     }
 
+    /// Find the first channel holding the given instrument type.
+    fn find_channel_by_type(&self, instrument_type: u32) -> Option<usize> {
+        self.channels
+            .iter()
+            .position(|ch| ch.instrument_type() == instrument_type)
+    }
+
     /// Get a KickConfig preset by ID
     fn kick_preset_by_id(id: u32) -> Option<KickConfig> {
         match id {
@@ -635,6 +882,33 @@ impl GooeyEngine {
             TOM_PRESET_RING => Some(Tom2Config::ring()),
             TOM_PRESET_BRUSH => Some(Tom2Config::brush()),
             TOM_PRESET_VOID => Some(Tom2Config::void_preset()),
+            _ => None,
+        }
+    }
+
+    /// Get a BassConfig preset by ID
+    fn bass_preset_by_id(id: u32) -> Option<BassConfig> {
+        match id {
+            BASS_PRESET_ACID => Some(BassConfig::acid()),
+            BASS_PRESET_SUB => Some(BassConfig::sub()),
+            BASS_PRESET_REESE => Some(BassConfig::reese()),
+            BASS_PRESET_STAB => Some(BassConfig::stab()),
+            _ => None,
+        }
+    }
+
+    /// Convert a MIDI note number to a normalized frequency value for an instrument's range.
+    fn midi_note_to_normalized_freq(note: u8, freq_min: f32, freq_max: f32) -> f32 {
+        let hz = 440.0 * 2f32.powf((note as f32 - 69.0) / 12.0);
+        ((hz - freq_min) / (freq_max - freq_min)).clamp(0.0, 1.0)
+    }
+
+    /// Get the frequency range (min, max) for a pitched instrument type.
+    fn freq_range_for_instrument(instrument_type: u32) -> Option<(f32, f32)> {
+        match instrument_type {
+            INSTRUMENT_BASS => Some((30.0, 200.0)),
+            INSTRUMENT_KICK => Some((30.0, 120.0)),
+            INSTRUMENT_TOM => Some((40.0, 600.0)),
             _ => None,
         }
     }
@@ -672,8 +946,12 @@ pub const EFFECT_LOWPASS_FILTER: u32 = 0;
 pub const EFFECT_DELAY: u32 = 1;
 /// Global effect: Saturation
 pub const EFFECT_SATURATION: u32 = 2;
+/// Global effect: Compressor
+pub const EFFECT_COMPRESSOR: u32 = 3;
+/// Global effect: Tilt filter (unified lowpass/highpass)
+pub const EFFECT_TILT_FILTER: u32 = 4;
 /// Total number of global effects
-pub const EFFECT_COUNT: u32 = 3;
+pub const EFFECT_COUNT: u32 = 5;
 
 // =============================================================================
 // Lowpass filter parameter indices (must match Swift FilterParam enum)
@@ -730,6 +1008,33 @@ pub const SATURATION_PARAM_DRIVE: u32 = 0;
 pub const SATURATION_PARAM_WARMTH: u32 = 1;
 /// Saturation parameter: wet/dry mix (0.0-1.0)
 pub const SATURATION_PARAM_MIX: u32 = 2;
+
+// =============================================================================
+// Compressor parameter indices (must match Swift CompressorParam enum)
+// =============================================================================
+
+/// Compressor parameter: threshold in dB (-60.0 to 0.0)
+pub const COMPRESSOR_PARAM_THRESHOLD: u32 = 0;
+/// Compressor parameter: ratio (1.0 to 20.0)
+pub const COMPRESSOR_PARAM_RATIO: u32 = 1;
+/// Compressor parameter: attack time in ms (0.1 to 100.0)
+pub const COMPRESSOR_PARAM_ATTACK: u32 = 2;
+/// Compressor parameter: release time in ms (5.0 to 1000.0)
+pub const COMPRESSOR_PARAM_RELEASE: u32 = 3;
+/// Compressor parameter: wet/dry mix (0.0 to 1.0)
+pub const COMPRESSOR_PARAM_MIX: u32 = 4;
+
+/// No sidechain — compressor uses main mix as input (default)
+pub const COMPRESSOR_SIDECHAIN_NONE: u32 = 0xFFFFFFFF;
+
+// =============================================================================
+// Tilt filter parameter indices
+// =============================================================================
+
+/// Tilt filter parameter: cutoff position (0.0-1.0, 0.5 = center/passthrough)
+pub const TILT_PARAM_CUTOFF: u32 = 0;
+/// Tilt filter parameter: resonance (0.0-1.0)
+pub const TILT_PARAM_RESONANCE: u32 = 1;
 
 // =============================================================================
 // Kick drum parameter indices (must match Swift KickParam enum)
@@ -841,8 +1146,10 @@ pub const INSTRUMENT_SNARE: u32 = 1;
 pub const INSTRUMENT_HIHAT: u32 = 2;
 /// Instrument ID: tom drum
 pub const INSTRUMENT_TOM: u32 = 3;
+/// Instrument ID: bass synth
+pub const INSTRUMENT_BASS: u32 = 4;
 /// Total number of instruments
-pub const INSTRUMENT_COUNT: u32 = 4;
+pub const INSTRUMENT_COUNT: u32 = 5;
 /// Internal usize version for array indexing
 const NUM_INSTRUMENTS: usize = INSTRUMENT_COUNT as usize;
 
@@ -867,6 +1174,53 @@ pub const TOM_PRESET_RING: u32 = 1;
 pub const TOM_PRESET_BRUSH: u32 = 2;
 /// Tom preset: Void - atmospheric, long
 pub const TOM_PRESET_VOID: u32 = 3;
+
+// =============================================================================
+// Bass synth parameter constants
+// =============================================================================
+
+/// Bass parameter: base frequency (0-1 -> 30-200 Hz)
+pub const BASS_PARAM_FREQUENCY: u32 = 0;
+/// Bass parameter: sub sine level (0-1)
+pub const BASS_PARAM_SUB_LEVEL: u32 = 1;
+/// Bass parameter: main saw/square level (0-1)
+pub const BASS_PARAM_OSC_LEVEL: u32 = 2;
+/// Bass parameter: detuned layer level (0-1)
+pub const BASS_PARAM_DETUNE_LEVEL: u32 = 3;
+/// Bass parameter: detune spread (0-1 -> 0-30 cents)
+pub const BASS_PARAM_DETUNE_AMOUNT: u32 = 4;
+/// Bass parameter: oscillator shape - saw(0) to square(1)
+pub const BASS_PARAM_OSC_SHAPE: u32 = 5;
+/// Bass parameter: filter cutoff (0-1 -> 20-18000 Hz exp)
+pub const BASS_PARAM_FILTER_CUTOFF: u32 = 6;
+/// Bass parameter: filter resonance (0-1 -> 0.5-15.0 Q)
+pub const BASS_PARAM_FILTER_RESONANCE: u32 = 7;
+/// Bass parameter: filter envelope depth (0-1)
+pub const BASS_PARAM_FILTER_ENV_AMOUNT: u32 = 8;
+/// Bass parameter: filter envelope decay (0-1 -> 0.01-2.0s)
+pub const BASS_PARAM_FILTER_ENV_DECAY: u32 = 9;
+/// Bass parameter: filter envelope curve (0-1 -> 0.1-8.0)
+pub const BASS_PARAM_FILTER_ENV_CURVE: u32 = 10;
+/// Bass parameter: amplitude decay (0-1 -> 0.05-4.0s)
+pub const BASS_PARAM_AMP_DECAY: u32 = 11;
+/// Bass parameter: amplitude decay curve (0-1 -> 0.1-10.0)
+pub const BASS_PARAM_AMP_DECAY_CURVE: u32 = 12;
+/// Bass parameter: pre-filter overdrive/saturation (0-1)
+pub const BASS_PARAM_OVERDRIVE: u32 = 13;
+/// Bass parameter: master volume (0-1)
+pub const BASS_PARAM_VOLUME: u32 = 14;
+
+/// Bass preset: Acid - TB-303-style, high resonance, short filter sweep
+pub const BASS_PRESET_ACID: u32 = 0;
+/// Bass preset: Sub - clean sub-bass, sine dominant
+pub const BASS_PRESET_SUB: u32 = 1;
+/// Bass preset: Reese - detuned saws, heavy overdrive
+pub const BASS_PRESET_REESE: u32 = 2;
+/// Bass preset: Stab - square wave, sharp filter, short decay
+pub const BASS_PRESET_STAB: u32 = 3;
+
+/// Sentinel value indicating no MIDI note is set for a step (use instrument's global frequency)
+pub const STEP_NOTE_NONE: u8 = 255;
 
 /// Snare preset: Tight - short, punchy snare
 pub const SNARE_PRESET_TIGHT: u32 = 0;
@@ -1164,6 +1518,174 @@ pub unsafe extern "C" fn gooey_engine_get_error_message(
 }
 
 // =============================================================================
+// Channel instrument type swap
+// =============================================================================
+
+/// Reassign which synthesizer type runs on a given channel.
+///
+/// After calling this, the channel produces the new instrument's sound.
+/// Resets synth DSP state for that channel (new instrument starts fresh).
+/// Preserves channel-level state: gain, mute, solo, sequencer pattern, blend position.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `channel` - Channel index (0-3)
+/// * `instrument_type` - Instrument type (INSTRUMENT_KICK=0, INSTRUMENT_SNARE=1, INSTRUMENT_HIHAT=2, INSTRUMENT_TOM=3)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_channel_instrument_type(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    instrument_type: u32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let idx = channel as usize;
+    if idx >= NUM_INSTRUMENTS {
+        return;
+    }
+
+    // No-op if already the requested type
+    if engine.channels[idx].instrument_type() == instrument_type {
+        return;
+    }
+
+    let new_instrument = match instrument_type {
+        INSTRUMENT_KICK => ChannelInstrument::Kick(KickDrum::new(engine.sample_rate)),
+        INSTRUMENT_SNARE => ChannelInstrument::Snare(SnareDrum::new(engine.sample_rate)),
+        INSTRUMENT_HIHAT => ChannelInstrument::HiHat(HiHat2::new(engine.sample_rate)),
+        INSTRUMENT_TOM => ChannelInstrument::Tom(Tom2::new(engine.sample_rate)),
+        INSTRUMENT_BASS => ChannelInstrument::Bass(BassSynth::new(engine.sample_rate)),
+        _ => return,
+    };
+
+    engine.channels[idx] = new_instrument;
+    engine.blenders[idx] = ChannelBlender::default_for_type(instrument_type);
+    engine.blend_corner_presets[idx] = ChannelBlender::default_corner_preset_ids(instrument_type);
+
+    // If blend is enabled, re-apply position with the new blender
+    if engine.blend_enabled[idx] {
+        let x = engine.blend_x[idx];
+        let y = engine.blend_y[idx];
+        engine.blenders[idx].blend_and_apply(&mut engine.channels[idx], x, y);
+    }
+    // channel gain, mute, solo, sequencer pattern all preserved (separate arrays)
+}
+
+/// Returns the current instrument type for a channel.
+///
+/// Default mapping: channel N has instrument_type N.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `channel` - Channel index (0-3)
+///
+/// # Returns
+/// Instrument type (INSTRUMENT_KICK=0, INSTRUMENT_SNARE=1, INSTRUMENT_HIHAT=2, INSTRUMENT_TOM=3),
+/// or 0xFFFFFFFF if invalid.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_channel_instrument_type(
+    engine: *const GooeyEngine,
+    channel: u32,
+) -> u32 {
+    if engine.is_null() {
+        return 0xFFFFFFFF;
+    }
+    let engine = &*engine;
+    let idx = channel as usize;
+    if idx >= NUM_INSTRUMENTS {
+        return 0xFFFFFFFF;
+    }
+    engine.channels[idx].instrument_type()
+}
+
+/// Set a parameter on a channel's instrument, regardless of what synth type it holds.
+///
+/// Parameter index meaning depends on the channel's current instrument type.
+/// For kick: param 0=frequency, 1=punch, etc. (same as `gooey_engine_set_kick_param`)
+/// For snare: param 0=frequency, 1=decay, etc. (same as `gooey_engine_set_snare_param`)
+/// For hihat: param 0=pitch, 1=decay, etc. (same as `gooey_engine_set_hihat_param`)
+/// For tom: param 0=tune, 1=bend, etc. (same as `gooey_engine_set_tom_param`)
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `channel` - Channel index (0-3)
+/// * `param` - Parameter index (meaning depends on instrument type)
+/// * `value` - Parameter value (0-1 normalized)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_channel_param(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    param: u32,
+    value: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let idx = channel as usize;
+    if idx >= NUM_INSTRUMENTS {
+        return;
+    }
+    engine.channels[idx].set_param(param, value);
+}
+
+/// Trigger a specific channel (regardless of what instrument type it holds).
+///
+/// The trigger will be processed on the next call to `gooey_engine_render`.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `channel` - Channel index (0-3)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_trigger_channel(
+    engine: *mut GooeyEngine,
+    channel: u32,
+) {
+    gooey_engine_trigger_channel_with_velocity(engine, channel, 1.0);
+}
+
+/// Trigger a specific channel with velocity.
+///
+/// The trigger will be processed on the next call to `gooey_engine_render`.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `channel` - Channel index (0-3)
+/// * `velocity` - Velocity from 0.0 (softest) to 1.0 (hardest)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_trigger_channel_with_velocity(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    velocity: f32,
+) {
+    if let Some(engine) = engine.as_ref() {
+        let idx = channel as usize;
+        if idx < NUM_INSTRUMENTS {
+            let vel_clamped = velocity.clamp(0.0, 1.0);
+            engine.trigger_velocity[idx].store(vel_clamped.to_bits(), Ordering::Release);
+            engine.trigger_pending[idx].store(true, Ordering::Release);
+        }
+    }
+}
+
+// =============================================================================
 // Instrument triggering
 // =============================================================================
 
@@ -1186,33 +1708,11 @@ pub unsafe extern "C" fn gooey_engine_trigger_instrument_with_velocity(
     velocity: f32,
 ) {
     if let Some(engine) = engine.as_ref() {
-        let vel_clamped = velocity.clamp(0.0, 1.0);
-        match instrument {
-            INSTRUMENT_KICK => {
-                engine
-                    .kick_trigger_velocity
-                    .store(vel_clamped.to_bits(), Ordering::Release);
-                engine.kick_trigger_pending.store(true, Ordering::Release);
-            }
-            INSTRUMENT_SNARE => {
-                engine
-                    .snare_trigger_velocity
-                    .store(vel_clamped.to_bits(), Ordering::Release);
-                engine.snare_trigger_pending.store(true, Ordering::Release);
-            }
-            INSTRUMENT_HIHAT => {
-                engine
-                    .hihat_trigger_velocity
-                    .store(vel_clamped.to_bits(), Ordering::Release);
-                engine.hihat_trigger_pending.store(true, Ordering::Release);
-            }
-            INSTRUMENT_TOM => {
-                engine
-                    .tom_trigger_velocity
-                    .store(vel_clamped.to_bits(), Ordering::Release);
-                engine.tom_trigger_pending.store(true, Ordering::Release);
-            }
-            _ => {} // Unknown instrument, ignore
+        let idx = instrument as usize;
+        if idx < NUM_INSTRUMENTS {
+            let vel_clamped = velocity.clamp(0.0, 1.0);
+            engine.trigger_velocity[idx].store(vel_clamped.to_bits(), Ordering::Release);
+            engine.trigger_pending[idx].store(true, Ordering::Release);
         }
     }
 }
@@ -1237,6 +1737,38 @@ pub unsafe extern "C" fn gooey_engine_trigger_instrument(
     gooey_engine_trigger_instrument_with_velocity(engine, instrument, 1.0);
 }
 
+// =============================================================================
+// Per-channel peak metering
+// =============================================================================
+
+/// Read per-channel peak amplitudes since the last call and reset them to zero.
+///
+/// Each value represents the maximum absolute amplitude seen on that channel
+/// since the previous call. Useful for driving UI level meters.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `out_peaks` - Pointer to a float buffer to receive peak values (0.0–1.0+)
+/// * `count` - Number of channels to read (clamped to NUM_INSTRUMENTS)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+/// `out_peaks` must point to a buffer of at least `count` floats.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_channel_peaks(
+    engine: *mut GooeyEngine,
+    out_peaks: *mut f32,
+    count: u32,
+) {
+    if let Some(engine) = engine.as_ref() {
+        let n = (count as usize).min(NUM_INSTRUMENTS);
+        for i in 0..n {
+            let bits = engine.channel_peaks[i].swap(0.0_f32.to_bits(), Ordering::Relaxed);
+            *out_peaks.add(i) = f32::from_bits(bits);
+        }
+    }
+}
+
 /// Trigger the kick drum manually (legacy function, prefer `gooey_engine_trigger_instrument`)
 ///
 /// Use this for manual triggering outside of the sequencer (e.g., user tap).
@@ -1247,7 +1779,7 @@ pub unsafe extern "C" fn gooey_engine_trigger_instrument(
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_trigger_kick(engine: *mut GooeyEngine) {
     if let Some(engine) = engine.as_ref() {
-        engine.kick_trigger_pending.store(true, Ordering::Release);
+        engine.trigger_pending[INSTRUMENT_KICK as usize].store(true, Ordering::Release);
     }
 }
 
@@ -1280,19 +1812,9 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
     if engine.is_null() {
         return;
     }
-
     let engine = &mut *engine;
-
-    // KickDrum's setters now handle smoothing internally
-    match param {
-        KICK_PARAM_FREQUENCY => engine.kick.set_frequency(value),
-        KICK_PARAM_PUNCH => engine.kick.set_punch(value),
-        KICK_PARAM_SUB => engine.kick.set_sub(value),
-        KICK_PARAM_CLICK => engine.kick.set_click(value),
-        KICK_PARAM_DECAY => engine.kick.set_oscillator_decay(value),
-        KICK_PARAM_PITCH_ENVELOPE => engine.kick.set_pitch_envelope_amount(value),
-        KICK_PARAM_VOLUME => engine.kick.set_volume(value),
-        _ => {} // Unknown parameter, ignore
+    if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_KICK) {
+        engine.channels[ch].set_param(param, value);
     }
 }
 
@@ -1322,17 +1844,9 @@ pub unsafe extern "C" fn gooey_engine_set_hihat_param(
     if engine.is_null() {
         return;
     }
-
     let engine = &mut *engine;
-
-    // HiHat2 setters handle smoothing internally
-    match param {
-        HIHAT_PARAM_PITCH => engine.hihat.set_pitch(value),
-        HIHAT_PARAM_DECAY => engine.hihat.set_decay(value),
-        HIHAT_PARAM_ATTACK => engine.hihat.set_attack(value),
-        HIHAT_PARAM_VOLUME => engine.hihat.set_volume(value),
-        HIHAT_PARAM_TONE => engine.hihat.set_tone(value),
-        _ => {} // Unknown parameter, ignore
+    if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_HIHAT) {
+        engine.channels[ch].set_param(param, value);
     }
 }
 
@@ -1377,32 +1891,9 @@ pub unsafe extern "C" fn gooey_engine_set_snare_param(
     if engine.is_null() {
         return;
     }
-
     let engine = &mut *engine;
-
-    // SnareDrum's setters now handle smoothing internally
-    // All parameters use normalized 0-1 range
-    match param {
-        SNARE_PARAM_FREQUENCY => engine.snare.set_frequency(value),
-        SNARE_PARAM_DECAY => engine.snare.set_decay(value),
-        SNARE_PARAM_BRIGHTNESS => engine.snare.set_brightness(value),
-        SNARE_PARAM_VOLUME => engine.snare.set_volume(value),
-        SNARE_PARAM_TONAL => engine.snare.set_tonal(value),
-        SNARE_PARAM_NOISE => engine.snare.set_noise(value),
-        SNARE_PARAM_PITCH_DROP => engine.snare.set_pitch_drop(value),
-        SNARE_PARAM_TONAL_DECAY => engine.snare.set_tonal_decay(value),
-        SNARE_PARAM_NOISE_DECAY => engine.snare.set_noise_decay(value),
-        SNARE_PARAM_NOISE_TAIL_DECAY => engine.snare.set_noise_tail_decay(value),
-        SNARE_PARAM_FILTER_CUTOFF => engine.snare.set_filter_cutoff(value),
-        SNARE_PARAM_FILTER_RESONANCE => engine.snare.set_filter_resonance(value),
-        SNARE_PARAM_FILTER_TYPE => engine.snare.set_filter_type(value as u8),
-        SNARE_PARAM_XFADE => engine.snare.set_xfade(value),
-        SNARE_PARAM_PHASE_MOD_AMOUNT => engine.snare.set_phase_mod_amount(value),
-        SNARE_PARAM_OVERDRIVE => engine.snare.set_overdrive(value),
-        SNARE_PARAM_AMP_DECAY => engine.snare.set_amp_decay(value),
-        SNARE_PARAM_AMP_DECAY_CURVE => engine.snare.set_amp_decay_curve(value),
-        SNARE_PARAM_TONAL_DECAY_CURVE => engine.snare.set_tonal_decay_curve(value),
-        _ => {} // Unknown parameter, ignore
+    if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_SNARE) {
+        engine.channels[ch].set_param(param, value);
     }
 }
 
@@ -1436,21 +1927,81 @@ pub unsafe extern "C" fn gooey_engine_set_tom_param(
     if engine.is_null() {
         return;
     }
-
     let engine = &mut *engine;
+    if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_TOM) {
+        engine.channels[ch].set_param(param, value);
+    }
+}
 
-    // Tom2 uses 0-100 range internally, FFI uses 0-1 normalized
-    let scaled = value.clamp(0.0, 1.0) * 100.0;
-    match param {
-        TOM_PARAM_TUNE => engine.tom.set_tune(scaled),
-        TOM_PARAM_BEND => engine.tom.set_bend(scaled),
-        TOM_PARAM_TONE => engine.tom.set_tone(scaled),
-        TOM_PARAM_COLOR => engine.tom.set_color(scaled),
-        TOM_PARAM_DECAY => engine.tom.set_decay(scaled),
-        TOM_PARAM_MEMBRANE => engine.tom.set_membrane(scaled),
-        TOM_PARAM_MEMBRANE_Q => engine.tom.set_membrane_q(scaled),
-        TOM_PARAM_VOLUME => engine.tom.set_volume(scaled),
-        _ => {} // Unknown parameter, ignore
+/// Set a bass synth parameter
+///
+/// All parameters use normalized 0-1 range. Values are internally scaled.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `param` - Parameter index (see BASS_PARAM_* constants)
+/// * `value` - Parameter value (0.0-1.0 normalized)
+///
+/// # Parameter indices and ranges
+/// - 0 (FREQUENCY): 0-1 → 30-200 Hz
+/// - 1 (SUB_LEVEL): 0-1
+/// - 2 (OSC_LEVEL): 0-1
+/// - 3 (DETUNE_LEVEL): 0-1
+/// - 4 (DETUNE_AMOUNT): 0-1 → 0-30 cents
+/// - 5 (OSC_SHAPE): 0-1 (saw to square)
+/// - 6 (FILTER_CUTOFF): 0-1 → 20-18000 Hz exp
+/// - 7 (FILTER_RESONANCE): 0-1 → 0.5-15.0 Q
+/// - 8 (FILTER_ENV_AMOUNT): 0-1
+/// - 9 (FILTER_ENV_DECAY): 0-1 → 0.01-2.0s
+/// - 10 (FILTER_ENV_CURVE): 0-1 → 0.1-8.0
+/// - 11 (AMP_DECAY): 0-1 → 0.05-4.0s
+/// - 12 (AMP_DECAY_CURVE): 0-1 → 0.1-10.0
+/// - 13 (OVERDRIVE): 0-1
+/// - 14 (VOLUME): 0-1
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_bass_param(
+    engine: *mut GooeyEngine,
+    param: u32,
+    value: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_BASS) {
+        engine.channels[ch].set_param(param, value);
+    }
+}
+
+/// Load a bass preset, setting all bass parameters to the preset's values.
+///
+/// This directly applies the preset's parameter values to the bass instrument
+/// without requiring the blend system.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `preset_id` - Preset ID (BASS_PRESET_ACID, BASS_PRESET_SUB, etc.)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_load_bass_preset(
+    engine: *mut GooeyEngine,
+    preset_id: u32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    if let Some(config) = GooeyEngine::bass_preset_by_id(preset_id) {
+        if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_BASS) {
+            if let ChannelInstrument::Bass(ref mut bass) = engine.channels[ch] {
+                bass.set_config(config);
+            }
+        }
     }
 }
 
@@ -1483,6 +2034,12 @@ pub unsafe extern "C" fn gooey_engine_set_tom_param(
 ///   - SATURATION_PARAM_DRIVE (0): 0.0-1.0
 ///   - SATURATION_PARAM_WARMTH (1): 0.0-1.0
 ///   - SATURATION_PARAM_MIX (2): 0.0-1.0
+/// - EFFECT_COMPRESSOR (3):
+///   - COMPRESSOR_PARAM_THRESHOLD (0): -60.0 to 0.0 dB
+///   - COMPRESSOR_PARAM_RATIO (1): 1.0-20.0
+///   - COMPRESSOR_PARAM_ATTACK (2): 0.1-100.0 ms
+///   - COMPRESSOR_PARAM_RELEASE (3): 5.0-1000.0 ms
+///   - COMPRESSOR_PARAM_MIX (4): 0.0-1.0
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -1520,6 +2077,19 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
             SATURATION_PARAM_DRIVE => engine.saturation.set_drive(value),
             SATURATION_PARAM_WARMTH => engine.saturation.set_warmth(value),
             SATURATION_PARAM_MIX => engine.saturation.set_mix(value),
+            _ => {} // Unknown parameter, ignore
+        },
+        EFFECT_COMPRESSOR => match param {
+            COMPRESSOR_PARAM_THRESHOLD => engine.compressor.set_threshold(value),
+            COMPRESSOR_PARAM_RATIO => engine.compressor.set_ratio(value),
+            COMPRESSOR_PARAM_ATTACK => engine.compressor.set_attack(value),
+            COMPRESSOR_PARAM_RELEASE => engine.compressor.set_release(value),
+            COMPRESSOR_PARAM_MIX => engine.compressor.set_mix(value),
+            _ => {} // Unknown parameter, ignore
+        },
+        EFFECT_TILT_FILTER => match param {
+            TILT_PARAM_CUTOFF => engine.tilt_filter.set_cutoff(value),
+            TILT_PARAM_RESONANCE => engine.tilt_filter.set_resonance(value),
             _ => {} // Unknown parameter, ignore
         },
         _ => {} // Unknown effect, ignore
@@ -1571,6 +2141,19 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
             SATURATION_PARAM_MIX => engine.saturation.get_mix(),
             _ => -1.0, // Unknown parameter
         },
+        EFFECT_COMPRESSOR => match param {
+            COMPRESSOR_PARAM_THRESHOLD => engine.compressor.get_threshold(),
+            COMPRESSOR_PARAM_RATIO => engine.compressor.get_ratio(),
+            COMPRESSOR_PARAM_ATTACK => engine.compressor.get_attack(),
+            COMPRESSOR_PARAM_RELEASE => engine.compressor.get_release(),
+            COMPRESSOR_PARAM_MIX => engine.compressor.get_mix(),
+            _ => -1.0, // Unknown parameter
+        },
+        EFFECT_TILT_FILTER => match param {
+            TILT_PARAM_CUTOFF => engine.tilt_filter.get_cutoff(),
+            TILT_PARAM_RESONANCE => engine.tilt_filter.get_resonance(),
+            _ => -1.0, // Unknown parameter
+        },
         _ => -1.0, // Unknown effect
     }
 }
@@ -1603,6 +2186,8 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_enabled(
         EFFECT_LOWPASS_FILTER => engine.lowpass_filter_enabled = enabled,
         EFFECT_DELAY => engine.delay_enabled = enabled,
         EFFECT_SATURATION => engine.saturation_enabled = enabled,
+        EFFECT_COMPRESSOR => engine.compressor_enabled = enabled,
+        EFFECT_TILT_FILTER => engine.tilt_filter_enabled = enabled,
         _ => {} // Unknown effect, ignore
     }
 }
@@ -1633,8 +2218,57 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_enabled(
         EFFECT_LOWPASS_FILTER => engine.lowpass_filter_enabled,
         EFFECT_DELAY => engine.delay_enabled,
         EFFECT_SATURATION => engine.saturation_enabled,
+        EFFECT_COMPRESSOR => engine.compressor_enabled,
+        EFFECT_TILT_FILTER => engine.tilt_filter_enabled,
         _ => false, // Unknown effect
     }
+}
+
+// =============================================================================
+// Compressor sidechain control
+// =============================================================================
+
+/// Set the compressor sidechain source instrument
+///
+/// When set to an instrument (INSTRUMENT_KICK, INSTRUMENT_SNARE, INSTRUMENT_HIHAT,
+/// INSTRUMENT_TOM), the compressor's envelope follower tracks that instrument's output
+/// while gain reduction is applied to the full mix. This enables techniques like
+/// kick-driven ducking.
+///
+/// Use COMPRESSOR_SIDECHAIN_NONE (0xFFFFFFFF) to use the main mix as input (default).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_compressor_sidechain(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+    engine.compressor_sidechain = instrument;
+}
+
+/// Get the current compressor sidechain source
+///
+/// # Returns
+/// An INSTRUMENT_* constant, or COMPRESSOR_SIDECHAIN_NONE if using the main mix
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_compressor_sidechain(
+    engine: *mut GooeyEngine,
+) -> u32 {
+    if engine.is_null() {
+        return COMPRESSOR_SIDECHAIN_NONE;
+    }
+
+    let engine = &*engine;
+    engine.compressor_sidechain
 }
 
 // =============================================================================
@@ -1659,10 +2293,9 @@ pub unsafe extern "C" fn gooey_engine_set_bpm(engine: *mut GooeyEngine, bpm: f32
 
     let engine = &mut *engine;
     engine.bpm = bpm;
-    engine.kick_sequencer.set_bpm(bpm);
-    engine.snare_sequencer.set_bpm(bpm);
-    engine.hihat_sequencer.set_bpm(bpm);
-    engine.tom_sequencer.set_bpm(bpm);
+    for seq in &mut engine.sequencers {
+        seq.set_bpm(bpm);
+    }
 
     // Update delay BPM for clocked timing
     engine.delay.set_bpm(bpm);
@@ -1686,10 +2319,9 @@ pub unsafe extern "C" fn gooey_engine_set_swing(engine: *mut GooeyEngine, swing:
     let engine = &mut *engine;
     let clamped = swing.clamp(0.0, 1.0);
     engine.swing = clamped;
-    engine.kick_sequencer.set_swing(clamped);
-    engine.snare_sequencer.set_swing(clamped);
-    engine.hihat_sequencer.set_swing(clamped);
-    engine.tom_sequencer.set_swing(clamped);
+    for seq in &mut engine.sequencers {
+        seq.set_swing(clamped);
+    }
 }
 
 /// Get the current global swing amount
@@ -1721,10 +2353,9 @@ pub unsafe extern "C" fn gooey_engine_sequencer_start(engine: *mut GooeyEngine) 
     }
 
     let engine = &mut *engine;
-    engine.kick_sequencer.start();
-    engine.snare_sequencer.start();
-    engine.hihat_sequencer.start();
-    engine.tom_sequencer.start();
+    for seq in &mut engine.sequencers {
+        seq.start();
+    }
 }
 
 /// Stop all sequencers
@@ -1738,10 +2369,9 @@ pub unsafe extern "C" fn gooey_engine_sequencer_stop(engine: *mut GooeyEngine) {
     }
 
     let engine = &mut *engine;
-    engine.kick_sequencer.stop();
-    engine.snare_sequencer.stop();
-    engine.hihat_sequencer.stop();
-    engine.tom_sequencer.stop();
+    for seq in &mut engine.sequencers {
+        seq.stop();
+    }
 }
 
 /// Reset all sequencers to step 0
@@ -1755,10 +2385,9 @@ pub unsafe extern "C" fn gooey_engine_sequencer_reset(engine: *mut GooeyEngine) 
     }
 
     let engine = &mut *engine;
-    engine.kick_sequencer.reset();
-    engine.snare_sequencer.reset();
-    engine.hihat_sequencer.reset();
-    engine.tom_sequencer.reset();
+    for seq in &mut engine.sequencers {
+        seq.reset();
+    }
 }
 
 /// Set all sequencers to a specific beat position in quarter notes.
@@ -1786,10 +2415,9 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_beat_position(
     }
 
     let engine = &mut *engine;
-    engine.kick_sequencer.set_beat_position(beat_position);
-    engine.snare_sequencer.set_beat_position(beat_position);
-    engine.hihat_sequencer.set_beat_position(beat_position);
-    engine.tom_sequencer.set_beat_position(beat_position);
+    for seq in &mut engine.sequencers {
+        seq.set_beat_position(beat_position);
+    }
 }
 
 /// Set a sequencer step on or off for the kick drum (legacy, prefer per-instrument functions)
@@ -1812,7 +2440,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_step(
     }
 
     let engine = &mut *engine;
-    engine.kick_sequencer.set_step(step as usize, enabled);
+    engine.sequencers[INSTRUMENT_KICK as usize].set_step(step as usize, enabled);
 }
 
 /// Get the current sequencer step (uses kick sequencer, all are synchronized)
@@ -1829,8 +2457,8 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_current_step(engine: *mut Go
     }
 
     let engine = &*engine;
-    if engine.kick_sequencer.is_running() {
-        engine.kick_sequencer.current_step() as i32
+    if engine.sequencers[0].is_running() {
+        engine.sequencers[0].current_step() as i32
     } else {
         -1
     }
@@ -1840,7 +2468,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_current_step(engine: *mut Go
 ///
 /// This compensates for audio buffer latency by looking ahead.
 /// Use this for UI display to sync visuals with audio output.
-/// Uses kick sequencer as reference (all sequencers are synchronized).
+/// Uses first sequencer as reference (all sequencers are synchronized).
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -1861,9 +2489,9 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_step_with_lookahead(
     }
 
     let engine = &*engine;
-    if engine.kick_sequencer.is_running() {
+    if engine.sequencers[0].is_running() {
         engine
-            .kick_sequencer
+            .sequencers[0]
             .step_at_lookahead(lookahead_samples as u64) as i32
     } else {
         -1
@@ -1877,22 +2505,20 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_step_with_lookahead(
 /// Helper to get a mutable reference to an instrument's sequencer
 impl GooeyEngine {
     fn sequencer_for_instrument(&mut self, instrument: u32) -> Option<&mut Sequencer> {
-        match instrument {
-            INSTRUMENT_KICK => Some(&mut self.kick_sequencer),
-            INSTRUMENT_SNARE => Some(&mut self.snare_sequencer),
-            INSTRUMENT_HIHAT => Some(&mut self.hihat_sequencer),
-            INSTRUMENT_TOM => Some(&mut self.tom_sequencer),
-            _ => None,
+        let idx = instrument as usize;
+        if idx < NUM_INSTRUMENTS {
+            Some(&mut self.sequencers[idx])
+        } else {
+            None
         }
     }
 
     fn sequencer_for_instrument_ref(&self, instrument: u32) -> Option<&Sequencer> {
-        match instrument {
-            INSTRUMENT_KICK => Some(&self.kick_sequencer),
-            INSTRUMENT_SNARE => Some(&self.snare_sequencer),
-            INSTRUMENT_HIHAT => Some(&self.hihat_sequencer),
-            INSTRUMENT_TOM => Some(&self.tom_sequencer),
-            _ => None,
+        let idx = instrument as usize;
+        if idx < NUM_INSTRUMENTS {
+            Some(&self.sequencers[idx])
+        } else {
+            None
         }
     }
 }
@@ -1980,7 +2606,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_with_velocit
     }
 }
 
-/// Set a step with optional velocity and optional blend setting.
+/// Set a step with optional velocity, optional blend setting, and optional MIDI note.
 ///
 /// Omitted settings are left unchanged.
 ///
@@ -1994,6 +2620,8 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_with_velocit
 /// * `set_blend` - Whether to apply blend X/Y
 /// * `blend_x` - Blend X position (0.0-1.0, used only when `set_blend` is true)
 /// * `blend_y` - Blend Y position (0.0-1.0, used only when `set_blend` is true)
+/// * `set_note` - Whether to apply the `midi_note` value
+/// * `midi_note` - MIDI note number (0-127, or STEP_NOTE_NONE); only applied when `set_note` is true
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -2008,6 +2636,8 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_settings(
     set_blend: bool,
     blend_x: f32,
     blend_y: f32,
+    set_note: bool,
+    midi_note: u8,
 ) {
     if engine.is_null() {
         return;
@@ -2022,8 +2652,18 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_settings(
             } else {
                 None
             },
+            note: None,
         };
         sequencer.set_step_with_settings(step as usize, enabled, settings);
+        // Handle note separately: set_note=true with STEP_NOTE_NONE clears the note
+        if set_note {
+            let step_idx = step as usize;
+            if midi_note == STEP_NOTE_NONE {
+                sequencer.clear_step_note(step_idx);
+            } else {
+                sequencer.set_step_note(step_idx, midi_note);
+            }
+        }
     }
 }
 
@@ -2101,6 +2741,111 @@ pub unsafe extern "C" fn gooey_engine_sequencer_clear_instrument_step_blend_over
     step: u32,
 ) {
     gooey_engine_sequencer_clear_instrument_step_blend(engine, instrument, step);
+}
+
+/// Set the MIDI note for a specific step in an instrument's sequencer.
+///
+/// When a step with a note triggers, the engine sets the instrument's
+/// frequency parameter to the note's frequency at the exact trigger sample.
+/// Steps without a note (STEP_NOTE_NONE) use the instrument's global
+/// frequency parameter as before (backward compatible).
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_BASS, etc.)
+/// * `step` - Step index (0-15)
+/// * `midi_note` - MIDI note number (0-127), or STEP_NOTE_NONE to clear
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_note(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+    midi_note: u8,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    if let Some(sequencer) = engine.sequencer_for_instrument(instrument) {
+        if midi_note == STEP_NOTE_NONE {
+            sequencer.clear_step_note(step as usize);
+        } else {
+            sequencer.set_step_note(step as usize, midi_note);
+        }
+    }
+}
+
+/// Get the MIDI note for a specific step.
+///
+/// # Returns
+/// The MIDI note number (0-127), or STEP_NOTE_NONE (255) if no note is set.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_note(
+    engine: *const GooeyEngine,
+    instrument: u32,
+    step: u32,
+) -> u8 {
+    if engine.is_null() {
+        return STEP_NOTE_NONE;
+    }
+    let engine = &*engine;
+    if let Some(sequencer) = engine.sequencer_for_instrument_ref(instrument) {
+        sequencer.get_step_note(step as usize).unwrap_or(STEP_NOTE_NONE)
+    } else {
+        STEP_NOTE_NONE
+    }
+}
+
+/// Clear the MIDI note for a step (reverts to global frequency).
+/// Equivalent to set_step_note(..., STEP_NOTE_NONE).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_clear_instrument_step_note(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    if let Some(sequencer) = engine.sequencer_for_instrument(instrument) {
+        sequencer.clear_step_note(step as usize);
+    }
+}
+
+/// Set MIDI notes for all 16 steps of an instrument's sequencer.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID
+/// * `notes` - Pointer to 16 uint8_t values (MIDI notes, or STEP_NOTE_NONE)
+///
+/// # Safety
+/// - `engine` must be a valid pointer returned by `gooey_engine_new`
+/// - `notes` must point to at least 16 bytes of allocated memory
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_note_pattern(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    notes: *const u8,
+) {
+    if engine.is_null() || notes.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let notes_slice = slice::from_raw_parts(notes, 16);
+    if let Some(sequencer) = engine.sequencer_for_instrument(instrument) {
+        sequencer.set_note_pattern(notes_slice);
+    }
 }
 
 /// Set the entire 16-step pattern for an instrument's sequencer
@@ -3056,33 +3801,11 @@ pub unsafe extern "C" fn gooey_engine_blend_set_position(
     engine.blend_x[idx] = x.clamp(0.0, 1.0);
     engine.blend_y[idx] = y.clamp(0.0, 1.0);
 
-    match instrument {
-        INSTRUMENT_KICK => {
-            let blended = engine
-                .kick_blender
-                .blend(engine.blend_x[idx], engine.blend_y[idx]);
-            engine.kick.set_config(blended);
-        }
-        INSTRUMENT_SNARE => {
-            let blended = engine
-                .snare_blender
-                .blend(engine.blend_x[idx], engine.blend_y[idx]);
-            engine.snare.set_config(blended);
-        }
-        INSTRUMENT_HIHAT => {
-            let blended = engine
-                .hihat_blender
-                .blend(engine.blend_x[idx], engine.blend_y[idx]);
-            engine.hihat.set_config(blended);
-        }
-        INSTRUMENT_TOM => {
-            let blended = engine
-                .tom_blender
-                .blend(engine.blend_x[idx], engine.blend_y[idx]);
-            engine.tom.set_config(blended);
-        }
-        _ => {}
-    }
+    engine.blenders[idx].blend_and_apply(
+        &mut engine.channels[idx],
+        engine.blend_x[idx],
+        engine.blend_y[idx],
+    );
 }
 
 /// Get the current X blend position for an instrument
@@ -3178,54 +3901,7 @@ pub unsafe extern "C" fn gooey_engine_blend_set_corner_preset(
     }
 
     engine.blend_corner_presets[idx][corner_idx] = preset_id;
-
-    match instrument {
-        INSTRUMENT_KICK => {
-            if let Some(config) = GooeyEngine::kick_preset_by_id(preset_id) {
-                match corner {
-                    BLEND_CORNER_BOTTOM_LEFT => engine.kick_blender.set_bottom_left(config),
-                    BLEND_CORNER_BOTTOM_RIGHT => engine.kick_blender.set_bottom_right(config),
-                    BLEND_CORNER_TOP_LEFT => engine.kick_blender.set_top_left(config),
-                    BLEND_CORNER_TOP_RIGHT => engine.kick_blender.set_top_right(config),
-                    _ => {}
-                }
-            }
-        }
-        INSTRUMENT_SNARE => {
-            if let Some(config) = GooeyEngine::snare_preset_by_id(preset_id) {
-                match corner {
-                    BLEND_CORNER_BOTTOM_LEFT => engine.snare_blender.set_bottom_left(config),
-                    BLEND_CORNER_BOTTOM_RIGHT => engine.snare_blender.set_bottom_right(config),
-                    BLEND_CORNER_TOP_LEFT => engine.snare_blender.set_top_left(config),
-                    BLEND_CORNER_TOP_RIGHT => engine.snare_blender.set_top_right(config),
-                    _ => {}
-                }
-            }
-        }
-        INSTRUMENT_HIHAT => {
-            if let Some(config) = GooeyEngine::hihat_preset_by_id(preset_id) {
-                match corner {
-                    BLEND_CORNER_BOTTOM_LEFT => engine.hihat_blender.set_bottom_left(config),
-                    BLEND_CORNER_BOTTOM_RIGHT => engine.hihat_blender.set_bottom_right(config),
-                    BLEND_CORNER_TOP_LEFT => engine.hihat_blender.set_top_left(config),
-                    BLEND_CORNER_TOP_RIGHT => engine.hihat_blender.set_top_right(config),
-                    _ => {}
-                }
-            }
-        }
-        INSTRUMENT_TOM => {
-            if let Some(config) = GooeyEngine::tom_preset_by_id(preset_id) {
-                match corner {
-                    BLEND_CORNER_BOTTOM_LEFT => engine.tom_blender.set_bottom_left(config),
-                    BLEND_CORNER_BOTTOM_RIGHT => engine.tom_blender.set_bottom_right(config),
-                    BLEND_CORNER_TOP_LEFT => engine.tom_blender.set_top_left(config),
-                    BLEND_CORNER_TOP_RIGHT => engine.tom_blender.set_top_right(config),
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
+    engine.blenders[idx].set_corner_preset(corner, preset_id);
 }
 
 /// Get the preset ID at a corner
@@ -3289,63 +3965,7 @@ pub unsafe extern "C" fn gooey_engine_blend_reset_corners(
         return;
     }
 
-    match instrument {
-        INSTRUMENT_KICK => {
-            engine.kick_blender = PresetBlender::new(
-                KickConfig::tight(),
-                KickConfig::punch(),
-                KickConfig::loose(),
-                KickConfig::dirt(),
-            );
-            engine.blend_corner_presets[idx] = [
-                KICK_PRESET_TIGHT,
-                KICK_PRESET_PUNCH,
-                KICK_PRESET_LOOSE,
-                KICK_PRESET_DIRT,
-            ];
-        }
-        INSTRUMENT_SNARE => {
-            engine.snare_blender = PresetBlender::new(
-                SnareConfig::tight(),
-                SnareConfig::loose(),
-                SnareConfig::hiss(),
-                SnareConfig::smack(),
-            );
-            engine.blend_corner_presets[idx] = [
-                SNARE_PRESET_TIGHT,
-                SNARE_PRESET_LOOSE,
-                SNARE_PRESET_HISS,
-                SNARE_PRESET_SMACK,
-            ];
-        }
-        INSTRUMENT_HIHAT => {
-            engine.hihat_blender = PresetBlender::new(
-                HiHat2Config::short(),
-                HiHat2Config::loose(),
-                HiHat2Config::dark(),
-                HiHat2Config::soft(),
-            );
-            engine.blend_corner_presets[idx] = [
-                HIHAT_PRESET_SHORT,
-                HIHAT_PRESET_LOOSE,
-                HIHAT_PRESET_DARK,
-                HIHAT_PRESET_SOFT,
-            ];
-        }
-        INSTRUMENT_TOM => {
-            engine.tom_blender = PresetBlender::new(
-                Tom2Config::derp(),
-                Tom2Config::ring(),
-                Tom2Config::brush(),
-                Tom2Config::void_preset(),
-            );
-            engine.blend_corner_presets[idx] = [
-                TOM_PRESET_DERP,
-                TOM_PRESET_RING,
-                TOM_PRESET_BRUSH,
-                TOM_PRESET_VOID,
-            ];
-        }
-        _ => {}
-    }
+    let inst_type = engine.channels[idx].instrument_type();
+    engine.blenders[idx] = ChannelBlender::default_for_type(inst_type);
+    engine.blend_corner_presets[idx] = ChannelBlender::default_corner_preset_ids(inst_type);
 }

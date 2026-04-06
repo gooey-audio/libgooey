@@ -22,9 +22,10 @@ impl SequencerBlendSetting {
 pub struct SequencerStepSettings {
     pub velocity: Option<f32>,
     pub blend: Option<SequencerBlendSetting>,
+    pub note: Option<u8>,
 }
 
-/// Represents a single sequencer step with enabled state, velocity, and optional blend setting
+/// Represents a single sequencer step with enabled state, velocity, optional blend setting, and optional MIDI note
 #[derive(Clone, Copy, Debug)]
 pub struct SequencerStep {
     /// Whether this step triggers the instrument
@@ -33,6 +34,8 @@ pub struct SequencerStep {
     pub velocity: f32,
     /// Optional absolute blend setting for this step
     pub blend: Option<SequencerBlendSetting>,
+    /// Optional MIDI note for this step (0-127). When set, overrides the instrument's global frequency.
+    pub note: Option<u8>,
 }
 
 impl Default for SequencerStep {
@@ -41,6 +44,7 @@ impl Default for SequencerStep {
             enabled: true,
             velocity: 1.0,
             blend: None,
+            note: None,
         }
     }
 }
@@ -52,6 +56,7 @@ impl SequencerStep {
             enabled,
             velocity: 1.0,
             blend: None,
+            note: None,
         }
     }
 
@@ -61,6 +66,7 @@ impl SequencerStep {
             enabled,
             velocity: velocity.clamp(0.0, 1.0),
             blend: None,
+            note: None,
         }
     }
 
@@ -74,6 +80,7 @@ impl SequencerStep {
             enabled,
             velocity: velocity.clamp(0.0, 1.0),
             blend,
+            note: None,
         }
     }
 }
@@ -90,6 +97,7 @@ pub struct SequencerTrigger<'a> {
     pub instrument_name: &'a str,
     pub velocity: f32,
     pub blend: Option<SequencerBlendSetting>,
+    pub note: Option<u8>,
 }
 
 /// A sample-accurate step sequencer with per-step velocity and optional blend settings
@@ -507,11 +515,13 @@ impl Sequencer {
         }
     }
 
-    /// Set both enabled state and velocity for a step (preserves any blend setting)
+    /// Set both enabled state and velocity for a step (preserves any blend setting and note)
     pub fn set_step_with_velocity(&mut self, step: usize, enabled: bool, velocity: f32) {
         if step < self.pattern.len() {
             let blend = self.pattern[step].blend;
+            let note = self.pattern[step].note;
             self.pattern[step] = SequencerStep::with_velocity_and_blend(enabled, velocity, blend);
+            self.pattern[step].note = note;
         }
     }
 
@@ -530,6 +540,9 @@ impl Sequencer {
             }
             if let Some(blend) = settings.blend {
                 self.pattern[step].blend = Some(blend);
+            }
+            if let Some(note) = settings.note {
+                self.pattern[step].note = Some(note);
             }
         }
     }
@@ -576,6 +589,33 @@ impl Sequencer {
     /// Get a step's blend setting
     pub fn get_step_blend(&self, step: usize) -> Option<SequencerBlendSetting> {
         self.pattern.get(step).and_then(|s| s.blend)
+    }
+
+    /// Set a step's MIDI note (0-127). When the step triggers, this overrides the instrument's global frequency.
+    pub fn set_step_note(&mut self, step: usize, note: u8) {
+        if step < self.pattern.len() {
+            self.pattern[step].note = Some(note);
+        }
+    }
+
+    /// Clear a step's MIDI note (reverts to global frequency)
+    pub fn clear_step_note(&mut self, step: usize) {
+        if step < self.pattern.len() {
+            self.pattern[step].note = None;
+        }
+    }
+
+    /// Get a step's MIDI note
+    pub fn get_step_note(&self, step: usize) -> Option<u8> {
+        self.pattern.get(step).and_then(|s| s.note)
+    }
+
+    /// Set MIDI notes for all steps. Values of 255 clear the note for that step.
+    pub fn set_note_pattern(&mut self, notes: &[u8]) {
+        let len = notes.len().min(self.pattern.len());
+        for i in 0..len {
+            self.pattern[i].note = if notes[i] == 255 { None } else { Some(notes[i]) };
+        }
     }
 
     /// Get the pattern with velocity information
@@ -673,6 +713,7 @@ impl Sequencer {
                     instrument_name: self.instrument_name.as_str(),
                     velocity: step.velocity,
                     blend: step.blend,
+                    note: step.note,
                 });
             }
 
