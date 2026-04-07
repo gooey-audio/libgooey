@@ -12,7 +12,9 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 use gooey::effects::LowpassFilterEffect;
-use gooey::engine::{Engine, EngineOutput, Instrument, Lfo, Modulatable, MusicalDivision, Sequencer};
+use gooey::engine::{
+    Engine, EngineOutput, Instrument, Lfo, Modulatable, MusicalDivision, Sequencer,
+};
 use gooey::instruments::HiHat;
 
 const LFO_DIVISIONS: [MusicalDivision; 8] = [
@@ -57,11 +59,11 @@ const PARAM_COUNT: usize = 7;
 struct SharedHiHat(Arc<Mutex<HiHat>>);
 
 impl Instrument for SharedHiHat {
-    fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         self.0.lock().unwrap().trigger_with_velocity(time, velocity);
     }
 
-    fn tick(&mut self, current_time: f32) -> f32 {
+    fn tick(&mut self, current_time: f64) -> f32 {
         self.0.lock().unwrap().tick(current_time)
     }
 
@@ -158,7 +160,11 @@ fn render_display(state: &SeqState, selected: usize) {
     );
 
     // Filter resonance
-    let ind = if selected == PARAM_RESONANCE { ">" } else { " " };
+    let ind = if selected == PARAM_RESONANCE {
+        ">"
+    } else {
+        " "
+    };
     let res_norm = state.resonance / 0.95;
     print!(
         "{} {:<18} [{}] {:>6.2}\r\n",
@@ -169,7 +175,11 @@ fn render_display(state: &SeqState, selected: usize) {
     );
 
     // LFO enabled
-    let ind = if selected == PARAM_LFO_ENABLED { ">" } else { " " };
+    let ind = if selected == PARAM_LFO_ENABLED {
+        ">"
+    } else {
+        " "
+    };
     let on_off = if state.lfo_enabled { "ON" } else { "OFF" };
     print!(
         "{} {:<18} [{}] {:>6}\r\n",
@@ -184,7 +194,11 @@ fn render_display(state: &SeqState, selected: usize) {
     );
 
     // LFO division
-    let ind = if selected == PARAM_LFO_DIVISION { ">" } else { " " };
+    let ind = if selected == PARAM_LFO_DIVISION {
+        ">"
+    } else {
+        " "
+    };
     let div = LFO_DIVISIONS[state.lfo_division_idx];
     let div_norm = state.lfo_division_idx as f32 / 7.0;
     print!(

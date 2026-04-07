@@ -24,7 +24,7 @@
 use std::collections::HashSet;
 
 use crate::effects::{
-    BrickWallLimiter, DelayEffect, DelayTiming, Effect, LowpassFilterEffect, TubeSaturation,
+    DelayEffect, DelayTiming, Effect, LowpassFilterEffect, SoftLimiter, TubeSaturation,
 };
 use crate::engine::{Engine, Instrument, Lfo, MusicalDivision, Sequencer, SequencerStep};
 use crate::instruments::{
@@ -661,7 +661,7 @@ impl EffectDef {
                 warmth,
                 mix,
             ))),
-            Self::Limiter { threshold } => Ok(Box::new(BrickWallLimiter::new(threshold))),
+            Self::Limiter { threshold } => Ok(Box::new(SoftLimiter::new(threshold))),
         }
     }
 }

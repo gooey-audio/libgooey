@@ -93,13 +93,13 @@ impl MembraneInstrument {
 }
 
 impl Instrument for MembraneInstrument {
-    fn trigger_with_velocity(&mut self, time: f32, _velocity: f32) {
+    fn trigger_with_velocity(&mut self, time: f64, _velocity: f32) {
         self.is_active = true;
         self.envelope.trigger(time);
         self.resonator.reset();
     }
 
-    fn tick(&mut self, current_time: f32) -> f32 {
+    fn tick(&mut self, current_time: f64) -> f32 {
         if !self.is_active {
             return 0.0;
         }
@@ -134,11 +134,11 @@ impl Instrument for MembraneInstrument {
 struct SharedMembrane(Arc<Mutex<MembraneInstrument>>);
 
 impl Instrument for SharedMembrane {
-    fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         self.0.lock().unwrap().trigger_with_velocity(time, velocity);
     }
 
-    fn tick(&mut self, current_time: f32) -> f32 {
+    fn tick(&mut self, current_time: f64) -> f32 {
         self.0.lock().unwrap().tick(current_time)
     }
 
