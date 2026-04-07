@@ -245,5 +245,4 @@ mod tests {
         // Move bottom (E4) down octave -> E3(52)
         assert_eq!(notes, vec![52, 67]); // E3, G4
     }
-
 }
