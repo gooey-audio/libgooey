@@ -10,9 +10,10 @@ use crate::effects::{
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
 use crate::instruments::{
-    BassConfig, BassSynth, HiHat2, HiHat2Config, KickConfig, KickDrum, SnareConfig, SnareDrum,
-    Tom2, Tom2Config,
+    BassConfig, BassSynth, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth, PolySynthConfig,
+    SnareConfig, SnareDrum, Tom2, Tom2Config,
 };
+use crate::music::{apply_voicing, available_voicings, Key, NoteName, ScaleType, VoicingType};
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CString};
 use std::slice;
@@ -546,6 +547,9 @@ pub struct GooeyEngine {
     // Used to let host MIDI input drive instruments instead of the internal sequencer.
     sequencer_triggers_enabled: bool,
 
+    // Polyphonic synthesizer for chord playback
+    poly_synth: PolySynth,
+
     // Error state (set after a panic in render, checked on every render call)
     error_occurred: AtomicBool,
     error_message: Option<CString>,
@@ -660,6 +664,8 @@ impl GooeyEngine {
             pending_midi_events: Vec::with_capacity(MIDI_EVENT_CAPACITY),
             // Sequencer triggers enabled by default (internal sequencer drives instruments)
             sequencer_triggers_enabled: true,
+            // Polyphonic synthesizer for chord playback
+            poly_synth: PolySynth::new(sample_rate),
             // Error state
             error_occurred: AtomicBool::new(false),
             error_message: None,
@@ -791,6 +797,9 @@ impl GooeyEngine {
                     self.channel_peaks[ch].store(abs_out.to_bits(), Ordering::Relaxed);
                 }
             }
+
+            // Mix in poly synth output
+            output += self.poly_synth.tick(self.current_time);
 
             // Apply global effects chain
             if self.saturation_enabled {
@@ -3983,4 +3992,229 @@ pub unsafe extern "C" fn gooey_engine_blend_reset_corners(
     let inst_type = engine.channels[idx].instrument_type();
     engine.blenders[idx] = ChannelBlender::default_for_type(inst_type);
     engine.blend_corner_presets[idx] = ChannelBlender::default_corner_preset_ids(inst_type);
+}
+
+// =============================================================================
+// Poly Synth — chord playback via music theory
+// =============================================================================
+
+// Preset IDs
+pub const POLY_PRESET_DEFAULT: u32 = 0;
+pub const POLY_PRESET_PAD: u32 = 1;
+pub const POLY_PRESET_PLUCK: u32 = 2;
+pub const POLY_PRESET_KEYS: u32 = 3;
+pub const POLY_PRESET_STRINGS: u32 = 4;
+
+// Scale type IDs
+pub const SCALE_MAJOR: u32 = 0;
+pub const SCALE_MINOR: u32 = 1;
+
+// Voicing type IDs
+pub const VOICING_ROOT_POSITION: u32 = 0;
+pub const VOICING_FIRST_INVERSION: u32 = 1;
+pub const VOICING_SECOND_INVERSION: u32 = 2;
+pub const VOICING_THIRD_INVERSION: u32 = 3;
+pub const VOICING_OPEN: u32 = 4;
+pub const VOICING_DROP2: u32 = 5;
+pub const VOICING_DROP3: u32 = 6;
+pub const VOICING_SPREAD: u32 = 7;
+pub const VOICING_SHELL: u32 = 8;
+pub const VOICING_ROOTLESS: u32 = 9;
+
+fn voicing_from_id(id: u32) -> VoicingType {
+    match id {
+        VOICING_FIRST_INVERSION => VoicingType::FirstInversion,
+        VOICING_SECOND_INVERSION => VoicingType::SecondInversion,
+        VOICING_THIRD_INVERSION => VoicingType::ThirdInversion,
+        VOICING_OPEN => VoicingType::OpenVoicing,
+        VOICING_DROP2 => VoicingType::Drop2,
+        VOICING_DROP3 => VoicingType::Drop3,
+        VOICING_SPREAD => VoicingType::Spread,
+        VOICING_SHELL => VoicingType::Shell,
+        VOICING_ROOTLESS => VoicingType::Rootless,
+        _ => VoicingType::RootPosition,
+    }
+}
+
+fn scale_from_id(id: u32) -> ScaleType {
+    match id {
+        SCALE_MINOR => ScaleType::NaturalMinor,
+        _ => ScaleType::Major,
+    }
+}
+
+fn root_from_id(id: u32) -> NoteName {
+    NoteName::from_index(id as u8 % 12)
+}
+
+fn preset_config(id: u32) -> PolySynthConfig {
+    match id {
+        POLY_PRESET_PAD => PolySynthConfig::pad(),
+        POLY_PRESET_PLUCK => PolySynthConfig::pluck(),
+        POLY_PRESET_KEYS => PolySynthConfig::keys(),
+        POLY_PRESET_STRINGS => PolySynthConfig::strings(),
+        _ => PolySynthConfig::default(),
+    }
+}
+
+/// Trigger a diatonic chord from a key.
+///
+/// Builds the chord from music theory (root + scale → diatonic chord at degree),
+/// applies the requested voicing, and triggers all notes on the poly synth.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `root` - Root note (0=C, 1=C#, 2=D, ... 11=B)
+/// * `scale_type` - Scale (SCALE_MAJOR=0, SCALE_MINOR=1)
+/// * `degree` - Diatonic degree (0-6, i.e. I through VII)
+/// * `voicing` - Voicing type ID (VOICING_ROOT_POSITION, etc.)
+/// * `preset` - Preset ID (POLY_PRESET_DEFAULT, etc.)
+/// * `octave` - Base octave (typically 3-5)
+/// * `velocity` - Note velocity (0.0-1.0)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_trigger_chord(
+    engine: *mut GooeyEngine,
+    root: u32,
+    scale_type: u32,
+    degree: u32,
+    voicing: u32,
+    preset: u32,
+    octave: i32,
+    velocity: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+
+    let root_note = root_from_id(root);
+    let scale = scale_from_id(scale_type);
+    let key = Key::new(root_note, scale);
+    let voicing_type = voicing_from_id(voicing);
+    let octave = octave.clamp(0, 8) as i8;
+    let velocity = velocity.clamp(0.0, 1.0);
+
+    // Apply preset
+    engine.poly_synth.set_config(preset_config(preset));
+    engine.poly_synth.snap_params();
+
+    // Get diatonic seventh chords and pick the requested degree
+    let chords = key.diatonic_sevenths();
+    let degree = degree as usize % chords.len();
+    let chord = &chords[degree];
+
+    // Apply voicing to get MIDI notes
+    let midi_notes = apply_voicing(chord, voicing_type, octave);
+
+    // Release any currently sounding notes, then trigger the new chord
+    engine.poly_synth.release_all();
+    for note in &midi_notes {
+        engine.poly_synth.trigger_note(*note, velocity);
+    }
+}
+
+/// Release all sounding poly synth notes.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_release(engine: *mut GooeyEngine) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    engine.poly_synth.release_all();
+}
+
+/// Set the poly synth preset.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `preset` - Preset ID (POLY_PRESET_DEFAULT, etc.)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_set_preset(engine: *mut GooeyEngine, preset: u32) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    engine.poly_synth.set_config(preset_config(preset));
+}
+
+/// Set a single poly synth parameter by index.
+///
+/// Parameter indices:
+/// - 0: osc_shape (0=saw, 1=square)
+/// - 1: detune_amount
+/// - 2: filter_cutoff
+/// - 3: filter_resonance
+/// - 4: filter_env_amount
+/// - 5: amp_attack
+/// - 6: amp_decay
+/// - 7: amp_sustain
+/// - 8: amp_release
+/// - 9: filter_attack
+/// - 10: filter_decay
+/// - 11: filter_sustain
+/// - 12: filter_release
+/// - 13: volume
+///
+/// All values are normalized 0.0-1.0.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_set_param(
+    engine: *mut GooeyEngine,
+    param: u32,
+    value: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let value = value.clamp(0.0, 1.0);
+
+    match param {
+        0 => engine.poly_synth.params.osc_shape.set_target(value),
+        1 => engine.poly_synth.params.detune_amount.set_target(value),
+        2 => engine.poly_synth.params.filter_cutoff.set_target(value),
+        3 => engine.poly_synth.params.filter_resonance.set_target(value),
+        4 => engine.poly_synth.params.filter_env_amount.set_target(value),
+        5 => engine.poly_synth.params.amp_attack.set_target(value),
+        6 => engine.poly_synth.params.amp_decay.set_target(value),
+        7 => engine.poly_synth.params.amp_sustain.set_target(value),
+        8 => engine.poly_synth.params.amp_release.set_target(value),
+        9 => engine.poly_synth.params.filter_attack.set_target(value),
+        10 => engine.poly_synth.params.filter_decay.set_target(value),
+        11 => engine.poly_synth.params.filter_sustain.set_target(value),
+        12 => engine.poly_synth.params.filter_release.set_target(value),
+        13 => engine.poly_synth.params.volume.set_target(value),
+        _ => {}
+    }
+}
+
+/// Query how many voicings are available for a given chord quality.
+///
+/// The chord quality is determined by root + scale + degree.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_available_voicing_count(
+    root: u32,
+    scale_type: u32,
+    degree: u32,
+) -> u32 {
+    let root_note = root_from_id(root);
+    let scale = scale_from_id(scale_type);
+    let key = Key::new(root_note, scale);
+    let chords = key.diatonic_sevenths();
+    let degree = degree as usize % chords.len();
+    available_voicings(&chords[degree].quality).len() as u32
 }
