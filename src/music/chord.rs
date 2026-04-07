@@ -163,7 +163,7 @@ impl Chord {
         self.quality
             .intervals()
             .iter()
-            .map(|interval| root_midi + interval.semitones())
+            .map(|interval| (root_midi + interval.semitones()).min(127))
             .collect()
     }
 
