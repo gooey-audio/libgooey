@@ -106,7 +106,7 @@ fn test_global_effects() {
     let sample_rate = 44100.0;
     let engine = Engine::new(sample_rate);
 
-    // Engine should have at least the default BrickWallLimiter
+    // Engine should have at least the default SoftLimiter
     assert!(
         engine.global_effect_count() >= 1,
         "Engine should have default global effects"

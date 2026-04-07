@@ -1,4 +1,5 @@
 use crate::envelope::{ADSRConfig, Envelope};
+use crate::gen::polyblep;
 use crate::gen::waveform::Waveform;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -103,23 +104,40 @@ impl Oscillator {
     ) -> f32 {
         let mut output = 0.0;
         let mut i = 1;
-        let max_harmonics = (self.sample_rate / (2.0 * self.frequency_hz)) as i32;
-        let max_harmonics = max_harmonics.min(20); // Cap at 20 harmonics maximum
+        let nyquist = self.sample_rate / 2.0;
+        let max_harmonics = (nyquist / self.frequency_hz) as i32;
 
         while i <= max_harmonics && !self.is_multiple_of_freq_above_nyquist(i as f32) {
             let gain = 1.0 / (i as f32).powf(gain_exponent);
-            output += gain * self.calculate_sine_output_from_freq(self.frequency_hz * i as f32);
+            // Gibbs taper: smooth rolloff for harmonics in the top 25% of bandwidth
+            let harmonic_freq = self.frequency_hz * i as f32;
+            let ratio = harmonic_freq / nyquist;
+            let taper = if ratio > 0.75 {
+                let t = (ratio - 0.75) / 0.25;
+                1.0 - t * t
+            } else {
+                1.0
+            };
+            output += gain * taper * self.calculate_sine_output_from_freq(harmonic_freq);
             i += harmonic_index_increment;
         }
         output
     }
 
+    fn polyblep_phase(&self) -> (f64, f64) {
+        let phase_inc = self.frequency_hz as f64 / self.sample_rate as f64;
+        let phase = (self.current_sample_index as f64 * phase_inc) % 1.0;
+        (phase, phase_inc)
+    }
+
     fn square_wave_time_based(&self) -> f32 {
-        self.generative_waveform_time_based(2, 1.0)
+        let (phase, phase_inc) = self.polyblep_phase();
+        polyblep::polyblep_square(phase, phase_inc)
     }
 
     fn saw_wave_time_based(&self) -> f32 {
-        self.generative_waveform_time_based(1, 1.0)
+        let (phase, phase_inc) = self.polyblep_phase();
+        polyblep::polyblep_saw(phase, phase_inc)
     }
 
     fn triangle_wave_time_based(&self) -> f32 {
@@ -201,14 +219,7 @@ impl Oscillator {
             Waveform::Noise => self.noise_wave_time_based(),
         };
 
-        // Simple anti-aliasing: reduce volume for high frequencies
-        let anti_alias_gain = if self.frequency_hz > self.sample_rate * 0.1 {
-            0.7
-        } else {
-            1.0
-        };
-
         let envelope_amplitude = self.envelope.get_amplitude(current_time);
-        raw_output * anti_alias_gain * envelope_amplitude * self.volume
+        raw_output * envelope_amplitude * self.volume
     }
 }

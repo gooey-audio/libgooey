@@ -20,6 +20,18 @@ cargo test --test engine_basics --verbose           # Single test file
 cargo test modulation --verbose                     # Pattern match
 ```
 
+## Validate
+
+After any code changes, run all of these before considering the work done:
+
+```bash
+cargo build                                        # Library builds
+cargo build --example kick --features native,crossterm  # Examples typecheck
+cargo test --verbose                               # All tests pass
+cargo fmt --all -- --check                         # Formatting
+cargo clippy --all-targets --all-features          # Clippy
+```
+
 ## Lint
 
 ```bash

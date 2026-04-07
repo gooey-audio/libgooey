@@ -4,7 +4,7 @@
 //! Designed for integration with iOS (and other platforms in the future).
 
 use crate::effects::{
-    BrickWallLimiter, DelayEffect, DelayTiming, Effect, LowpassFilterEffect, TiltFilterEffect,
+    DelayEffect, DelayTiming, Effect, LowpassFilterEffect, SoftLimiter, TiltFilterEffect,
     TubeCompressor, TubeSaturation,
 };
 use crate::engine::lfo::{Lfo, MusicalDivision};
@@ -432,11 +432,36 @@ impl ChannelBlender {
     /// Returns the default corner preset IDs for a given instrument type.
     fn default_corner_preset_ids(instrument_type: u32) -> [u32; 4] {
         match instrument_type {
-            INSTRUMENT_KICK => [KICK_PRESET_TIGHT, KICK_PRESET_PUNCH, KICK_PRESET_LOOSE, KICK_PRESET_DIRT],
-            INSTRUMENT_SNARE => [SNARE_PRESET_TIGHT, SNARE_PRESET_LOOSE, SNARE_PRESET_HISS, SNARE_PRESET_SMACK],
-            INSTRUMENT_HIHAT => [HIHAT_PRESET_SHORT, HIHAT_PRESET_LOOSE, HIHAT_PRESET_DARK, HIHAT_PRESET_SOFT],
-            INSTRUMENT_TOM => [TOM_PRESET_DERP, TOM_PRESET_RING, TOM_PRESET_BRUSH, TOM_PRESET_VOID],
-            INSTRUMENT_BASS => [BASS_PRESET_ACID, BASS_PRESET_SUB, BASS_PRESET_REESE, BASS_PRESET_STAB],
+            INSTRUMENT_KICK => [
+                KICK_PRESET_TIGHT,
+                KICK_PRESET_PUNCH,
+                KICK_PRESET_LOOSE,
+                KICK_PRESET_DIRT,
+            ],
+            INSTRUMENT_SNARE => [
+                SNARE_PRESET_TIGHT,
+                SNARE_PRESET_LOOSE,
+                SNARE_PRESET_HISS,
+                SNARE_PRESET_SMACK,
+            ],
+            INSTRUMENT_HIHAT => [
+                HIHAT_PRESET_SHORT,
+                HIHAT_PRESET_LOOSE,
+                HIHAT_PRESET_DARK,
+                HIHAT_PRESET_SOFT,
+            ],
+            INSTRUMENT_TOM => [
+                TOM_PRESET_DERP,
+                TOM_PRESET_RING,
+                TOM_PRESET_BRUSH,
+                TOM_PRESET_VOID,
+            ],
+            INSTRUMENT_BASS => [
+                BASS_PRESET_ACID,
+                BASS_PRESET_SUB,
+                BASS_PRESET_REESE,
+                BASS_PRESET_STAB,
+            ],
             _ => [0, 1, 2, 3],
         }
     }
@@ -470,7 +495,7 @@ pub struct GooeyEngine {
     compressor: TubeCompressor,
     compressor_enabled: bool,
     compressor_sidechain: u32,
-    limiter: BrickWallLimiter,
+    limiter: SoftLimiter,
 
     // Engine state
     sample_rate: f32,
@@ -593,7 +618,7 @@ impl GooeyEngine {
             compressor,
             compressor_enabled: true,
             compressor_sidechain: COMPRESSOR_SIDECHAIN_NONE,
-            limiter: BrickWallLimiter::new(1.0),
+            limiter: SoftLimiter::new(1.0),
             sample_rate,
             bpm,
             swing: 0.5,
@@ -715,8 +740,7 @@ impl GooeyEngine {
                                 Self::freq_range_for_instrument(instr_type)
                             {
                                 if self.saved_global_freq[ch].is_none() {
-                                    self.saved_global_freq[ch] =
-                                        self.channels[ch].get_freq_param();
+                                    self.saved_global_freq[ch] = self.channels[ch].get_freq_param();
                                 }
                                 let normalized = Self::midi_note_to_normalized_freq(
                                     midi_note, freq_min, freq_max,
@@ -1387,14 +1411,13 @@ pub unsafe extern "C" fn gooey_engine_drain_midi_events(
     }
 
     let engine_ref = &mut *engine;
-    let count = engine_ref.pending_midi_events.len().min(max_events as usize);
+    let count = engine_ref
+        .pending_midi_events
+        .len()
+        .min(max_events as usize);
 
     if count > 0 {
-        std::ptr::copy_nonoverlapping(
-            engine_ref.pending_midi_events.as_ptr(),
-            out_events,
-            count,
-        );
+        std::ptr::copy_nonoverlapping(engine_ref.pending_midi_events.as_ptr(), out_events, count);
         // Remove only the events that were copied; retain any overflow
         engine_ref.pending_midi_events.drain(..count);
     }
@@ -1651,10 +1674,7 @@ pub unsafe extern "C" fn gooey_engine_set_channel_param(
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
 #[no_mangle]
-pub unsafe extern "C" fn gooey_engine_trigger_channel(
-    engine: *mut GooeyEngine,
-    channel: u32,
-) {
+pub unsafe extern "C" fn gooey_engine_trigger_channel(engine: *mut GooeyEngine, channel: u32) {
     gooey_engine_trigger_channel_with_velocity(engine, channel, 1.0);
 }
 
@@ -1988,10 +2008,7 @@ pub unsafe extern "C" fn gooey_engine_set_bass_param(
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
 #[no_mangle]
-pub unsafe extern "C" fn gooey_engine_load_bass_preset(
-    engine: *mut GooeyEngine,
-    preset_id: u32,
-) {
+pub unsafe extern "C" fn gooey_engine_load_bass_preset(engine: *mut GooeyEngine, preset_id: u32) {
     if engine.is_null() {
         return;
     }
@@ -2260,9 +2277,7 @@ pub unsafe extern "C" fn gooey_engine_set_compressor_sidechain(
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
 #[no_mangle]
-pub unsafe extern "C" fn gooey_engine_get_compressor_sidechain(
-    engine: *mut GooeyEngine,
-) -> u32 {
+pub unsafe extern "C" fn gooey_engine_get_compressor_sidechain(engine: *mut GooeyEngine) -> u32 {
     if engine.is_null() {
         return COMPRESSOR_SIDECHAIN_NONE;
     }
@@ -2490,9 +2505,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_step_with_lookahead(
 
     let engine = &*engine;
     if engine.sequencers[0].is_running() {
-        engine
-            .sequencers[0]
-            .step_at_lookahead(lookahead_samples as u64) as i32
+        engine.sequencers[0].step_at_lookahead(lookahead_samples as u64) as i32
     } else {
         -1
     }
@@ -2796,7 +2809,9 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_note(
     }
     let engine = &*engine;
     if let Some(sequencer) = engine.sequencer_for_instrument_ref(instrument) {
-        sequencer.get_step_note(step as usize).unwrap_or(STEP_NOTE_NONE)
+        sequencer
+            .get_step_note(step as usize)
+            .unwrap_or(STEP_NOTE_NONE)
     } else {
         STEP_NOTE_NONE
     }

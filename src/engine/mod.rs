@@ -1,4 +1,4 @@
-use crate::effects::{BrickWallLimiter, Effect};
+use crate::effects::{Effect, SoftLimiter};
 use crate::utils::SmoothedParam;
 use std::collections::{HashMap, VecDeque};
 
@@ -101,7 +101,7 @@ impl Engine {
     pub fn new(sample_rate: f32) -> Self {
         // Initialize with a brick wall limiter as the default global effect
         let mut global_effects: Vec<Box<dyn Effect>> = Vec::new();
-        global_effects.push(Box::new(BrickWallLimiter::new(1.0)));
+        global_effects.push(Box::new(SoftLimiter::new(1.0)));
 
         Self {
             sample_rate,
@@ -304,9 +304,7 @@ impl Engine {
                             }
                         }
                         instrument.set_midi_note(midi_note);
-                    } else if let Some(saved) =
-                        self.saved_global_freq.remove(instrument_name)
-                    {
+                    } else if let Some(saved) = self.saved_global_freq.remove(instrument_name) {
                         // Restore global frequency when step has no note
                         instrument.set_frequency_normalized(saved);
                     }

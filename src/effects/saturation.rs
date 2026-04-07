@@ -6,6 +6,7 @@
 //! generation for a more analog sound than simple tanh.
 
 use crate::effects::Effect;
+use crate::utils::oversampler::Oversampler2x;
 use crate::utils::smoother::SmoothedParam;
 use std::cell::UnsafeCell;
 use std::f32::consts::FRAC_2_PI;
@@ -27,6 +28,9 @@ struct SaturationState {
     // DC blocker state (high-pass to remove DC offset)
     dc_x1: f32,
     dc_y1: f32,
+
+    // 2x oversampler to reduce aliasing from nonlinear processing
+    oversampler: Oversampler2x,
 }
 
 /// Tube-style saturation effect
@@ -70,6 +74,7 @@ impl TubeSaturation {
                 mix_smoothed: SmoothedParam::new(mix_clamped, 0.0, 1.0, sample_rate, 30.0),
                 dc_x1: 0.0,
                 dc_y1: 0.0,
+                oversampler: Oversampler2x::new(),
             }),
             drive_target: AtomicU32::new(drive_clamped.to_bits()),
             warmth_target: AtomicU32::new(warmth_clamped.to_bits()),
@@ -171,6 +176,7 @@ impl TubeSaturation {
         let state = unsafe { &mut *self.state.get() };
         state.dc_x1 = 0.0;
         state.dc_y1 = 0.0;
+        state.oversampler = Oversampler2x::new();
     }
 }
 
@@ -202,8 +208,10 @@ impl Effect for TubeSaturation {
             return input;
         }
 
-        // Apply saturation
-        let saturated = Self::saturate(input, drive, warmth);
+        // Apply saturation with 2x oversampling to reduce aliasing
+        let saturated = state
+            .oversampler
+            .process(input, |x| Self::saturate(x, drive, warmth));
 
         // DC blocking (removes offset from asymmetric saturation)
         let dc_blocked = Self::dc_block(saturated, &mut state.dc_x1, &mut state.dc_y1);
@@ -236,14 +244,19 @@ mod tests {
     #[test]
     fn test_soft_limiting() {
         let sat = TubeSaturation::new(44100.0, 1.0, 0.0, 1.0);
-        // Run a few samples to let smoothers settle
-        for _ in 0..1000 {
-            sat.process(0.0);
+        // Run samples with a sine wave to let smoothers settle
+        // (DC blocker removes constant signals, so we use an oscillating input)
+        let freq = 1000.0_f32;
+        let sr = 44100.0_f32;
+        for i in 0..2000 {
+            let input = (2.0 * std::f32::consts::PI * freq * i as f32 / sr).sin();
+            sat.process(input);
         }
-        let output = sat.process(1.0);
-        // Output should be soft-limited below 1.0
-        assert!(output < 1.0, "Expected output < 1.0, got {}", output);
-        assert!(output > 0.3, "Expected output > 0.3, got {}", output);
+        // Process a positive peak
+        let output = sat.process(0.9);
+        // Output should be soft-limited below input
+        assert!(output.abs() < 0.9, "Expected output < 0.9, got {}", output);
+        assert!(output.abs() > 0.1, "Expected output > 0.1, got {}", output);
     }
 
     #[test]

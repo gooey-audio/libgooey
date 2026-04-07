@@ -51,11 +51,11 @@ const PARAM_INFO: [ParamInfo; 4] = [
 struct SharedHiHat2(Arc<Mutex<HiHat2>>);
 
 impl Instrument for SharedHiHat2 {
-    fn trigger_with_velocity(&mut self, time: f32, velocity: f32) {
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         self.0.lock().unwrap().trigger_with_velocity(time, velocity);
     }
 
-    fn tick(&mut self, current_time: f32) -> f32 {
+    fn tick(&mut self, current_time: f64) -> f32 {
         self.0.lock().unwrap().tick(current_time)
     }
 
