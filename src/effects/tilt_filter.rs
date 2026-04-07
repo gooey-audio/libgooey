@@ -42,13 +42,7 @@ impl TiltFilterEffect {
 
         Self {
             state: UnsafeCell::new(TiltFilterState {
-                cutoff_smoothed: SmoothedParam::new(
-                    default_cutoff,
-                    0.0,
-                    1.0,
-                    sample_rate,
-                    30.0,
-                ),
+                cutoff_smoothed: SmoothedParam::new(default_cutoff, 0.0, 1.0, sample_rate, 30.0),
                 resonance_smoothed: SmoothedParam::new(
                     default_resonance,
                     0.0,

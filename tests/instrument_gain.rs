@@ -7,10 +7,22 @@ fn test_default_gain() {
     unsafe {
         let engine = gooey_engine_new(44100.0);
 
-        assert_eq!(gooey_engine_get_instrument_gain(engine, INSTRUMENT_KICK), 1.0);
-        assert_eq!(gooey_engine_get_instrument_gain(engine, INSTRUMENT_SNARE), 1.0);
-        assert_eq!(gooey_engine_get_instrument_gain(engine, INSTRUMENT_HIHAT), 1.0);
-        assert_eq!(gooey_engine_get_instrument_gain(engine, INSTRUMENT_TOM), 1.0);
+        assert_eq!(
+            gooey_engine_get_instrument_gain(engine, INSTRUMENT_KICK),
+            1.0
+        );
+        assert_eq!(
+            gooey_engine_get_instrument_gain(engine, INSTRUMENT_SNARE),
+            1.0
+        );
+        assert_eq!(
+            gooey_engine_get_instrument_gain(engine, INSTRUMENT_HIHAT),
+            1.0
+        );
+        assert_eq!(
+            gooey_engine_get_instrument_gain(engine, INSTRUMENT_TOM),
+            1.0
+        );
 
         gooey_engine_free(engine);
     }
@@ -29,7 +41,10 @@ fn test_gain_zero_silences_instrument() {
 
         // Set gain to zero
         gooey_engine_set_instrument_gain(engine, INSTRUMENT_KICK, 0.0);
-        assert_eq!(gooey_engine_get_instrument_gain(engine, INSTRUMENT_KICK), 0.0);
+        assert_eq!(
+            gooey_engine_get_instrument_gain(engine, INSTRUMENT_KICK),
+            0.0
+        );
 
         // Trigger again and let gain smoothing settle
         gooey_engine_trigger_instrument(engine, INSTRUMENT_KICK);
@@ -88,10 +103,16 @@ fn test_gain_clamped() {
         let engine = gooey_engine_new(44100.0);
 
         gooey_engine_set_instrument_gain(engine, INSTRUMENT_KICK, 2.0);
-        assert_eq!(gooey_engine_get_instrument_gain(engine, INSTRUMENT_KICK), 1.0);
+        assert_eq!(
+            gooey_engine_get_instrument_gain(engine, INSTRUMENT_KICK),
+            1.0
+        );
 
         gooey_engine_set_instrument_gain(engine, INSTRUMENT_KICK, -0.5);
-        assert_eq!(gooey_engine_get_instrument_gain(engine, INSTRUMENT_KICK), 0.0);
+        assert_eq!(
+            gooey_engine_get_instrument_gain(engine, INSTRUMENT_KICK),
+            0.0
+        );
 
         gooey_engine_free(engine);
     }
@@ -113,7 +134,10 @@ fn test_gain_with_mute() {
         }
         let has_audio = buffer.iter().any(|&s| s.abs() > 0.001);
 
-        assert!(!has_audio, "Muted instrument should be silent even with gain 1.0");
+        assert!(
+            !has_audio,
+            "Muted instrument should be silent even with gain 1.0"
+        );
 
         gooey_engine_free(engine);
     }

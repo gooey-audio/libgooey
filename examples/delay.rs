@@ -170,7 +170,11 @@ fn render_display(state: &DelayState, selected: usize) {
     );
 
     // Filter cutoff
-    let ind = if selected == PARAM_FILTER_CUTOFF { ">" } else { " " };
+    let ind = if selected == PARAM_FILTER_CUTOFF {
+        ">"
+    } else {
+        " "
+    };
     let cutoff_norm = (state.filter_cutoff - 20.0) / 19980.0;
     print!(
         "{} {:<18} [{}] {:>5.0} Hz\r\n",

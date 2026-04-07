@@ -46,13 +46,13 @@ pub enum FilterSlope {
 
 #[derive(Clone, Copy, Debug)]
 pub struct HiHat2Config {
-    pub pitch: f32,   // 0-1 normalized (pow2 curve -> 3500-10000 Hz)
-    pub decay: f32,   // 0-1 normalized (0.5-4000 ms)
-    pub attack: f32,  // 0-1 normalized (0.5-200 ms)
+    pub pitch: f32,  // 0-1 normalized (pow2 curve -> 3500-10000 Hz)
+    pub decay: f32,  // 0-1 normalized (0.5-4000 ms)
+    pub attack: f32, // 0-1 normalized (0.5-200 ms)
     pub noise_color: NoiseColor,
     pub filter_slope: FilterSlope,
-    pub tone: f32,    // 0-1 normalized (500-10000 Hz)
-    pub volume: f32,  // 0-1 overall volume
+    pub tone: f32,   // 0-1 normalized (500-10000 Hz)
+    pub volume: f32, // 0-1 overall volume
 }
 
 impl HiHat2Config {
@@ -170,7 +170,13 @@ impl HiHat2Params {
                 DEFAULT_SMOOTH_TIME_MS,
             ),
             tone: SmoothedParam::new(config.tone, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
-            volume: SmoothedParam::new(config.volume, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            volume: SmoothedParam::new(
+                config.volume,
+                0.0,
+                1.0,
+                sample_rate,
+                DEFAULT_SMOOTH_TIME_MS,
+            ),
         }
     }
 
