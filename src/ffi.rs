@@ -458,7 +458,7 @@ pub struct GooeyEngine {
     // Per-channel sequencers (sample-accurate, synchronized)
     sequencers: [Sequencer; NUM_INSTRUMENTS],
 
-    // Global effects (applied in order: delay -> lowpass filter -> saturation -> compressor -> limiter)
+    // Global effects (applied in order: saturation -> lowpass filter -> tilt filter -> delay -> compressor -> limiter)
     delay: DelayEffect,
     delay_enabled: bool,
     lowpass_filter: LowpassFilterEffect,
@@ -769,8 +769,8 @@ impl GooeyEngine {
             }
 
             // Apply global effects chain
-            if self.delay_enabled {
-                output = self.delay.process(output);
+            if self.saturation_enabled {
+                output = self.saturation.process(output);
             }
             if self.lowpass_filter_enabled {
                 output = self.lowpass_filter.process(output);
@@ -778,8 +778,8 @@ impl GooeyEngine {
             if self.tilt_filter_enabled {
                 output = self.tilt_filter.process(output);
             }
-            if self.saturation_enabled {
-                output = self.saturation.process(output);
+            if self.delay_enabled {
+                output = self.delay.process(output);
             }
 
             // Compressor (if enabled), with optional sidechain from individual channel
