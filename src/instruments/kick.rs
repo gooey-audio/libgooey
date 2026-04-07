@@ -786,8 +786,8 @@ impl KickDrum {
             noise_envelope: Envelope::new(),
             waveshaper: FeedbackWaveshaper::new(
                 sample_rate,
-                1.0 + config.overdrive_amount * config.overdrive_amount * 29.0,
-                config.feedback_amount * 0.95,
+                1.0 + config.overdrive_amount * config.overdrive_amount * 99.0,
+                config.feedback_amount * 0.98,
                 200.0 + config.feedback_cutoff * 3800.0,
                 1.0,
             ),
@@ -1146,14 +1146,14 @@ impl KickDrum {
 
         let total_output = sub_output + punch_output + filtered_click_output + noise_output;
 
-        // Map overdrive amount (0.0-1.0) to drive (1.0-30.0) with quadratic curve
+        // Map overdrive amount (0.0-1.0) to drive (1.0-100.0) with quadratic curve
         let overdrive_amount = self.params.overdrive.get();
-        let drive = 1.0 + (overdrive_amount * overdrive_amount * 29.0);
+        let drive = 1.0 + (overdrive_amount * overdrive_amount * 99.0);
         self.waveshaper.set_drive(drive);
 
-        // Map feedback amount (0.0-1.0) to feedback gain (0.0-0.95)
+        // Map feedback amount (0.0-1.0) to feedback gain (0.0-0.98)
         let feedback_amount = self.params.feedback.get();
-        self.waveshaper.set_feedback(feedback_amount * 0.95);
+        self.waveshaper.set_feedback(feedback_amount * 0.98);
 
         // Map feedback cutoff (0.0-1.0) to Hz (200-4000)
         let fb_cutoff = self.params.feedback_cutoff.get();
