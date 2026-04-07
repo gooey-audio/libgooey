@@ -19,10 +19,7 @@ struct SharedBass(Arc<Mutex<BassSynth>>);
 
 impl Instrument for SharedBass {
     fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
-        self.0
-            .lock()
-            .unwrap()
-            .trigger_with_velocity(time, velocity);
+        self.0.lock().unwrap().trigger_with_velocity(time, velocity);
     }
 
     fn tick(&mut self, current_time: f64) -> f32 {
@@ -58,7 +55,9 @@ impl Instrument for SharedBass {
 
 /// MIDI note to name (e.g. 36 -> "C2")
 fn note_name(midi: u8) -> String {
-    let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    let names = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
     let octave = (midi / 12) as i32 - 1;
     let name = names[(midi % 12) as usize];
     format!("{}{}", name, octave)
@@ -85,23 +84,33 @@ struct ArpPattern {
 const ARP_PATTERNS: [ArpPattern; 5] = [
     ArpPattern {
         name: "Octave Bounce",
-        notes: [36, NONE, 48, NONE, 36, NONE, 48, NONE, 36, NONE, 48, NONE, 36, NONE, 48, NONE],
+        notes: [
+            36, NONE, 48, NONE, 36, NONE, 48, NONE, 36, NONE, 48, NONE, 36, NONE, 48, NONE,
+        ],
     },
     ArpPattern {
         name: "Minor Walk",
-        notes: [36, 36, 39, 39, 41, 41, 43, 43, 41, 41, 39, 39, 36, 36, 34, 34],
+        notes: [
+            36, 36, 39, 39, 41, 41, 43, 43, 41, 41, 39, 39, 36, 36, 34, 34,
+        ],
     },
     ArpPattern {
         name: "Acid Line",
-        notes: [36, NONE, 36, 48, NONE, 36, 39, NONE, 36, NONE, 48, 36, NONE, 39, 36, NONE],
+        notes: [
+            36, NONE, 36, 48, NONE, 36, 39, NONE, 36, NONE, 48, 36, NONE, 39, 36, NONE,
+        ],
     },
     ArpPattern {
         name: "Chromatic",
-        notes: [36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 47, 46, 45],
+        notes: [
+            36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 47, 46, 45,
+        ],
     },
     ArpPattern {
         name: "Root Only",
-        notes: [36, NONE, NONE, NONE, 36, NONE, NONE, NONE, 36, NONE, NONE, NONE, 36, NONE, NONE, NONE],
+        notes: [
+            36, NONE, NONE, NONE, 36, NONE, NONE, NONE, 36, NONE, NONE, NONE, 36, NONE, NONE, NONE,
+        ],
     },
 ];
 
@@ -128,7 +137,10 @@ fn render_display(state: &AppState, playhead: usize) {
 
     print!("=== Bass Sequencer Lab ===\r\n");
     let status = if state.running { "PLAYING" } else { "STOPPED" };
-    print!("Status: {}  BPM: {}  Preset: {}\r\n", status, state.bpm as u32, state.current_preset);
+    print!(
+        "Status: {}  BPM: {}  Preset: {}\r\n",
+        status, state.bpm as u32, state.current_preset
+    );
 
     match state.edit_mode {
         EditMode::Steps => {
@@ -161,7 +173,11 @@ fn render_display(state: &AppState, playhead: usize) {
     // Step enabled row
     print!("   On:  ");
     for i in 0..16 {
-        let marker = if state.pattern_enabled[i] { " * " } else { " . " };
+        let marker = if state.pattern_enabled[i] {
+            " * "
+        } else {
+            " . "
+        };
         if i == state.selected_step {
             print!("\x1b[4m{}\x1b[0m", marker);
         } else {
@@ -213,7 +229,11 @@ fn render_display(state: &AppState, playhead: usize) {
     // Selected step detail
     print!("\r\n");
     let step = state.selected_step;
-    let enabled = if state.pattern_enabled[step] { "ON" } else { "OFF" };
+    let enabled = if state.pattern_enabled[step] {
+        "ON"
+    } else {
+        "OFF"
+    };
     if state.step_notes[step] == NONE {
         print!(
             "  Step {} | {} | Note: none (uses global freq)\r\n",
@@ -303,10 +323,7 @@ fn main() -> anyhow::Result<()> {
         // Get current playhead position
         let playhead = {
             let engine = audio_engine.lock().unwrap();
-            engine
-                .sequencer(0)
-                .map(|s| s.current_step())
-                .unwrap_or(0)
+            engine.sequencer(0).map(|s| s.current_step()).unwrap_or(0)
         };
 
         if needs_redraw || state.running {

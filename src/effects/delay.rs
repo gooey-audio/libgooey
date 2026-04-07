@@ -183,13 +183,7 @@ impl DelayEffect {
                 filter_z2: 0.0,
                 previous_timing: timing.to_timing_constant(),
                 // Use 50ms smoothing for delay time to avoid zipper noise
-                time_smoothed: SmoothedParam::new(
-                    time,
-                    0.0,
-                    MAX_DELAY_TIME,
-                    sample_rate,
-                    50.0,
-                ),
+                time_smoothed: SmoothedParam::new(time, 0.0, MAX_DELAY_TIME, sample_rate, 50.0),
                 // Use 30ms smoothing for feedback and mix
                 feedback_smoothed: SmoothedParam::new(
                     feedback_clamped,
@@ -295,8 +289,8 @@ impl Effect for DelayEffect {
         // Read atomic targets and compute delay time from timing + BPM
         let timing_const = self.timing_target.load(Ordering::Relaxed);
         let bpm = f32::from_bits(self.bpm_target.load(Ordering::Relaxed));
-        let timing = DelayTiming::from_timing_constant(timing_const)
-            .unwrap_or(DelayTiming::Quarter);
+        let timing =
+            DelayTiming::from_timing_constant(timing_const).unwrap_or(DelayTiming::Quarter);
         let time_target = timing.to_seconds(bpm);
         let feedback_target = f32::from_bits(self.feedback_target.load(Ordering::Relaxed));
         let mix_target = f32::from_bits(self.mix_target.load(Ordering::Relaxed));
@@ -444,8 +438,7 @@ mod tests {
 
     #[test]
     fn test_delay_parameter_clamping() {
-        let delay =
-            DelayEffect::new(44100.0, DelayTiming::Quarter, 120.0, 0.5, 0.5, 10000.0);
+        let delay = DelayEffect::new(44100.0, DelayTiming::Quarter, 120.0, 0.5, 0.5, 10000.0);
 
         // Test feedback clamping
         delay.set_feedback(2.0);

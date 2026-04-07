@@ -35,10 +35,7 @@ unsafe fn assert_volume_zero_silences(
     // Render a few buffers to capture the full transient region
     for _ in 0..5 {
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
-        let max_sample = buffer
-            .iter()
-            .map(|s| s.abs())
-            .fold(0.0f32, f32::max);
+        let max_sample = buffer.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
         assert!(
             max_sample < 1e-6,
             "Instrument {} should be silent at volume 0, got peak {:.9}",
@@ -79,10 +76,7 @@ unsafe fn assert_volume_zero_silences_mid_playback(
 
     // After smoothing settles, output must be fully silent
     gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
-    let max_sample = buffer
-        .iter()
-        .map(|s| s.abs())
-        .fold(0.0f32, f32::max);
+    let max_sample = buffer.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
     assert!(
         max_sample < 1e-6,
         "Instrument {} should be silent after volume set to 0 mid-playback, got peak {:.9}",

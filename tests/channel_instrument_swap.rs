@@ -7,10 +7,22 @@ fn test_default_channel_types() {
     unsafe {
         let engine = gooey_engine_new(44100.0);
 
-        assert_eq!(gooey_engine_get_channel_instrument_type(engine, 0), INSTRUMENT_KICK);
-        assert_eq!(gooey_engine_get_channel_instrument_type(engine, 1), INSTRUMENT_SNARE);
-        assert_eq!(gooey_engine_get_channel_instrument_type(engine, 2), INSTRUMENT_HIHAT);
-        assert_eq!(gooey_engine_get_channel_instrument_type(engine, 3), INSTRUMENT_TOM);
+        assert_eq!(
+            gooey_engine_get_channel_instrument_type(engine, 0),
+            INSTRUMENT_KICK
+        );
+        assert_eq!(
+            gooey_engine_get_channel_instrument_type(engine, 1),
+            INSTRUMENT_SNARE
+        );
+        assert_eq!(
+            gooey_engine_get_channel_instrument_type(engine, 2),
+            INSTRUMENT_HIHAT
+        );
+        assert_eq!(
+            gooey_engine_get_channel_instrument_type(engine, 3),
+            INSTRUMENT_TOM
+        );
 
         gooey_engine_free(engine);
     }
@@ -22,14 +34,26 @@ fn test_swap_and_query() {
         let engine = gooey_engine_new(44100.0);
 
         gooey_engine_set_channel_instrument_type(engine, 0, INSTRUMENT_SNARE);
-        assert_eq!(gooey_engine_get_channel_instrument_type(engine, 0), INSTRUMENT_SNARE);
+        assert_eq!(
+            gooey_engine_get_channel_instrument_type(engine, 0),
+            INSTRUMENT_SNARE
+        );
 
         gooey_engine_set_channel_instrument_type(engine, 0, INSTRUMENT_TOM);
-        assert_eq!(gooey_engine_get_channel_instrument_type(engine, 0), INSTRUMENT_TOM);
+        assert_eq!(
+            gooey_engine_get_channel_instrument_type(engine, 0),
+            INSTRUMENT_TOM
+        );
 
         // Other channels unchanged
-        assert_eq!(gooey_engine_get_channel_instrument_type(engine, 1), INSTRUMENT_SNARE);
-        assert_eq!(gooey_engine_get_channel_instrument_type(engine, 2), INSTRUMENT_HIHAT);
+        assert_eq!(
+            gooey_engine_get_channel_instrument_type(engine, 1),
+            INSTRUMENT_SNARE
+        );
+        assert_eq!(
+            gooey_engine_get_channel_instrument_type(engine, 2),
+            INSTRUMENT_HIHAT
+        );
 
         gooey_engine_free(engine);
     }
@@ -42,7 +66,10 @@ fn test_swap_same_type_noop() {
 
         // Swapping to the same type should be a no-op
         gooey_engine_set_channel_instrument_type(engine, 0, INSTRUMENT_KICK);
-        assert_eq!(gooey_engine_get_channel_instrument_type(engine, 0), INSTRUMENT_KICK);
+        assert_eq!(
+            gooey_engine_get_channel_instrument_type(engine, 0),
+            INSTRUMENT_KICK
+        );
 
         gooey_engine_free(engine);
     }
@@ -129,7 +156,10 @@ fn test_trigger_channel_api() {
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
 
         let has_audio = buffer.iter().any(|&s| s.abs() > 0.001);
-        assert!(has_audio, "Trigger channel with velocity should produce audio");
+        assert!(
+            has_audio,
+            "Trigger channel with velocity should produce audio"
+        );
 
         gooey_engine_free(engine);
     }
@@ -152,7 +182,10 @@ fn test_set_channel_param() {
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
 
         let has_audio = buffer.iter().any(|&s| s.abs() > 0.001);
-        assert!(has_audio, "Channel param set + trigger should produce audio");
+        assert!(
+            has_audio,
+            "Channel param set + trigger should produce audio"
+        );
 
         gooey_engine_free(engine);
     }
@@ -169,7 +202,10 @@ fn test_backward_compat_param_setter() {
         let mut buffer = vec![0.0f32; 1024];
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
         let has_audio = buffer.iter().any(|&s| s.abs() > 0.001);
-        assert!(has_audio, "set_kick_param should still work at default mapping");
+        assert!(
+            has_audio,
+            "set_kick_param should still work at default mapping"
+        );
 
         gooey_engine_free(engine);
     }
@@ -183,8 +219,14 @@ fn test_duplicate_instrument_types() {
         // Put kick on both channel 0 and channel 2
         gooey_engine_set_channel_instrument_type(engine, 2, INSTRUMENT_KICK);
 
-        assert_eq!(gooey_engine_get_channel_instrument_type(engine, 0), INSTRUMENT_KICK);
-        assert_eq!(gooey_engine_get_channel_instrument_type(engine, 2), INSTRUMENT_KICK);
+        assert_eq!(
+            gooey_engine_get_channel_instrument_type(engine, 0),
+            INSTRUMENT_KICK
+        );
+        assert_eq!(
+            gooey_engine_get_channel_instrument_type(engine, 2),
+            INSTRUMENT_KICK
+        );
 
         // Trigger both channels, both should produce audio
         gooey_engine_trigger_channel(engine, 0);
@@ -206,11 +248,17 @@ fn test_invalid_args() {
 
         // Invalid channel index
         gooey_engine_set_channel_instrument_type(engine, 99, INSTRUMENT_KICK);
-        assert_eq!(gooey_engine_get_channel_instrument_type(engine, 99), 0xFFFFFFFF);
+        assert_eq!(
+            gooey_engine_get_channel_instrument_type(engine, 99),
+            0xFFFFFFFF
+        );
 
         // Invalid instrument type
         gooey_engine_set_channel_instrument_type(engine, 0, 99);
-        assert_eq!(gooey_engine_get_channel_instrument_type(engine, 0), INSTRUMENT_KICK);
+        assert_eq!(
+            gooey_engine_get_channel_instrument_type(engine, 0),
+            INSTRUMENT_KICK
+        );
 
         // Invalid channel for trigger
         gooey_engine_trigger_channel(engine, 99);
@@ -221,7 +269,10 @@ fn test_invalid_args() {
 
         // Null engine
         gooey_engine_set_channel_instrument_type(std::ptr::null_mut(), 0, INSTRUMENT_KICK);
-        assert_eq!(gooey_engine_get_channel_instrument_type(std::ptr::null(), 0), 0xFFFFFFFF);
+        assert_eq!(
+            gooey_engine_get_channel_instrument_type(std::ptr::null(), 0),
+            0xFFFFFFFF
+        );
 
         gooey_engine_free(engine);
     }

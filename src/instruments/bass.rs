@@ -64,21 +64,21 @@ pub(crate) mod ranges {
 /// All parameters use normalized 0.0-1.0 values.
 #[derive(Clone, Copy, Debug)]
 pub struct BassConfig {
-    pub frequency: f32,          // Base frequency (0-1 -> 30-200 Hz)
-    pub sub_level: f32,          // Sub sine level (0-1)
-    pub osc_level: f32,          // Main saw/square level (0-1)
-    pub detune_level: f32,       // Detuned layer level (0-1)
-    pub detune_amount: f32,      // Detune spread (0-1 -> 0-30 cents)
-    pub osc_shape: f32,          // Saw(0) to Square(1) morph (0-1)
-    pub filter_cutoff: f32,      // SVF lowpass cutoff (0-1 -> 20-18000 Hz exp)
-    pub filter_resonance: f32,   // SVF Q (0-1 -> 0.5-15.0)
-    pub filter_env_amount: f32,  // Filter envelope depth (0-1)
-    pub filter_env_decay: f32,   // Filter envelope decay (0-1 -> 0.01-2.0s)
-    pub filter_env_curve: f32,   // Filter envelope curve (0-1 -> 0.1-8.0)
-    pub amp_decay: f32,          // Amplitude decay (0-1 -> 0.05-4.0s)
-    pub amp_decay_curve: f32,    // Amp curve shape (0-1 -> 0.1-10.0)
-    pub overdrive: f32,          // Pre-filter saturation (0-1)
-    pub volume: f32,             // Master volume (0-1)
+    pub frequency: f32,         // Base frequency (0-1 -> 30-200 Hz)
+    pub sub_level: f32,         // Sub sine level (0-1)
+    pub osc_level: f32,         // Main saw/square level (0-1)
+    pub detune_level: f32,      // Detuned layer level (0-1)
+    pub detune_amount: f32,     // Detune spread (0-1 -> 0-30 cents)
+    pub osc_shape: f32,         // Saw(0) to Square(1) morph (0-1)
+    pub filter_cutoff: f32,     // SVF lowpass cutoff (0-1 -> 20-18000 Hz exp)
+    pub filter_resonance: f32,  // SVF Q (0-1 -> 0.5-15.0)
+    pub filter_env_amount: f32, // Filter envelope depth (0-1)
+    pub filter_env_decay: f32,  // Filter envelope decay (0-1 -> 0.01-2.0s)
+    pub filter_env_curve: f32,  // Filter envelope curve (0-1 -> 0.1-8.0)
+    pub amp_decay: f32,         // Amplitude decay (0-1 -> 0.05-4.0s)
+    pub amp_decay_curve: f32,   // Amp curve shape (0-1 -> 0.1-10.0)
+    pub overdrive: f32,         // Pre-filter saturation (0-1)
+    pub volume: f32,            // Master volume (0-1)
 }
 
 impl BassConfig {
@@ -594,7 +594,11 @@ impl BassSynth {
             sub_phase: 0.0,
             osc_phase: 0.0,
             detune_phase: 0.0,
-            filter: StateVariableFilterTpt::new(sample_rate, config.filter_cutoff_hz(), config.filter_resonance_q()),
+            filter: StateVariableFilterTpt::new(
+                sample_rate,
+                config.filter_cutoff_hz(),
+                config.filter_resonance_q(),
+            ),
             amp_envelope: Envelope::new(),
             filter_envelope: Envelope::new(),
             waveshaper: Waveshaper::new(config.overdrive, 1.0),
@@ -612,12 +616,22 @@ impl BassSynth {
         self.params.detune_amount.set_target(config.detune_amount);
         self.params.osc_shape.set_target(config.osc_shape);
         self.params.filter_cutoff.set_target(config.filter_cutoff);
-        self.params.filter_resonance.set_target(config.filter_resonance);
-        self.params.filter_env_amount.set_target(config.filter_env_amount);
-        self.params.filter_env_decay.set_target(config.filter_env_decay);
-        self.params.filter_env_curve.set_target(config.filter_env_curve);
+        self.params
+            .filter_resonance
+            .set_target(config.filter_resonance);
+        self.params
+            .filter_env_amount
+            .set_target(config.filter_env_amount);
+        self.params
+            .filter_env_decay
+            .set_target(config.filter_env_decay);
+        self.params
+            .filter_env_curve
+            .set_target(config.filter_env_curve);
         self.params.amp_decay.set_target(config.amp_decay);
-        self.params.amp_decay_curve.set_target(config.amp_decay_curve);
+        self.params
+            .amp_decay_curve
+            .set_target(config.amp_decay_curve);
         self.params.overdrive.set_target(config.overdrive);
         self.params.volume.set_target(config.volume);
     }
@@ -811,10 +825,8 @@ impl crate::engine::Instrument for BassSynth {
         let env_amount = self.params.filter_env_amount.get();
         // Envelope sweeps from (base + offset) down to base
         let env_offset = (ranges::FILTER_CUTOFF_MAX - base_cutoff) * env_amount * filter_env;
-        let cutoff = (base_cutoff + env_offset).clamp(
-            ranges::FILTER_CUTOFF_MIN,
-            ranges::FILTER_CUTOFF_MAX,
-        );
+        let cutoff =
+            (base_cutoff + env_offset).clamp(ranges::FILTER_CUTOFF_MIN, ranges::FILTER_CUTOFF_MAX);
         let resonance = self.params.filter_resonance_q();
         self.filter.set_params(cutoff, resonance);
         let (filtered, _, _) = self.filter.process_all(saturated);
@@ -874,7 +886,10 @@ mod tests {
             bass.tick(time);
         }
 
-        assert!(!bass.is_active(), "bass should deactivate after envelope finishes");
+        assert!(
+            !bass.is_active(),
+            "bass should deactivate after envelope finishes"
+        );
     }
 
     #[test]
@@ -903,7 +918,12 @@ mod tests {
 
         // All presets should produce sound
         for (i, e) in energies.iter().enumerate() {
-            assert!(*e > 0.01, "preset {} should produce sound, got energy {}", i, e);
+            assert!(
+                *e > 0.01,
+                "preset {} should produce sound, got energy {}",
+                i,
+                e
+            );
         }
     }
 

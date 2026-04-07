@@ -614,7 +614,11 @@ impl Sequencer {
     pub fn set_note_pattern(&mut self, notes: &[u8]) {
         let len = notes.len().min(self.pattern.len());
         for i in 0..len {
-            self.pattern[i].note = if notes[i] == 255 { None } else { Some(notes[i]) };
+            self.pattern[i].note = if notes[i] == 255 {
+                None
+            } else {
+                Some(notes[i])
+            };
         }
     }
 
