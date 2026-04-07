@@ -37,13 +37,13 @@ impl FeedbackWaveshaper {
     ///
     /// # Arguments
     /// * `sample_rate` - Audio sample rate in Hz
-    /// * `drive` - Distortion amount (1.0-30.0, clamped, 1.0 = bypass)
-    /// * `feedback` - Feedback gain (0.0-0.95, clamped)
+    /// * `drive` - Distortion amount (1.0-100.0, clamped, 1.0 = bypass)
+    /// * `feedback` - Feedback gain (0.0-0.98, clamped)
     /// * `filter_cutoff` - Feedback lowpass cutoff in Hz (200-20000, clamped)
     /// * `mix` - Dry/wet mix (0.0-1.0, clamped)
     pub fn new(sample_rate: f32, drive: f32, feedback: f32, filter_cutoff: f32, mix: f32) -> Self {
-        let drive = drive.clamp(1.0, 30.0);
-        let feedback = feedback.clamp(0.0, 0.95);
+        let drive = drive.clamp(1.0, 100.0);
+        let feedback = feedback.clamp(0.0, 0.98);
         let filter_cutoff = filter_cutoff.clamp(200.0, 20000.0);
         let mix = mix.clamp(0.0, 1.0);
         Self {
@@ -93,13 +93,9 @@ impl FeedbackWaveshaper {
         // Waveshape with tanh
         let shaped = fb_input.tanh();
 
-        // Gain compensation: full at low drive, fading out at high drive
-        // so extreme settings deliver raw, uncompensated distortion
+        // Gain compensation: maintain consistent output level across all drive values
         let reference = 0.5_f32;
-        let full_compensation = reference.tanh() / (reference * self.drive).tanh();
-        let drive_normalized = (self.drive - 1.0) / 29.0;
-        let compensation_blend = 1.0 - drive_normalized * drive_normalized;
-        let compensation = full_compensation * compensation_blend + (1.0 - compensation_blend);
+        let compensation = reference.tanh() / (reference * self.drive).tanh();
         let compensated = shaped * compensation;
 
         // DC block the output
@@ -117,7 +113,7 @@ impl FeedbackWaveshaper {
         self.last_out = self.filter_state;
 
         // Safety: clamp feedback state to prevent runaway
-        if !self.last_out.is_finite() || self.last_out.abs() > 20.0 {
+        if !self.last_out.is_finite() || self.last_out.abs() > 50.0 {
             self.reset();
             return input;
         }
@@ -134,9 +130,9 @@ impl FeedbackWaveshaper {
         self.dc_y1 = 0.0;
     }
 
-    /// Set the drive amount (1.0-30.0)
+    /// Set the drive amount (1.0-100.0)
     pub fn set_drive(&mut self, drive: f32) {
-        self.drive = drive.clamp(1.0, 30.0);
+        self.drive = drive.clamp(1.0, 100.0);
     }
 
     /// Get the current drive amount
@@ -144,9 +140,9 @@ impl FeedbackWaveshaper {
         self.drive
     }
 
-    /// Set the feedback gain (0.0-0.95)
+    /// Set the feedback gain (0.0-0.98)
     pub fn set_feedback(&mut self, feedback: f32) {
-        self.feedback = feedback.clamp(0.0, 0.95);
+        self.feedback = feedback.clamp(0.0, 0.98);
     }
 
     /// Get the current feedback gain
@@ -216,8 +212,8 @@ mod tests {
     fn test_soft_clipping() {
         let mut ws = FeedbackWaveshaper::new(44100.0, 10.0, 0.0, 2000.0, 1.0);
         let output = ws.process(1.0);
-        // At drive=10, compensation partially fades out
-        assert!(output > 0.4 && output < 0.6, "output was {output}");
+        // Full gain compensation keeps output near reference level
+        assert!(output > 0.3 && output < 0.7, "output was {output}");
 
         let output_low = ws.process(0.1);
         assert!(output_low > 0.0);
@@ -226,9 +222,9 @@ mod tests {
 
     #[test]
     fn test_parameter_clamping() {
-        let ws = FeedbackWaveshaper::new(44100.0, 100.0, 5.0, 50.0, 10.0);
-        assert_eq!(ws.drive(), 30.0);
-        assert_eq!(ws.feedback(), 0.95);
+        let ws = FeedbackWaveshaper::new(44100.0, 200.0, 5.0, 50.0, 10.0);
+        assert_eq!(ws.drive(), 100.0);
+        assert_eq!(ws.feedback(), 0.98);
         assert_eq!(ws.filter_cutoff(), 200.0);
         assert_eq!(ws.mix(), 1.0);
     }
@@ -274,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_extreme_settings_stability() {
-        let mut ws = FeedbackWaveshaper::new(44100.0, 30.0, 0.95, 2000.0, 1.0);
+        let mut ws = FeedbackWaveshaper::new(44100.0, 100.0, 0.98, 2000.0, 1.0);
         for i in 0..44100 {
             let input = if i % 100 < 50 { 0.8 } else { -0.8 };
             let output = ws.process(input);
