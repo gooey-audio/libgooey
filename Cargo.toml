@@ -11,7 +11,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [features]
 default = ["native"]
 native = ["cpal"]
-ios = []  # iOS target - no native audio output, just the engine
+ios = ["bounce"]  # iOS target - no native audio output, just the engine
 crossterm = ["dep:crossterm"]
 visualization = ["glfw", "gl", "rustfft"]
 midi = ["midir"]  # MIDI input support for examples
