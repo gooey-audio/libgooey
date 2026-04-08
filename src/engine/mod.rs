@@ -343,4 +343,24 @@ impl Engine {
     pub fn sample_rate(&self) -> f32 {
         self.sample_rate
     }
+
+    /// Prepare the engine for an offline bounce.
+    /// Resets all sequencers to beat 0, starts them, and snaps
+    /// master gain to its target to avoid smoothing artifacts.
+    pub fn prepare_for_bounce(&mut self) {
+        for i in 0..self.sequencers.len() {
+            self.sequencers[i].reset();
+            self.sequencers[i].start();
+        }
+        self.master_gain.snap();
+        self.trigger_queue.clear();
+        self.saved_global_freq.clear();
+    }
+
+    /// Stop all sequencers (called after a bounce completes).
+    pub fn stop_all_sequencers(&mut self) {
+        for seq in &mut self.sequencers {
+            seq.stop();
+        }
+    }
 }

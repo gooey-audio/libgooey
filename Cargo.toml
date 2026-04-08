@@ -15,6 +15,7 @@ ios = []  # iOS target - no native audio output, just the engine
 crossterm = ["dep:crossterm"]
 visualization = ["glfw", "gl", "rustfft"]
 midi = ["midir"]  # MIDI input support for examples
+bounce = ["hound"]  # Offline audio bounce/export to WAV
 
 [profile.release]
 panic = "unwind"
@@ -31,6 +32,7 @@ glfw = { version = "0.58", optional = true }
 gl = { version = "0.14", optional = true }
 rustfft = { version = "6.2", optional = true }
 midir = { version = "0.10", optional = true }
+hound = { version = "3.5", optional = true }
 
 [[example]]
 name = "kick"
@@ -87,3 +89,7 @@ required-features = ["native", "crossterm"]
 [[example]]
 name = "chords"
 required-features = ["native", "crossterm"]
+
+[[example]]
+name = "bounce"
+required-features = ["bounce"]
