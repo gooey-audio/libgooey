@@ -573,6 +573,11 @@ pub struct GooeyEngine {
     // Polyphonic synthesizer for chord playback
     poly_synth: PolySynth,
 
+    // When true, an external source (e.g. Ableton Link) owns the tempo.
+    // The host should check this flag to decide whether local BPM changes
+    // should be applied directly or routed through the external sync source.
+    link_enabled: AtomicBool,
+
     // Error state (set after a panic in render, checked on every render call)
     error_occurred: AtomicBool,
     error_message: Option<CString>,
@@ -689,6 +694,8 @@ impl GooeyEngine {
             sequencer_triggers_enabled: true,
             // Polyphonic synthesizer for chord playback
             poly_synth: PolySynth::new(sample_rate),
+            // External sync (e.g. Ableton Link)
+            link_enabled: AtomicBool::new(false),
             // Error state
             error_occurred: AtomicBool::new(false),
             error_message: None,
@@ -2415,6 +2422,92 @@ pub unsafe extern "C" fn gooey_engine_set_bpm(engine: *mut GooeyEngine, bpm: f32
     for lfo in &mut engine.lfos {
         lfo.set_bpm(bpm);
     }
+}
+
+/// Get the current BPM.
+///
+/// # Returns
+/// The current beats per minute, or 120.0 if `engine` is null.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_bpm(engine: *const GooeyEngine) -> f32 {
+    if engine.is_null() {
+        return 120.0;
+    }
+    let engine = &*engine;
+    engine.bpm
+}
+
+/// Mark the engine as being driven by an external tempo source (e.g. Ableton Link).
+///
+/// When enabled, the host should route local BPM changes through the external
+/// sync source instead of calling `gooey_engine_set_bpm` directly, to avoid
+/// feedback loops.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_link_enabled(engine: *mut GooeyEngine, enabled: bool) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &*engine;
+    engine.link_enabled.store(enabled, Ordering::Release);
+}
+
+/// Check whether the engine is being driven by an external tempo source.
+///
+/// # Returns
+/// `true` if an external sync source (e.g. Ableton Link) is active.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_is_link_enabled(engine: *const GooeyEngine) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    let engine = &*engine;
+    engine.link_enabled.load(Ordering::Acquire)
+}
+
+/// Get the current sequencer beat position in quarter notes.
+///
+/// Uses the kick sequencer as reference (all sequencers are synchronized).
+/// Returns the fractional beat position, e.g. 0.0 = bar start, 1.25 = one
+/// beat and one 16th note in.
+///
+/// This is useful for drift detection when syncing to an external clock
+/// (e.g. Ableton Link): compare the returned value with the external
+/// beat position and call `gooey_engine_sequencer_set_beat_position` if
+/// the drift exceeds a threshold.
+///
+/// # Returns
+/// Current position in quarter notes, or 0.0 if the engine pointer is null.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_get_beat_position(
+    engine: *const GooeyEngine,
+) -> f64 {
+    if engine.is_null() {
+        return 0.0;
+    }
+    let engine = &*engine;
+    let seq = &engine.sequencers[0];
+    let step = seq.current_step() as f64;
+    let samples_into_step = if seq.sample_count() as f32 > seq.samples_per_step() {
+        (seq.sample_count() as f32
+            - (seq.sample_count() as f32 / seq.samples_per_step()).floor() * seq.samples_per_step())
+            / seq.samples_per_step()
+    } else {
+        seq.sample_count() as f32 / seq.samples_per_step()
+    } as f64;
+    // Each step is a 16th note; 4 steps = 1 quarter note
+    (step + samples_into_step) / 4.0
 }
 
 /// Set the global swing amount for all sequencers (0.0-1.0, where 0.5 = no swing)
