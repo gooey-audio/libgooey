@@ -2,7 +2,7 @@ use crate::effects::waveshaper::Waveshaper;
 use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
 use crate::filters::StateVariableFilterTpt;
 use crate::gen::polyblep::{polyblep_saw, polyblep_square};
-use crate::utils::{Blendable, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
+use crate::utils::{tuning_to_multiplier, Blendable, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 use std::f64::consts::TAU;
 
 /// Normalization ranges for bass synth parameters.
@@ -311,6 +311,8 @@ pub struct BassParams {
     pub amp_decay_curve: SmoothedParam,
     pub overdrive: SmoothedParam,
     pub volume: SmoothedParam,
+    // Per-instrument tuning (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
+    pub tuning: SmoothedParam,
 }
 
 impl BassParams {
@@ -421,6 +423,7 @@ impl BassParams {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
+            tuning: SmoothedParam::new(0.5, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
         }
     }
 
@@ -441,6 +444,7 @@ impl BassParams {
         self.amp_decay_curve.tick();
         self.overdrive.tick();
         self.volume.tick();
+        self.tuning.tick();
     }
 
     pub fn snap_all(&mut self) {
@@ -459,6 +463,27 @@ impl BassParams {
         self.amp_decay_curve.snap();
         self.overdrive.snap();
         self.volume.snap();
+        self.tuning.snap();
+    }
+
+    /// Check if all parameters have settled
+    pub fn is_settled(&self) -> bool {
+        self.frequency.is_settled()
+            && self.sub_level.is_settled()
+            && self.osc_level.is_settled()
+            && self.detune_level.is_settled()
+            && self.detune_amount.is_settled()
+            && self.osc_shape.is_settled()
+            && self.filter_cutoff.is_settled()
+            && self.filter_resonance.is_settled()
+            && self.filter_env_amount.is_settled()
+            && self.filter_env_decay.is_settled()
+            && self.filter_env_curve.is_settled()
+            && self.amp_decay.is_settled()
+            && self.amp_decay_curve.is_settled()
+            && self.overdrive.is_settled()
+            && self.volume.is_settled()
+            && self.tuning.is_settled()
     }
 
     pub fn to_config(&self) -> BassConfig {
@@ -711,6 +736,11 @@ impl BassSynth {
     pub fn set_volume(&mut self, value: f32) {
         self.params.volume.set_target(value.clamp(0.0, 1.0));
     }
+
+    /// Set tuning offset (smoothed, 0-1: 0=−12 semitones, 0.5=neutral, 1=+12 semitones)
+    pub fn set_tuning(&mut self, value: f32) {
+        self.params.tuning.set_target(value.clamp(0.0, 1.0));
+    }
 }
 
 impl crate::engine::Instrument for BassSynth {
@@ -769,7 +799,7 @@ impl crate::engine::Instrument for BassSynth {
         }
 
         // Read params
-        let freq = self.triggered_frequency;
+        let freq = self.triggered_frequency * tuning_to_multiplier(self.params.tuning.get());
         let sub_level = self.params.sub_level.get();
         let osc_level = self.params.osc_level.get();
         let detune_level = self.params.detune_level.get();
@@ -848,6 +878,127 @@ impl crate::engine::Instrument for BassSynth {
 
     fn is_active(&self) -> bool {
         self.is_active
+    }
+
+    fn as_modulatable(&mut self) -> Option<&mut dyn crate::engine::Modulatable> {
+        Some(self)
+    }
+}
+
+// Implement modulation support for BassSynth
+// All parameters use normalized 0-1 ranges
+impl crate::engine::Modulatable for BassSynth {
+    fn modulatable_parameters(&self) -> Vec<&'static str> {
+        vec![
+            "frequency",
+            "sub_level",
+            "osc_level",
+            "detune_level",
+            "detune_amount",
+            "osc_shape",
+            "filter_cutoff",
+            "filter_resonance",
+            "filter_env_amount",
+            "filter_env_decay",
+            "filter_env_curve",
+            "amp_decay",
+            "amp_decay_curve",
+            "overdrive",
+            "volume",
+            "tuning",
+        ]
+    }
+
+    fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
+        match parameter {
+            "frequency" => {
+                self.params.frequency.set_bipolar(value);
+                Ok(())
+            }
+            "sub_level" => {
+                self.params.sub_level.set_bipolar(value);
+                Ok(())
+            }
+            "osc_level" => {
+                self.params.osc_level.set_bipolar(value);
+                Ok(())
+            }
+            "detune_level" => {
+                self.params.detune_level.set_bipolar(value);
+                Ok(())
+            }
+            "detune_amount" => {
+                self.params.detune_amount.set_bipolar(value);
+                Ok(())
+            }
+            "osc_shape" => {
+                self.params.osc_shape.set_bipolar(value);
+                Ok(())
+            }
+            "filter_cutoff" => {
+                self.params.filter_cutoff.set_bipolar(value);
+                Ok(())
+            }
+            "filter_resonance" => {
+                self.params.filter_resonance.set_bipolar(value);
+                Ok(())
+            }
+            "filter_env_amount" => {
+                self.params.filter_env_amount.set_bipolar(value);
+                Ok(())
+            }
+            "filter_env_decay" => {
+                self.params.filter_env_decay.set_bipolar(value);
+                Ok(())
+            }
+            "filter_env_curve" => {
+                self.params.filter_env_curve.set_bipolar(value);
+                Ok(())
+            }
+            "amp_decay" => {
+                self.params.amp_decay.set_bipolar(value);
+                Ok(())
+            }
+            "amp_decay_curve" => {
+                self.params.amp_decay_curve.set_bipolar(value);
+                Ok(())
+            }
+            "overdrive" => {
+                self.params.overdrive.set_bipolar(value);
+                Ok(())
+            }
+            "volume" => {
+                self.params.volume.set_bipolar(value);
+                Ok(())
+            }
+            "tuning" => {
+                self.params.tuning.set_bipolar(value);
+                Ok(())
+            }
+            _ => Err(format!("Unknown parameter: {}", parameter)),
+        }
+    }
+
+    fn parameter_range(&self, parameter: &str) -> Option<(f32, f32)> {
+        match parameter {
+            "frequency" => Some(self.params.frequency.range()),
+            "sub_level" => Some(self.params.sub_level.range()),
+            "osc_level" => Some(self.params.osc_level.range()),
+            "detune_level" => Some(self.params.detune_level.range()),
+            "detune_amount" => Some(self.params.detune_amount.range()),
+            "osc_shape" => Some(self.params.osc_shape.range()),
+            "filter_cutoff" => Some(self.params.filter_cutoff.range()),
+            "filter_resonance" => Some(self.params.filter_resonance.range()),
+            "filter_env_amount" => Some(self.params.filter_env_amount.range()),
+            "filter_env_decay" => Some(self.params.filter_env_decay.range()),
+            "filter_env_curve" => Some(self.params.filter_env_curve.range()),
+            "amp_decay" => Some(self.params.amp_decay.range()),
+            "amp_decay_curve" => Some(self.params.amp_decay_curve.range()),
+            "overdrive" => Some(self.params.overdrive.range()),
+            "volume" => Some(self.params.volume.range()),
+            "tuning" => Some(self.params.tuning.range()),
+            _ => None,
+        }
     }
 }
 

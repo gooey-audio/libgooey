@@ -4,7 +4,7 @@ use crate::filters::StateVariableFilter;
 use crate::gen::oscillator::Oscillator;
 use crate::gen::waveform::Waveform;
 use crate::instruments::fm_snap::PhaseModulator;
-use crate::utils::{Blendable, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
+use crate::utils::{tuning_to_multiplier, Blendable, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 /// Normalization ranges for snare drum parameters
 /// All external-facing parameters use 0.0-1.0 normalized values
@@ -410,6 +410,8 @@ pub struct SnareParams {
     pub overdrive: SmoothedParam, // Overdrive/saturation (0-1, 0 = bypass)
     pub amp_decay: SmoothedParam, // Master amplitude decay (0-1 → 0-4.0s)
     pub amp_decay_curve: SmoothedParam, // Decay curve shape (0-1 → 0.1-10.0)
+    // Per-instrument tuning (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
+    pub tuning: SmoothedParam,
 }
 
 impl SnareParams {
@@ -534,6 +536,7 @@ impl SnareParams {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
+            tuning: SmoothedParam::new(0.5, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
         }
     }
 
@@ -652,6 +655,7 @@ impl SnareParams {
         self.overdrive.tick();
         self.amp_decay.tick();
         self.amp_decay_curve.tick();
+        self.tuning.tick();
         !self.is_settled()
     }
 
@@ -675,6 +679,7 @@ impl SnareParams {
             && self.overdrive.is_settled()
             && self.amp_decay.is_settled()
             && self.amp_decay_curve.is_settled()
+            && self.tuning.is_settled()
     }
 
     /// Snap all smoothed parameters to their targets instantly.
@@ -697,6 +702,7 @@ impl SnareParams {
         self.overdrive.snap();
         self.amp_decay.snap();
         self.amp_decay_curve.snap();
+        self.tuning.snap();
     }
 }
 
@@ -1051,8 +1057,9 @@ impl SnareDrum {
             self.apply_params();
         }
 
-        // Use denormalized frequency for pitch calculations
-        let base_frequency = self.params.frequency_hz();
+        // Use denormalized frequency for pitch calculations, with per-instrument tuning
+        let base_frequency =
+            self.params.frequency_hz() * tuning_to_multiplier(self.params.tuning.get());
 
         // Calculate pitch modulation from envelope
         let pitch_envelope_value = self.pitch_envelope.get_amplitude(current_time);
@@ -1286,6 +1293,11 @@ impl SnareDrum {
             .amp_decay_curve
             .set_target(curve.clamp(0.0, 1.0));
     }
+
+    /// Set tuning offset (smoothed, 0-1: 0=−12 semitones, 0.5=neutral, 1=+12 semitones)
+    pub fn set_tuning(&mut self, value: f32) {
+        self.params.tuning.set_target(value.clamp(0.0, 1.0));
+    }
 }
 
 impl crate::engine::Instrument for SnareDrum {
@@ -1331,6 +1343,7 @@ impl crate::engine::Modulatable for SnareDrum {
             "overdrive",
             "amp_decay",
             "amp_decay_curve",
+            "tuning",
         ]
     }
 
@@ -1410,6 +1423,10 @@ impl crate::engine::Modulatable for SnareDrum {
                 self.params.amp_decay_curve.set_bipolar(value);
                 Ok(())
             }
+            "tuning" => {
+                self.params.tuning.set_bipolar(value);
+                Ok(())
+            }
             _ => Err(format!("Unknown parameter: {}", parameter)),
         }
     }
@@ -1436,6 +1453,7 @@ impl crate::engine::Modulatable for SnareDrum {
             "overdrive" => Some(self.params.overdrive.range()),
             "amp_decay" => Some(self.params.amp_decay.range()),
             "amp_decay_curve" => Some(self.params.amp_decay_curve.range()),
+            "tuning" => Some(self.params.tuning.range()),
             _ => None,
         }
     }

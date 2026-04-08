@@ -22,7 +22,7 @@ struct ParamInfo {
     unit: &'static str,
 }
 
-const PARAM_INFO: [ParamInfo; 15] = [
+const PARAM_INFO: [ParamInfo; 16] = [
     ParamInfo {
         name: "amp_decay",
         coarse_step: 0.1,
@@ -113,6 +113,12 @@ const PARAM_INFO: [ParamInfo; 15] = [
         fine_step: 0.02,
         unit: "",
     },
+    ParamInfo {
+        name: "tuning",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        unit: "",
+    },
 ];
 
 // Wrapper to share BassSynth between audio thread and main thread
@@ -154,6 +160,7 @@ fn get_param_value(bass: &BassSynth, index: usize) -> f32 {
         12 => bass.params.overdrive.get(),
         13 => bass.params.sub_level.get(),
         14 => bass.params.volume.get(),
+        15 => bass.params.tuning.get(),
         _ => 0.0,
     }
 }
@@ -175,6 +182,7 @@ fn set_param_value(bass: &mut BassSynth, index: usize, value: f32) {
         12 => bass.set_overdrive(value),
         13 => bass.set_sub_level(value),
         14 => bass.set_volume(value),
+        15 => bass.set_tuning(value),
         _ => {}
     }
 }
