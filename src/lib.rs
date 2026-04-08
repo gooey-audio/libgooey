@@ -15,6 +15,8 @@ pub mod music;
 pub mod sequencer;
 pub mod utils;
 
+pub mod bounce;
+
 // Visualization module (optional)
 #[cfg(feature = "visualization")]
 pub mod visualization;

@@ -4305,3 +4305,149 @@ pub unsafe extern "C" fn gooey_engine_poly_available_voicing_count(
     let degree = degree as usize % chords.len();
     available_voicings(&chords[degree].quality).len() as u32
 }
+
+// ---------------------------------------------------------------------------
+// Offline bounce
+// ---------------------------------------------------------------------------
+
+impl GooeyEngine {
+    /// Render `bars` bars of audio offline into a new buffer.
+    fn bounce_to_buffer(&mut self, bars: u32) -> Vec<f32> {
+        let samples_per_bar = 4.0_f64 * (60.0 / self.bpm as f64) * self.sample_rate as f64;
+        let total_samples = (bars as f64 * samples_per_bar).round() as usize;
+
+        // Reset engine to a clean state
+        self.current_time = 0.0;
+        for seq in &mut self.sequencers {
+            seq.reset();
+            seq.start();
+        }
+        for lfo in &mut self.lfos {
+            lfo.reset();
+        }
+        for gain in &mut self.instrument_gains {
+            gain.snap();
+        }
+        for gain in &mut self.instrument_channel_gains {
+            gain.snap();
+        }
+
+        // Render in chunks using the same path as real-time playback
+        let mut output = Vec::with_capacity(total_samples);
+        let chunk_size = 512;
+        let mut chunk_buf = vec![0.0_f32; chunk_size];
+
+        let mut remaining = total_samples;
+        while remaining > 0 {
+            let n = remaining.min(chunk_size);
+            let slice = &mut chunk_buf[..n];
+            for s in slice.iter_mut() {
+                *s = 0.0;
+            }
+            self.render(slice);
+            output.extend_from_slice(slice);
+            remaining -= n;
+        }
+
+        for seq in &mut self.sequencers {
+            seq.stop();
+        }
+
+        output
+    }
+}
+
+/// Bounce the engine offline for the given number of bars.
+///
+/// Returns a heap-allocated `f32` buffer. The caller must free it with
+/// [`gooey_engine_free_buffer`]. The number of samples is written to
+/// `out_length`.
+///
+/// # Safety
+/// - `engine` must be a valid pointer returned by `gooey_engine_new`.
+/// - `out_length` must be a valid pointer to a `u32`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_bounce_to_buffer(
+    engine: *mut GooeyEngine,
+    bars: u32,
+    out_length: *mut u32,
+) -> *mut f32 {
+    if engine.is_null() || out_length.is_null() {
+        return std::ptr::null_mut();
+    }
+    let engine = &mut *engine;
+    let buffer = engine.bounce_to_buffer(bars);
+    if buffer.len() > u32::MAX as usize {
+        return std::ptr::null_mut();
+    }
+    let len = buffer.len() as u32;
+    let boxed = buffer.into_boxed_slice();
+    let ptr = Box::into_raw(boxed) as *mut f32;
+    *out_length = len;
+    ptr
+}
+
+/// Free a buffer returned by [`gooey_engine_bounce_to_buffer`].
+///
+/// # Safety
+/// - `buffer` must have been returned by `gooey_engine_bounce_to_buffer`.
+/// - `length` must match the `out_length` value from that call.
+/// - Must only be called once per buffer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_free_buffer(buffer: *mut f32, length: u32) {
+    if buffer.is_null() {
+        return;
+    }
+    let slice = std::slice::from_raw_parts_mut(buffer, length as usize);
+    drop(Box::from_raw(slice as *mut [f32]));
+}
+
+/// Bounce the engine offline and write a WAV file.
+///
+/// Returns `true` on success. The file is written as mono 16-bit PCM
+/// at the engine's sample rate.
+///
+/// # Safety
+/// - `engine` must be a valid pointer returned by `gooey_engine_new`.
+/// - `path` must be a valid null-terminated UTF-8 string.
+#[cfg(feature = "bounce")]
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_bounce_to_wav(
+    engine: *mut GooeyEngine,
+    bars: u32,
+    path: *const std::os::raw::c_char,
+) -> bool {
+    if engine.is_null() || path.is_null() {
+        return false;
+    }
+    let engine = &mut *engine;
+    let path_str = match std::ffi::CStr::from_ptr(path).to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let buffer = engine.bounce_to_buffer(bars);
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: engine.sample_rate as u32,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+
+    let mut writer = match hound::WavWriter::create(path_str, spec) {
+        Ok(w) => w,
+        Err(_) => return false,
+    };
+
+    let scale = i16::MAX as f32;
+    for &sample in &buffer {
+        if writer
+            .write_sample((sample * scale).round() as i16)
+            .is_err()
+        {
+            return false;
+        }
+    }
+
+    writer.finalize().is_ok()
+}
