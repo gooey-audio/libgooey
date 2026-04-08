@@ -109,6 +109,10 @@ pub struct Sequencer {
     sample_count: u64,
     next_trigger_sample: u64,
     samples_per_step: f32,
+    // The sample at which the current (playhead) step started.
+    // Updated on every trigger so that beat-position queries can
+    // interpolate correctly even when swing shifts step durations.
+    step_start_sample: u64,
 
     // Pattern and current position (now with velocity per step)
     pattern: Vec<SequencerStep>,
@@ -377,6 +381,7 @@ impl Sequencer {
             sample_count: 0,
             next_trigger_sample: 0,
             samples_per_step,
+            step_start_sample: 0,
             pattern,
             current_step: 0,
             playhead_step: 0,
@@ -404,6 +409,7 @@ impl Sequencer {
             sample_count: 0,
             next_trigger_sample: 0,
             samples_per_step,
+            step_start_sample: 0,
             pattern,
             current_step: 0,
             playhead_step: 0,
@@ -428,6 +434,7 @@ impl Sequencer {
             sample_count: 0,
             next_trigger_sample: 0,
             samples_per_step,
+            step_start_sample: 0,
             pattern,
             current_step: 0,
             playhead_step: 0,
@@ -461,6 +468,7 @@ impl Sequencer {
     pub fn reset(&mut self) {
         self.sample_count = 0;
         self.next_trigger_sample = 0;
+        self.step_start_sample = 0;
         self.current_step = 0;
         self.playhead_step = 0;
     }
@@ -490,6 +498,7 @@ impl Sequencer {
         // Compute sample offset: how far into the current step we are
         let offset_samples = (fractional_step * self.samples_per_step as f64) as u64;
         self.sample_count = offset_samples;
+        self.step_start_sample = 0;
         self.next_trigger_sample = (self.samples_per_step as f64
             - fractional_step * self.samples_per_step as f64)
             .round() as u64;
@@ -707,6 +716,9 @@ impl Sequencer {
 
         // Check if we've reached the next trigger point
         if self.sample_count >= self.next_trigger_sample {
+            // Record when this step started (for beat-position queries)
+            self.step_start_sample = self.sample_count;
+
             // Update playhead to show the step that's about to play
             self.playhead_step = self.current_step;
 
@@ -775,6 +787,22 @@ impl Sequencer {
         } else {
             0
         }
+    }
+
+    /// Get the sample at which the current step started (swing-aware).
+    /// Together with `next_trigger_sample()` this defines the true duration
+    /// of the current step, which may differ from `samples_per_step` when
+    /// swing is active.
+    pub fn step_start_sample(&self) -> u64 {
+        self.step_start_sample
+    }
+
+    /// Get the sample at which the next step will trigger.
+    /// This boundary accounts for swing, so
+    /// `next_trigger_sample - step_start_sample` gives the actual duration
+    /// of the current step.
+    pub fn next_trigger_sample(&self) -> u64 {
+        self.next_trigger_sample
     }
 
     /// Get samples per step (useful for UI timing calculations)
