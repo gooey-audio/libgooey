@@ -2477,7 +2477,9 @@ pub unsafe extern "C" fn gooey_engine_is_link_enabled(engine: *const GooeyEngine
 ///
 /// Uses the kick sequencer as reference (all sequencers are synchronized).
 /// Returns the fractional beat position, e.g. 0.0 = bar start, 1.25 = one
-/// beat and one 16th note in.
+/// beat and one 16th note in.  The fraction within the current step is
+/// derived from the actual swing-aware step boundaries, so the value
+/// progresses monotonically even when swing shifts step durations.
 ///
 /// This is useful for drift detection when syncing to an external clock
 /// (e.g. Ableton Link): compare the returned value with the external
@@ -2498,16 +2500,24 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_beat_position(
     }
     let engine = &*engine;
     let seq = &engine.sequencers[0];
+
     let step = seq.current_step() as f64;
-    let samples_into_step = if seq.sample_count() as f32 > seq.samples_per_step() {
-        (seq.sample_count() as f32
-            - (seq.sample_count() as f32 / seq.samples_per_step()).floor() * seq.samples_per_step())
-            / seq.samples_per_step()
+
+    // Interpolate within the current step using swing-aware boundaries.
+    // step_start_sample and next_trigger_sample define the true duration
+    // of this step (which differs from samples_per_step when swing != 0.5).
+    let step_start = seq.step_start_sample();
+    let step_end = seq.next_trigger_sample();
+    let step_duration = step_end.saturating_sub(step_start);
+    let frac = if step_duration > 0 {
+        let elapsed = seq.sample_count().saturating_sub(step_start);
+        (elapsed as f64 / step_duration as f64).clamp(0.0, 1.0)
     } else {
-        seq.sample_count() as f32 / seq.samples_per_step()
-    } as f64;
+        0.0
+    };
+
     // Each step is a 16th note; 4 steps = 1 quarter note
-    (step + samples_into_step) / 4.0
+    (step + frac) / 4.0
 }
 
 /// Set the global swing amount for all sequencers (0.0-1.0, where 0.5 = no swing)
