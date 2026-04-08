@@ -23,6 +23,7 @@ use crate::engine::Instrument;
 use crate::filters::{BiquadBandpass, MembraneResonator};
 use crate::gen::{ClickOsc, MorphOsc};
 use crate::max_curve::MaxCurveEnvelope;
+use crate::utils::tuning_to_multiplier;
 use crate::utils::Blendable;
 
 /// Frequency range constants (from Max zmap 0 1 40 600)
@@ -88,6 +89,9 @@ pub struct Tom2 {
     membrane_resonator: MembraneResonator,
     membrane: f32,   // 0-100: mix amount
     membrane_q: f32, // 0-100: Q scale (maps to 0.005-0.02, centered at 0.01)
+
+    // Per-instrument tuning (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
+    tuning: f32,
 
     // Overall volume (0-100)
     volume: f32,
@@ -222,6 +226,7 @@ impl Tom2 {
             membrane_resonator: MembraneResonator::new(sample_rate),
             membrane: 0.0,    // Off by default
             membrane_q: 50.0, // Middle Q scale
+            tuning: 0.5,      // Neutral tuning
             volume: 100.0,    // Full volume by default
             main_sound_done: false,
         };
@@ -372,6 +377,16 @@ impl Tom2 {
         self.volume
     }
 
+    /// Get current tuning value (0-1)
+    pub fn tuning(&self) -> f32 {
+        self.tuning
+    }
+
+    /// Set tuning offset (0-1: 0=−12 semitones, 0.5=neutral, 1=+12 semitones)
+    pub fn set_tuning(&mut self, value: f32) {
+        self.tuning = value.clamp(0.0, 1.0);
+    }
+
     /// Update membrane resonator parameters based on current membrane_q setting
     fn update_membrane_params(&mut self) {
         // Map 0-100 to Q scale range 0.005-0.02 (centered at 0.01 which matches membrane example)
@@ -445,8 +460,8 @@ impl Instrument for Tom2 {
             self.past_attack = true;
         }
 
-        // Get base frequency from tune parameter
-        let base_frequency = Self::tune_to_freq(self.tune);
+        // Get base frequency from tune parameter, adjusted by per-instrument tuning
+        let base_frequency = Self::tune_to_freq(self.tune) * tuning_to_multiplier(self.tuning);
 
         // Bend controls pitch envelope depth (how much pitch drops from peak to base)
         // bend=0: no pitch modulation, frequency stays at base_frequency

@@ -37,7 +37,7 @@ struct ParamInfo {
 }
 
 // Parameters in alphabetical order for display
-const PARAM_INFO: [ParamInfo; 18] = [
+const PARAM_INFO: [ParamInfo; 19] = [
     ParamInfo {
         name: "amp_decay",
         coarse_step: 0.1,
@@ -146,6 +146,12 @@ const PARAM_INFO: [ParamInfo; 18] = [
         fine_step: 0.02,
         unit: "",
     },
+    ParamInfo {
+        name: "tuning",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        unit: "",
+    },
 ];
 
 // Wrapper to share KickDrum between audio thread and main thread
@@ -192,6 +198,7 @@ fn get_param_value(kick: &KickDrum, index: usize) -> f32 {
         15 => kick.params.punch.get(),
         16 => kick.params.sub.get(),
         17 => kick.params.volume.get(),
+        18 => kick.params.tuning.get(),
         _ => 0.0,
     }
 }
@@ -221,6 +228,7 @@ fn set_param_value(kick: &mut KickDrum, index: usize, value: f32) {
         15 => kick.set_punch(value),
         16 => kick.set_sub(value),
         17 => kick.set_volume(value),
+        18 => kick.set_tuning(value),
         _ => {}
     }
 }

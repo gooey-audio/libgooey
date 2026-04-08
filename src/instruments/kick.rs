@@ -5,7 +5,7 @@ use crate::gen::oscillator::Oscillator;
 use crate::gen::pink_noise::PinkNoise;
 use crate::gen::waveform::Waveform;
 use crate::instruments::fm_snap::PhaseModulator;
-use crate::utils::{Blendable, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
+use crate::utils::{tuning_to_multiplier, Blendable, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 /// Normalization ranges for kick drum parameters
 /// All external-facing parameters use 0.0-1.0 normalized values
@@ -389,6 +389,8 @@ pub struct KickParams {
     // Master amplitude envelope parameters (amp_attack hardcoded to instant)
     pub amp_decay: SmoothedParam, // Amplitude decay time (0-1 → 0.0-4.0s)
     pub amp_decay_curve: SmoothedParam, // Decay curve (0-1 → 0.1-10.0)
+    // Per-instrument tuning (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
+    pub tuning: SmoothedParam,
 }
 
 impl KickParams {
@@ -522,6 +524,7 @@ impl KickParams {
                 sample_rate,
                 DEFAULT_SMOOTH_TIME_MS,
             ),
+            tuning: SmoothedParam::new(0.5, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
         }
     }
 
@@ -546,6 +549,7 @@ impl KickParams {
         self.feedback_cutoff.tick();
         self.amp_decay.tick();
         self.amp_decay_curve.tick();
+        self.tuning.tick();
 
         // Return true if any smoother is still active
         !self.is_settled()
@@ -571,6 +575,7 @@ impl KickParams {
             && self.feedback_cutoff.is_settled()
             && self.amp_decay.is_settled()
             && self.amp_decay_curve.is_settled()
+            && self.tuning.is_settled()
     }
 
     /// Snap all smoothed parameters to their targets instantly.
@@ -593,6 +598,7 @@ impl KickParams {
         self.feedback_cutoff.snap();
         self.amp_decay.snap();
         self.amp_decay_curve.snap();
+        self.tuning.snap();
     }
 
     /// Get a snapshot of current normalized values as a KickConfig
@@ -1088,8 +1094,9 @@ impl KickDrum {
         // Apply smoothed parameters to oscillators (mix/volume only)
         self.apply_params();
 
-        // Use triggered (snapshot) frequency - frozen at trigger time to prevent pitch snaps
-        let base_frequency = self.triggered_frequency;
+        // Use triggered (snapshot) frequency with live tuning multiplier
+        let base_frequency =
+            self.triggered_frequency * tuning_to_multiplier(self.params.tuning.get());
 
         // Calculate pitch modulation from envelope using triggered pitch multiplier
         let pitch_envelope_value = self.pitch_envelope.get_amplitude(current_time);
@@ -1300,6 +1307,11 @@ impl KickDrum {
             .amp_decay_curve
             .set_target(curve.clamp(0.0, 1.0));
     }
+
+    /// Set tuning offset (smoothed, 0-1: 0=−12 semitones, 0.5=neutral, 1=+12 semitones)
+    pub fn set_tuning(&mut self, value: f32) {
+        self.params.tuning.set_target(value.clamp(0.0, 1.0));
+    }
 }
 
 impl crate::engine::Instrument for KickDrum {
@@ -1343,6 +1355,7 @@ impl crate::engine::Modulatable for KickDrum {
             "feedback_cutoff",
             "amp_decay",
             "amp_decay_curve",
+            "tuning",
         ]
     }
 
@@ -1421,6 +1434,10 @@ impl crate::engine::Modulatable for KickDrum {
                 self.params.amp_decay_curve.set_bipolar(value);
                 Ok(())
             }
+            "tuning" => {
+                self.params.tuning.set_bipolar(value);
+                Ok(())
+            }
             _ => Err(format!("Unknown parameter: {}", parameter)),
         }
     }
@@ -1446,6 +1463,7 @@ impl crate::engine::Modulatable for KickDrum {
             "feedback_cutoff" => Some(self.params.feedback_cutoff.range()),
             "amp_decay" => Some(self.params.amp_decay.range()),
             "amp_decay_curve" => Some(self.params.amp_decay_curve.range()),
+            "tuning" => Some(self.params.tuning.range()),
             _ => None,
         }
     }

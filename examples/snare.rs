@@ -40,7 +40,7 @@ struct ParamInfo {
 
 // Parameters in alphabetical order for display
 // All parameters display normalized 0-1 values (matching the API)
-const PARAM_INFO: [ParamInfo; 19] = [
+const PARAM_INFO: [ParamInfo; 20] = [
     ParamInfo {
         name: "amp_decay",
         coarse_step: 0.05,
@@ -193,6 +193,14 @@ const PARAM_INFO: [ParamInfo; 19] = [
         display_max: 1.0,
         unit: "",
     },
+    ParamInfo {
+        name: "tuning",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        display_min: 0.0,
+        display_max: 1.0,
+        unit: "",
+    },
 ];
 
 // Wrapper to share SnareDrum between audio thread and main thread
@@ -264,6 +272,7 @@ fn get_param_value(snare: &SnareDrum, index: usize) -> f32 {
         16 => snare.params.tonal_decay_curve.get(),
         17 => snare.params.volume.get(),
         18 => snare.params.xfade.get(),
+        19 => snare.params.tuning.get(),
         _ => 0.0,
     }
 }
@@ -294,6 +303,7 @@ fn set_param_value(snare: &mut SnareDrum, index: usize, value: f32) {
         16 => snare.set_tonal_decay_curve(value),
         17 => snare.set_volume(value),
         18 => snare.set_xfade(value),
+        19 => snare.set_tuning(value),
         _ => {}
     }
 }

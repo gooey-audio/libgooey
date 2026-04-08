@@ -146,6 +146,17 @@ impl ChannelInstrument {
         }
     }
 
+    /// Get the current tuning value (0-1, 0.5 = neutral).
+    fn get_tuning(&self) -> f32 {
+        match self {
+            Self::Kick(k) => k.params.tuning.get(),
+            Self::Snare(s) => s.params.tuning.get(),
+            Self::HiHat(h) => h.params.tuning.get(),
+            Self::Tom(t) => t.tuning(),
+            Self::Bass(b) => b.params.tuning.get(),
+        }
+    }
+
     /// Set a parameter by index. Dispatches to the correct setter for the current instrument type.
     /// All parameters use normalized 0-1 range from the FFI.
     fn set_param(&mut self, param: u32, value: f32) {
@@ -158,6 +169,7 @@ impl ChannelInstrument {
                 KICK_PARAM_DECAY => k.set_oscillator_decay(value),
                 KICK_PARAM_PITCH_ENVELOPE => k.set_pitch_envelope_amount(value),
                 KICK_PARAM_VOLUME => k.set_volume(value),
+                KICK_PARAM_TUNING => k.set_tuning(value),
                 _ => {}
             },
             Self::Snare(s) => match param {
@@ -180,6 +192,7 @@ impl ChannelInstrument {
                 SNARE_PARAM_AMP_DECAY => s.set_amp_decay(value),
                 SNARE_PARAM_AMP_DECAY_CURVE => s.set_amp_decay_curve(value),
                 SNARE_PARAM_TONAL_DECAY_CURVE => s.set_tonal_decay_curve(value),
+                SNARE_PARAM_TUNING => s.set_tuning(value),
                 _ => {}
             },
             Self::HiHat(h) => match param {
@@ -188,6 +201,7 @@ impl ChannelInstrument {
                 HIHAT_PARAM_ATTACK => h.set_attack(value),
                 HIHAT_PARAM_VOLUME => h.set_volume(value),
                 HIHAT_PARAM_TONE => h.set_tone(value),
+                HIHAT_PARAM_TUNING => h.set_tuning(value),
                 _ => {}
             },
             Self::Tom(t) => {
@@ -202,6 +216,8 @@ impl ChannelInstrument {
                     TOM_PARAM_MEMBRANE => t.set_membrane(scaled),
                     TOM_PARAM_MEMBRANE_Q => t.set_membrane_q(scaled),
                     TOM_PARAM_VOLUME => t.set_volume(scaled),
+                    // Tuning uses 0-1 directly (not 0-100)
+                    TOM_PARAM_TUNING => t.set_tuning(value.clamp(0.0, 1.0)),
                     _ => {}
                 }
             }
@@ -221,6 +237,7 @@ impl ChannelInstrument {
                 BASS_PARAM_AMP_DECAY_CURVE => b.set_amp_decay_curve(value),
                 BASS_PARAM_OVERDRIVE => b.set_overdrive(value),
                 BASS_PARAM_VOLUME => b.set_volume(value),
+                BASS_PARAM_TUNING => b.set_tuning(value),
                 _ => {}
             },
         }
@@ -237,6 +254,7 @@ impl ChannelInstrument {
                 KICK_PARAM_DECAY => k.params.oscillator_decay.set_bipolar(value),
                 KICK_PARAM_PITCH_ENVELOPE => k.params.pitch_envelope_amount.set_bipolar(value),
                 KICK_PARAM_VOLUME => k.params.volume.set_bipolar(value),
+                KICK_PARAM_TUNING => k.params.tuning.set_bipolar(value),
                 _ => {}
             },
             Self::Snare(s) => match param {
@@ -258,6 +276,7 @@ impl ChannelInstrument {
                 SNARE_PARAM_AMP_DECAY => s.params.amp_decay.set_bipolar(value),
                 SNARE_PARAM_AMP_DECAY_CURVE => s.params.amp_decay_curve.set_bipolar(value),
                 SNARE_PARAM_TONAL_DECAY_CURVE => s.params.tonal_decay_curve.set_bipolar(value),
+                SNARE_PARAM_TUNING => s.params.tuning.set_bipolar(value),
                 _ => {}
             },
             Self::HiHat(h) => match param {
@@ -266,6 +285,7 @@ impl ChannelInstrument {
                 HIHAT_PARAM_ATTACK => h.params.attack.set_bipolar(value),
                 HIHAT_PARAM_TONE => h.params.tone.set_bipolar(value),
                 HIHAT_PARAM_VOLUME => h.params.volume.set_bipolar(value),
+                HIHAT_PARAM_TUNING => h.params.tuning.set_bipolar(value),
                 _ => {}
             },
             Self::Tom(t) => {
@@ -280,6 +300,8 @@ impl ChannelInstrument {
                     TOM_PARAM_MEMBRANE => t.set_membrane(scaled),
                     TOM_PARAM_MEMBRANE_Q => t.set_membrane_q(scaled),
                     TOM_PARAM_VOLUME => t.set_volume(scaled),
+                    // Tuning uses 0-1 directly (not 0-100)
+                    TOM_PARAM_TUNING => t.set_tuning(value.clamp(0.0, 1.0)),
                     _ => {}
                 }
             }
@@ -299,6 +321,7 @@ impl ChannelInstrument {
                 BASS_PARAM_AMP_DECAY_CURVE => b.params.amp_decay_curve.set_bipolar(value),
                 BASS_PARAM_OVERDRIVE => b.params.overdrive.set_bipolar(value),
                 BASS_PARAM_VOLUME => b.params.volume.set_bipolar(value),
+                BASS_PARAM_TUNING => b.params.tuning.set_bipolar(value),
                 _ => {}
             },
         }
@@ -1087,6 +1110,8 @@ pub const KICK_PARAM_DECAY: u32 = 4;
 pub const KICK_PARAM_PITCH_ENVELOPE: u32 = 5;
 /// Kick parameter: overall volume (0-1)
 pub const KICK_PARAM_VOLUME: u32 = 6;
+/// Kick parameter: tuning offset (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
+pub const KICK_PARAM_TUNING: u32 = 7;
 
 // =============================================================================
 // Hi-hat parameter indices (must match Swift HiHatParam enum)
@@ -1102,6 +1127,8 @@ pub const HIHAT_PARAM_ATTACK: u32 = 2;
 pub const HIHAT_PARAM_TONE: u32 = 3;
 /// Hi-hat parameter: volume (0-1 normalized)
 pub const HIHAT_PARAM_VOLUME: u32 = 4;
+/// Hi-hat parameter: tuning offset (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
+pub const HIHAT_PARAM_TUNING: u32 = 5;
 
 // =============================================================================
 // Snare drum parameter indices (must match Swift SnareParam enum)
@@ -1145,6 +1172,8 @@ pub const SNARE_PARAM_AMP_DECAY: u32 = 16;
 pub const SNARE_PARAM_AMP_DECAY_CURVE: u32 = 17;
 /// Snare parameter: tonal decay curve (0-1 → 0.1-10.0)
 pub const SNARE_PARAM_TONAL_DECAY_CURVE: u32 = 18;
+/// Snare parameter: tuning offset (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
+pub const SNARE_PARAM_TUNING: u32 = 19;
 
 // =============================================================================
 // Tom drum parameter indices (Tom2 - must match Swift TomParam enum)
@@ -1166,6 +1195,8 @@ pub const TOM_PARAM_MEMBRANE: u32 = 5;
 pub const TOM_PARAM_MEMBRANE_Q: u32 = 6;
 /// Tom parameter: volume (0-1 → 0-100, overall volume)
 pub const TOM_PARAM_VOLUME: u32 = 7;
+/// Tom parameter: tuning offset (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
+pub const TOM_PARAM_TUNING: u32 = 8;
 
 // =============================================================================
 // Instrument IDs (must match Swift/C enum if used)
@@ -1242,6 +1273,8 @@ pub const BASS_PARAM_AMP_DECAY_CURVE: u32 = 12;
 pub const BASS_PARAM_OVERDRIVE: u32 = 13;
 /// Bass parameter: master volume (0-1)
 pub const BASS_PARAM_VOLUME: u32 = 14;
+/// Bass parameter: tuning offset (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
+pub const BASS_PARAM_TUNING: u32 = 15;
 
 /// Bass preset: Acid - TB-303-style, high resonance, short filter sweep
 pub const BASS_PRESET_ACID: u32 = 0;
@@ -1670,6 +1703,60 @@ pub unsafe extern "C" fn gooey_engine_set_channel_param(
         return;
     }
     engine.channels[idx].set_param(param, value);
+}
+
+/// Set the tuning offset for a channel (0.0 = −12 semitones, 0.5 = neutral, 1.0 = +12 semitones).
+///
+/// This is a convenience function that dispatches to the correct tuning parameter
+/// for whatever instrument type is currently loaded on the channel.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_channel_tuning(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    value: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let idx = channel as usize;
+    if idx >= NUM_INSTRUMENTS {
+        return;
+    }
+    let tuning_param = match engine.channels[idx].instrument_type() {
+        INSTRUMENT_KICK => KICK_PARAM_TUNING,
+        INSTRUMENT_SNARE => SNARE_PARAM_TUNING,
+        INSTRUMENT_HIHAT => HIHAT_PARAM_TUNING,
+        INSTRUMENT_TOM => TOM_PARAM_TUNING,
+        INSTRUMENT_BASS => BASS_PARAM_TUNING,
+        _ => return,
+    };
+    engine.channels[idx].set_param(tuning_param, value);
+}
+
+/// Get the current tuning value for a channel (0.0–1.0).
+///
+/// Returns 0.5 (neutral) if the channel index is out of range or engine is null.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_channel_tuning(
+    engine: *const GooeyEngine,
+    channel: u32,
+) -> f32 {
+    if engine.is_null() {
+        return 0.5;
+    }
+    let engine = &*engine;
+    let idx = channel as usize;
+    if idx >= NUM_INSTRUMENTS {
+        return 0.5;
+    }
+    engine.channels[idx].get_tuning()
 }
 
 /// Trigger a specific channel (regardless of what instrument type it holds).
@@ -3117,7 +3204,7 @@ pub extern "C" fn gooey_engine_kick_param_count() -> u32 {
 /// Get the number of hi-hat parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_hihat_param_count() -> u32 {
-    5
+    6
 }
 
 /// Get the number of sequencer steps
@@ -3535,16 +3622,16 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_phase(
 /// Get the number of snare parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_snare_param_count() -> u32 {
-    19 // frequency, decay, brightness, volume, tonal, noise, pitch_drop,
+    20 // frequency, decay, brightness, volume, tonal, noise, pitch_drop,
        // tonal_decay, noise_decay, noise_tail_decay, filter_cutoff, filter_resonance,
        // filter_type, xfade, phase_mod_amount, overdrive, amp_decay, amp_decay_curve,
-       // tonal_decay_curve
+       // tonal_decay_curve, tuning
 }
 
 /// Get the number of tom parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_tom_param_count() -> u32 {
-    8 // tune, bend, tone, color, decay, membrane, membrane_q, volume (Tom2)
+    9 // tune, bend, tone, color, decay, membrane, membrane_q, volume, tuning (Tom2)
 }
 
 // =============================================================================

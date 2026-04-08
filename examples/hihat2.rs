@@ -21,7 +21,7 @@ struct ParamInfo {
     unit: &'static str,
 }
 
-const PARAM_INFO: [ParamInfo; 4] = [
+const PARAM_INFO: [ParamInfo; 5] = [
     ParamInfo {
         name: "pitch",
         coarse_step: 0.05,
@@ -42,6 +42,12 @@ const PARAM_INFO: [ParamInfo; 4] = [
     },
     ParamInfo {
         name: "tone",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+        unit: "",
+    },
+    ParamInfo {
+        name: "tuning",
         coarse_step: 0.05,
         fine_step: 0.01,
         unit: "",
@@ -74,6 +80,7 @@ fn get_param_value(hihat: &HiHat2, index: usize) -> f32 {
         1 => hihat.params.decay.get(),
         2 => hihat.params.attack.get(),
         3 => hihat.params.tone.get(),
+        4 => hihat.params.tuning.get(),
         _ => 0.0,
     }
 }
@@ -84,6 +91,7 @@ fn set_param_value(hihat: &mut HiHat2, index: usize, value: f32) {
         1 => hihat.set_decay(value),
         2 => hihat.set_attack(value),
         3 => hihat.set_tone(value),
+        4 => hihat.set_tuning(value),
         _ => {}
     }
 }
