@@ -3204,7 +3204,7 @@ pub extern "C" fn gooey_engine_kick_param_count() -> u32 {
 /// Get the number of hi-hat parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_hihat_param_count() -> u32 {
-    5
+    6
 }
 
 /// Get the number of sequencer steps
@@ -3622,16 +3622,16 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_phase(
 /// Get the number of snare parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_snare_param_count() -> u32 {
-    19 // frequency, decay, brightness, volume, tonal, noise, pitch_drop,
+    20 // frequency, decay, brightness, volume, tonal, noise, pitch_drop,
        // tonal_decay, noise_decay, noise_tail_decay, filter_cutoff, filter_resonance,
        // filter_type, xfade, phase_mod_amount, overdrive, amp_decay, amp_decay_curve,
-       // tonal_decay_curve
+       // tonal_decay_curve, tuning
 }
 
 /// Get the number of tom parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_tom_param_count() -> u32 {
-    8 // tune, bend, tone, color, decay, membrane, membrane_q, volume (Tom2)
+    9 // tune, bend, tone, color, decay, membrane, membrane_q, volume, tuning (Tom2)
 }
 
 // =============================================================================
