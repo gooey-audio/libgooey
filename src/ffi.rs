@@ -4235,6 +4235,9 @@ impl GooeyEngine {
             seq.reset();
             seq.start();
         }
+        for lfo in &mut self.lfos {
+            lfo.reset();
+        }
         for gain in &mut self.instrument_gains {
             gain.snap();
         }
@@ -4287,6 +4290,9 @@ pub unsafe extern "C" fn gooey_engine_bounce_to_buffer(
     }
     let engine = &mut *engine;
     let buffer = engine.bounce_to_buffer(bars);
+    if buffer.len() > u32::MAX as usize {
+        return std::ptr::null_mut();
+    }
     let len = buffer.len() as u32;
     let boxed = buffer.into_boxed_slice();
     let ptr = Box::into_raw(boxed) as *mut f32;

@@ -83,6 +83,13 @@ pub fn bounce_to_wav(
     path: &std::path::Path,
     config: WavConfig,
 ) -> Result<(), String> {
+    if config.bit_depth != 16 && config.bit_depth != 24 {
+        return Err(format!(
+            "Unsupported bit depth: {}. Use 16 or 24.",
+            config.bit_depth
+        ));
+    }
+
     let sample_rate = engine.sample_rate();
     let buffer = bounce_to_buffer(engine, length);
 
@@ -115,7 +122,7 @@ pub fn bounce_to_wav(
                     .map_err(|e| format!("Failed to write sample: {e}"))?;
             }
         }
-        _ => return Err(format!("Unsupported bit depth: {}", config.bit_depth)),
+        _ => unreachable!("bit depth validated above"),
     }
 
     writer

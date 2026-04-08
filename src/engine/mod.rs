@@ -352,6 +352,9 @@ impl Engine {
             self.sequencers[i].reset();
             self.sequencers[i].start();
         }
+        for lfo in &mut self.lfos {
+            lfo.reset();
+        }
         self.master_gain.snap();
         self.trigger_queue.clear();
         self.saved_global_freq.clear();
