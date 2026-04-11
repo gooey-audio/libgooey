@@ -87,6 +87,10 @@ name = "delay"
 required-features = ["native", "crossterm"]
 
 [[example]]
+name = "reverb"
+required-features = ["native", "crossterm"]
+
+[[example]]
 name = "chords"
 required-features = ["native", "crossterm"]
 

@@ -4,8 +4,8 @@
 //! Designed for integration with iOS (and other platforms in the future).
 
 use crate::effects::{
-    DelayEffect, DelayTiming, Effect, LowpassFilterEffect, SoftLimiter, TiltFilterEffect,
-    TubeCompressor, TubeSaturation,
+    DelayEffect, DelayTiming, Effect, LowpassFilterEffect, SoftLimiter, SpringReverbEffect,
+    TiltFilterEffect, TubeCompressor, TubeSaturation,
 };
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
@@ -507,7 +507,7 @@ pub struct GooeyEngine {
     // Per-channel sequencers (sample-accurate, synchronized)
     sequencers: [Sequencer; NUM_INSTRUMENTS],
 
-    // Global effects (applied in order: saturation -> lowpass filter -> tilt filter -> delay -> compressor -> limiter)
+    /// Global effects (applied in order: saturation -> lowpass filter -> tilt filter -> delay -> compressor -> reverb -> limiter)
     delay: DelayEffect,
     delay_enabled: bool,
     lowpass_filter: LowpassFilterEffect,
@@ -519,6 +519,8 @@ pub struct GooeyEngine {
     compressor: TubeCompressor,
     compressor_enabled: bool,
     compressor_sidechain: u32,
+    reverb: SpringReverbEffect,
+    reverb_enabled: bool,
     limiter: SoftLimiter,
     limiter_enabled: bool,
 
@@ -624,6 +626,9 @@ impl GooeyEngine {
         // threshold: -12 dB, ratio: 4:1, attack: 5ms, release: 100ms, mix: 0.5
         let compressor = TubeCompressor::new(sample_rate, -12.0, 4.0, 5.0, 100.0, 0.5);
 
+        // Create spring reverb with default settings (decay: 0.5, mix: 0.0 = dry, damping: 0.5)
+        let reverb = SpringReverbEffect::new(sample_rate, 0.5, 0.0, 0.5);
+
         // Create LFO pool (8 LFOs, all disabled by default with quarter note timing)
         let lfos = std::array::from_fn(|_| Lfo::with_sample_rate(sample_rate));
         let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] = std::array::from_fn(|_| Vec::new());
@@ -651,6 +656,8 @@ impl GooeyEngine {
             compressor,
             compressor_enabled: true,
             compressor_sidechain: COMPRESSOR_SIDECHAIN_NONE,
+            reverb,
+            reverb_enabled: false,
             limiter: SoftLimiter::new(1.0),
             limiter_enabled: true,
             sample_rate,
@@ -858,6 +865,11 @@ impl GooeyEngine {
                 };
             }
 
+            // Reverb (if enabled)
+            if self.reverb_enabled {
+                output = self.reverb.process(output);
+            }
+
             // Limiter (protects output from clipping)
             if self.limiter_enabled {
                 *sample = self.limiter.process(output);
@@ -1021,8 +1033,10 @@ pub const EFFECT_COMPRESSOR: u32 = 3;
 pub const EFFECT_TILT_FILTER: u32 = 4;
 /// Global effect: Limiter (soft limiter, protects output from clipping)
 pub const EFFECT_LIMITER: u32 = 5;
+/// Global effect: Spring reverb
+pub const EFFECT_REVERB: u32 = 6;
 /// Total number of global effects
-pub const EFFECT_COUNT: u32 = 6;
+pub const EFFECT_COUNT: u32 = 7;
 
 // =============================================================================
 // Lowpass filter parameter indices (must match Swift FilterParam enum)
@@ -1106,6 +1120,17 @@ pub const COMPRESSOR_SIDECHAIN_NONE: u32 = 0xFFFFFFFF;
 pub const TILT_PARAM_CUTOFF: u32 = 0;
 /// Tilt filter parameter: resonance (0.0-1.0)
 pub const TILT_PARAM_RESONANCE: u32 = 1;
+
+// =============================================================================
+// Reverb parameter indices
+// =============================================================================
+
+/// Reverb parameter: decay amount (0.0-1.0)
+pub const REVERB_PARAM_DECAY: u32 = 0;
+/// Reverb parameter: wet/dry mix (0.0-1.0)
+pub const REVERB_PARAM_MIX: u32 = 1;
+/// Reverb parameter: high-frequency damping (0.0-1.0)
+pub const REVERB_PARAM_DAMPING: u32 = 2;
 
 // =============================================================================
 // Kick drum parameter indices (must match Swift KickParam enum)
@@ -2220,6 +2245,12 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
             TILT_PARAM_RESONANCE => engine.tilt_filter.set_resonance(value),
             _ => {} // Unknown parameter, ignore
         },
+        EFFECT_REVERB => match param {
+            REVERB_PARAM_DECAY => engine.reverb.set_decay(value),
+            REVERB_PARAM_MIX => engine.reverb.set_mix(value),
+            REVERB_PARAM_DAMPING => engine.reverb.set_damping(value),
+            _ => {} // Unknown parameter, ignore
+        },
         _ => {} // Unknown effect, ignore
     }
 }
@@ -2282,6 +2313,12 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
             TILT_PARAM_RESONANCE => engine.tilt_filter.get_resonance(),
             _ => -1.0, // Unknown parameter
         },
+        EFFECT_REVERB => match param {
+            REVERB_PARAM_DECAY => engine.reverb.get_decay(),
+            REVERB_PARAM_MIX => engine.reverb.get_mix(),
+            REVERB_PARAM_DAMPING => engine.reverb.get_damping(),
+            _ => -1.0, // Unknown parameter
+        },
         _ => -1.0, // Unknown effect
     }
 }
@@ -2317,6 +2354,7 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_enabled(
         EFFECT_COMPRESSOR => engine.compressor_enabled = enabled,
         EFFECT_TILT_FILTER => engine.tilt_filter_enabled = enabled,
         EFFECT_LIMITER => engine.limiter_enabled = enabled,
+        EFFECT_REVERB => engine.reverb_enabled = enabled,
         _ => {} // Unknown effect, ignore
     }
 }
@@ -2350,6 +2388,7 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_enabled(
         EFFECT_COMPRESSOR => engine.compressor_enabled,
         EFFECT_TILT_FILTER => engine.tilt_filter_enabled,
         EFFECT_LIMITER => engine.limiter_enabled,
+        EFFECT_REVERB => engine.reverb_enabled,
         _ => false, // Unknown effect
     }
 }
