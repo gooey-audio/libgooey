@@ -94,11 +94,12 @@ impl FeedbackWaveshaper {
         let shaped = fb_input.tanh();
 
         // Gain compensation: maintain consistent output level across all drive values.
-        // The feedback loop forms a geometric series with small-signal gain
-        // drive / (1 - feedback), so we compensate for that effective drive.
+        // Since last_out is already compensated, the loop gain is feedback * compensation.
+        // Solving for equal loudness with and without feedback gives:
+        //   compensation = comp_no_fb / (1 + comp_no_fb * feedback)
         let reference = 0.5_f32;
-        let effective_drive = self.drive / (1.0 - self.feedback);
-        let compensation = reference.tanh() / (reference * effective_drive).tanh();
+        let comp_no_fb = reference.tanh() / (reference * self.drive).tanh();
+        let compensation = comp_no_fb / (1.0 + comp_no_fb * self.feedback);
         let compensated = shaped * compensation;
 
         // DC block the output
