@@ -520,6 +520,7 @@ pub struct GooeyEngine {
     compressor_enabled: bool,
     compressor_sidechain: u32,
     limiter: SoftLimiter,
+    limiter_enabled: bool,
 
     // Engine state
     sample_rate: f32,
@@ -651,6 +652,7 @@ impl GooeyEngine {
             compressor_enabled: true,
             compressor_sidechain: COMPRESSOR_SIDECHAIN_NONE,
             limiter: SoftLimiter::new(1.0),
+            limiter_enabled: true,
             sample_rate,
             bpm,
             swing: 0.5,
@@ -856,8 +858,12 @@ impl GooeyEngine {
                 };
             }
 
-            // Limiter (always on - protects output from clipping)
-            *sample = self.limiter.process(output);
+            // Limiter (protects output from clipping)
+            if self.limiter_enabled {
+                *sample = self.limiter.process(output);
+            } else {
+                *sample = output;
+            }
 
             self.current_time += sample_period;
             sample_offset += 1;
@@ -1013,8 +1019,10 @@ pub const EFFECT_SATURATION: u32 = 2;
 pub const EFFECT_COMPRESSOR: u32 = 3;
 /// Global effect: Tilt filter (unified lowpass/highpass)
 pub const EFFECT_TILT_FILTER: u32 = 4;
+/// Global effect: Limiter (soft limiter, protects output from clipping)
+pub const EFFECT_LIMITER: u32 = 5;
 /// Total number of global effects
-pub const EFFECT_COUNT: u32 = 5;
+pub const EFFECT_COUNT: u32 = 6;
 
 // =============================================================================
 // Lowpass filter parameter indices (must match Swift FilterParam enum)
@@ -2308,6 +2316,7 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_enabled(
         EFFECT_SATURATION => engine.saturation_enabled = enabled,
         EFFECT_COMPRESSOR => engine.compressor_enabled = enabled,
         EFFECT_TILT_FILTER => engine.tilt_filter_enabled = enabled,
+        EFFECT_LIMITER => engine.limiter_enabled = enabled,
         _ => {} // Unknown effect, ignore
     }
 }
@@ -2340,6 +2349,7 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_enabled(
         EFFECT_SATURATION => engine.saturation_enabled,
         EFFECT_COMPRESSOR => engine.compressor_enabled,
         EFFECT_TILT_FILTER => engine.tilt_filter_enabled,
+        EFFECT_LIMITER => engine.limiter_enabled,
         _ => false, // Unknown effect
     }
 }
