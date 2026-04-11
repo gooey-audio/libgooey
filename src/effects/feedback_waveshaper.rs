@@ -93,9 +93,13 @@ impl FeedbackWaveshaper {
         // Waveshape with tanh
         let shaped = fb_input.tanh();
 
-        // Gain compensation: maintain consistent output level across all drive values
+        // Gain compensation: maintain consistent output level across all drive values.
+        // Since last_out is already compensated, the loop gain is feedback * compensation.
+        // Solving for equal loudness with and without feedback gives:
+        //   compensation = comp_no_fb / (1 + comp_no_fb * feedback)
         let reference = 0.5_f32;
-        let compensation = reference.tanh() / (reference * self.drive).tanh();
+        let comp_no_fb = reference.tanh() / (reference * self.drive).tanh();
+        let compensation = comp_no_fb / (1.0 + comp_no_fb * self.feedback);
         let compensated = shaped * compensation;
 
         // DC block the output
@@ -311,6 +315,33 @@ mod tests {
         // After reset, normal input should work
         let output = ws.process(0.5);
         assert!(output.is_finite());
+    }
+
+    #[test]
+    fn test_feedback_gain_compensation() {
+        // Verify that feedback doesn't significantly increase perceived loudness
+        let input_signal: Vec<f32> = (0..4000).map(|i| (i as f32 * 0.1).sin() * 0.5).collect();
+
+        let mut ws_no_fb = FeedbackWaveshaper::new(44100.0, 5.0, 0.0, 2000.0, 1.0);
+        let mut ws_fb = FeedbackWaveshaper::new(44100.0, 5.0, 0.7, 2000.0, 1.0);
+
+        let rms_no_fb: f32 = input_signal
+            .iter()
+            .map(|&s| ws_no_fb.process(s).powi(2))
+            .sum::<f32>()
+            / input_signal.len() as f32;
+        let rms_fb: f32 = input_signal
+            .iter()
+            .map(|&s| ws_fb.process(s).powi(2))
+            .sum::<f32>()
+            / input_signal.len() as f32;
+
+        let rms_ratio = (rms_fb / rms_no_fb).sqrt();
+        assert!(
+            rms_ratio < 1.5,
+            "feedback increased RMS by {:.0}%, expected <50%",
+            (rms_ratio - 1.0) * 100.0
+        );
     }
 
     #[test]
