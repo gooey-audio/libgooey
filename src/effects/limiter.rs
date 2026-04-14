@@ -41,6 +41,9 @@ impl SoftLimiter {
     }
 
     pub fn set_threshold(&mut self, threshold: f32) {
+        if !threshold.is_finite() {
+            return;
+        }
         let threshold = threshold.clamp(0.001, 1.0);
         self.threshold = threshold;
         self.inv_threshold = 1.0 / threshold;
