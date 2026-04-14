@@ -39,6 +39,16 @@ impl SoftLimiter {
             inv_threshold: 1.0 / threshold,
         }
     }
+
+    pub fn set_threshold(&mut self, threshold: f32) {
+        let threshold = threshold.clamp(0.001, 1.0);
+        self.threshold = threshold;
+        self.inv_threshold = 1.0 / threshold;
+    }
+
+    pub fn get_threshold(&self) -> f32 {
+        self.threshold
+    }
 }
 
 impl Effect for SoftLimiter {
