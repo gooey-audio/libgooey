@@ -1033,6 +1033,13 @@ pub const EFFECT_COMPRESSOR: u32 = 3;
 pub const EFFECT_TILT_FILTER: u32 = 4;
 /// Global effect: Limiter (soft limiter, protects output from clipping)
 pub const EFFECT_LIMITER: u32 = 5;
+
+// =============================================================================
+// Limiter parameter indices (must match Swift LimiterParam enum)
+// =============================================================================
+
+/// Limiter parameter: threshold (0.001-1.0)
+pub const LIMITER_PARAM_THRESHOLD: u32 = 0;
 /// Global effect: Spring reverb
 pub const EFFECT_REVERB: u32 = 6;
 /// Total number of global effects
@@ -2193,6 +2200,8 @@ pub unsafe extern "C" fn gooey_engine_load_bass_preset(engine: *mut GooeyEngine,
 ///   - COMPRESSOR_PARAM_ATTACK (2): 0.1-100.0 ms
 ///   - COMPRESSOR_PARAM_RELEASE (3): 5.0-1000.0 ms
 ///   - COMPRESSOR_PARAM_MIX (4): 0.0-1.0
+/// - EFFECT_LIMITER (5):
+///   - LIMITER_PARAM_THRESHOLD (0): 0.001-1.0
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -2249,6 +2258,10 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
             REVERB_PARAM_DECAY => engine.reverb.set_decay(value),
             REVERB_PARAM_MIX => engine.reverb.set_mix(value),
             REVERB_PARAM_DAMPING => engine.reverb.set_damping(value),
+            _ => {} // Unknown parameter, ignore
+        },
+        EFFECT_LIMITER => match param {
+            LIMITER_PARAM_THRESHOLD => engine.limiter.set_threshold(value),
             _ => {} // Unknown parameter, ignore
         },
         _ => {} // Unknown effect, ignore
@@ -2317,6 +2330,10 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
             REVERB_PARAM_DECAY => engine.reverb.get_decay(),
             REVERB_PARAM_MIX => engine.reverb.get_mix(),
             REVERB_PARAM_DAMPING => engine.reverb.get_damping(),
+            _ => -1.0, // Unknown parameter
+        },
+        EFFECT_LIMITER => match param {
+            LIMITER_PARAM_THRESHOLD => engine.limiter.get_threshold(),
             _ => -1.0, // Unknown parameter
         },
         _ => -1.0, // Unknown effect
