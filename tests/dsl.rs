@@ -56,3 +56,22 @@ fn lfo_hz_rate_and_offset_syntax() {
     assert_eq!(engine.lfo(0).unwrap().amount, 0.7);
     assert_eq!(engine.lfo(0).unwrap().offset, 0.1);
 }
+
+#[test]
+fn legacy_kick_pitch_aliases_migrate_to_tuning() {
+    // Programs written against the old kick pitch LFO targets must keep
+    // building. All four historical pitch aliases now resolve to `tuning`.
+    for alias in ["pitch_drop", "pitch_env_amt", "pitch_env_crv", "pitch_ratio"] {
+        let src = format!("inst kick kick\nlfo 1bar kick.{} amt=1\n", alias);
+        let program = Program::parse(&src).expect("parse");
+        let engine = program
+            .build_engine(44100.0)
+            .unwrap_or_else(|e| panic!("build engine for alias '{}': {}", alias, e));
+        assert_eq!(
+            engine.lfo(0).unwrap().target_parameter,
+            "tuning",
+            "alias '{}' should migrate to tuning",
+            alias
+        );
+    }
+}
