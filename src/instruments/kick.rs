@@ -1098,22 +1098,27 @@ impl KickDrum {
         let vel_squared = self.current_velocity * self.current_velocity;
         let decay_scale = 1.0 - (self.velocity_to_decay * vel_squared);
         let base_decay = self.params.oscillator_decay_secs() * decay_scale;
+
         self.sub_oscillator.envelope.set_decay_time(base_decay);
         self.sub_oscillator
             .envelope
             .set_release_time(base_decay * 0.2);
+
         self.punch_oscillator.envelope.set_decay_time(base_decay);
         self.punch_oscillator
             .envelope
             .set_release_time(base_decay * 0.2);
+
         self.click_oscillator
             .envelope
             .set_decay_time(base_decay * 0.2);
         self.click_oscillator
             .envelope
             .set_release_time(base_decay * 0.02);
+
         self.noise_envelope.set_decay_time(base_decay);
         self.noise_envelope.set_release_time(base_decay * 0.2);
+
         self.pitch_envelope.set_decay_time(base_decay);
         self.pitch_envelope.set_release_time(base_decay * 0.2);
 
