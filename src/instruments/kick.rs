@@ -719,8 +719,6 @@ pub struct KickDrum {
     pub pitch_envelope: Envelope,
     /// Pitch start multiplier snapshot (frozen at trigger time)
     triggered_pitch_multiplier: f32,
-    /// Base frequency snapshot in Hz (frozen at trigger time)
-    triggered_frequency: f32,
 
     // High-pass filter for click oscillator
     pub click_filter: ResonantHighpassFilter,
@@ -784,7 +782,6 @@ impl KickDrum {
             click_oscillator: Oscillator::new(sample_rate, freq_hz * 40.0),
             pitch_envelope: Envelope::new(),
             triggered_pitch_multiplier,
-            triggered_frequency: freq_hz,
             click_filter: ResonantHighpassFilter::new(sample_rate, 8000.0, 4.0),
             phase_modulator: PhaseModulator::new(sample_rate),
             pink_noise: PinkNoise::new(),
@@ -984,8 +981,9 @@ impl KickDrum {
         let base_freq = self.params.frequency_hz();
 
         // Snapshot pitch parameters at trigger time
-        // These values are frozen for the entire decay to prevent discontinuities
-        self.triggered_frequency = base_freq;
+        // These values are frozen for the entire decay to prevent discontinuities.
+        // (`pitch_envelope_amount` and `pitch_start_ratio` are intentionally not
+        // exposed as LFO targets — use `tuning` for live pitch modulation.)
         let pitch_envelope_amount = self.params.pitch_envelope_amount.get();
         let pitch_start_ratio = self.params.pitch_start_ratio_value();
         self.triggered_pitch_multiplier = 1.0 + (pitch_start_ratio - 1.0) * pitch_envelope_amount;
@@ -1094,9 +1092,35 @@ impl KickDrum {
         // Apply smoothed parameters to oscillators (mix/volume only)
         self.apply_params();
 
-        // Use triggered (snapshot) frequency with live tuning multiplier
+        // Re-apply oscillator decay times each sample so LFO modulation of
+        // `oscillator_decay` audibly affects an in-flight note. Mirrors the
+        // scaling used in trigger_with_velocity().
+        let vel_squared = self.current_velocity * self.current_velocity;
+        let decay_scale = 1.0 - (self.velocity_to_decay * vel_squared);
+        let base_decay = self.params.oscillator_decay_secs() * decay_scale;
+        self.sub_oscillator.envelope.set_decay_time(base_decay);
+        self.sub_oscillator
+            .envelope
+            .set_release_time(base_decay * 0.2);
+        self.punch_oscillator.envelope.set_decay_time(base_decay);
+        self.punch_oscillator
+            .envelope
+            .set_release_time(base_decay * 0.2);
+        self.click_oscillator
+            .envelope
+            .set_decay_time(base_decay * 0.2);
+        self.click_oscillator
+            .envelope
+            .set_release_time(base_decay * 0.02);
+        self.noise_envelope.set_decay_time(base_decay);
+        self.noise_envelope.set_release_time(base_decay * 0.2);
+        self.pitch_envelope.set_decay_time(base_decay);
+        self.pitch_envelope.set_release_time(base_decay * 0.2);
+
+        // Read frequency per-sample so LFO modulation of `frequency` is audible
+        // mid-note. Tuning was already live; frequency now matches.
         let base_frequency =
-            self.triggered_frequency * tuning_to_multiplier(self.params.tuning.get());
+            self.params.frequency_hz() * tuning_to_multiplier(self.params.tuning.get());
 
         // Calculate pitch modulation from envelope using triggered pitch multiplier
         let pitch_envelope_value = self.pitch_envelope.get_amplitude(current_time);
@@ -1342,10 +1366,7 @@ impl crate::engine::Modulatable for KickDrum {
             "sub",
             "click",
             "oscillator_decay",
-            "pitch_envelope_amount",
-            "pitch_envelope_curve",
             "volume",
-            "pitch_start_ratio",
             "phase_mod_amount",
             "noise_amount",
             "noise_cutoff",
@@ -1382,20 +1403,8 @@ impl crate::engine::Modulatable for KickDrum {
                 self.params.oscillator_decay.set_bipolar(value);
                 Ok(())
             }
-            "pitch_envelope_amount" => {
-                self.params.pitch_envelope_amount.set_bipolar(value);
-                Ok(())
-            }
-            "pitch_envelope_curve" => {
-                self.params.pitch_envelope_curve.set_bipolar(value);
-                Ok(())
-            }
             "volume" => {
                 self.params.volume.set_bipolar(value);
-                Ok(())
-            }
-            "pitch_start_ratio" => {
-                self.params.pitch_start_ratio.set_bipolar(value);
                 Ok(())
             }
             "phase_mod_amount" => {
@@ -1450,10 +1459,7 @@ impl crate::engine::Modulatable for KickDrum {
             "sub" => Some(self.params.sub.range()),
             "click" => Some(self.params.click.range()),
             "oscillator_decay" => Some(self.params.oscillator_decay.range()),
-            "pitch_envelope_amount" => Some(self.params.pitch_envelope_amount.range()),
-            "pitch_envelope_curve" => Some(self.params.pitch_envelope_curve.range()),
             "volume" => Some(self.params.volume.range()),
-            "pitch_start_ratio" => Some(self.params.pitch_start_ratio.range()),
             "phase_mod_amount" => Some(self.params.phase_mod_amount.range()),
             "noise_amount" => Some(self.params.noise_amount.range()),
             "noise_cutoff" => Some(self.params.noise_cutoff.range()),

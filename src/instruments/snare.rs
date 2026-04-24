@@ -1057,6 +1057,46 @@ impl SnareDrum {
             self.apply_params();
         }
 
+        // Re-apply decay-driven envelope times each sample so LFO modulation of
+        // `decay`, `tonal_decay`, `noise_decay`, `noise_tail_decay`, and
+        // `amp_decay` is audible mid-note. Mirrors the scaling used in
+        // trigger_with_velocity().
+        let vel_squared = self.current_velocity * self.current_velocity;
+        let decay_scale = 1.0 - (self.velocity_to_decay * vel_squared);
+        let pitch_decay_scale = 1.0 - (self.velocity_to_pitch * vel_squared);
+        let scaled_decay = self.params.decay_secs() * decay_scale;
+        let pitch_decay_time = (scaled_decay * 0.3 * pitch_decay_scale).min(scaled_decay * 0.25);
+        self.pitch_envelope.set_decay_time(pitch_decay_time);
+        self.pitch_envelope.set_release_time(pitch_decay_time * 0.1);
+        self.tonal_oscillator
+            .envelope
+            .set_release_time(scaled_decay * 0.4);
+        self.noise_oscillator
+            .envelope
+            .set_release_time(scaled_decay * 0.3);
+        self.crack_oscillator
+            .envelope
+            .set_decay_time(scaled_decay * 0.2);
+        self.crack_oscillator
+            .envelope
+            .set_release_time(scaled_decay * 0.1);
+        let scaled_tonal_decay = self.params.tonal_decay_secs() * decay_scale;
+        self.tonal_envelope.set_decay_time(scaled_tonal_decay);
+        self.tonal_envelope
+            .set_release_time(scaled_tonal_decay * 0.2);
+        let scaled_noise_decay = self.params.noise_decay_secs() * decay_scale;
+        self.main_noise_envelope.set_decay_time(scaled_noise_decay);
+        self.main_noise_envelope
+            .set_release_time(scaled_noise_decay * 0.2);
+        let scaled_tail_decay = self.params.noise_tail_decay_secs() * decay_scale;
+        self.noise_tail_envelope.set_decay_time(scaled_tail_decay);
+        self.noise_tail_envelope
+            .set_release_time(scaled_tail_decay * 0.3);
+        let scaled_amp_decay = self.params.amp_decay_secs() * decay_scale;
+        self.amplitude_envelope.set_decay_time(scaled_amp_decay);
+        self.amplitude_envelope
+            .set_release_time(scaled_amp_decay * 0.2);
+
         // Use denormalized frequency for pitch calculations, with per-instrument tuning
         let base_frequency =
             self.params.frequency_hz() * tuning_to_multiplier(self.params.tuning.get());

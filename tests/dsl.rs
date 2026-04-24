@@ -49,11 +49,10 @@ fn lfo_hz_rate_and_offset_syntax() {
     let engine = program.build_engine(44100.0).expect("build engine");
 
     assert_eq!(engine.lfo(0).unwrap().target_instrument, "kick");
-    // DSL alias: kick.pitch_drop => kick.pitch_envelope_amount
-    assert_eq!(
-        engine.lfo(0).unwrap().target_parameter,
-        "pitch_envelope_amount"
-    );
+    // DSL alias: kick.pitch_drop => kick.tuning (the historical
+    // pitch_envelope_amount target was removed as an LFO target because it
+    // was frozen at trigger; tuning is live and replaces it).
+    assert_eq!(engine.lfo(0).unwrap().target_parameter, "tuning");
     assert_eq!(engine.lfo(0).unwrap().amount, 0.7);
     assert_eq!(engine.lfo(0).unwrap().offset, 0.1);
 }
