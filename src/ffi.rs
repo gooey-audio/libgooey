@@ -252,7 +252,9 @@ impl ChannelInstrument {
                 KICK_PARAM_SUB => k.params.sub.set_bipolar(value),
                 KICK_PARAM_CLICK => k.params.click.set_bipolar(value),
                 KICK_PARAM_DECAY => k.params.oscillator_decay.set_bipolar(value),
-                KICK_PARAM_PITCH_ENVELOPE => k.params.pitch_envelope_amount.set_bipolar(value),
+                // KICK_PARAM_PITCH_ENVELOPE is no longer modulatable: it was
+                // baked at trigger time and never re-read. Use KICK_PARAM_TUNING
+                // for live pitch modulation instead.
                 KICK_PARAM_VOLUME => k.params.volume.set_bipolar(value),
                 KICK_PARAM_TUNING => k.params.tuning.set_bipolar(value),
                 _ => {}

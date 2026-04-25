@@ -671,9 +671,13 @@ fn resolve_parameter_alias(kind: Option<InstrumentKind>, parameter: &str) -> Str
     match kind {
         Some(InstrumentKind::Kick) => match parameter.as_str() {
             // Historical / example-friendly aliases.
-            "pitch_drop" | "pitch_env_amt" => "pitch_envelope_amount".to_string(),
-            "pitch_env_crv" => "pitch_envelope_curve".to_string(),
-            "pitch_ratio" => "pitch_start_ratio".to_string(),
+            // `pitch_drop`, `pitch_env_amt`, `pitch_env_crv`, and `pitch_ratio`
+            // were aliases for kick pitch parameters that are no longer
+            // exposed as LFO targets (they were baked at trigger time and
+            // never re-read). Migrate them all to `tuning`, which provides
+            // live kick pitch modulation.
+            "pitch_drop" | "pitch_env_amt" | "pitch_env_crv" | "pitch_ratio"
+            | "tuning_offset" => "tuning".to_string(),
             "osc_decay" => "oscillator_decay".to_string(),
             "phase_mod_amt" => "phase_mod_amount".to_string(),
             "noise_res" => "noise_resonance".to_string(),
