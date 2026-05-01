@@ -6,7 +6,7 @@ use gooey::ffi::{
     gooey_engine_drain_midi_events, gooey_engine_free, gooey_engine_new, gooey_engine_render,
     gooey_engine_sequencer_set_beat_position, gooey_engine_sequencer_set_step,
     gooey_engine_sequencer_start, gooey_engine_sequencer_start_at_host_time,
-    gooey_engine_set_render_host_time, GooeyMidiEvent,
+    gooey_engine_set_render_host_time, gooey_engine_trigger_channel, GooeyMidiEvent,
 };
 
 const SAMPLE_RATE: f32 = 48_000.0;
@@ -225,6 +225,48 @@ fn arm_lands_at_specified_beat_position() {
         assert!(
             events.iter().any(|(ch, off)| *ch == 0 && *off == 50),
             "step 4 should fire at sample 50 (kick channel 0); got {:?}",
+            events
+        );
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn manual_triggers_during_silent_armed_buffer_do_not_latch() {
+    // Regression: a silent armed buffer must not leave manual triggers
+    // queued, otherwise they fire late once the arm resolves and produce
+    // mistimed/stale notes.
+    unsafe {
+        let engine = gooey_engine_new(SAMPLE_RATE);
+
+        let host_now: u64 = 1_000_000_000;
+        let host_ticks_per_sample = 1.0_f64;
+        gooey_engine_set_render_host_time(engine, host_now, host_ticks_per_sample);
+        // Arm 10 buffers in the future so the next render is fully silent.
+        let arm_offset = (10 * BUF_FRAMES) as u64;
+        gooey_engine_sequencer_start_at_host_time(engine, host_now + arm_offset, 0.0);
+
+        // Queue a manual trigger while we wait for the arm.
+        gooey_engine_trigger_channel(engine, 0);
+
+        // Render a silent buffer (arm not yet reached).
+        let audio = render_buf(engine);
+        assert!(
+            audio.iter().all(|s| *s == 0.0),
+            "armed-but-not-firing buffer must be silent"
+        );
+
+        // Advance host time to land the arm at sample 0 of the next buffer.
+        gooey_engine_set_render_host_time(engine, host_now + arm_offset, host_ticks_per_sample);
+        let _audio = render_buf(engine);
+        let events = drain_midi(engine);
+        // The arm should fire (no kick steps enabled, so no sequencer event)
+        // and the latched manual trigger must NOT replay — it was consumed
+        // (and discarded) by the silent render.
+        assert!(
+            events.is_empty(),
+            "manual trigger must not latch through a silent armed buffer; got {:?}",
             events
         );
 

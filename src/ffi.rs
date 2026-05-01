@@ -828,6 +828,12 @@ impl GooeyEngine {
             ArmResolution::FiresAt(n) => Some(n),
             ArmResolution::SilentBuffer => {
                 // Whole buffer is silent — pre-fire countdown spans this entire buffer.
+                // Drain any pending manual triggers so they don't latch and fire
+                // late once the arm resolves; the trigger API contract is "fires
+                // on the next render call", and this render produced silence.
+                for ch in 0..NUM_INSTRUMENTS {
+                    self.trigger_pending[ch].store(false, Ordering::Release);
+                }
                 for sample in buffer.iter_mut() {
                     *sample = 0.0;
                 }
