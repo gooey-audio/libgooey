@@ -588,6 +588,49 @@ pub struct GooeyEngine {
     error_message: Option<CString>,
     error_callback: Option<extern "C" fn(*mut c_void, *const c_char)>,
     error_callback_context: *mut c_void,
+
+    // Host-clock state for scheduled (Link-synced) sequencer start.
+    // `host_clock_anchor` is set by `gooey_engine_set_render_host_time` once
+    // per buffer in the audio callback. `pending_arm_host_time` is staged by
+    // `gooey_engine_sequencer_start_at_host_time` and resolved at the top of
+    // each render call against `host_clock_anchor`.
+    host_clock_anchor: Option<HostClockAnchor>,
+    pending_arm_host_time: Option<PendingArm>,
+}
+
+/// Host-clock reference for the next render buffer. The audio callback sets
+/// this just before calling `gooey_engine_render` so the engine can convert
+/// absolute host times into per-buffer sample offsets.
+#[derive(Clone, Copy, Debug)]
+struct HostClockAnchor {
+    /// Host time (e.g. mach_absolute_time) of sample 0 of the buffer.
+    host_time_first_sample: u64,
+    /// Host-clock ticks per audio sample (host_ticks_per_second / sample_rate).
+    host_ticks_per_sample: f64,
+}
+
+/// A pending scheduled start. Resolved at render time using the current
+/// `HostClockAnchor`; if the buffer ends before the start time, the arm
+/// stays staged for the next render.
+#[derive(Clone, Copy, Debug)]
+struct PendingArm {
+    /// Absolute host time at which the sequencer should start.
+    start_host_time: u64,
+    /// Cursor position (in quarter notes) at the moment the arm fires.
+    beat_position: f64,
+}
+
+/// Outcome of resolving `pending_arm_host_time` against `host_clock_anchor`
+/// at the start of a render call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArmResolution {
+    /// No arm pending — render normally.
+    NotPending,
+    /// Arm fires at this sample offset within the buffer (0-based).
+    FiresAt(u32),
+    /// Arm fires later than this buffer — emit silence for the whole buffer
+    /// and leave the arm staged for the next render.
+    SilentBuffer,
 }
 
 impl GooeyEngine {
@@ -712,6 +755,47 @@ impl GooeyEngine {
             error_message: None,
             error_callback: None,
             error_callback_context: std::ptr::null_mut(),
+            // Scheduled-start state (used for Ableton Link Sync Start/Stop)
+            host_clock_anchor: None,
+            pending_arm_host_time: None,
+        }
+    }
+
+    /// Resolve any `pending_arm_host_time` against the current
+    /// `host_clock_anchor` for a buffer of `frames` samples. Called once at
+    /// the top of `render`; the result drives whether (and at which sample
+    /// offset within this buffer) the arm fires.
+    fn resolve_pending_arm(&self, frames: usize) -> ArmResolution {
+        let pending = match self.pending_arm_host_time {
+            Some(p) => p,
+            None => return ArmResolution::NotPending,
+        };
+
+        let anchor = match self.host_clock_anchor {
+            Some(a) if a.host_ticks_per_sample > 0.0 => a,
+            // No host-clock reference — fail-safe to immediate fire so
+            // callers that arm but forget to set the host clock get a
+            // working sequencer rather than silence forever.
+            _ => return ArmResolution::FiresAt(0),
+        };
+
+        // Use i128 to safely express the (signed) delta between two u64
+        // host times when the start time may be earlier than the anchor.
+        let delta_ticks = pending.start_host_time as i128 - anchor.host_time_first_sample as i128;
+        if delta_ticks <= 0 {
+            return ArmResolution::FiresAt(0);
+        }
+
+        let samples_until = (delta_ticks as f64 / anchor.host_ticks_per_sample).ceil();
+        if !samples_until.is_finite() || samples_until <= 0.0 {
+            return ArmResolution::FiresAt(0);
+        }
+
+        let samples_until = samples_until as u64;
+        if (samples_until as usize) < frames {
+            ArmResolution::FiresAt(samples_until as u32)
+        } else {
+            ArmResolution::SilentBuffer
         }
     }
 
@@ -730,6 +814,33 @@ impl GooeyEngine {
     fn render(&mut self, buffer: &mut [f32]) {
         // Clear pending MIDI events from previous render pass
         self.pending_midi_events.clear();
+
+        // Resolve any host-time-armed start against this buffer's host clock.
+        // Possible outcomes:
+        //   `Some(0)`  → arm fires on sample 0 of this buffer.
+        //   `Some(N)`  → samples 0..N produce silence; arm fires on sample N.
+        //   `None`     → no arm pending OR arm fires later than this buffer.
+        // When the arm fires later than this buffer, we zero the whole
+        // buffer below and leave `pending_arm_host_time` staged so the next
+        // render re-evaluates against its own host time.
+        let arm_state = self.resolve_pending_arm(buffer.len());
+        let mut arm_fires_at: Option<u32> = match arm_state {
+            ArmResolution::FiresAt(n) => Some(n),
+            ArmResolution::SilentBuffer => {
+                // Whole buffer is silent — pre-fire countdown spans this entire buffer.
+                // Drain any pending manual triggers so they don't latch and fire
+                // late once the arm resolves; the trigger API contract is "fires
+                // on the next render call", and this render produced silence.
+                for ch in 0..NUM_INSTRUMENTS {
+                    self.trigger_pending[ch].store(false, Ordering::Release);
+                }
+                for sample in buffer.iter_mut() {
+                    *sample = 0.0;
+                }
+                return;
+            }
+            ArmResolution::NotPending => None,
+        };
 
         // Check for pending manual triggers with velocity (all channels)
         // Manual triggers fire at sample_offset 0 (start of buffer)
@@ -759,6 +870,30 @@ impl GooeyEngine {
 
         let mut sample_offset: u32 = 0;
         for sample in buffer.iter_mut() {
+            // Pre-fire portion of an armed start: emit silence and skip all
+            // per-sample work (no sequencer ticks, no instrument ticks, no
+            // LFO ticks, no time advance) so the engine stays exactly where
+            // it was at arm time.
+            if let Some(fire_at) = arm_fires_at {
+                if sample_offset < fire_at {
+                    *sample = 0.0;
+                    sample_offset += 1;
+                    continue;
+                }
+                // sample_offset == fire_at — arm fires this sample. Apply
+                // the staged seek+start to all sequencers so they begin
+                // running at the requested beat position. Clearing
+                // arm_fires_at locally and pending_arm_host_time on the
+                // engine ensures we only fire once per render.
+                if let Some(pending) = self.pending_arm_host_time.take() {
+                    for seq in &mut self.sequencers {
+                        seq.set_beat_position(pending.beat_position);
+                        seq.start();
+                    }
+                }
+                arm_fires_at = None;
+            }
+
             // Tick ALL sequencers first to ensure sample-accurate synchronization
             let mut seq_triggers: [Option<(f32, Option<SequencerBlendSetting>, Option<u8>)>;
                 NUM_INSTRUMENTS] = [None; NUM_INSTRUMENTS];
@@ -2624,7 +2759,9 @@ pub unsafe extern "C" fn gooey_engine_get_swing(engine: *mut GooeyEngine) -> f32
 // Sequencer control (all instruments)
 // =============================================================================
 
-/// Start all sequencers
+/// Start all sequencers.
+///
+/// Cancels any pending `gooey_engine_sequencer_start_at_host_time` arm.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -2635,12 +2772,15 @@ pub unsafe extern "C" fn gooey_engine_sequencer_start(engine: *mut GooeyEngine) 
     }
 
     let engine = &mut *engine;
+    engine.pending_arm_host_time = None;
     for seq in &mut engine.sequencers {
         seq.start();
     }
 }
 
-/// Stop all sequencers
+/// Stop all sequencers.
+///
+/// Cancels any pending `gooey_engine_sequencer_start_at_host_time` arm.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -2651,12 +2791,15 @@ pub unsafe extern "C" fn gooey_engine_sequencer_stop(engine: *mut GooeyEngine) {
     }
 
     let engine = &mut *engine;
+    engine.pending_arm_host_time = None;
     for seq in &mut engine.sequencers {
         seq.stop();
     }
 }
 
-/// Reset all sequencers to step 0
+/// Reset all sequencers to step 0.
+///
+/// Cancels any pending `gooey_engine_sequencer_start_at_host_time` arm.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -2667,6 +2810,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_reset(engine: *mut GooeyEngine) 
     }
 
     let engine = &mut *engine;
+    engine.pending_arm_host_time = None;
     for seq in &mut engine.sequencers {
         seq.reset();
     }
@@ -2674,12 +2818,16 @@ pub unsafe extern "C" fn gooey_engine_sequencer_reset(engine: *mut GooeyEngine) 
 
 /// Set all sequencers to a specific beat position in quarter notes.
 ///
-/// This is used for AUv3 host transport sync. The host provides
-/// `currentBeatPosition` and all sequencers jump to the correct
-/// step and sub-step offset. Call this before `sequencer_start()`
-/// when the host resumes transport.
+/// Silently teleports the cursor — no step is fired by this call, including
+/// the step that the new position lands on. The step at the target position
+/// fires when the cursor next crosses its boundary on the regular tick path.
+/// Suitable for external phase locking (e.g. Ableton Link drift correction)
+/// and for AUv3 host transport sync.
 ///
 /// Each step is a 16th note (4 steps per quarter-note beat).
+///
+/// Cancels any pending `gooey_engine_sequencer_start_at_host_time` arm. Call
+/// this before `sequencer_start()` when the host resumes transport.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -2697,8 +2845,91 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_beat_position(
     }
 
     let engine = &mut *engine;
+    engine.pending_arm_host_time = None;
     for seq in &mut engine.sequencers {
         seq.set_beat_position(beat_position);
+    }
+}
+
+/// Tell the engine the host time corresponding to sample 0 of the next
+/// render call, plus the host-tick-to-sample conversion factor. The engine
+/// uses this to evaluate any pending
+/// `gooey_engine_sequencer_start_at_host_time` arm.
+///
+/// Call this once per buffer from the audio callback, immediately before
+/// `gooey_engine_render`. Only required while a host-time arm is pending;
+/// calling it otherwise is a cheap no-op that simply updates the host-clock
+/// reference.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `host_time_first_sample` - mach_absolute_time of the first sample to be
+///   rendered.
+/// * `host_ticks_per_sample` - Host-clock ticks per audio sample
+///   (e.g. host_ticks_per_second / sample_rate). Must be > 0 to take effect.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_render_host_time(
+    engine: *mut GooeyEngine,
+    host_time_first_sample: u64,
+    host_ticks_per_sample: f64,
+) {
+    if engine.is_null() || !host_ticks_per_sample.is_finite() || host_ticks_per_sample <= 0.0 {
+        return;
+    }
+    let engine = &mut *engine;
+    engine.host_clock_anchor = Some(HostClockAnchor {
+        host_time_first_sample,
+        host_ticks_per_sample,
+    });
+}
+
+/// Arm all sequencers to start playback at `start_host_time` (in
+/// mach_absolute_time units) with the cursor at `beat_position` at that
+/// instant. Until the host clock reaches `start_host_time`, render produces
+/// silence and emits no step events. From `start_host_time` onward the
+/// cursor advances normally starting at `beat_position`.
+///
+/// Requires the audio callback to call `gooey_engine_set_render_host_time`
+/// before each `gooey_engine_render` while armed. Without a host clock
+/// reference the arm fires immediately (fail-safe behaviour).
+///
+/// Safe to call from the main thread; takes effect on the next render call.
+/// If `start_host_time` has already been crossed by the time render reaches
+/// it, behaves like an immediate start at `beat_position`. Subsequent calls
+/// to `sequencer_set_beat_position`, `sequencer_start`, `sequencer_stop`, or
+/// `sequencer_reset` cancel the pending arm.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `start_host_time` - Absolute host time at which the sequencer should
+///   start (mach_absolute_time units).
+/// * `beat_position` - Cursor position in quarter notes at the moment the
+///   arm fires (e.g. 0.0 = bar start).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_start_at_host_time(
+    engine: *mut GooeyEngine,
+    start_host_time: u64,
+    beat_position: f64,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    // Stage the arm; it is resolved against the host clock at render time.
+    // Stop the underlying sequencers so they emit nothing until the arm fires.
+    engine.pending_arm_host_time = Some(PendingArm {
+        start_host_time,
+        beat_position,
+    });
+    for seq in &mut engine.sequencers {
+        seq.cancel_arm();
+        seq.stop();
     }
 }
 

@@ -100,6 +100,17 @@ pub struct SequencerTrigger<'a> {
     pub note: Option<u8>,
 }
 
+/// State for a pending armed start. The sequencer counts down
+/// `samples_until_start` ticks producing no triggers; when it reaches zero
+/// the cursor is teleported to `beat_position` and the sequencer begins
+/// running. Set by `arm_at_samples`, cleared by `cancel_arm` and by any
+/// manual transport call (`start`, `stop`, `reset`, `set_beat_position`).
+#[derive(Clone, Copy, Debug)]
+struct ArmedStart {
+    samples_until_start: u64,
+    beat_position: f64,
+}
+
 /// A sample-accurate step sequencer with per-step velocity and optional blend settings
 pub struct Sequencer {
     bpm: f32,
@@ -130,6 +141,11 @@ pub struct Sequencer {
 
     // Swing timing (0.0-1.0, where 0.5 = neutral/no swing)
     swing: SmoothedParam,
+
+    // When Some, the sequencer is armed to start in `samples_until_start`
+    // ticks at `beat_position`. tick_with_settings counts down and fires
+    // when the countdown reaches zero.
+    armed_start: Option<ArmedStart>,
 }
 
 #[cfg(test)]
@@ -356,6 +372,121 @@ mod tests {
         assert!(trigger.is_some());
         assert_eq!(seq.current_step(), 4); // playhead_step
     }
+
+    #[test]
+    fn test_arm_at_samples_silent_during_countdown() {
+        let mut seq = Sequencer::with_pattern(120.0, 44100.0, vec![true; 16], "kick");
+        seq.arm_at_samples(100, 0.0);
+        assert!(seq.is_armed());
+
+        for _ in 0..100 {
+            assert!(seq.tick().is_none(), "must not trigger during countdown");
+        }
+    }
+
+    #[test]
+    fn test_arm_at_samples_fires_at_zero() {
+        let mut seq = Sequencer::with_pattern(120.0, 44100.0, vec![true; 16], "kick");
+        seq.arm_at_samples(50, 0.0);
+
+        // 50 silent ticks
+        for _ in 0..50 {
+            assert!(seq.tick().is_none());
+        }
+
+        // Tick #51 fires the landing step
+        let trigger = seq.tick();
+        assert!(trigger.is_some(), "arm must fire at countdown==0");
+        assert_eq!(seq.current_step(), 0);
+        assert!(!seq.is_armed(), "arm must be cleared after firing");
+    }
+
+    #[test]
+    fn test_arm_at_samples_zero_fires_immediately() {
+        let mut seq = Sequencer::with_pattern(120.0, 44100.0, vec![true; 16], "kick");
+        seq.arm_at_samples(0, 0.0);
+
+        let trigger = seq.tick();
+        assert!(trigger.is_some(), "arm with countdown=0 fires on next tick");
+        assert!(!seq.is_armed());
+    }
+
+    #[test]
+    fn test_arm_at_samples_lands_at_beat_position() {
+        let mut seq = Sequencer::with_pattern(120.0, 44100.0, vec![true; 16], "kick");
+        // Arm to land at beat 1.0 (step 4) after 10 samples
+        seq.arm_at_samples(10, 1.0);
+
+        for _ in 0..10 {
+            seq.tick();
+        }
+
+        let trigger = seq.tick();
+        assert!(trigger.is_some());
+        assert_eq!(seq.current_step(), 4);
+    }
+
+    #[test]
+    fn test_cancel_arm_clears_pending_arm() {
+        let mut seq = Sequencer::with_pattern(120.0, 44100.0, vec![true; 16], "kick");
+        seq.arm_at_samples(1000, 0.0);
+        assert!(seq.is_armed());
+
+        seq.cancel_arm();
+        assert!(!seq.is_armed());
+
+        // No silent countdown, no spurious trigger — sequencer is stopped
+        for _ in 0..2000 {
+            assert!(seq.tick().is_none());
+        }
+    }
+
+    #[test]
+    fn test_set_beat_position_cancels_arm() {
+        let mut seq = Sequencer::with_pattern(120.0, 44100.0, vec![true; 16], "kick");
+        seq.arm_at_samples(1000, 2.0);
+        seq.set_beat_position(0.5);
+        assert!(!seq.is_armed());
+    }
+
+    #[test]
+    fn test_start_cancels_arm() {
+        let mut seq = Sequencer::with_pattern(120.0, 44100.0, vec![true; 16], "kick");
+        seq.arm_at_samples(1000, 2.0);
+        seq.start();
+        assert!(!seq.is_armed());
+        assert!(seq.tick().is_some(), "start should make the next tick fire");
+    }
+
+    #[test]
+    fn test_stop_cancels_arm() {
+        let mut seq = Sequencer::with_pattern(120.0, 44100.0, vec![true; 16], "kick");
+        seq.arm_at_samples(1000, 2.0);
+        seq.stop();
+        assert!(!seq.is_armed());
+    }
+
+    #[test]
+    fn test_reset_cancels_arm() {
+        let mut seq = Sequencer::with_pattern(120.0, 44100.0, vec![true; 16], "kick");
+        seq.arm_at_samples(1000, 2.0);
+        seq.reset();
+        assert!(!seq.is_armed());
+    }
+
+    #[test]
+    fn test_arm_replaces_previous_arm() {
+        let mut seq = Sequencer::with_pattern(120.0, 44100.0, vec![true; 16], "kick");
+        seq.arm_at_samples(10000, 0.0);
+        seq.arm_at_samples(5, 1.0); // replace with shorter countdown
+
+        for _ in 0..5 {
+            assert!(seq.tick().is_none());
+        }
+        let trigger = seq.tick();
+        assert!(trigger.is_some());
+        assert_eq!(seq.current_step(), 4); // beat 1.0 → step 4
+    }
 }
 
 impl Sequencer {
@@ -388,6 +519,7 @@ impl Sequencer {
             instrument_name: instrument_name.into(),
             is_running: false,
             swing: SmoothedParam::new(0.5, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            armed_start: None,
         }
     }
 
@@ -416,6 +548,7 @@ impl Sequencer {
             instrument_name: instrument_name.into(),
             is_running: false,
             swing: SmoothedParam::new(0.5, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            armed_start: None,
         }
     }
 
@@ -441,6 +574,7 @@ impl Sequencer {
             instrument_name: instrument_name.into(),
             is_running: false,
             swing: SmoothedParam::new(0.5, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            armed_start: None,
         }
     }
 
@@ -453,19 +587,28 @@ impl Sequencer {
         seconds_per_16th * sample_rate
     }
 
-    /// Start the sequencer
+    /// Start the sequencer.
+    ///
+    /// Cancels any pending armed start.
     pub fn start(&mut self) {
+        self.armed_start = None;
         self.is_running = true;
         self.next_trigger_sample = self.sample_count;
     }
 
-    /// Stop the sequencer
+    /// Stop the sequencer.
+    ///
+    /// Cancels any pending armed start.
     pub fn stop(&mut self) {
+        self.armed_start = None;
         self.is_running = false;
     }
 
-    /// Reset the sequencer to step 0
+    /// Reset the sequencer to step 0.
+    ///
+    /// Cancels any pending armed start.
     pub fn reset(&mut self) {
+        self.armed_start = None;
         self.sample_count = 0;
         self.next_trigger_sample = 0;
         self.step_start_sample = 0;
@@ -473,14 +616,48 @@ impl Sequencer {
         self.playhead_step = 0;
     }
 
+    /// Arm the sequencer to start in `samples_until_start` ticks with the
+    /// cursor at `beat_position` at the moment it fires. Until then,
+    /// `tick_with_settings` returns `None` and does not advance internal
+    /// state. When the countdown reaches zero, the cursor teleports to
+    /// `beat_position` and `is_running` is set to true on the same tick;
+    /// from that tick onward the sequencer behaves as if `start()` had been
+    /// called with `set_beat_position(beat_position)` already applied.
+    ///
+    /// Replaces any previous armed start.
+    pub fn arm_at_samples(&mut self, samples_until_start: u64, beat_position: f64) {
+        self.is_running = false;
+        self.armed_start = Some(ArmedStart {
+            samples_until_start,
+            beat_position,
+        });
+    }
+
+    /// Cancel any pending armed start. No-op if no arm is pending.
+    pub fn cancel_arm(&mut self) {
+        self.armed_start = None;
+    }
+
+    /// True if an armed start is pending.
+    pub fn is_armed(&self) -> bool {
+        self.armed_start.is_some()
+    }
+
     /// Set the sequencer to a specific beat position in quarter notes.
     ///
-    /// This is used for AUv3 host transport sync: the host provides
-    /// `currentBeatPosition` and we jump to the correct step/sub-step.
+    /// Silently teleports the cursor — no step is fired by this call,
+    /// including the step that the new position lands on. The step at the
+    /// target position fires when the cursor next crosses its boundary.
+    /// Suitable for external phase locking (e.g. Ableton Link drift
+    /// correction) and for AUv3 host transport sync.
+    ///
     /// Each step is a 16th note (4 steps per quarter-note beat).
     ///
-    /// Call this before `start()` when an AUv3 host resumes transport.
+    /// Cancels any pending armed start. Call this before `start()` when an
+    /// AUv3 host resumes transport.
     pub fn set_beat_position(&mut self, beat_position: f64) {
+        self.armed_start = None;
+
         let step_count = self.pattern.len();
         if step_count == 0 {
             return;
@@ -704,6 +881,25 @@ impl Sequencer {
 
     /// Process one sample and return trigger info if applicable (with settings)
     pub fn tick_with_settings(&mut self) -> Option<SequencerTrigger<'_>> {
+        // Handle a pending armed start: count down silently, then fire.
+        if let Some(arm) = self.armed_start {
+            if arm.samples_until_start > 0 {
+                self.armed_start = Some(ArmedStart {
+                    samples_until_start: arm.samples_until_start - 1,
+                    beat_position: arm.beat_position,
+                });
+                return None;
+            }
+            // Countdown reached zero on this tick — teleport cursor to
+            // beat_position and begin running. set_beat_position clears
+            // armed_start; start() then makes the next tick fire the
+            // landing step, matching the canonical
+            // `set_beat_position(beat); start();` workflow.
+            self.set_beat_position(arm.beat_position);
+            self.start();
+            // Fall through to normal tick logic on this same sample.
+        }
+
         if !self.is_running || self.pattern.is_empty() {
             self.sample_count += 1;
             return None;
