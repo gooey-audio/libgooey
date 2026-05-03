@@ -61,7 +61,12 @@ fn lfo_hz_rate_and_offset_syntax() {
 fn legacy_kick_pitch_aliases_migrate_to_tuning() {
     // Programs written against the old kick pitch LFO targets must keep
     // building. All four historical pitch aliases now resolve to `tuning`.
-    for alias in ["pitch_drop", "pitch_env_amt", "pitch_env_crv", "pitch_ratio"] {
+    for alias in [
+        "pitch_drop",
+        "pitch_env_amt",
+        "pitch_env_crv",
+        "pitch_ratio",
+    ] {
         let src = format!("inst kick kick\nlfo 1bar kick.{} amt=1\n", alias);
         let program = Program::parse(&src).expect("parse");
         let engine = program

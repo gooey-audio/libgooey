@@ -457,6 +457,11 @@ impl HiHat2 {
             return 0.0;
         }
 
+        self.envelope
+            .set_segment_duration_ms(0, self.params.attack_ms());
+        self.envelope
+            .set_segment_duration_ms(1, self.params.decay_ms());
+
         let pitch_hz = self.params.pitch_hz() * tuning_to_multiplier(self.params.tuning.get());
         let mod_freq = pitch_hz * 0.1;
         self.mod_osc.set_frequency(mod_freq);
