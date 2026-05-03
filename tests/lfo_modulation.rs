@@ -289,71 +289,85 @@ fn audio_kick_pitch_targets_no_longer_modulatable() {
 }
 
 // ---------------------------------------------------------------------------
-// Trigger-time pickup tests for envelopes that can't be live-updated.
-//
-// HiHat2 uses MaxCurveEnvelope which has no live-update API, so attack/decay
-// modulation is intentionally trigger-time only. Tom2 stores decay as a plain
-// f32 and rebuilds its MaxCurveEnvelope at each trigger, so the same applies.
-// What we verify here is that the *next* trigger picks up the LFO-modulated
-// value, which is the documented contract for these instruments.
+// HiHat2 attack/decay LFO modulation. Like kick/snare, hihat now re-applies
+// MaxCurveEnvelope segment durations every tick so modulation is audible
+// both at trigger time and mid-note.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn audio_hihat_attack_pickup_at_next_trigger() {
-    // Two identical hihat instances triggered with attack at -1 vs +1 should
-    // differ. The smoother for `attack` is read at trigger time.
-    fn render_hihat(attack_mod: f32) -> Vec<f32> {
-        let mut h = HiHat2::new(SR);
-        h.apply_modulation("attack", attack_mod).unwrap();
-        for _ in 0..2048 {
-            h.tick(0.0);
-        }
-        let mut out = Vec::with_capacity(RENDER_SAMPLES);
-        h.apply_modulation("attack", attack_mod).unwrap();
-        h.trigger_with_velocity(0.0, 1.0);
-        for i in 0..RENDER_SAMPLES {
-            h.apply_modulation("attack", attack_mod).unwrap();
-            let t = i as f64 / SR as f64;
-            out.push(h.tick(t));
-        }
-        out
+fn render_hihat_with_mod(param: &str, mod_value: f32) -> Vec<f32> {
+    let mut h = HiHat2::new(SR);
+    h.apply_modulation(param, mod_value).unwrap();
+    for _ in 0..2048 {
+        h.tick(0.0);
     }
+    h.trigger_with_velocity(0.0, 1.0);
+    let mut out = Vec::with_capacity(RENDER_SAMPLES);
+    for i in 0..RENDER_SAMPLES {
+        h.apply_modulation(param, mod_value).unwrap();
+        let t = i as f64 / SR as f64;
+        out.push(h.tick(t));
+    }
+    out
+}
 
-    let short = render_hihat(-1.0);
-    let long = render_hihat(1.0);
+#[test]
+fn audio_hihat_attack_lfo_changes_output() {
+    let short = render_hihat_with_mod("attack", -1.0);
+    let long = render_hihat_with_mod("attack", 1.0);
     let diff = mean_abs_diff(&short, &long);
     assert!(
         diff > DIFF_THRESHOLD,
-        "hihat attack LFO produced no audible change at next trigger (mean abs diff = {})",
+        "hihat attack LFO produced no audible change (mean abs diff = {})",
         diff
     );
 }
 
 #[test]
-fn audio_hihat_decay_pickup_at_next_trigger() {
-    fn render_hihat(decay_mod: f32) -> Vec<f32> {
+fn audio_hihat_decay_lfo_changes_output() {
+    let short = render_hihat_with_mod("decay", -1.0);
+    let long = render_hihat_with_mod("decay", 1.0);
+    let diff = mean_abs_diff(&short, &long);
+    assert!(
+        diff > DIFF_THRESHOLD,
+        "hihat decay LFO produced no audible change (mean abs diff = {})",
+        diff
+    );
+}
+
+#[test]
+fn audio_hihat_decay_lfo_changes_output_mid_note() {
+    // Specifically verify the fix: trigger first with no modulation, then
+    // start modulating decay only after the note is in flight. Output must
+    // diverge from a baseline that triggers identically with no modulation.
+    fn render(decay_mod_after_trigger: f32) -> Vec<f32> {
         let mut h = HiHat2::new(SR);
-        h.apply_modulation("decay", decay_mod).unwrap();
         for _ in 0..2048 {
             h.tick(0.0);
         }
-        let mut out = Vec::with_capacity(RENDER_SAMPLES);
-        h.apply_modulation("decay", decay_mod).unwrap();
         h.trigger_with_velocity(0.0, 1.0);
-        for i in 0..RENDER_SAMPLES {
-            h.apply_modulation("decay", decay_mod).unwrap();
+        // First few samples with no mod so trigger-time attack/decay match.
+        let mut out = Vec::with_capacity(RENDER_SAMPLES);
+        for i in 0..16 {
+            let t = i as f64 / SR as f64;
+            out.push(h.tick(t));
+        }
+        h.apply_modulation("decay", decay_mod_after_trigger)
+            .unwrap();
+        for i in 16..RENDER_SAMPLES {
+            h.apply_modulation("decay", decay_mod_after_trigger)
+                .unwrap();
             let t = i as f64 / SR as f64;
             out.push(h.tick(t));
         }
         out
     }
 
-    let short = render_hihat(-1.0);
-    let long = render_hihat(1.0);
-    let diff = mean_abs_diff(&short, &long);
+    let baseline = render(0.0);
+    let modulated = render(1.0);
+    let diff = mean_abs_diff(&baseline, &modulated);
     assert!(
         diff > DIFF_THRESHOLD,
-        "hihat decay LFO produced no audible change at next trigger (mean abs diff = {})",
+        "hihat decay LFO had no mid-note effect (mean abs diff = {})",
         diff
     );
 }
