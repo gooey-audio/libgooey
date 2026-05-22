@@ -243,6 +243,75 @@ impl ChannelInstrument {
         }
     }
 
+    /// Read the most-recently-set value of a parameter, in the same normalized 0-1
+    /// range used by `set_param`. Returns `f32::NAN` if `param` is not recognized
+    /// for the current variant.
+    ///
+    /// Uses `SmoothedParam::target()` (not `.get()`) so callers see the value they
+    /// set, independent of any in-flight smoothing — appropriate for state recovery.
+    fn get_param(&self, param: u32) -> f32 {
+        match self {
+            Self::Kick(k) => match param {
+                KICK_PARAM_FREQUENCY => k.params.frequency.target(),
+                KICK_PARAM_PUNCH => k.params.punch.target(),
+                KICK_PARAM_SUB => k.params.sub.target(),
+                KICK_PARAM_CLICK => k.params.click.target(),
+                KICK_PARAM_DECAY => k.params.oscillator_decay.target(),
+                KICK_PARAM_PITCH_ENVELOPE => k.params.pitch_envelope_amount.target(),
+                KICK_PARAM_VOLUME => k.params.volume.target(),
+                KICK_PARAM_TUNING => k.params.tuning.target(),
+                _ => f32::NAN,
+            },
+            Self::Snare(s) => match param {
+                SNARE_PARAM_FREQUENCY => s.params.frequency.target(),
+                SNARE_PARAM_DECAY => s.params.decay.target(),
+                SNARE_PARAM_BRIGHTNESS => s.params.brightness.target(),
+                SNARE_PARAM_VOLUME => s.params.volume.target(),
+                SNARE_PARAM_TONAL => s.params.tonal.target(),
+                SNARE_PARAM_NOISE => s.params.noise.target(),
+                SNARE_PARAM_PITCH_DROP => s.params.pitch_drop.target(),
+                SNARE_PARAM_TONAL_DECAY => s.params.tonal_decay.target(),
+                SNARE_PARAM_NOISE_DECAY => s.params.noise_decay.target(),
+                SNARE_PARAM_NOISE_TAIL_DECAY => s.params.noise_tail_decay.target(),
+                SNARE_PARAM_FILTER_CUTOFF => s.params.filter_cutoff.target(),
+                SNARE_PARAM_FILTER_RESONANCE => s.params.filter_resonance.target(),
+                SNARE_PARAM_FILTER_TYPE => s.params.filter_type as f32,
+                SNARE_PARAM_XFADE => s.params.xfade.target(),
+                SNARE_PARAM_PHASE_MOD_AMOUNT => s.params.phase_mod_amount.target(),
+                SNARE_PARAM_OVERDRIVE => s.params.overdrive.target(),
+                SNARE_PARAM_AMP_DECAY => s.params.amp_decay.target(),
+                SNARE_PARAM_AMP_DECAY_CURVE => s.params.amp_decay_curve.target(),
+                SNARE_PARAM_TONAL_DECAY_CURVE => s.params.tonal_decay_curve.target(),
+                SNARE_PARAM_TUNING => s.params.tuning.target(),
+                _ => f32::NAN,
+            },
+            Self::HiHat(h) => match param {
+                HIHAT_PARAM_PITCH => h.params.pitch.target(),
+                HIHAT_PARAM_DECAY => h.params.decay.target(),
+                HIHAT_PARAM_ATTACK => h.params.attack.target(),
+                HIHAT_PARAM_VOLUME => h.params.volume.target(),
+                HIHAT_PARAM_TONE => h.params.tone.target(),
+                HIHAT_PARAM_TUNING => h.params.tuning.target(),
+                _ => f32::NAN,
+            },
+            Self::Tom(t) => match param {
+                // Tom2 stores 0-100 internally; renormalize to 0-1 for the FFI surface.
+                TOM_PARAM_TUNE => t.tune() / 100.0,
+                TOM_PARAM_BEND => t.bend() / 100.0,
+                TOM_PARAM_TONE => t.tone() / 100.0,
+                TOM_PARAM_COLOR => t.color() / 100.0,
+                TOM_PARAM_DECAY => t.decay() / 100.0,
+                TOM_PARAM_MEMBRANE => t.membrane() / 100.0,
+                TOM_PARAM_MEMBRANE_Q => t.membrane_q() / 100.0,
+                TOM_PARAM_VOLUME => t.volume() / 100.0,
+                // Tuning is stored 0-1 directly, mirroring the setter exception.
+                TOM_PARAM_TUNING => t.tuning(),
+                _ => f32::NAN,
+            },
+            Self::Bass(_) => f32::NAN,
+        }
+    }
+
     /// Apply LFO modulation to a parameter. Uses bipolar modulation for smoothed params.
     fn apply_modulation(&mut self, param: u32, value: f32) {
         match self {
@@ -2118,6 +2187,40 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
     }
 }
 
+/// Read a kick drum parameter in the same normalized form used by
+/// `gooey_engine_set_kick_param`.
+///
+/// Returns the most-recently-set target value (not the in-flight smoothed sample),
+/// so set→get round-trips exactly. Use this to capture mutations applied by
+/// randomize/mutate flows for snapshot/undo.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `param` - Parameter index (see KICK_PARAM_* constants)
+///
+/// # Returns
+/// The current parameter value, or `f32::NAN` if `engine` is null, the kick
+/// channel is missing, or `param` is unrecognized. Note that
+/// `KICK_PARAM_PITCH_ENVELOPE` reports the value set via the setter; it only
+/// takes audible effect at the next trigger.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_kick_param(
+    engine: *const GooeyEngine,
+    param: u32,
+) -> f32 {
+    if engine.is_null() {
+        return f32::NAN;
+    }
+    let engine = &*engine;
+    match engine.find_channel_by_type(INSTRUMENT_KICK) {
+        Some(ch) => engine.channels[ch].get_param(param),
+        None => f32::NAN,
+    }
+}
+
 /// Set a hi-hat parameter
 ///
 /// All parameters are automatically smoothed to prevent clicks/pops.
@@ -2147,6 +2250,37 @@ pub unsafe extern "C" fn gooey_engine_set_hihat_param(
     let engine = &mut *engine;
     if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_HIHAT) {
         engine.channels[ch].set_param(param, value);
+    }
+}
+
+/// Read a hi-hat parameter in the same normalized form used by
+/// `gooey_engine_set_hihat_param`.
+///
+/// Returns the most-recently-set target value (not the in-flight smoothed sample),
+/// so set→get round-trips exactly.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `param` - Parameter index (see HIHAT_PARAM_* constants)
+///
+/// # Returns
+/// The current parameter value, or `f32::NAN` if `engine` is null, the hi-hat
+/// channel is missing, or `param` is unrecognized.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_hihat_param(
+    engine: *const GooeyEngine,
+    param: u32,
+) -> f32 {
+    if engine.is_null() {
+        return f32::NAN;
+    }
+    let engine = &*engine;
+    match engine.find_channel_by_type(INSTRUMENT_HIHAT) {
+        Some(ch) => engine.channels[ch].get_param(param),
+        None => f32::NAN,
     }
 }
 
@@ -2197,6 +2331,38 @@ pub unsafe extern "C" fn gooey_engine_set_snare_param(
     }
 }
 
+/// Read a snare drum parameter in the same normalized form used by
+/// `gooey_engine_set_snare_param`.
+///
+/// Returns the most-recently-set target value (not the in-flight smoothed sample),
+/// so set→get round-trips exactly. `SNARE_PARAM_FILTER_TYPE` is reported as the
+/// raw 0-3 enum value cast to `f32`.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `param` - Parameter index (see SNARE_PARAM_* constants)
+///
+/// # Returns
+/// The current parameter value, or `f32::NAN` if `engine` is null, the snare
+/// channel is missing, or `param` is unrecognized.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_snare_param(
+    engine: *const GooeyEngine,
+    param: u32,
+) -> f32 {
+    if engine.is_null() {
+        return f32::NAN;
+    }
+    let engine = &*engine;
+    match engine.find_channel_by_type(INSTRUMENT_SNARE) {
+        Some(ch) => engine.channels[ch].get_param(param),
+        None => f32::NAN,
+    }
+}
+
 /// Set a tom drum parameter
 ///
 /// All parameters use normalized 0-1 range. Values are internally scaled
@@ -2230,6 +2396,35 @@ pub unsafe extern "C" fn gooey_engine_set_tom_param(
     let engine = &mut *engine;
     if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_TOM) {
         engine.channels[ch].set_param(param, value);
+    }
+}
+
+/// Read a tom drum parameter in the same normalized form used by
+/// `gooey_engine_set_tom_param`.
+///
+/// Tom2 stores parameters 0-7 internally on a 0-100 scale; the getter
+/// renormalizes back to 0-1 to match the setter contract. `TOM_PARAM_TUNING`
+/// (param 8) is the exception: it's already 0-1 in both directions.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `param` - Parameter index (see TOM_PARAM_* constants)
+///
+/// # Returns
+/// The current parameter value, or `f32::NAN` if `engine` is null, the tom
+/// channel is missing, or `param` is unrecognized.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_tom_param(engine: *const GooeyEngine, param: u32) -> f32 {
+    if engine.is_null() {
+        return f32::NAN;
+    }
+    let engine = &*engine;
+    match engine.find_channel_by_type(INSTRUMENT_TOM) {
+        Some(ch) => engine.channels[ch].get_param(param),
+        None => f32::NAN,
     }
 }
 
