@@ -112,6 +112,13 @@ impl MaxCurveEnvelope {
         self.initial_value = value;
     }
 
+    /// Update the duration (in ms) of a specific segment.
+    pub fn set_segment_duration_ms(&mut self, index: usize, duration_ms: f32) {
+        if let Some(seg) = self.segments.get_mut(index) {
+            seg.duration_secs = (duration_ms / 1000.0).max(0.0);
+        }
+    }
+
     /// Trigger the envelope at the given time
     pub fn trigger(&mut self, time: f64) {
         self.is_active = true;
