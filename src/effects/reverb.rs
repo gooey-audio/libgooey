@@ -123,6 +123,18 @@ impl SpringReverbEffect {
     pub fn get_damping(&self) -> f32 {
         f32::from_bits(self.damping_target.load(Ordering::Relaxed))
     }
+
+    /// Reset reverb state (clear allpass buffers and feedback path)
+    pub fn reset(&self) {
+        // SAFETY: Called from main thread when reverb is not processing
+        let state = unsafe { &mut *self.state.get() };
+        for ap in state.allpasses.iter_mut() {
+            ap.buffer.fill(0.0);
+            ap.index = 0;
+        }
+        state.feedback_sample = 0.0;
+        state.damping_filter_state = 0.0;
+    }
 }
 
 impl Effect for SpringReverbEffect {

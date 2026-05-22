@@ -507,7 +507,9 @@ pub struct GooeyEngine {
     // Per-channel sequencers (sample-accurate, synchronized)
     sequencers: [Sequencer; NUM_INSTRUMENTS],
 
-    /// Global effects (applied in order: saturation -> lowpass filter -> tilt filter -> delay -> compressor -> reverb -> limiter)
+    /// Global effects. Applied in the order described by `effect_order`,
+    /// followed by the limiter which is always last.
+    /// Default order: saturation -> lowpass filter -> tilt filter -> delay -> compressor -> reverb -> limiter.
     delay: DelayEffect,
     delay_enabled: bool,
     lowpass_filter: LowpassFilterEffect,
@@ -523,6 +525,10 @@ pub struct GooeyEngine {
     reverb_enabled: bool,
     limiter: SoftLimiter,
     limiter_enabled: bool,
+
+    /// Order in which the reorderable effects are applied. Stores `EFFECT_*`
+    /// IDs (excluding `EFFECT_LIMITER`, which is pinned at the end of the chain).
+    effect_order: [u32; REORDERABLE_EFFECT_COUNT as usize],
 
     // Engine state
     sample_rate: f32,
@@ -660,6 +666,7 @@ impl GooeyEngine {
             reverb_enabled: false,
             limiter: SoftLimiter::new(1.0),
             limiter_enabled: true,
+            effect_order: DEFAULT_EFFECT_ORDER,
             sample_rate,
             bpm,
             swing: 0.5,
@@ -840,37 +847,38 @@ impl GooeyEngine {
             // Mix in poly synth output
             output += self.poly_synth.tick(self.current_time);
 
-            // Apply global effects chain
-            if self.saturation_enabled {
-                output = self.saturation.process(output);
-            }
-            if self.lowpass_filter_enabled {
-                output = self.lowpass_filter.process(output);
-            }
-            if self.tilt_filter_enabled {
-                output = self.tilt_filter.process(output);
-            }
-            if self.delay_enabled {
-                output = self.delay.process(output);
+            // Apply global effects chain (order is user-configurable; limiter is always last)
+            for &effect_id in &self.effect_order {
+                match effect_id {
+                    EFFECT_SATURATION if self.saturation_enabled => {
+                        output = self.saturation.process(output);
+                    }
+                    EFFECT_LOWPASS_FILTER if self.lowpass_filter_enabled => {
+                        output = self.lowpass_filter.process(output);
+                    }
+                    EFFECT_TILT_FILTER if self.tilt_filter_enabled => {
+                        output = self.tilt_filter.process(output);
+                    }
+                    EFFECT_DELAY if self.delay_enabled => {
+                        output = self.delay.process(output);
+                    }
+                    EFFECT_COMPRESSOR if self.compressor_enabled => {
+                        let sc = self.compressor_sidechain as usize;
+                        output = if sc < NUM_INSTRUMENTS {
+                            self.compressor
+                                .process_with_sidechain(output, channel_outs[sc])
+                        } else {
+                            self.compressor.process(output)
+                        };
+                    }
+                    EFFECT_REVERB if self.reverb_enabled => {
+                        output = self.reverb.process(output);
+                    }
+                    _ => {}
+                }
             }
 
-            // Compressor (if enabled), with optional sidechain from individual channel
-            if self.compressor_enabled {
-                let sc = self.compressor_sidechain as usize;
-                output = if sc < NUM_INSTRUMENTS {
-                    self.compressor
-                        .process_with_sidechain(output, channel_outs[sc])
-                } else {
-                    self.compressor.process(output)
-                };
-            }
-
-            // Reverb (if enabled)
-            if self.reverb_enabled {
-                output = self.reverb.process(output);
-            }
-
-            // Limiter (protects output from clipping)
+            // Limiter (always last; protects output from clipping)
             if self.limiter_enabled {
                 *sample = self.limiter.process(output);
             } else {
@@ -905,6 +913,19 @@ impl GooeyEngine {
         if idx < NUM_INSTRUMENTS {
             self.blenders[idx].blend_and_apply(&mut self.channels[idx], x, y);
         }
+    }
+
+    /// Clear internal state of all reorderable effects so a new chain order
+    /// does not inherit stale buffers/envelopes from the previous routing.
+    /// Limiter is intentionally skipped — keeping its gain-reduction state
+    /// stable avoids transients on the protective output stage.
+    fn reset_effect_states(&self) {
+        self.saturation.reset();
+        self.lowpass_filter.reset();
+        self.tilt_filter.reset();
+        self.delay.reset();
+        self.compressor.reset();
+        self.reverb.reset();
     }
 
     /// Apply LFO modulation to a channel's instrument parameter by index
@@ -1044,6 +1065,21 @@ pub const LIMITER_PARAM_THRESHOLD: u32 = 0;
 pub const EFFECT_REVERB: u32 = 6;
 /// Total number of global effects
 pub const EFFECT_COUNT: u32 = 7;
+
+/// Number of reorderable effects in the chain. Excludes the limiter,
+/// which is pinned at the end of the chain (output-protection stage).
+pub const REORDERABLE_EFFECT_COUNT: u32 = 6;
+
+/// Default order for the reorderable effects, matching the historical
+/// hardcoded chain (saturation -> lowpass -> tilt -> delay -> compressor -> reverb).
+const DEFAULT_EFFECT_ORDER: [u32; REORDERABLE_EFFECT_COUNT as usize] = [
+    EFFECT_SATURATION,
+    EFFECT_LOWPASS_FILTER,
+    EFFECT_TILT_FILTER,
+    EFFECT_DELAY,
+    EFFECT_COMPRESSOR,
+    EFFECT_REVERB,
+];
 
 // =============================================================================
 // Lowpass filter parameter indices (must match Swift FilterParam enum)
@@ -3392,6 +3428,166 @@ pub extern "C" fn gooey_engine_instrument_count() -> u32 {
 #[no_mangle]
 pub extern "C" fn gooey_engine_global_effect_count() -> u32 {
     EFFECT_COUNT
+}
+
+// =============================================================================
+// Effect chain reordering
+// =============================================================================
+
+/// Get the number of reorderable effects in the chain.
+///
+/// The limiter is excluded — it is always pinned at the end of the chain
+/// as a protective output stage. Only the other effects can be reordered.
+#[no_mangle]
+pub extern "C" fn gooey_engine_reorderable_effect_count() -> u32 {
+    REORDERABLE_EFFECT_COUNT
+}
+
+/// Returns true iff `id` is a valid reorderable effect ID
+/// (any `EFFECT_*` constant except `EFFECT_LIMITER`).
+fn is_reorderable_effect(id: u32) -> bool {
+    matches!(
+        id,
+        EFFECT_LOWPASS_FILTER
+            | EFFECT_DELAY
+            | EFFECT_SATURATION
+            | EFFECT_COMPRESSOR
+            | EFFECT_TILT_FILTER
+            | EFFECT_REVERB
+    )
+}
+
+/// Set the full effect-chain order in one call.
+///
+/// `ids` must point to exactly `REORDERABLE_EFFECT_COUNT` u32 values, each a
+/// distinct reorderable effect ID (any of `EFFECT_LOWPASS_FILTER`,
+/// `EFFECT_DELAY`, `EFFECT_SATURATION`, `EFFECT_COMPRESSOR`,
+/// `EFFECT_TILT_FILTER`, `EFFECT_REVERB`). `EFFECT_LIMITER` is pinned at the
+/// end of the chain and must not appear in `ids`.
+///
+/// On success, the chain order is replaced and the internal state of every
+/// reorderable effect is reset (delay buffer, reverb tail, compressor envelope,
+/// filter poles) so a stale routing does not bleed into the new one.
+///
+/// Returns `true` on success. Returns `false` (leaving the chain unchanged) if
+/// `len != REORDERABLE_EFFECT_COUNT`, any ID is not reorderable, or any ID
+/// appears more than once.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`. `ids` must
+/// point to at least `len` u32 values. Caller must ensure the engine is not
+/// concurrently mutated from another thread.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_effect_order(
+    engine: *mut GooeyEngine,
+    ids: *const u32,
+    len: u32,
+) -> bool {
+    if engine.is_null() || ids.is_null() {
+        return false;
+    }
+    if len != REORDERABLE_EFFECT_COUNT {
+        return false;
+    }
+
+    let slice = std::slice::from_raw_parts(ids, len as usize);
+    let mut new_order = [0u32; REORDERABLE_EFFECT_COUNT as usize];
+    for (i, &id) in slice.iter().enumerate() {
+        if !is_reorderable_effect(id) {
+            return false;
+        }
+        if slice[..i].contains(&id) {
+            return false;
+        }
+        new_order[i] = id;
+    }
+
+    let engine = &mut *engine;
+    engine.effect_order = new_order;
+    engine.reset_effect_states();
+    true
+}
+
+/// Move a single effect to `new_position` (0-indexed within the reorderable
+/// section of the chain). Other effects shift to fill the gap, preserving
+/// their relative order.
+///
+/// On success, internal state of every reorderable effect is reset (see
+/// `gooey_engine_set_effect_order` for rationale).
+///
+/// Returns `false` (leaving the chain unchanged) if `effect_id` is not
+/// reorderable (e.g. `EFFECT_LIMITER`) or `new_position >=
+/// REORDERABLE_EFFECT_COUNT`.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`. Caller
+/// must ensure the engine is not concurrently mutated from another thread.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_move_effect(
+    engine: *mut GooeyEngine,
+    effect_id: u32,
+    new_position: u32,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    if !is_reorderable_effect(effect_id) {
+        return false;
+    }
+    if new_position >= REORDERABLE_EFFECT_COUNT {
+        return false;
+    }
+
+    let engine = &mut *engine;
+    let Some(current_pos) = engine.effect_order.iter().position(|&id| id == effect_id) else {
+        return false;
+    };
+    let new_pos = new_position as usize;
+    if current_pos == new_pos {
+        return true;
+    }
+
+    if new_pos > current_pos {
+        // Shift left: elements (current_pos+1 ..= new_pos) move down by one.
+        for i in current_pos..new_pos {
+            engine.effect_order[i] = engine.effect_order[i + 1];
+        }
+    } else {
+        // Shift right: elements (new_pos .. current_pos) move up by one.
+        for i in (new_pos..current_pos).rev() {
+            engine.effect_order[i + 1] = engine.effect_order[i];
+        }
+    }
+    engine.effect_order[new_pos] = effect_id;
+    engine.reset_effect_states();
+    true
+}
+
+/// Read the current effect-chain order. Writes up to `max_len` IDs into
+/// `out_ids` in chain order (position 0 first, the limiter — always pinned
+/// last — is not written).
+///
+/// Returns the number of IDs written, which equals `REORDERABLE_EFFECT_COUNT`
+/// when `max_len` is large enough, or `max_len` otherwise. Returns `0` if
+/// `engine` or `out_ids` is null.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`. `out_ids`
+/// must point to a buffer of at least `max_len` u32 values.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_effect_order(
+    engine: *const GooeyEngine,
+    out_ids: *mut u32,
+    max_len: u32,
+) -> u32 {
+    if engine.is_null() || out_ids.is_null() || max_len == 0 {
+        return 0;
+    }
+    let engine = &*engine;
+    let n = (max_len as usize).min(engine.effect_order.len());
+    let dst = std::slice::from_raw_parts_mut(out_ids, n);
+    dst.copy_from_slice(&engine.effect_order[..n]);
+    n as u32
 }
 
 // =============================================================================
