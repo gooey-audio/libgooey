@@ -10,8 +10,8 @@ use crate::effects::{
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
 use crate::instruments::{
-    BassConfig, BassSynth, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth, PolySynthConfig,
-    SnareConfig, SnareDrum, Tom2, Tom2Config,
+    BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth,
+    PolySynthConfig, SampleBuffer, SnareConfig, SnareDrum, Tom2, Tom2Config,
 };
 use crate::music::{apply_voicing, available_voicings, Key, NoteName, ScaleType, VoicingType};
 use crate::utils::{PresetBlender, SmoothedParam};
@@ -653,6 +653,9 @@ pub struct GooeyEngine {
     // Polyphonic synthesizer for chord playback
     poly_synth: PolySynth,
 
+    // Mono granular instrument (sample buffer loaded by the host)
+    granulator: Granulator,
+
     // When true, an external source (e.g. Ableton Link) owns the tempo.
     // The host should check this flag to decide whether local BPM changes
     // should be applied directly or routed through the external sync source.
@@ -824,6 +827,12 @@ impl GooeyEngine {
             sequencer_triggers_enabled: true,
             // Polyphonic synthesizer for chord playback
             poly_synth: PolySynth::new(sample_rate),
+            // Granulator with a silent placeholder buffer until the host loads samples
+            granulator: Granulator::new(
+                sample_rate,
+                SampleBuffer::from_mono(vec![0.0_f32], sample_rate)
+                    .expect("placeholder sample buffer"),
+            ),
             // External sync (e.g. Ableton Link)
             link_enabled: AtomicBool::new(false),
             // Error state
@@ -1052,6 +1061,9 @@ impl GooeyEngine {
 
             // Mix in poly synth output
             output += self.poly_synth.tick(self.current_time);
+
+            // Mix in granulator output
+            output += self.granulator.tick(self.current_time);
 
             // Apply global effects chain (order is user-configurable; limiter is always last)
             for &effect_id in &self.effect_order {
@@ -1564,6 +1576,34 @@ pub const BASS_PARAM_OVERDRIVE: u32 = 13;
 pub const BASS_PARAM_VOLUME: u32 = 14;
 /// Bass parameter: tuning offset (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
 pub const BASS_PARAM_TUNING: u32 = 15;
+
+// =============================================================================
+// Granulator parameter constants
+// =============================================================================
+//
+// All values are normalized 0.0-1.0. Mapping to internal units (ms, Hz, ratio)
+// happens inside `Granulator`; see `src/instruments/granulator.rs`.
+
+/// Granulator parameter: scan position into the loaded buffer (0=start, 1=end)
+pub const GRANULATOR_PARAM_SCAN_POSITION: u32 = 0;
+/// Granulator parameter: grain length (0-1 -> 5-3000 ms, quadratic curve)
+pub const GRANULATOR_PARAM_GRAIN_LENGTH: u32 = 1;
+/// Granulator parameter: spray / randomization of grain start (0-1 -> 0-10 s, cubic)
+pub const GRANULATOR_PARAM_SPRAY: u32 = 2;
+/// Granulator parameter: playback pitch (0-1 -> 0.25x-4x, exponential)
+pub const GRANULATOR_PARAM_PITCH: u32 = 3;
+/// Granulator parameter: density of grains per second (0-1 -> 0-80 g/s)
+pub const GRANULATOR_PARAM_DENSITY: u32 = 4;
+/// Granulator parameter: window shape / texture (0=soft, 1=hard)
+pub const GRANULATOR_PARAM_TEXTURE: u32 = 5;
+/// Granulator parameter: probability a grain plays in reverse (0=forward only, 1=reverse only)
+pub const GRANULATOR_PARAM_DIRECTION: u32 = 6;
+/// Granulator parameter: cloud duration after a trigger (0-1 -> 50-8000 ms, quadratic)
+pub const GRANULATOR_PARAM_CLOUD_DURATION: u32 = 7;
+/// Granulator parameter: output volume (0-1)
+pub const GRANULATOR_PARAM_VOLUME: u32 = 8;
+/// Total number of granulator parameters
+pub const GRANULATOR_PARAM_COUNT: u32 = 9;
 
 /// Bass preset: Acid - TB-303-style, high resonance, short filter sweep
 pub const BASS_PRESET_ACID: u32 = 0;
@@ -5097,6 +5137,214 @@ pub unsafe extern "C" fn gooey_engine_poly_available_voicing_count(
     let chords = key.diatonic_sevenths();
     let degree = degree as usize % chords.len();
     available_voicings(&chords[degree].quality).len() as u32
+}
+
+// ---------------------------------------------------------------------------
+// Granulator
+// ---------------------------------------------------------------------------
+
+/// Load a mono sample buffer into the granulator.
+///
+/// Copies `len` samples from `samples` into the engine. Replaces any
+/// previously loaded buffer and kills all currently active grains.
+///
+/// The granulator is mono only. Stereo or multichannel hosts should downmix
+/// before calling this function.
+///
+/// Returns `true` on success, `false` if any argument is invalid (null engine,
+/// null `samples`, `len == 0`, non-finite or non-positive `sample_rate`, or
+/// any non-finite value in the sample slice).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`. `samples`
+/// must point to at least `len` valid `f32` values when `len > 0`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_set_buffer(
+    engine: *mut GooeyEngine,
+    samples: *const f32,
+    len: u32,
+    sample_rate: f32,
+) -> bool {
+    if engine.is_null() || samples.is_null() || len == 0 {
+        return false;
+    }
+    let engine = &mut *engine;
+    let slice = slice::from_raw_parts(samples, len as usize);
+    let owned = slice.to_vec();
+    match SampleBuffer::from_mono(owned, sample_rate) {
+        Ok(buffer) => {
+            engine.granulator.set_buffer(buffer);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Return the length, in samples, of the granulator's currently loaded buffer.
+///
+/// Returns 0 if `engine` is null. Immediately after `gooey_engine_new`, the
+/// granulator holds a 1-sample silent placeholder, so a return value of 1
+/// (with no `set_buffer` call) indicates "no host buffer loaded yet".
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_buffer_len(engine: *const GooeyEngine) -> u32 {
+    if engine.is_null() {
+        return 0;
+    }
+    let engine = &*engine;
+    engine.granulator.buffer_len() as u32
+}
+
+/// Return the sample rate of the granulator's currently loaded buffer.
+///
+/// Returns 0.0 if `engine` is null.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_buffer_sample_rate(
+    engine: *const GooeyEngine,
+) -> f32 {
+    if engine.is_null() {
+        return 0.0;
+    }
+    let engine = &*engine;
+    engine.granulator.buffer_sample_rate()
+}
+
+/// Trigger the granulator with a velocity, starting a cloud of grains.
+///
+/// Unlike drum-channel triggers, granulator triggers are applied immediately
+/// against the engine's current time and are not deferred through an atomic
+/// pending flag. The caller is expected to invoke this from the host thread
+/// (e.g. UI / MIDI input handler), not from inside the audio render callback.
+///
+/// `velocity` is clamped to 0.0-1.0.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_trigger(engine: *mut GooeyEngine, velocity: f32) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let velocity = velocity.clamp(0.0, 1.0);
+    engine
+        .granulator
+        .trigger_with_velocity(engine.current_time, velocity);
+}
+
+/// Set a granulator parameter by index. All values are normalized 0.0-1.0.
+///
+/// Parameter indices: see the `GRANULATOR_PARAM_*` constants. Unknown indices
+/// are silently ignored, matching the pattern used by other instrument
+/// setters in this file.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_set_param(
+    engine: *mut GooeyEngine,
+    param: u32,
+    value: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let value = value.clamp(0.0, 1.0);
+    match param {
+        GRANULATOR_PARAM_SCAN_POSITION => engine.granulator.set_scan_position(value),
+        GRANULATOR_PARAM_GRAIN_LENGTH => engine.granulator.set_grain_length(value),
+        GRANULATOR_PARAM_SPRAY => engine.granulator.set_spray(value),
+        GRANULATOR_PARAM_PITCH => engine.granulator.set_pitch(value),
+        GRANULATOR_PARAM_DENSITY => engine.granulator.set_density(value),
+        GRANULATOR_PARAM_TEXTURE => engine.granulator.set_texture(value),
+        GRANULATOR_PARAM_DIRECTION => engine.granulator.set_direction(value),
+        GRANULATOR_PARAM_CLOUD_DURATION => engine.granulator.set_cloud_duration(value),
+        GRANULATOR_PARAM_VOLUME => engine.granulator.set_volume(value),
+        _ => {}
+    }
+}
+
+/// Read the most-recently-set value of a granulator parameter, in the same
+/// normalized 0.0-1.0 range used by `gooey_engine_granulator_set_param`.
+///
+/// Returns `f32::NAN` if `engine` is null or `param` is unrecognized.
+/// Reads the `SmoothedParam::target()` so callers see the value they last
+/// wrote even before the audio thread has finished smoothing into it.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_get_param(
+    engine: *const GooeyEngine,
+    param: u32,
+) -> f32 {
+    if engine.is_null() {
+        return f32::NAN;
+    }
+    let engine = &*engine;
+    match param {
+        GRANULATOR_PARAM_SCAN_POSITION => engine.granulator.scan_position(),
+        GRANULATOR_PARAM_GRAIN_LENGTH => engine.granulator.grain_length(),
+        GRANULATOR_PARAM_SPRAY => engine.granulator.spray(),
+        GRANULATOR_PARAM_PITCH => engine.granulator.pitch(),
+        GRANULATOR_PARAM_DENSITY => engine.granulator.density(),
+        GRANULATOR_PARAM_TEXTURE => engine.granulator.texture(),
+        GRANULATOR_PARAM_DIRECTION => engine.granulator.direction(),
+        GRANULATOR_PARAM_CLOUD_DURATION => engine.granulator.cloud_duration(),
+        GRANULATOR_PARAM_VOLUME => engine.granulator.volume(),
+        _ => f32::NAN,
+    }
+}
+
+/// Seed the granulator's grain-spray PRNG. Used for reproducible output in
+/// tests; callers that don't need determinism can ignore this.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_set_seed(engine: *mut GooeyEngine, seed: u32) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    engine.granulator.set_seed(seed);
+}
+
+/// Return the number of grains currently sounding inside the granulator.
+/// Returns 0 if `engine` is null. Useful for UI metering.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_active_grain_count(
+    engine: *const GooeyEngine,
+) -> u32 {
+    if engine.is_null() {
+        return 0;
+    }
+    let engine = &*engine;
+    engine.granulator.active_grain_count() as u32
+}
+
+/// Snap all granulator smoothed parameters to their target values, bypassing
+/// the usual ~15 ms exponential smoothing. Useful when loading a preset or
+/// resetting state between songs without introducing audible glides.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_snap_params(engine: *mut GooeyEngine) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    engine.granulator.snap_params();
 }
 
 // ---------------------------------------------------------------------------
