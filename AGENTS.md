@@ -75,6 +75,12 @@ Sequencer ──trigger──▶ Instruments ──tick──▶ Sum ──▶ M
 - **Thread safety**: `Engine` wrapped in `Arc<Mutex<>>` for audio thread. Trigger queue decouples main/audio threads.
 - **Click prevention**: `SmoothedParam` (~15ms smoothing) used on all real-time parameter changes.
 
+## Planning Conventions
+
+- Store execution plans in `.context/plans/`.
+- Use dash-separated lowercase filenames for plans, for example `granulator-original-design-gap-plan.md`.
+- When writing an ExecPlan, follow `.agent/PLANS.md` and keep the plan self-contained.
+
 ## Feature Flags
 
 | Feature | Description |
