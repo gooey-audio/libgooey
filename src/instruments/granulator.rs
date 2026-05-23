@@ -302,6 +302,14 @@ impl Granulator {
         self.rng = XorShift32::new(seed);
     }
 
+    pub fn buffer_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn buffer_sample_rate(&self) -> f32 {
+        self.buffer.sample_rate()
+    }
+
     pub fn snap_params(&mut self) {
         self.params.snap_all();
         self.gain_compensation.snap();
