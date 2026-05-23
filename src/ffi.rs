@@ -827,11 +827,14 @@ impl GooeyEngine {
             sequencer_triggers_enabled: true,
             // Polyphonic synthesizer for chord playback
             poly_synth: PolySynth::new(sample_rate),
-            // Granulator with a silent placeholder buffer until the host loads samples
+            // Granulator with a silent placeholder buffer until the host loads samples.
+            // The placeholder uses a hardcoded sample rate so this constructor cannot
+            // fail on a non-finite or non-positive `sample_rate` argument — `gooey_engine_new`
+            // is an `extern "C"` entry point and must never panic on user input.
             granulator: Granulator::new(
                 sample_rate,
-                SampleBuffer::from_mono(vec![0.0_f32], sample_rate)
-                    .expect("placeholder sample buffer"),
+                SampleBuffer::from_mono(vec![0.0_f32], 44_100.0)
+                    .unwrap_or_else(|_| unreachable!("constant placeholder buffer is valid")),
             ),
             // External sync (e.g. Ableton Link)
             link_enabled: AtomicBool::new(false),

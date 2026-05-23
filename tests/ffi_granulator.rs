@@ -26,11 +26,12 @@ fn sine_samples(seconds: f32, hz: f32) -> Vec<f32> {
 fn placeholder_buffer_present_until_set_buffer() {
     unsafe {
         let engine = gooey_engine_new(SAMPLE_RATE);
+        // Length is the contract: 1 means "no host buffer loaded yet".
+        // The placeholder's internal sample rate is an implementation
+        // detail (intentionally hardcoded to avoid panicking on a bad
+        // engine `sample_rate`) and is not asserted here.
         assert_eq!(gooey_engine_granulator_buffer_len(engine), 1);
-        approx_eq(
-            gooey_engine_granulator_buffer_sample_rate(engine),
-            SAMPLE_RATE,
-        );
+        assert!(gooey_engine_granulator_buffer_sample_rate(engine) > 0.0);
         gooey_engine_free(engine);
     }
 }
