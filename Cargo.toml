@@ -97,3 +97,7 @@ required-features = ["native", "crossterm"]
 [[example]]
 name = "bounce"
 required-features = ["bounce"]
+
+[[example]]
+name = "granulator"
+required-features = ["native", "crossterm", "bounce"]

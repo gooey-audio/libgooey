@@ -1,5 +1,6 @@
 pub mod bass;
 pub mod fm_snap;
+pub mod granulator;
 pub mod hihat2;
 pub mod kick;
 pub mod poly_synth;
@@ -9,6 +10,7 @@ pub mod tom2;
 
 pub use self::bass::*;
 pub use self::fm_snap::*;
+pub use self::granulator::*;
 pub use self::hihat2::*;
 pub use self::kick::*;
 pub use self::poly_synth::*;
