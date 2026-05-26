@@ -51,6 +51,9 @@ fn granulator_parameters_are_modulatable() {
         "density",
         "texture",
         "direction",
+        "random_timing",
+        "random_amp",
+        "drive",
         "volume",
     ];
 
