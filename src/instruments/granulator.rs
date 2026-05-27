@@ -5,6 +5,7 @@
 //! position, with random spray, pitch/speed, direction probability, and a
 //! shaped window envelope.
 
+use crate::effects::Waveshaper;
 use crate::engine::{Instrument, Modulatable};
 use crate::utils::SmoothedParam;
 use std::sync::Arc;
@@ -14,6 +15,13 @@ const MAX_GRAINS: usize = 64;
 // one. ~4 ms is short enough to be inaudible as a duck but long enough to
 // avoid a click from terminating mid-envelope.
 const STEAL_RELEASE_MS: f32 = 4.0;
+// Fixed internal drive for the shared Waveshaper effect. The user-facing
+// `drive` parameter controls the Waveshaper's mix rather than its drive
+// gain, so going from 0 to 1 fades the saturated path in against the dry
+// path instead of pushing more level into the saturator. The Waveshaper's
+// own compensation (`tanh(0.5) / tanh(0.5 * drive)`) keeps the wet path
+// unity at ±0.5 amplitude, so peaks soften and quiet signal is preserved.
+const DRIVE_INTERNAL_AMOUNT: f32 = 4.0;
 const MIN_GRAIN_MS: f32 = 5.0;
 const MAX_GRAIN_MS: f32 = 3000.0;
 const MAX_SPRAY_SECS: f32 = 10.0;
@@ -300,6 +308,7 @@ pub struct Granulator {
     next_grain_time: f64,
     current_velocity: f32,
     rng: XorShift32,
+    drive_shaper: Waveshaper,
 }
 
 impl Granulator {
@@ -308,6 +317,11 @@ impl Granulator {
     }
 
     pub fn with_config(sample_rate: f32, buffer: SampleBuffer, config: GranulatorConfig) -> Self {
+        // Initialize Waveshaper with mix = configured drive so the wet path
+        // matches the requested drive level on construction; internal drive
+        // is fixed so the user-facing param is gain-neutral (see
+        // DRIVE_INTERNAL_AMOUNT comment).
+        let drive_shaper = Waveshaper::new(DRIVE_INTERNAL_AMOUNT, config.drive.clamp(0.0, 1.0));
         Self {
             sample_rate,
             buffer,
@@ -319,6 +333,7 @@ impl Granulator {
             next_grain_time: 0.0,
             current_velocity: 1.0,
             rng: XorShift32::new(0x1234_abcd),
+            drive_shaper,
         }
     }
 
@@ -669,7 +684,13 @@ impl Instrument for Granulator {
         self.params.tick();
         self.spawn_due_grains(current_time);
         let raw = self.tick_grains();
-        let driven = soft_saturate(raw, self.params.drive.get());
+        // Push the latest smoothed drive target into the Waveshaper's mix.
+        // Drive=0 → mix=0 → exact dry passthrough; drive=1 → fully wet at
+        // the fixed internal drive. Internal drive is held constant so this
+        // user-facing knob fades saturation in/out rather than boosting
+        // level into the saturator.
+        self.drive_shaper.set_mix(self.params.drive.get());
+        let driven = self.drive_shaper.process(raw);
         driven * self.params.volume.get()
     }
 
@@ -766,19 +787,6 @@ fn raised_sine_window(phase: f32, shape: f32) -> f32 {
         .sin()
         .max(0.0)
         .powf(shape)
-}
-
-#[inline]
-fn soft_saturate(x: f32, drive: f32) -> f32 {
-    let drive = drive.clamp(0.0, 1.0);
-    if drive <= 0.0 {
-        return x;
-    }
-    // Map drive 0..1 to gain 1..5, then normalize by tanh(gain) so that a
-    // unity-input maps to a unity-output (avoids the loudness boost a raw
-    // tanh would add and keeps quiet signal recognizable).
-    let gain = 1.0 + drive * 4.0;
-    (x * gain).tanh() / gain.tanh()
 }
 
 #[inline]
@@ -984,18 +992,40 @@ mod tests {
     }
 
     #[test]
-    fn drive_increases_peak_for_quiet_signal_and_is_bounded() {
-        // Saturation should raise small-signal output (the tanh derivative at
-        // 0 is `gain / tanh(gain) > 1`) and keep large-signal output bounded
-        // near unity. The exact ceiling is `1 / tanh(1 + 4*drive)`, which at
-        // drive=1.0 is ~1.0001 — so we use a small slack rather than 1.0.
-        let dry = soft_saturate(0.1, 0.0);
-        let wet = soft_saturate(0.1, 1.0);
-        assert!(wet > dry);
-        assert!(soft_saturate(10.0, 1.0).abs() <= 1.01);
-        assert!(soft_saturate(-10.0, 1.0).abs() <= 1.01);
-        // drive = 0 is identity.
-        assert_eq!(soft_saturate(0.42, 0.0), 0.42);
+    fn drive_is_roughly_gain_neutral() {
+        // The drive parameter is wired into the Waveshaper's mix while the
+        // internal drive is fixed. With Waveshaper's reference-level
+        // compensation centered at ±0.5, full drive (mix=1) must not boost
+        // the cloud's peak level substantially over a clean (drive=0) cloud.
+        // Same seed and inputs → directly comparable peak levels.
+        fn peak_with_drive(drive: f32) -> f32 {
+            let mut g = Granulator::new(44100.0, test_buffer());
+            g.set_seed(17);
+            g.set_density(0.4);
+            g.set_cloud_duration(0.6);
+            g.set_volume(1.0);
+            g.set_drive(drive);
+            g.snap_params();
+            g.trigger_with_velocity(0.0, 1.0);
+            let mut peak = 0.0_f32;
+            for i in 0..44_100 {
+                let s = g.tick(i as f64 / 44100.0);
+                assert!(s.is_finite());
+                peak = peak.max(s.abs());
+            }
+            peak
+        }
+        let dry_peak = peak_with_drive(0.0);
+        let wet_peak = peak_with_drive(1.0);
+        // Wet path must not exceed the dry peak by more than ~25%. This is
+        // the user-visible contract: turning drive up should saturate, not
+        // boost loudness.
+        assert!(
+            wet_peak <= dry_peak * 1.25,
+            "drive boosted peak too much: dry={dry_peak}, wet={wet_peak}"
+        );
+        // And the peak should still be bounded (no runaway).
+        assert!(wet_peak.is_finite() && wet_peak < 4.0);
     }
 
     #[cfg(feature = "bounce")]
