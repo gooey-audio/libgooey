@@ -1605,8 +1605,14 @@ pub const GRANULATOR_PARAM_DIRECTION: u32 = 6;
 pub const GRANULATOR_PARAM_CLOUD_DURATION: u32 = 7;
 /// Granulator parameter: output volume (0-1)
 pub const GRANULATOR_PARAM_VOLUME: u32 = 8;
+/// Granulator parameter: per-grain spawn-time jitter (0=periodic, 1=±100% of interval)
+pub const GRANULATOR_PARAM_RANDOM_TIMING: u32 = 9;
+/// Granulator parameter: per-grain random amplitude (0=uniform, 1=full random duck to 0)
+pub const GRANULATOR_PARAM_RANDOM_AMP: u32 = 10;
+/// Granulator parameter: output soft-saturation drive (0=clean, 1=heavy tanh)
+pub const GRANULATOR_PARAM_DRIVE: u32 = 11;
 /// Total number of granulator parameters
-pub const GRANULATOR_PARAM_COUNT: u32 = 9;
+pub const GRANULATOR_PARAM_COUNT: u32 = 12;
 
 /// Bass preset: Acid - TB-303-style, high resonance, short filter sweep
 pub const BASS_PRESET_ACID: u32 = 0;
@@ -5269,6 +5275,9 @@ pub unsafe extern "C" fn gooey_engine_granulator_set_param(
         GRANULATOR_PARAM_DIRECTION => engine.granulator.set_direction(value),
         GRANULATOR_PARAM_CLOUD_DURATION => engine.granulator.set_cloud_duration(value),
         GRANULATOR_PARAM_VOLUME => engine.granulator.set_volume(value),
+        GRANULATOR_PARAM_RANDOM_TIMING => engine.granulator.set_random_timing(value),
+        GRANULATOR_PARAM_RANDOM_AMP => engine.granulator.set_random_amp(value),
+        GRANULATOR_PARAM_DRIVE => engine.granulator.set_drive(value),
         _ => {}
     }
 }
@@ -5301,6 +5310,9 @@ pub unsafe extern "C" fn gooey_engine_granulator_get_param(
         GRANULATOR_PARAM_DIRECTION => engine.granulator.direction(),
         GRANULATOR_PARAM_CLOUD_DURATION => engine.granulator.cloud_duration(),
         GRANULATOR_PARAM_VOLUME => engine.granulator.volume(),
+        GRANULATOR_PARAM_RANDOM_TIMING => engine.granulator.random_timing(),
+        GRANULATOR_PARAM_RANDOM_AMP => engine.granulator.random_amp(),
+        GRANULATOR_PARAM_DRIVE => engine.granulator.drive(),
         _ => f32::NAN,
     }
 }

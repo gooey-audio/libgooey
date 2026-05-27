@@ -23,7 +23,7 @@ struct ParamInfo {
     fine_step: f32,
 }
 
-const PARAM_INFO: [ParamInfo; 9] = [
+const PARAM_INFO: [ParamInfo; 12] = [
     ParamInfo {
         name: "scan_position",
         coarse_step: 0.05,
@@ -69,6 +69,21 @@ const PARAM_INFO: [ParamInfo; 9] = [
         coarse_step: 0.05,
         fine_step: 0.01,
     },
+    ParamInfo {
+        name: "random_timing",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+    },
+    ParamInfo {
+        name: "random_amp",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+    },
+    ParamInfo {
+        name: "drive",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+    },
 ];
 
 struct SharedGranulator(Arc<Mutex<Granulator>>);
@@ -102,6 +117,9 @@ fn get_param_value(granulator: &Granulator, index: usize) -> f32 {
         6 => granulator.direction(),
         7 => granulator.cloud_duration(),
         8 => granulator.volume(),
+        9 => granulator.random_timing(),
+        10 => granulator.random_amp(),
+        11 => granulator.drive(),
         _ => 0.0,
     }
 }
@@ -117,6 +135,9 @@ fn set_param_value(granulator: &mut Granulator, index: usize, value: f32) {
         6 => granulator.set_direction(value),
         7 => granulator.set_cloud_duration(value),
         8 => granulator.set_volume(value),
+        9 => granulator.set_random_timing(value),
+        10 => granulator.set_random_amp(value),
+        11 => granulator.set_drive(value),
         _ => {}
     }
 }

@@ -101,6 +101,9 @@ fn param_round_trip() {
         gooey_engine_granulator_set_param(engine, GRANULATOR_PARAM_DIRECTION, 0.0);
         gooey_engine_granulator_set_param(engine, GRANULATOR_PARAM_CLOUD_DURATION, 0.5);
         gooey_engine_granulator_set_param(engine, GRANULATOR_PARAM_VOLUME, 0.9);
+        gooey_engine_granulator_set_param(engine, GRANULATOR_PARAM_RANDOM_TIMING, 0.45);
+        gooey_engine_granulator_set_param(engine, GRANULATOR_PARAM_RANDOM_AMP, 0.65);
+        gooey_engine_granulator_set_param(engine, GRANULATOR_PARAM_DRIVE, 0.8);
 
         approx_eq(
             gooey_engine_granulator_get_param(engine, GRANULATOR_PARAM_SCAN_POSITION),
@@ -137,6 +140,18 @@ fn param_round_trip() {
         approx_eq(
             gooey_engine_granulator_get_param(engine, GRANULATOR_PARAM_VOLUME),
             0.9,
+        );
+        approx_eq(
+            gooey_engine_granulator_get_param(engine, GRANULATOR_PARAM_RANDOM_TIMING),
+            0.45,
+        );
+        approx_eq(
+            gooey_engine_granulator_get_param(engine, GRANULATOR_PARAM_RANDOM_AMP),
+            0.65,
+        );
+        approx_eq(
+            gooey_engine_granulator_get_param(engine, GRANULATOR_PARAM_DRIVE),
+            0.8,
         );
 
         assert!(gooey_engine_granulator_get_param(engine, 999).is_nan());

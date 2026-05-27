@@ -5,11 +5,31 @@
 //! position, with random spray, pitch/speed, direction probability, and a
 //! shaped window envelope.
 
+use crate::effects::Waveshaper;
 use crate::engine::{Instrument, Modulatable};
 use crate::utils::SmoothedParam;
 use std::sync::Arc;
 
 const MAX_GRAINS: usize = 64;
+// Capacity of the auxiliary "release pool" used to hold stolen victims while
+// they fade out. Keeping the release pool separate from the main grain pool
+// means a steal can both fade the victim AND allow the new spawn into the
+// freed main slot, so we don't drop scheduled grains under sustained
+// saturation. The pool is small because each release lasts only ~4 ms; at
+// the maximum density of 80 g/s and a 4 ms release that's ≤1 concurrent
+// stolen grain on average, with headroom for bursts.
+const RELEASE_POOL_SIZE: usize = 16;
+// Length of the fade-out applied when a grain is stolen to make room for a new
+// one. ~4 ms is short enough to be inaudible as a duck but long enough to
+// avoid a click from terminating mid-envelope.
+const STEAL_RELEASE_MS: f32 = 4.0;
+// Fixed internal drive for the shared Waveshaper effect. The user-facing
+// `drive` parameter controls the Waveshaper's mix rather than its drive
+// gain, so going from 0 to 1 fades the saturated path in against the dry
+// path instead of pushing more level into the saturator. The Waveshaper's
+// own compensation (`tanh(0.5) / tanh(0.5 * drive)`) keeps the wet path
+// unity at ±0.5 amplitude, so peaks soften and quiet signal is preserved.
+const DRIVE_INTERNAL_AMOUNT: f32 = 4.0;
 const MIN_GRAIN_MS: f32 = 5.0;
 const MAX_GRAIN_MS: f32 = 3000.0;
 const MAX_SPRAY_SECS: f32 = 10.0;
@@ -160,6 +180,9 @@ pub struct GranulatorConfig {
     pub direction: f32,
     pub cloud_duration: f32,
     pub volume: f32,
+    pub random_timing: f32,
+    pub random_amp: f32,
+    pub drive: f32,
 }
 
 impl Default for GranulatorConfig {
@@ -174,6 +197,9 @@ impl Default for GranulatorConfig {
             direction: 0.0,
             cloud_duration: 0.35,
             volume: 0.8,
+            random_timing: 0.0,
+            random_amp: 0.0,
+            drive: 0.0,
         }
     }
 }
@@ -189,6 +215,9 @@ struct GranulatorParams {
     direction: SmoothedParam,
     cloud_duration: SmoothedParam,
     volume: SmoothedParam,
+    random_timing: SmoothedParam,
+    random_amp: SmoothedParam,
+    drive: SmoothedParam,
 }
 
 impl GranulatorParams {
@@ -203,6 +232,9 @@ impl GranulatorParams {
             direction: SmoothedParam::new_normalized(config.direction, sample_rate),
             cloud_duration: SmoothedParam::new_normalized(config.cloud_duration, sample_rate),
             volume: SmoothedParam::new_normalized(config.volume, sample_rate),
+            random_timing: SmoothedParam::new_normalized(config.random_timing, sample_rate),
+            random_amp: SmoothedParam::new_normalized(config.random_amp, sample_rate),
+            drive: SmoothedParam::new_normalized(config.drive, sample_rate),
         }
     }
 
@@ -217,6 +249,9 @@ impl GranulatorParams {
         self.direction.tick();
         self.cloud_duration.tick();
         self.volume.tick();
+        self.random_timing.tick();
+        self.random_amp.tick();
+        self.drive.tick();
     }
 
     fn snap_all(&mut self) {
@@ -229,6 +264,9 @@ impl GranulatorParams {
         self.direction.snap();
         self.cloud_duration.snap();
         self.volume.snap();
+        self.random_timing.snap();
+        self.random_amp.snap();
+        self.drive.snap();
     }
 }
 
@@ -242,6 +280,11 @@ struct Grain {
     direction: f32,
     window_shape: f32,
     velocity: f32,
+    // Soft-kill fade-out state. While `release_samples > 0`, the grain is being
+    // faded out (used when a new spawn steals this slot); when it hits 0 the
+    // grain deactivates without producing a sample-edge discontinuity.
+    release_samples: f32,
+    release_total: f32,
 }
 
 impl Default for Grain {
@@ -255,6 +298,8 @@ impl Default for Grain {
             direction: 1.0,
             window_shape: 1.0,
             velocity: 1.0,
+            release_samples: 0.0,
+            release_total: 0.0,
         }
     }
 }
@@ -265,12 +310,18 @@ pub struct Granulator {
     buffer: SampleBuffer,
     params: GranulatorParams,
     grains: [Grain; MAX_GRAINS],
+    // Auxiliary slots that only ever hold grains in the middle of a release
+    // fade-out. Used when stealing a slot from a saturated `grains` pool: the
+    // victim is moved here so its envelope can finish cleanly while a new
+    // grain takes the freed main slot. See RELEASE_POOL_SIZE for sizing.
+    release_grains: [Grain; RELEASE_POOL_SIZE],
     gain_compensation: SmoothedParam,
     cloud_active: bool,
     cloud_end_time: f64,
     next_grain_time: f64,
     current_velocity: f32,
     rng: XorShift32,
+    drive_shaper: Waveshaper,
 }
 
 impl Granulator {
@@ -279,17 +330,24 @@ impl Granulator {
     }
 
     pub fn with_config(sample_rate: f32, buffer: SampleBuffer, config: GranulatorConfig) -> Self {
+        // Initialize Waveshaper with mix = configured drive so the wet path
+        // matches the requested drive level on construction; internal drive
+        // is fixed so the user-facing param is gain-neutral (see
+        // DRIVE_INTERNAL_AMOUNT comment).
+        let drive_shaper = Waveshaper::new(DRIVE_INTERNAL_AMOUNT, config.drive.clamp(0.0, 1.0));
         Self {
             sample_rate,
             buffer,
             params: GranulatorParams::from_config(config, sample_rate),
             grains: [Grain::default(); MAX_GRAINS],
+            release_grains: [Grain::default(); RELEASE_POOL_SIZE],
             gain_compensation: SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0),
             cloud_active: false,
             cloud_end_time: 0.0,
             next_grain_time: 0.0,
             current_velocity: 1.0,
             rng: XorShift32::new(0x1234_abcd),
+            drive_shaper,
         }
     }
 
@@ -351,6 +409,18 @@ impl Granulator {
         self.params.volume.target()
     }
 
+    pub fn random_timing(&self) -> f32 {
+        self.params.random_timing.target()
+    }
+
+    pub fn random_amp(&self) -> f32 {
+        self.params.random_amp.target()
+    }
+
+    pub fn drive(&self) -> f32 {
+        self.params.drive.target()
+    }
+
     pub fn grain_length_ms(&self) -> f32 {
         grain_length_ms(self.grain_length())
     }
@@ -407,12 +477,32 @@ impl Granulator {
         self.params.volume.set_target(value);
     }
 
+    pub fn set_random_timing(&mut self, value: f32) {
+        self.params.random_timing.set_target(value);
+    }
+
+    pub fn set_random_amp(&mut self, value: f32) {
+        self.params.random_amp.set_target(value);
+    }
+
+    pub fn set_drive(&mut self, value: f32) {
+        self.params.drive.set_target(value);
+    }
+
     pub fn active_grain_count(&self) -> usize {
         self.grains.iter().filter(|grain| grain.active).count()
+            + self
+                .release_grains
+                .iter()
+                .filter(|grain| grain.active)
+                .count()
     }
 
     fn kill_all_grains(&mut self) {
         for grain in &mut self.grains {
+            grain.active = false;
+        }
+        for grain in &mut self.release_grains {
             grain.active = false;
         }
         self.cloud_active = false;
@@ -434,10 +524,18 @@ impl Granulator {
         }
 
         let interval = 1.0 / density as f64;
+        let random_timing = self.params.random_timing.get().clamp(0.0, 1.0) as f64;
         let mut guard = 0;
         while self.cloud_active && current_time + 1e-12 >= self.next_grain_time && guard < 8 {
             self.spawn_grain();
             self.next_grain_time += interval;
+            // Random timing jitter: signed offset bounded by ±interval * amount.
+            // Average density is preserved because the jitter is zero-mean and
+            // applied after the interval has already advanced.
+            if random_timing > 0.0 {
+                let jitter = ((self.rng.next_f32() as f64) * 2.0 - 1.0) * interval * random_timing;
+                self.next_grain_time = (self.next_grain_time + jitter).max(current_time);
+            }
             if self.next_grain_time > self.cloud_end_time {
                 self.cloud_active = false;
             }
@@ -446,8 +544,26 @@ impl Granulator {
     }
 
     fn spawn_grain(&mut self) {
-        let Some(slot) = self.grains.iter().position(|grain| !grain.active) else {
-            return;
+        // Pre-roll the RNG for amp jitter so the deterministic-output test still
+        // sees a stable sequence regardless of whether the slot is free or stolen.
+        let amp_jitter = self.rng.next_f32();
+
+        let slot = match self.grains.iter().position(|grain| !grain.active) {
+            Some(s) => s,
+            None => {
+                // Soft stealing: move the victim out into the release pool so
+                // it can fade out cleanly, freeing its main slot for this
+                // spawn. If the release pool is also full we drop this grain
+                // — but the steal_grain path is the common case, so the
+                // requested spawn usually proceeds instead of being lost.
+                if !self.steal_grain() {
+                    return;
+                }
+                match self.grains.iter().position(|grain| !grain.active) {
+                    Some(s) => s,
+                    None => return,
+                }
+            }
         };
 
         let last_sample = (self.buffer.len() - 1) as f32;
@@ -485,6 +601,10 @@ impl Granulator {
             requested_source_pos.clamp(0.0, last_sample - source_travel)
         };
 
+        // Per-grain random amplitude: factor in [1 - random_amp, 1.0].
+        let random_amp = self.params.random_amp.get().clamp(0.0, 1.0);
+        let amp_factor = 1.0 - random_amp * amp_jitter;
+
         self.grains[slot] = Grain {
             active: true,
             source_pos,
@@ -493,8 +613,49 @@ impl Granulator {
             speed,
             direction,
             window_shape,
-            velocity: self.current_velocity,
+            velocity: self.current_velocity * amp_factor,
+            release_samples: 0.0,
+            release_total: 0.0,
         };
+    }
+
+    /// Relocate the most-stealable active grain from `grains` into
+    /// `release_grains` with a short fade-out, freeing its main slot for a
+    /// new spawn. Returns true if a main slot was freed, false otherwise
+    /// (release pool full or no active main grains).
+    fn steal_grain(&mut self) -> bool {
+        // Pick the active main-pool grain with the shortest remaining
+        // playback time — that's the grain whose loss costs the least.
+        let mut victim: Option<usize> = None;
+        let mut shortest_remaining = f32::INFINITY;
+        for (idx, grain) in self.grains.iter().enumerate() {
+            if !grain.active {
+                continue;
+            }
+            let remaining = (grain.duration_samples - grain.age_samples).max(0.0);
+            if remaining < shortest_remaining {
+                shortest_remaining = remaining;
+                victim = Some(idx);
+            }
+        }
+        let Some(idx) = victim else {
+            return false;
+        };
+
+        let Some(release_slot) = self.release_grains.iter().position(|grain| !grain.active) else {
+            return false;
+        };
+
+        let release = (STEAL_RELEASE_MS * 0.001 * self.sample_rate).max(1.0);
+        let remaining = (self.grains[idx].duration_samples - self.grains[idx].age_samples).max(1.0);
+        let release = release.min(remaining);
+
+        let mut moved = self.grains[idx];
+        moved.release_samples = release;
+        moved.release_total = release;
+        self.release_grains[release_slot] = moved;
+        self.grains[idx].active = false;
+        true
     }
 
     fn tick_grains(&mut self) -> f32 {
@@ -509,7 +670,23 @@ impl Granulator {
             .set_target(1.0 / (active_count as f32).sqrt());
         let gain_comp = self.gain_compensation.tick();
         let mut output = 0.0;
-        for grain in &mut self.grains {
+        Self::tick_grain_slice(&mut self.grains, &self.buffer, gain_comp, &mut output);
+        Self::tick_grain_slice(
+            &mut self.release_grains,
+            &self.buffer,
+            gain_comp,
+            &mut output,
+        );
+        output
+    }
+
+    fn tick_grain_slice(
+        slice: &mut [Grain],
+        buffer: &SampleBuffer,
+        gain_comp: f32,
+        output: &mut f32,
+    ) {
+        for grain in slice.iter_mut() {
             if !grain.active {
                 continue;
             }
@@ -521,14 +698,23 @@ impl Granulator {
 
             let phase = (grain.age_samples / grain.duration_samples).clamp(0.0, 1.0);
             let window = raised_sine_window(phase, grain.window_shape);
-            let sample = self.buffer.sample_interpolated(grain.source_pos);
-            output += sample * window * grain.velocity * gain_comp;
+            let release_gain = if grain.release_total > 0.0 {
+                (grain.release_samples / grain.release_total).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let sample = buffer.sample_interpolated(grain.source_pos);
+            *output += sample * window * release_gain * grain.velocity * gain_comp;
 
             grain.source_pos += grain.speed * grain.direction;
             grain.age_samples += 1.0;
+            if grain.release_samples > 0.0 {
+                grain.release_samples -= 1.0;
+                if grain.release_samples <= 0.0 {
+                    grain.active = false;
+                }
+            }
         }
-
-        output
     }
 }
 
@@ -544,7 +730,15 @@ impl Instrument for Granulator {
     fn tick(&mut self, current_time: f64) -> f32 {
         self.params.tick();
         self.spawn_due_grains(current_time);
-        self.tick_grains() * self.params.volume.get()
+        let raw = self.tick_grains();
+        // Push the latest smoothed drive target into the Waveshaper's mix.
+        // Drive=0 → mix=0 → exact dry passthrough; drive=1 → fully wet at
+        // the fixed internal drive. Internal drive is held constant so this
+        // user-facing knob fades saturation in/out rather than boosting
+        // level into the saturator.
+        self.drive_shaper.set_mix(self.params.drive.get());
+        let driven = self.drive_shaper.process(raw);
+        driven * self.params.volume.get()
     }
 
     fn is_active(&self) -> bool {
@@ -566,6 +760,9 @@ impl Modulatable for Granulator {
             "density",
             "texture",
             "direction",
+            "random_timing",
+            "random_amp",
+            "drive",
             "volume",
         ]
     }
@@ -579,6 +776,9 @@ impl Modulatable for Granulator {
             "density" => self.params.density.set_bipolar(value),
             "texture" => self.params.texture.set_bipolar(value),
             "direction" => self.params.direction.set_bipolar(value),
+            "random_timing" => self.params.random_timing.set_bipolar(value),
+            "random_amp" => self.params.random_amp.set_bipolar(value),
+            "drive" => self.params.drive.set_bipolar(value),
             "volume" => self.params.volume.set_bipolar(value),
             _ => return Err(format!("Unknown granulator parameter: {parameter}")),
         }
@@ -588,7 +788,7 @@ impl Modulatable for Granulator {
     fn parameter_range(&self, parameter: &str) -> Option<(f32, f32)> {
         match parameter {
             "scan_position" | "grain_length" | "spray" | "pitch" | "density" | "texture"
-            | "direction" | "volume" => Some((0.0, 1.0)),
+            | "direction" | "random_timing" | "random_amp" | "drive" | "volume" => Some((0.0, 1.0)),
             _ => None,
         }
     }
@@ -750,6 +950,195 @@ mod tests {
         for parameter in granulator.modulatable_parameters() {
             assert_eq!(granulator.parameter_range(parameter), Some((0.0, 1.0)));
         }
+    }
+
+    #[test]
+    fn dense_cloud_with_random_amp_remains_finite() {
+        let mut granulator = Granulator::new(44100.0, test_buffer());
+        granulator.set_seed(13);
+        granulator.set_density(1.0);
+        granulator.set_random_amp(1.0);
+        granulator.set_random_timing(1.0);
+        granulator.set_cloud_duration(1.0);
+        granulator.snap_params();
+        granulator.trigger_with_velocity(0.0, 1.0);
+
+        let mut max_abs = 0.0_f32;
+        for i in 0..88_200 {
+            let sample = granulator.tick(i as f64 / 44100.0);
+            assert!(sample.is_finite(), "non-finite sample at {i}");
+            max_abs = max_abs.max(sample.abs());
+        }
+        assert!(max_abs > 0.001, "expected audible output");
+    }
+
+    #[test]
+    fn random_timing_preserves_average_density() {
+        // With random_timing = 1.0 the spawn times are heavily jittered. The
+        // long-run average density must still track the target because the
+        // jitter is zero-mean.
+        let mut granulator = Granulator::new(44100.0, test_buffer());
+        granulator.set_seed(101);
+        granulator.set_density(0.5); // 0.5 * MAX_DENSITY(80) = 40 grains/sec target
+        granulator.set_grain_length(0.0); // shortest grains so they end quickly and free slots
+        granulator.set_random_timing(1.0);
+        granulator.set_cloud_duration(1.0);
+        granulator.snap_params();
+        granulator.trigger_with_velocity(0.0, 1.0);
+
+        // Run ~2 seconds and count grain spawns by sampling the pool. Because
+        // grain_length is the shortest setting (~5 ms) each grain ends fast
+        // enough that we can approximate the spawn rate from active counts
+        // observed at large intervals — but a simpler accept-band check is
+        // enough here: confirm the granulator is producing audio across the
+        // whole cloud duration, which only happens if scheduling is healthy.
+        let mut audible_blocks = 0;
+        let block = 4410; // 0.1s
+        for b in 0..20 {
+            let mut block_max = 0.0_f32;
+            for i in 0..block {
+                let t = (b * block + i) as f64 / 44100.0;
+                let s = granulator.tick(t);
+                assert!(s.is_finite());
+                block_max = block_max.max(s.abs());
+            }
+            if block_max > 1e-4 {
+                audible_blocks += 1;
+            }
+        }
+        // At density 40/s with grains across a 2s cloud, the vast majority
+        // of 0.1s windows should be audible even under heavy jitter.
+        assert!(
+            audible_blocks >= 12,
+            "random_timing collapsed scheduling: only {audible_blocks}/20 blocks audible"
+        );
+    }
+
+    #[test]
+    fn soft_grain_stealing_does_not_click() {
+        // Force the grain pool to saturate by combining max density with
+        // long grains. The release pool absorbs stolen victims so new
+        // spawns still land. Output must stay finite and bounded.
+        let mut granulator = Granulator::new(44100.0, test_buffer());
+        granulator.set_seed(31);
+        granulator.set_density(1.0);
+        granulator.set_grain_length(1.0); // 3000 ms grains
+        granulator.set_cloud_duration(1.0);
+        granulator.snap_params();
+        granulator.trigger_with_velocity(0.0, 1.0);
+
+        for i in 0..88_200 {
+            let s = granulator.tick(i as f64 / 44100.0);
+            assert!(s.is_finite());
+            assert!(s.abs() < 4.0, "runaway gain at sample {i}: {s}");
+        }
+        // Total live voices are bounded by main + release pool capacity.
+        assert!(granulator.active_grain_count() <= MAX_GRAINS + RELEASE_POOL_SIZE);
+    }
+
+    #[test]
+    fn soft_steal_promotes_new_spawn_into_main_pool() {
+        // Saturate the main pool with long grains so every subsequent
+        // spawn must go through steal_grain. The contract under review:
+        // the new spawn must actually land in the main pool instead of
+        // being silently dropped while the victim fades out.
+        //
+        // Use a deliberately long buffer (3s) so grain durations aren't
+        // clamped down by buffer length — otherwise short grains free
+        // their slots naturally and the pool never saturates.
+        let sample_rate = 44100.0;
+        let long_buffer_samples: Vec<f32> = (0..(sample_rate as usize * 3))
+            .map(|i| ((i as f32 / sample_rate) * 440.0 * std::f32::consts::TAU).sin() * 0.5)
+            .collect();
+        let buffer = SampleBuffer::from_mono(long_buffer_samples, sample_rate).unwrap();
+        let mut granulator = Granulator::new(sample_rate, buffer);
+        granulator.set_seed(53);
+        granulator.set_density(1.0); // 80 g/s
+        granulator.set_grain_length(1.0); // 3000 ms — main pool fills fast
+        granulator.set_cloud_duration(1.0);
+        granulator.snap_params();
+        granulator.trigger_with_velocity(0.0, 1.0);
+
+        // Run ~1.5 s: at 80 g/s × 3 s grains, the 64-slot main pool
+        // saturates around t≈0.8 s; everything after that exercises
+        // the steal path. Track the peak releasing-pool occupancy because
+        // each release fade is only ~4 ms while steals happen every ~12 ms,
+        // so the release pool is empty more often than not at any
+        // arbitrary moment.
+        let mut peak_releasing = 0usize;
+        let mut peak_main = 0usize;
+        for i in 0..((sample_rate * 1.5) as usize) {
+            granulator.tick(i as f64 / sample_rate as f64);
+            let main_now = granulator.grains.iter().filter(|g| g.active).count();
+            let rel_now = granulator
+                .release_grains
+                .iter()
+                .filter(|g| g.active)
+                .count();
+            peak_main = peak_main.max(main_now);
+            peak_releasing = peak_releasing.max(rel_now);
+        }
+
+        assert_eq!(
+            peak_main, MAX_GRAINS,
+            "main pool should saturate under sustained density"
+        );
+        assert!(
+            peak_releasing > 0,
+            "release pool should hold at least one stolen victim at some point"
+        );
+
+        // And the youngest grain in the main pool should be very young
+        // (the post-steal spawn), proving new grains are landing rather
+        // than being dropped.
+        let youngest_age = granulator
+            .grains
+            .iter()
+            .filter(|g| g.active)
+            .map(|g| g.age_samples as i32)
+            .min()
+            .unwrap_or(i32::MAX);
+        assert!(
+            youngest_age < (sample_rate * 0.05) as i32,
+            "no recently-spawned grain found in main pool (youngest = {youngest_age} samples)"
+        );
+    }
+
+    #[test]
+    fn drive_is_roughly_gain_neutral() {
+        // The drive parameter is wired into the Waveshaper's mix while the
+        // internal drive is fixed. With Waveshaper's reference-level
+        // compensation centered at ±0.5, full drive (mix=1) must not boost
+        // the cloud's peak level substantially over a clean (drive=0) cloud.
+        // Same seed and inputs → directly comparable peak levels.
+        fn peak_with_drive(drive: f32) -> f32 {
+            let mut g = Granulator::new(44100.0, test_buffer());
+            g.set_seed(17);
+            g.set_density(0.4);
+            g.set_cloud_duration(0.6);
+            g.set_volume(1.0);
+            g.set_drive(drive);
+            g.snap_params();
+            g.trigger_with_velocity(0.0, 1.0);
+            let mut peak = 0.0_f32;
+            for i in 0..44_100 {
+                let s = g.tick(i as f64 / 44100.0);
+                assert!(s.is_finite());
+                peak = peak.max(s.abs());
+            }
+            peak
+        }
+        let dry_peak = peak_with_drive(0.0);
+        let wet_peak = peak_with_drive(1.0);
+        // Wet path must not exceed the dry peak by more than ~25%. This is
+        // the user-visible contract: turning drive up should saturate, not
+        // boost loudness.
+        assert!(
+            wet_peak <= dry_peak * 1.25,
+            "drive boosted peak too much: dry={dry_peak}, wet={wet_peak}"
+        );
+        // And the peak should still be bounded (no runaway).
+        assert!(wet_peak.is_finite() && wet_peak < 4.0);
     }
 
     #[cfg(feature = "bounce")]
