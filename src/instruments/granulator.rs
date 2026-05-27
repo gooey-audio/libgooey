@@ -11,6 +11,14 @@ use crate::utils::SmoothedParam;
 use std::sync::Arc;
 
 const MAX_GRAINS: usize = 64;
+// Capacity of the auxiliary "release pool" used to hold stolen victims while
+// they fade out. Keeping the release pool separate from the main grain pool
+// means a steal can both fade the victim AND allow the new spawn into the
+// freed main slot, so we don't drop scheduled grains under sustained
+// saturation. The pool is small because each release lasts only ~4 ms; at
+// the maximum density of 80 g/s and a 4 ms release that's ≤1 concurrent
+// stolen grain on average, with headroom for bursts.
+const RELEASE_POOL_SIZE: usize = 16;
 // Length of the fade-out applied when a grain is stolen to make room for a new
 // one. ~4 ms is short enough to be inaudible as a duck but long enough to
 // avoid a click from terminating mid-envelope.
@@ -302,6 +310,11 @@ pub struct Granulator {
     buffer: SampleBuffer,
     params: GranulatorParams,
     grains: [Grain; MAX_GRAINS],
+    // Auxiliary slots that only ever hold grains in the middle of a release
+    // fade-out. Used when stealing a slot from a saturated `grains` pool: the
+    // victim is moved here so its envelope can finish cleanly while a new
+    // grain takes the freed main slot. See RELEASE_POOL_SIZE for sizing.
+    release_grains: [Grain; RELEASE_POOL_SIZE],
     gain_compensation: SmoothedParam,
     cloud_active: bool,
     cloud_end_time: f64,
@@ -327,6 +340,7 @@ impl Granulator {
             buffer,
             params: GranulatorParams::from_config(config, sample_rate),
             grains: [Grain::default(); MAX_GRAINS],
+            release_grains: [Grain::default(); RELEASE_POOL_SIZE],
             gain_compensation: SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0),
             cloud_active: false,
             cloud_end_time: 0.0,
@@ -477,10 +491,18 @@ impl Granulator {
 
     pub fn active_grain_count(&self) -> usize {
         self.grains.iter().filter(|grain| grain.active).count()
+            + self
+                .release_grains
+                .iter()
+                .filter(|grain| grain.active)
+                .count()
     }
 
     fn kill_all_grains(&mut self) {
         for grain in &mut self.grains {
+            grain.active = false;
+        }
+        for grain in &mut self.release_grains {
             grain.active = false;
         }
         self.cloud_active = false;
@@ -529,12 +551,18 @@ impl Granulator {
         let slot = match self.grains.iter().position(|grain| !grain.active) {
             Some(s) => s,
             None => {
-                // Soft stealing: mark a victim for fade-out, then drop this
-                // spawn. The next scheduled spawn will pick up the freed slot
-                // once the victim's release completes. This avoids zeroing a
-                // grain mid-window and keeps the cap at MAX_GRAINS.
-                self.steal_grain();
-                return;
+                // Soft stealing: move the victim out into the release pool so
+                // it can fade out cleanly, freeing its main slot for this
+                // spawn. If the release pool is also full we drop this grain
+                // — but the steal_grain path is the common case, so the
+                // requested spawn usually proceeds instead of being lost.
+                if !self.steal_grain() {
+                    return;
+                }
+                match self.grains.iter().position(|grain| !grain.active) {
+                    Some(s) => s,
+                    None => return,
+                }
             }
         };
 
@@ -591,38 +619,43 @@ impl Granulator {
         };
     }
 
-    fn steal_grain(&mut self) {
-        // Pick the active grain with the shortest remaining playback time.
-        // Already-releasing grains will naturally have small remaining time
-        // because their release window dominates, so they are preferred.
+    /// Relocate the most-stealable active grain from `grains` into
+    /// `release_grains` with a short fade-out, freeing its main slot for a
+    /// new spawn. Returns true if a main slot was freed, false otherwise
+    /// (release pool full or no active main grains).
+    fn steal_grain(&mut self) -> bool {
+        // Pick the active main-pool grain with the shortest remaining
+        // playback time — that's the grain whose loss costs the least.
         let mut victim: Option<usize> = None;
         let mut shortest_remaining = f32::INFINITY;
         for (idx, grain) in self.grains.iter().enumerate() {
             if !grain.active {
                 continue;
             }
-            let remaining = if grain.release_samples > 0.0 {
-                grain.release_samples
-            } else {
-                (grain.duration_samples - grain.age_samples).max(0.0)
-            };
+            let remaining = (grain.duration_samples - grain.age_samples).max(0.0);
             if remaining < shortest_remaining {
                 shortest_remaining = remaining;
                 victim = Some(idx);
             }
         }
+        let Some(idx) = victim else {
+            return false;
+        };
 
-        if let Some(idx) = victim {
-            let grain = &mut self.grains[idx];
-            if grain.release_samples > 0.0 {
-                return;
-            }
-            let release = (STEAL_RELEASE_MS * 0.001 * self.sample_rate).max(1.0);
-            let remaining = (grain.duration_samples - grain.age_samples).max(1.0);
-            let release = release.min(remaining);
-            grain.release_samples = release;
-            grain.release_total = release;
-        }
+        let Some(release_slot) = self.release_grains.iter().position(|grain| !grain.active) else {
+            return false;
+        };
+
+        let release = (STEAL_RELEASE_MS * 0.001 * self.sample_rate).max(1.0);
+        let remaining = (self.grains[idx].duration_samples - self.grains[idx].age_samples).max(1.0);
+        let release = release.min(remaining);
+
+        let mut moved = self.grains[idx];
+        moved.release_samples = release;
+        moved.release_total = release;
+        self.release_grains[release_slot] = moved;
+        self.grains[idx].active = false;
+        true
     }
 
     fn tick_grains(&mut self) -> f32 {
@@ -637,7 +670,23 @@ impl Granulator {
             .set_target(1.0 / (active_count as f32).sqrt());
         let gain_comp = self.gain_compensation.tick();
         let mut output = 0.0;
-        for grain in &mut self.grains {
+        Self::tick_grain_slice(&mut self.grains, &self.buffer, gain_comp, &mut output);
+        Self::tick_grain_slice(
+            &mut self.release_grains,
+            &self.buffer,
+            gain_comp,
+            &mut output,
+        );
+        output
+    }
+
+    fn tick_grain_slice(
+        slice: &mut [Grain],
+        buffer: &SampleBuffer,
+        gain_comp: f32,
+        output: &mut f32,
+    ) {
+        for grain in slice.iter_mut() {
             if !grain.active {
                 continue;
             }
@@ -654,8 +703,8 @@ impl Granulator {
             } else {
                 1.0
             };
-            let sample = self.buffer.sample_interpolated(grain.source_pos);
-            output += sample * window * release_gain * grain.velocity * gain_comp;
+            let sample = buffer.sample_interpolated(grain.source_pos);
+            *output += sample * window * release_gain * grain.velocity * gain_comp;
 
             grain.source_pos += grain.speed * grain.direction;
             grain.age_samples += 1.0;
@@ -666,8 +715,6 @@ impl Granulator {
                 }
             }
         }
-
-        output
     }
 }
 
@@ -970,10 +1017,8 @@ mod tests {
     #[test]
     fn soft_grain_stealing_does_not_click() {
         // Force the grain pool to saturate by combining max density with
-        // long grains. Without soft stealing the older implementation would
-        // simply drop the new grain; the new implementation fades an
-        // existing grain out instead. Either way the output must stay
-        // finite and bounded.
+        // long grains. The release pool absorbs stolen victims so new
+        // spawns still land. Output must stay finite and bounded.
         let mut granulator = Granulator::new(44100.0, test_buffer());
         granulator.set_seed(31);
         granulator.set_density(1.0);
@@ -987,8 +1032,76 @@ mod tests {
             assert!(s.is_finite());
             assert!(s.abs() < 4.0, "runaway gain at sample {i}: {s}");
         }
-        // The pool is hard-capped at MAX_GRAINS.
-        assert!(granulator.active_grain_count() <= MAX_GRAINS);
+        // Total live voices are bounded by main + release pool capacity.
+        assert!(granulator.active_grain_count() <= MAX_GRAINS + RELEASE_POOL_SIZE);
+    }
+
+    #[test]
+    fn soft_steal_promotes_new_spawn_into_main_pool() {
+        // Saturate the main pool with long grains so every subsequent
+        // spawn must go through steal_grain. The contract under review:
+        // the new spawn must actually land in the main pool instead of
+        // being silently dropped while the victim fades out.
+        //
+        // Use a deliberately long buffer (3s) so grain durations aren't
+        // clamped down by buffer length — otherwise short grains free
+        // their slots naturally and the pool never saturates.
+        let sample_rate = 44100.0;
+        let long_buffer_samples: Vec<f32> = (0..(sample_rate as usize * 3))
+            .map(|i| ((i as f32 / sample_rate) * 440.0 * std::f32::consts::TAU).sin() * 0.5)
+            .collect();
+        let buffer = SampleBuffer::from_mono(long_buffer_samples, sample_rate).unwrap();
+        let mut granulator = Granulator::new(sample_rate, buffer);
+        granulator.set_seed(53);
+        granulator.set_density(1.0); // 80 g/s
+        granulator.set_grain_length(1.0); // 3000 ms — main pool fills fast
+        granulator.set_cloud_duration(1.0);
+        granulator.snap_params();
+        granulator.trigger_with_velocity(0.0, 1.0);
+
+        // Run ~1.5 s: at 80 g/s × 3 s grains, the 64-slot main pool
+        // saturates around t≈0.8 s; everything after that exercises
+        // the steal path. Track the peak releasing-pool occupancy because
+        // each release fade is only ~4 ms while steals happen every ~12 ms,
+        // so the release pool is empty more often than not at any
+        // arbitrary moment.
+        let mut peak_releasing = 0usize;
+        let mut peak_main = 0usize;
+        for i in 0..((sample_rate * 1.5) as usize) {
+            granulator.tick(i as f64 / sample_rate as f64);
+            let main_now = granulator.grains.iter().filter(|g| g.active).count();
+            let rel_now = granulator
+                .release_grains
+                .iter()
+                .filter(|g| g.active)
+                .count();
+            peak_main = peak_main.max(main_now);
+            peak_releasing = peak_releasing.max(rel_now);
+        }
+
+        assert_eq!(
+            peak_main, MAX_GRAINS,
+            "main pool should saturate under sustained density"
+        );
+        assert!(
+            peak_releasing > 0,
+            "release pool should hold at least one stolen victim at some point"
+        );
+
+        // And the youngest grain in the main pool should be very young
+        // (the post-steal spawn), proving new grains are landing rather
+        // than being dropped.
+        let youngest_age = granulator
+            .grains
+            .iter()
+            .filter(|g| g.active)
+            .map(|g| g.age_samples as i32)
+            .min()
+            .unwrap_or(i32::MAX);
+        assert!(
+            youngest_age < (sample_rate * 0.05) as i32,
+            "no recently-spawned grain found in main pool (youngest = {youngest_age} samples)"
+        );
     }
 
     #[test]
