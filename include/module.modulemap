@@ -1,0 +1,4 @@
+module Gooey [system] {
+    header "gooey.h"
+    export *
+}
