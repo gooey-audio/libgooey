@@ -648,7 +648,9 @@ pub struct GooeyEngine {
 
     // When false, sequencers still advance position but don't trigger instruments or emit MIDI events.
     // Used to let host MIDI input drive instruments instead of the internal sequencer.
-    sequencer_triggers_enabled: bool,
+    // Atomic so the host thread (FFI setter) and audio thread (render read) don't race;
+    // mirrors the `instrument_muted` thread-safety pattern.
+    sequencer_triggers_enabled: AtomicBool,
 
     // Polyphonic synthesizer for chord playback
     poly_synth: PolySynth,
@@ -824,7 +826,7 @@ impl GooeyEngine {
             // MIDI event buffer (pre-allocated for audio thread safety)
             pending_midi_events: Vec::with_capacity(MIDI_EVENT_CAPACITY),
             // Sequencer triggers enabled by default (internal sequencer drives instruments)
-            sequencer_triggers_enabled: true,
+            sequencer_triggers_enabled: AtomicBool::new(true),
             // Polyphonic synthesizer for chord playback
             poly_synth: PolySynth::new(sample_rate),
             // Granulator with a silent placeholder buffer until the host loads samples.
@@ -992,7 +994,7 @@ impl GooeyEngine {
             }
 
             // Apply triggers with velocity after all sequencers have been ticked.
-            if self.sequencer_triggers_enabled {
+            if self.sequencer_triggers_enabled.load(Ordering::Relaxed) {
                 for ch in 0..NUM_INSTRUMENTS {
                     if let Some((velocity, blend, note)) = seq_triggers[ch] {
                         self.apply_sequencer_blend_setting(ch as u32, blend);
@@ -1831,7 +1833,9 @@ pub unsafe extern "C" fn gooey_engine_set_sequencer_triggers_enabled(
     if engine.is_null() {
         return;
     }
-    (*engine).sequencer_triggers_enabled = enabled;
+    (*engine)
+        .sequencer_triggers_enabled
+        .store(enabled, Ordering::Release);
 }
 
 /// Query whether sequencer triggers are currently enabled.
@@ -1847,7 +1851,7 @@ pub unsafe extern "C" fn gooey_engine_get_sequencer_triggers_enabled(
     if engine.is_null() {
         return true;
     }
-    (*engine).sequencer_triggers_enabled
+    (*engine).sequencer_triggers_enabled.load(Ordering::Acquire)
 }
 
 // =============================================================================
