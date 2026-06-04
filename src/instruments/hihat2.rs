@@ -369,7 +369,7 @@ impl HiHat2 {
             hpf_stage_2: BiquadHighpass::new(sample_rate),
             svf: StateVariableFilterTpt::new(sample_rate, tone_hz, 0.5),
             white_noise_state: 0x1234_5678_9abc_def0,
-            pink_noise: PinkNoise::new(),
+            pink_noise: PinkNoise::new(sample_rate),
             is_active: false,
             current_velocity: 1.0,
         }
