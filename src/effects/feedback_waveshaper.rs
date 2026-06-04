@@ -12,6 +12,18 @@ const DENORMAL_THRESHOLD: f32 = 1e-15;
 /// DC blocker coefficient (R in RC circuit, ~20Hz cutoff at 44.1kHz)
 const DC_BLOCKER_COEFF: f32 = 0.995;
 
+/// Amplitude-envelope follower attack time (ms): fast, to catch the transient
+/// so the attack isn't over-compensated by the makeup gain.
+const ENV_ATTACK_MS: f32 = 1.0;
+
+/// Amplitude-envelope follower release time (ms): slow, to ride the kick body
+/// without chasing individual sub-oscillator cycles.
+const ENV_RELEASE_MS: f32 = 120.0;
+
+/// Floor for the envelope reference used by the makeup gain. Avoids division
+/// blow-up as the envelope approaches zero and prevents extreme boost in silence.
+const ENV_FLOOR: f32 = 0.05;
+
 /// Waveshaper with feedback loop for richer harmonic distortion
 ///
 /// The feedback path includes a one-pole lowpass filter (controllable cutoff)
@@ -24,12 +36,15 @@ pub struct FeedbackWaveshaper {
     sample_rate: f32,
     filter_cutoff: f32,
     filter_coeff: f32,
+    env_att_coeff: f32,
+    env_rel_coeff: f32,
 
     // State
     last_out: f32,
     filter_state: f32,
     dc_x1: f32,
     dc_y1: f32,
+    env: f32,
 }
 
 impl FeedbackWaveshaper {
@@ -53,10 +68,13 @@ impl FeedbackWaveshaper {
             sample_rate,
             filter_cutoff,
             filter_coeff: Self::compute_filter_coeff(filter_cutoff, sample_rate),
+            env_att_coeff: Self::compute_env_coeff(ENV_ATTACK_MS, sample_rate),
+            env_rel_coeff: Self::compute_env_coeff(ENV_RELEASE_MS, sample_rate),
             last_out: 0.0,
             filter_state: 0.0,
             dc_x1: 0.0,
             dc_y1: 0.0,
+            env: 0.0,
         }
     }
 
@@ -93,11 +111,27 @@ impl FeedbackWaveshaper {
         // Waveshape with tanh
         let shaped = fb_input.tanh();
 
+        // Track the amplitude envelope of the dry input with a slow follower.
+        // Referencing the makeup gain to this level (instead of a fixed 0.5)
+        // keeps loud transients punchy and quiet tails from being boosted.
+        // The envelope must be slow relative to the waveform: an instantaneous
+        // |input| reference would cancel the waveshaping entirely.
+        let rect = input.abs();
+        let coeff = if rect > self.env {
+            self.env_att_coeff
+        } else {
+            self.env_rel_coeff
+        };
+        self.env += (1.0 - coeff) * (rect - self.env);
+        if self.env.abs() < DENORMAL_THRESHOLD {
+            self.env = 0.0;
+        }
+
         // Gain compensation: maintain consistent output level across all drive values.
         // Since last_out is already compensated, the loop gain is feedback * compensation.
         // Solving for equal loudness with and without feedback gives:
         //   compensation = comp_no_fb / (1 + comp_no_fb * feedback)
-        let reference = 0.5_f32;
+        let reference = self.env.max(ENV_FLOOR);
         let comp_no_fb = reference.tanh() / (reference * self.drive).tanh();
         let compensation = comp_no_fb / (1.0 + comp_no_fb * self.feedback);
         let compensated = shaped * compensation;
@@ -132,6 +166,7 @@ impl FeedbackWaveshaper {
         self.filter_state = 0.0;
         self.dc_x1 = 0.0;
         self.dc_y1 = 0.0;
+        self.env = 0.0;
     }
 
     /// Set the drive amount (1.0-100.0)
@@ -181,6 +216,14 @@ impl FeedbackWaveshaper {
         g.clamp(0.0, 0.9)
     }
 
+    /// One-pole smoothing coefficient for the envelope follower from a time
+    /// constant in milliseconds. Returns the retention factor (closer to 1.0 =
+    /// slower); the per-sample update applies `(1.0 - coeff)` as the step size.
+    #[inline]
+    fn compute_env_coeff(time_ms: f32, sample_rate: f32) -> f32 {
+        (-1.0 / (time_ms / 1000.0 * sample_rate)).exp()
+    }
+
     #[inline]
     fn dc_block(input: f32, x1: &mut f32, y1: &mut f32) -> f32 {
         let output = input - *x1 + DC_BLOCKER_COEFF * *y1;
@@ -214,14 +257,32 @@ mod tests {
 
     #[test]
     fn test_soft_clipping() {
+        // Drive a full-scale sine so the envelope follower settles near 1.0
+        // (a steady DC input would be removed by the DC blocker).
         let mut ws = FeedbackWaveshaper::new(44100.0, 10.0, 0.0, 2000.0, 1.0);
-        let output = ws.process(1.0);
-        // Full gain compensation keeps output near reference level
-        assert!(output > 0.3 && output < 0.7, "output was {output}");
+        let mut peak_full: f32 = 0.0;
+        for i in 0..2000 {
+            let s = (i as f32 * 0.3).sin();
+            peak_full = peak_full.max(ws.process(s).abs());
+        }
+        // Soft-clipped: peak stays below unity but is substantial.
+        assert!(
+            peak_full > 0.5 && peak_full < 1.0,
+            "peak_full was {peak_full}"
+        );
 
-        let output_low = ws.process(0.1);
-        assert!(output_low > 0.0);
-        assert!(output_low < output);
+        // A much quieter signal yields a smaller peak (level-tracked makeup
+        // preserves dynamics instead of boosting the quiet input to unity).
+        let mut ws_quiet = FeedbackWaveshaper::new(44100.0, 10.0, 0.0, 2000.0, 1.0);
+        let mut peak_quiet: f32 = 0.0;
+        for i in 0..2000 {
+            let s = (i as f32 * 0.3).sin() * 0.1;
+            peak_quiet = peak_quiet.max(ws_quiet.process(s).abs());
+        }
+        assert!(
+            peak_quiet < peak_full,
+            "quiet peak ({peak_quiet}) should be below full peak ({peak_full})"
+        );
     }
 
     #[test]
@@ -358,5 +419,36 @@ mod tests {
         let out_reset = ws.process(0.5);
         let out_fresh = fresh.process(0.5);
         assert_eq!(out_reset, out_fresh);
+    }
+
+    #[test]
+    fn test_transient_not_compressed_below_tail() {
+        // Level-tracked makeup must preserve dynamics: the loud attack should
+        // stay louder than the quiet decay tail. The old fixed-0.5 reference
+        // compressed the attack and boosted the tail, flattening the punch.
+        let mut ws = FeedbackWaveshaper::new(44100.0, 10.0, 0.0, 2000.0, 1.0);
+
+        let sr = 44100.0;
+        let n = (0.2 * sr) as usize; // 200 ms decaying tone
+        let attack_window = (0.005 * sr) as usize; // first 5 ms
+
+        let mut attack_peak: f32 = 0.0;
+        let mut tail_peak: f32 = 0.0;
+        for i in 0..n {
+            // Amplitude envelope decays 1.0 -> 0.1 over the tone.
+            let amp = (1.0 - i as f32 / n as f32) * 0.9 + 0.1;
+            let signal = (i as f32 * 0.2).sin() * amp;
+            let out = ws.process(signal).abs();
+            if i < attack_window {
+                attack_peak = attack_peak.max(out);
+            } else if i > n - attack_window {
+                tail_peak = tail_peak.max(out);
+            }
+        }
+
+        assert!(
+            attack_peak > tail_peak,
+            "attack ({attack_peak}) should stay louder than tail ({tail_peak})"
+        );
     }
 }

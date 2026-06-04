@@ -56,6 +56,17 @@ pub(crate) mod ranges {
     }
 }
 
+/// Map normalized overdrive (0.0-1.0) to waveshaper drive (1.0-41.0).
+///
+/// A cubic curve keeps the bottom of the range gentle so default presets only
+/// lightly saturate (0.2 -> ~1.32x, 0.3 -> ~2.08x) while still reaching strong
+/// drive at the top (1.0 -> 41x). Used by both the constructor and `process()`
+/// so the two stay in sync.
+#[inline]
+fn overdrive_to_drive(overdrive_amount: f32) -> f32 {
+    1.0 + overdrive_amount * overdrive_amount * overdrive_amount * 40.0
+}
+
 /// Static configuration for kick drum presets
 /// All parameters use normalized 0.0-1.0 values for easy integration with external systems.
 /// Use the `ranges` module to convert to/from actual values.
@@ -304,7 +315,7 @@ impl KickConfig {
             0.07, // noise_amount
             0.01, // noise_cutoff
             0.02, // noise_res
-            0.30, // overdrive
+            0.25, // overdrive
             0.00, // feedback
             0.47, // fb_cutoff
             0.12, // amp_decay
@@ -789,7 +800,7 @@ impl KickDrum {
             noise_envelope: Envelope::new(),
             waveshaper: FeedbackWaveshaper::new(
                 sample_rate,
-                1.0 + config.overdrive_amount * config.overdrive_amount * 99.0,
+                overdrive_to_drive(config.overdrive_amount),
                 config.feedback_amount * 0.98,
                 200.0 + config.feedback_cutoff * 3800.0,
                 1.0,
@@ -1182,9 +1193,9 @@ impl KickDrum {
 
         let total_output = sub_output + punch_output + filtered_click_output + noise_output;
 
-        // Map overdrive amount (0.0-1.0) to drive (1.0-100.0) with quadratic curve
+        // Map overdrive amount (0.0-1.0) to drive (1.0-41.0) with a gentle cubic curve
         let overdrive_amount = self.params.overdrive.get();
-        let drive = 1.0 + (overdrive_amount * overdrive_amount * 99.0);
+        let drive = overdrive_to_drive(overdrive_amount);
         self.waveshaper.set_drive(drive);
 
         // Map feedback amount (0.0-1.0) to feedback gain (0.0-0.98)
