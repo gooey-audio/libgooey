@@ -5,7 +5,7 @@ pub mod oversampler;
 pub mod smoother;
 
 pub use blendable::{Blendable, PresetBlender};
-pub use oversampler::Oversampler2x;
+pub use oversampler::{Oversampler, Oversampler2x, Oversampler4x, OversamplingMode};
 pub use smoother::{ParamSmoother, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 /// Convert a normalized tuning value (0.0–1.0) to a frequency multiplier.

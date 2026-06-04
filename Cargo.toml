@@ -33,6 +33,7 @@ gl = { version = "0.14", optional = true }
 rustfft = { version = "6.2", optional = true }
 midir = { version = "0.10", optional = true }
 hound = { version = "3.5", optional = true }
+halfband = "0.2"
 
 [[example]]
 name = "kick"
@@ -101,3 +102,7 @@ required-features = ["bounce"]
 [[example]]
 name = "granulator"
 required-features = ["native", "crossterm", "bounce"]
+
+[[example]]
+name = "antialias_validation"
+required-features = ["bounce"]

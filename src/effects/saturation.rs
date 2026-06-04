@@ -6,11 +6,11 @@
 //! generation for a more analog sound than simple tanh.
 
 use crate::effects::Effect;
-use crate::utils::oversampler::Oversampler2x;
+use crate::utils::oversampler::{Oversampler, OversamplingMode};
 use crate::utils::smoother::SmoothedParam;
 use std::cell::UnsafeCell;
 use std::f32::consts::FRAC_2_PI;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 /// Threshold for flushing denormal numbers to zero
 const DENORMAL_THRESHOLD: f32 = 1e-15;
@@ -29,8 +29,8 @@ struct SaturationState {
     dc_x1: f32,
     dc_y1: f32,
 
-    // 2x oversampler to reduce aliasing from nonlinear processing
-    oversampler: Oversampler2x,
+    // Selectable oversampler to reduce aliasing from nonlinear processing
+    oversampler: Oversampler,
 }
 
 /// Tube-style saturation effect
@@ -48,6 +48,7 @@ pub struct TubeSaturation {
     drive_target: AtomicU32,
     warmth_target: AtomicU32,
     mix_target: AtomicU32,
+    oversampling_mode_target: AtomicU8,
 }
 
 // SAFETY: UnsafeCell only accessed from single audio thread
@@ -74,11 +75,12 @@ impl TubeSaturation {
                 mix_smoothed: SmoothedParam::new(mix_clamped, 0.0, 1.0, sample_rate, 30.0),
                 dc_x1: 0.0,
                 dc_y1: 0.0,
-                oversampler: Oversampler2x::new(),
+                oversampler: Oversampler::default(),
             }),
             drive_target: AtomicU32::new(drive_clamped.to_bits()),
             warmth_target: AtomicU32::new(warmth_clamped.to_bits()),
             mix_target: AtomicU32::new(mix_clamped.to_bits()),
+            oversampling_mode_target: AtomicU8::new(OversamplingMode::X4 as u8),
         }
     }
 
@@ -154,6 +156,12 @@ impl TubeSaturation {
         self.mix_target.store(clamped.to_bits(), Ordering::Relaxed);
     }
 
+    /// Set the oversampling rate. The audio thread clears filter history when it applies the change.
+    pub fn set_oversampling_mode(&self, mode: OversamplingMode) {
+        self.oversampling_mode_target
+            .store(mode as u8, Ordering::Relaxed);
+    }
+
     // Parameter getters
 
     /// Get the current drive setting
@@ -171,12 +179,17 @@ impl TubeSaturation {
         f32::from_bits(self.mix_target.load(Ordering::Relaxed))
     }
 
+    /// Get the requested oversampling rate.
+    pub fn get_oversampling_mode(&self) -> OversamplingMode {
+        OversamplingMode::from_u8(self.oversampling_mode_target.load(Ordering::Relaxed))
+    }
+
     /// Reset internal state (DC blocker)
     pub fn reset(&self) {
         let state = unsafe { &mut *self.state.get() };
         state.dc_x1 = 0.0;
         state.dc_y1 = 0.0;
-        state.oversampler = Oversampler2x::new();
+        state.oversampler.reset();
     }
 }
 
@@ -184,6 +197,7 @@ impl Effect for TubeSaturation {
     fn process(&self, input: f32) -> f32 {
         // NaN/infinity protection at input
         if !input.is_finite() {
+            self.reset();
             return 0.0;
         }
 
@@ -193,6 +207,10 @@ impl Effect for TubeSaturation {
         let drive_target = f32::from_bits(self.drive_target.load(Ordering::Relaxed));
         let warmth_target = f32::from_bits(self.warmth_target.load(Ordering::Relaxed));
         let mix_target = f32::from_bits(self.mix_target.load(Ordering::Relaxed));
+        let oversampling_mode =
+            OversamplingMode::from_u8(self.oversampling_mode_target.load(Ordering::Relaxed));
+
+        state.oversampler.set_mode(oversampling_mode);
 
         state.drive_smoothed.set_target(drive_target);
         state.warmth_smoothed.set_target(warmth_target);
@@ -208,7 +226,7 @@ impl Effect for TubeSaturation {
             return input;
         }
 
-        // Apply saturation with 2x oversampling to reduce aliasing
+        // Apply saturation at the selected oversampling rate
         let saturated = state
             .oversampler
             .process(input, |x| Self::saturate(x, drive, warmth));
@@ -223,6 +241,7 @@ impl Effect for TubeSaturation {
         if !output.is_finite() {
             state.dc_x1 = 0.0;
             state.dc_y1 = 0.0;
+            state.oversampler.reset();
             return 0.0;
         }
 
@@ -244,19 +263,25 @@ mod tests {
     #[test]
     fn test_soft_limiting() {
         let sat = TubeSaturation::new(44100.0, 1.0, 0.0, 1.0);
-        // Run samples with a sine wave to let smoothers settle
-        // (DC blocker removes constant signals, so we use an oscillating input)
+        // Run an oscillating signal because the DC blocker removes constants.
         let freq = 1000.0_f32;
         let sr = 44100.0_f32;
-        for i in 0..2000 {
+        let mut max_output = 0.0_f32;
+        for i in 0..4000 {
             let input = (2.0 * std::f32::consts::PI * freq * i as f32 / sr).sin();
-            sat.process(input);
+            let output = sat.process(input);
+            if i >= 2000 {
+                max_output = max_output.max(output.abs());
+            }
         }
-        // Process a positive peak
-        let output = sat.process(0.9);
-        // Output should be soft-limited below input
-        assert!(output.abs() < 0.9, "Expected output < 0.9, got {}", output);
-        assert!(output.abs() > 0.1, "Expected output > 0.1, got {}", output);
+        assert!(
+            max_output < 1.0,
+            "Expected soft-limited peak < 1.0, got {max_output}"
+        );
+        assert!(
+            max_output > 0.1,
+            "Expected audible output, got {max_output}"
+        );
     }
 
     #[test]
@@ -293,9 +318,44 @@ mod tests {
         sat.set_drive(0.7);
         sat.set_warmth(0.5);
         sat.set_mix(0.8);
+        sat.set_oversampling_mode(OversamplingMode::X2);
 
         assert!((sat.get_drive() - 0.7).abs() < 0.001);
         assert!((sat.get_warmth() - 0.5).abs() < 0.001);
         assert!((sat.get_mix() - 0.8).abs() < 0.001);
+        assert_eq!(sat.get_oversampling_mode(), OversamplingMode::X2);
+    }
+
+    #[test]
+    fn test_oversampling_defaults_to_4x() {
+        let sat = TubeSaturation::new(44100.0, 0.5, 0.5, 1.0);
+        assert_eq!(sat.get_oversampling_mode(), OversamplingMode::X4);
+    }
+
+    #[test]
+    fn test_reset_matches_fresh_instance() {
+        let reset = TubeSaturation::new(44100.0, 0.5, 0.5, 1.0);
+        for i in 0..1000 {
+            reset.process((i as f32 * 0.1).sin());
+        }
+        reset.reset();
+
+        let fresh = TubeSaturation::new(44100.0, 0.5, 0.5, 1.0);
+        for i in 0..100 {
+            let input = (i as f32 * 0.27).sin();
+            assert_eq!(reset.process(input), fresh.process(input));
+        }
+    }
+
+    #[test]
+    fn test_nan_protection_resets_state() {
+        let reset = TubeSaturation::new(44100.0, 0.5, 0.5, 1.0);
+        for i in 0..1000 {
+            reset.process((i as f32 * 0.1).sin());
+        }
+        assert_eq!(reset.process(f32::NAN), 0.0);
+
+        let fresh = TubeSaturation::new(44100.0, 0.5, 0.5, 1.0);
+        assert_eq!(reset.process(0.5), fresh.process(0.5));
     }
 }
