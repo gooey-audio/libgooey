@@ -5,7 +5,9 @@ use crate::gen::oscillator::Oscillator;
 use crate::gen::pink_noise::PinkNoise;
 use crate::gen::waveform::Waveform;
 use crate::instruments::fm_snap::PhaseModulator;
-use crate::utils::{tuning_to_multiplier, Blendable, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
+use crate::utils::{
+    tuning_to_multiplier, Blendable, OversamplingMode, SmoothedParam, DEFAULT_SMOOTH_TIME_MS,
+};
 
 /// Normalization ranges for kick drum parameters
 /// All external-facing parameters use 0.0-1.0 normalized values
@@ -1320,6 +1322,16 @@ impl KickDrum {
         self.params.overdrive.set_target(amount.clamp(0.0, 1.0));
     }
 
+    /// Set the oversampling rate used by the kick's feedback waveshaper.
+    pub fn set_oversampling_mode(&mut self, mode: OversamplingMode) {
+        self.waveshaper.set_oversampling_mode(mode);
+    }
+
+    /// Get the oversampling rate used by the kick's feedback waveshaper.
+    pub fn oversampling_mode(&self) -> OversamplingMode {
+        self.waveshaper.oversampling_mode()
+    }
+
     /// Set feedback waveshaper amount (smoothed, 0-1 → 0.0-0.9 gain)
     pub fn set_feedback(&mut self, amount: f32) {
         self.params.feedback.set_target(amount.clamp(0.0, 1.0));
@@ -1487,5 +1499,19 @@ impl crate::engine::Modulatable for KickDrum {
             "tuning" => Some(self.params.tuning.range()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kick_oversampling_mode_defaults_to_4x_and_is_configurable() {
+        let mut kick = KickDrum::new(48_000.0);
+        assert_eq!(kick.oversampling_mode(), OversamplingMode::X4);
+
+        kick.set_oversampling_mode(OversamplingMode::Off);
+        assert_eq!(kick.oversampling_mode(), OversamplingMode::Off);
     }
 }

@@ -6,6 +6,8 @@
 //! DC drift. Higher feedback on kicks creates sub-harmonic growl,
 //! moderate feedback on snares adds a gritty, self-exciting tail.
 
+use crate::utils::oversampler::{Oversampler, OversamplingMode};
+
 /// Threshold for flushing denormal numbers to zero
 const DENORMAL_THRESHOLD: f32 = 1e-15;
 
@@ -27,7 +29,8 @@ const ENV_FLOOR: f32 = 0.05;
 /// Waveshaper with feedback loop for richer harmonic distortion
 ///
 /// The feedback path includes a one-pole lowpass filter (controllable cutoff)
-/// and a DC blocker to keep the loop stable.
+/// and a DC blocker to keep the loop stable. The tanh nonlinearity defaults to
+/// 4x oversampling to reduce audible foldback.
 pub struct FeedbackWaveshaper {
     // Parameters
     drive: f32,
@@ -45,6 +48,7 @@ pub struct FeedbackWaveshaper {
     dc_x1: f32,
     dc_y1: f32,
     env: f32,
+    oversampler: Oversampler,
 }
 
 impl FeedbackWaveshaper {
@@ -75,6 +79,7 @@ impl FeedbackWaveshaper {
             dc_x1: 0.0,
             dc_y1: 0.0,
             env: 0.0,
+            oversampler: Oversampler::default(),
         }
     }
 
@@ -108,8 +113,9 @@ impl FeedbackWaveshaper {
         // Sum input with filtered feedback
         let fb_input = self.drive * input + self.feedback * self.last_out;
 
-        // Waveshape with tanh
-        let shaped = fb_input.tanh();
+        // Oversample only the memoryless nonlinearity. Feedback state and
+        // filtering remain at the engine rate to preserve loop timing.
+        let shaped = self.oversampler.process(fb_input, |x| x.tanh());
 
         // Track the amplitude envelope of the dry input with a slow follower.
         // Referencing the makeup gain to this level (instead of a fixed 0.5)
@@ -167,6 +173,7 @@ impl FeedbackWaveshaper {
         self.dc_x1 = 0.0;
         self.dc_y1 = 0.0;
         self.env = 0.0;
+        self.oversampler.reset();
     }
 
     /// Set the drive amount (1.0-100.0)
@@ -208,6 +215,16 @@ impl FeedbackWaveshaper {
     /// Get the current mix amount
     pub fn mix(&self) -> f32 {
         self.mix
+    }
+
+    /// Set the oversampling rate. Changing it clears oversampling filter history.
+    pub fn set_oversampling_mode(&mut self, mode: OversamplingMode) {
+        self.oversampler.set_mode(mode);
+    }
+
+    /// Get the current oversampling rate.
+    pub fn oversampling_mode(&self) -> OversamplingMode {
+        self.oversampler.mode()
     }
 
     #[inline]
@@ -265,9 +282,10 @@ mod tests {
             let s = (i as f32 * 0.3).sin();
             peak_full = peak_full.max(ws.process(s).abs());
         }
-        // Soft-clipped: peak stays below unity but is substantial.
+        // Soft-clipped: the peak remains tightly bounded but is substantial.
+        // The IIR anti-alias filters can reconstruct a small overshoot above 1.0.
         assert!(
-            peak_full > 0.5 && peak_full < 1.0,
+            peak_full > 0.5 && peak_full < 1.1,
             "peak_full was {peak_full}"
         );
 
@@ -292,6 +310,15 @@ mod tests {
         assert_eq!(ws.feedback(), 0.98);
         assert_eq!(ws.filter_cutoff(), 200.0);
         assert_eq!(ws.mix(), 1.0);
+    }
+
+    #[test]
+    fn test_configurable_oversampling_defaults_to_4x() {
+        let mut ws = FeedbackWaveshaper::new(44100.0, 5.0, 0.5, 2000.0, 1.0);
+        assert_eq!(ws.oversampling_mode(), OversamplingMode::X4);
+
+        ws.set_oversampling_mode(OversamplingMode::Off);
+        assert_eq!(ws.oversampling_mode(), OversamplingMode::Off);
     }
 
     #[test]

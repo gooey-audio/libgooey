@@ -13,7 +13,7 @@ use std::io::{self, Write};
 
 use gooey::engine::{Engine, EngineOutput, Instrument};
 use gooey::instruments::{KickConfig, KickDrum};
-use gooey::utils::PresetBlender;
+use gooey::utils::{OversamplingMode, PresetBlender};
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "midi")]
@@ -248,6 +248,22 @@ fn make_bar(normalized: f32, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
 }
 
+fn oversampling_label(mode: OversamplingMode) -> &'static str {
+    match mode {
+        OversamplingMode::Off => "Off",
+        OversamplingMode::X2 => "2x",
+        OversamplingMode::X4 => "4x",
+    }
+}
+
+fn next_oversampling_mode(mode: OversamplingMode) -> OversamplingMode {
+    match mode {
+        OversamplingMode::Off => OversamplingMode::X2,
+        OversamplingMode::X2 => OversamplingMode::X4,
+        OversamplingMode::X4 => OversamplingMode::Off,
+    }
+}
+
 // Blend mode state
 struct BlendState {
     enabled: bool,
@@ -286,10 +302,10 @@ fn render_display(
 
     print!("=== Kick Drum Lab ===\r\n");
     if blend.enabled {
-        print!("SPACE=hit Q=quit WASD=blend B=exit blend mode\r\n");
+        print!("SPACE=hit O=oversampling Q=quit WASD=blend B=exit blend mode\r\n");
         print!("Z/X/C/V=vel 25/50/75/100%\r\n");
     } else {
-        print!("SPACE=hit Q=quit ↑↓=sel ←→=adj []=fine B=blend\r\n");
+        print!("SPACE=hit O=oversampling Q=quit ↑↓=sel ←→=adj []=fine B=blend\r\n");
         print!("Z/X/C/V=vel 25/50/75/100% +/-=adj 1-4=preset\r\n");
     }
     print!("Preset: {}\r\n", preset_name);
@@ -348,7 +364,12 @@ fn render_display(
     }
 
     print!("\r\n");
-    print!("Hits: {} | Vel: {:.0}%", trigger_count, velocity * 100.0);
+    print!(
+        "Hits: {} | Vel: {:.0}% | Oversampling: {}",
+        trigger_count,
+        velocity * 100.0,
+        oversampling_label(kick.oversampling_mode())
+    );
 
     // Flush to ensure display updates
     io::stdout().flush().unwrap();
@@ -669,6 +690,14 @@ fn main() -> anyhow::Result<()> {
                     }
                     KeyCode::Char('-') | KeyCode::Char('_') => {
                         current_velocity = (current_velocity - 0.05).max(0.05);
+                        needs_redraw = true;
+                    }
+
+                    // Cycle kick waveshaper oversampling for live A/B comparison
+                    KeyCode::Char('o') | KeyCode::Char('O') => {
+                        let mut k = kick.lock().unwrap();
+                        let next_mode = next_oversampling_mode(k.oversampling_mode());
+                        k.set_oversampling_mode(next_mode);
                         needs_redraw = true;
                     }
 
