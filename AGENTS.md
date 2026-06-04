@@ -47,10 +47,26 @@ src/
 │   └── blendable.rs     # PresetBlender: cross-fade between parameter sets
 │
 ├── envelope.rs          # ADSR envelope with curve shaping
-├── dsl.rs               # Line-based DSL for declarative instrument setup
+├── dsl.rs               # Line-based DSL for declarative *engine* setup (instruments + seq + lfo + fx)
+├── graph/               # Node-graph synth engine: describe an instrument's internals as a DSL graph
+│   ├── node.rs          # Primitive nodes (osc, env, noise, lp/hp/bp, shape, gain, const, mul/add)
+│   ├── parser.rs        # Low-noise DSL → GraphSpec (constant-folding expression parser)
+│   └── mod.rs           # CompiledGraph evaluator + GraphInstrument (impl Instrument) + Topology
 ├── ffi.rs               # C FFI bindings for iOS/Swift integration
 └── visualization.rs     # Waveform display (feature-gated)
 ```
+
+## Two DSLs (don't confuse them)
+
+- **`src/dsl.rs`** wires a whole *engine program*: which instruments exist, their sequencer
+  patterns, LFO routes, and global effects. It treats each instrument (kick, snare…) as a black box.
+- **`src/graph/`** describes a *single instrument's internals* as a graph of primitive nodes
+  (oscillators, envelopes, noise, filters, an opaque `shape`/saturation effect) so you can see and
+  re-wire which component shapes which part of the sound. A `GraphInstrument` implements the standard
+  `Instrument` trait, so a graph drops straight into the `Engine`, sequencer, and bounce paths. The
+  engine is pure-Rust and always compiled (no feature flag), and exposes a `Topology` (nodes + edges)
+  for the planned glow/shader node-graph GUI. See `examples/instruments/*.graph` and
+  `cargo run --example graph --features bounce -- examples/instruments/kick.graph`.
 
 ## Core Traits
 

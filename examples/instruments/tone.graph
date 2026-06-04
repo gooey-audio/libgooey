@@ -1,0 +1,8 @@
+# tone.graph — the smallest useful instrument: one oscillator, one envelope.
+#
+# A good first thing to load in the GUI to see the graph diagram and the
+# envelope's time location.
+
+body = env a=.005 d=.4 curve=2.0
+sub  = osc sine 220
+out  = sub * body

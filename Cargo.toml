@@ -100,6 +100,10 @@ name = "bounce"
 required-features = ["bounce"]
 
 [[example]]
+name = "graph"
+required-features = ["bounce"]
+
+[[example]]
 name = "granulator"
 required-features = ["native", "crossterm", "bounce"]
 

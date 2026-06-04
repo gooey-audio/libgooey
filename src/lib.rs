@@ -3,6 +3,7 @@
 pub mod dsl;
 pub mod envelope;
 pub mod filters;
+pub mod graph;
 pub mod max_curve;
 
 // New organized modules

@@ -1,0 +1,36 @@
+# kick.graph — a kick drum decomposed into visible, nameable nodes.
+#
+# Every line below is one node in the graph. Compare this to the ~250-line
+# hand-written KickDrum::tick() in src/instruments/kick.rs: here you can see at
+# a glance which component shapes which part of the sound, mute any one of them,
+# or re-route it. Each named node also appears as a box in the graph diagram.
+
+sr 48000
+
+# Pitch envelope: a fast, punchy drop from high to low (output 0..1).
+# Lower `curve` = snappier initial drop.
+pitch = env a=.001 d=.09 curve=.4
+
+# Master amplitude envelope — the "body" of the kick.
+body  = env a=.001 d=.45 curve=2.0
+
+# Sub sine. `fm=pitch*5` sweeps it from ~6x the base frequency down to the
+# base as the pitch envelope falls — this is the classic kick "boom".
+sub   = osc sine 50 fm=pitch*5
+
+# Mid "punch" triangle roughly an octave up, swept by the same envelope.
+punch = osc tri 125 fm=pitch*5
+
+# Click transient: white noise through a high-pass with its own tiny envelope.
+ctap  = env a=.001 d=.02 curve=.3
+click = hp (osc noise 2000) cutoff=7000 q=.6
+
+# Pink-noise body layer through a resonant low-pass.
+nz    = lp (noise) cutoff=2000 q=2.0
+
+# Mix the layers, then apply the amplitude envelope.
+voice = (sub + punch*.5 + click*ctap*.6 + nz*.15) * body
+
+# Overdrive the whole thing. `shape` is the opaque-effect building block: a
+# saturator that can't be expressed in terms of oscillators and envelopes.
+out   = shape voice drive=.25

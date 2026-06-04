@@ -126,3 +126,6 @@ benches/target/
 test-results/ 
 
 .opencode/**
+
+# Rendered audio from the graph example
+examples/instruments/*.wav
