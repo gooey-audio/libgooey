@@ -579,8 +579,8 @@ pub struct GooeyEngine {
     sequencers: [Sequencer; NUM_INSTRUMENTS],
 
     /// Global effects. Applied in the order described by `effect_order`,
-    /// followed by the limiter which is always last.
-    /// Default order: saturation -> lowpass filter -> tilt filter -> delay -> compressor -> reverb -> limiter.
+    /// followed by the optional limiter which is always last.
+    /// Processing order when enabled: saturation -> lowpass filter -> tilt filter -> delay -> compressor -> reverb -> limiter.
     delay: DelayEffect,
     delay_enabled: bool,
     lowpass_filter: LowpassFilterEffect,
@@ -606,6 +606,8 @@ pub struct GooeyEngine {
     bpm: f32,
     swing: f32,
     current_time: f64,
+    /// Smoothed gain applied to the complete instrument sum before global effects.
+    master_gain: SmoothedParam,
 
     // Per-channel manual trigger flags and velocities
     trigger_pending: [AtomicBool; NUM_INSTRUMENTS],
@@ -777,19 +779,21 @@ impl GooeyEngine {
             tilt_filter,
             tilt_filter_enabled: false,
             saturation,
-            saturation_enabled: true,
+            saturation_enabled: false,
             compressor,
-            compressor_enabled: true,
+            compressor_enabled: false,
             compressor_sidechain: COMPRESSOR_SIDECHAIN_NONE,
             reverb,
             reverb_enabled: false,
             limiter: SoftLimiter::new(1.0),
-            limiter_enabled: true,
+            limiter_enabled: false,
             effect_order: DEFAULT_EFFECT_ORDER,
             sample_rate,
             bpm,
             swing: 0.5,
             current_time: 0.0,
+            // Match the native Engine's default summing headroom.
+            master_gain: SmoothedParam::new(DEFAULT_MASTER_GAIN, 0.0, 2.0, sample_rate, 30.0),
             trigger_pending: std::array::from_fn(|_| AtomicBool::new(false)),
             trigger_velocity: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
             channel_peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
@@ -1070,6 +1074,9 @@ impl GooeyEngine {
             // Mix in granulator output
             output += self.granulator.tick(self.current_time);
 
+            // Apply master headroom before the optional global effects.
+            output *= self.master_gain.tick();
+
             // Apply global effects chain (order is user-configurable; limiter is always last)
             for &effect_id in &self.effect_order {
                 match effect_id {
@@ -1101,7 +1108,7 @@ impl GooeyEngine {
                 }
             }
 
-            // Limiter (always last; protects output from clipping)
+            // Optional limiter (always last when enabled)
             if self.limiter_enabled {
                 *sample = self.limiter.process(output);
             } else {
@@ -1141,7 +1148,7 @@ impl GooeyEngine {
     /// Clear internal state of all reorderable effects so a new chain order
     /// does not inherit stale buffers/envelopes from the previous routing.
     /// Limiter is intentionally skipped — keeping its gain-reduction state
-    /// stable avoids transients on the protective output stage.
+    /// stable avoids transients if the optional final stage is enabled.
     fn reset_effect_states(&self) {
         self.saturation.reset();
         self.lowpass_filter.reset();
@@ -1275,7 +1282,7 @@ pub const EFFECT_SATURATION: u32 = 2;
 pub const EFFECT_COMPRESSOR: u32 = 3;
 /// Global effect: Tilt filter (unified lowpass/highpass)
 pub const EFFECT_TILT_FILTER: u32 = 4;
-/// Global effect: Limiter (soft limiter, protects output from clipping)
+/// Global effect: Optional soft limiter
 pub const EFFECT_LIMITER: u32 = 5;
 
 // =============================================================================
@@ -1289,8 +1296,8 @@ pub const EFFECT_REVERB: u32 = 6;
 /// Total number of global effects
 pub const EFFECT_COUNT: u32 = 7;
 
-/// Number of reorderable effects in the chain. Excludes the limiter,
-/// which is pinned at the end of the chain (output-protection stage).
+/// Number of reorderable effects in the chain. Excludes the optional limiter,
+/// which is pinned at the end of the chain when enabled.
 pub const REORDERABLE_EFFECT_COUNT: u32 = 6;
 
 /// Default order for the reorderable effects, matching the historical
@@ -1522,6 +1529,7 @@ pub const INSTRUMENT_BASS: u32 = 4;
 pub const INSTRUMENT_COUNT: u32 = 5;
 /// Internal usize version for array indexing
 const NUM_INSTRUMENTS: usize = INSTRUMENT_COUNT as usize;
+const DEFAULT_MASTER_GAIN: f32 = 0.25;
 
 // =============================================================================
 // Preset blend constants
@@ -2765,6 +2773,7 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
 ///
 /// When disabled, the effect is bypassed and does not process audio.
 /// This is useful for A/B comparison or saving CPU when an effect is not needed.
+/// Saturation, compressor, and limiter are disabled by default.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -2874,6 +2883,44 @@ pub unsafe extern "C" fn gooey_engine_get_compressor_sidechain(engine: *mut Gooe
 
     let engine = &*engine;
     engine.compressor_sidechain
+}
+
+// =============================================================================
+// Master gain
+// =============================================================================
+
+/// Set the master output gain.
+///
+/// This gain is applied to the complete instrument sum before global effects.
+/// It is smoothed over 30ms to prevent clicks.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `gain` - Linear gain, clamped to 0.0-2.0. The default is 0.25.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_master_gain(engine: *mut GooeyEngine, gain: f32) {
+    if engine.is_null() || !gain.is_finite() {
+        return;
+    }
+    (*engine).master_gain.set_target(gain);
+}
+
+/// Get the current master output gain target.
+///
+/// # Returns
+/// The current linear gain target, or 0.25 if `engine` is null.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_master_gain(engine: *const GooeyEngine) -> f32 {
+    if engine.is_null() {
+        return DEFAULT_MASTER_GAIN;
+    }
+    (*engine).master_gain.target()
 }
 
 // =============================================================================
@@ -3917,8 +3964,8 @@ pub extern "C" fn gooey_engine_global_effect_count() -> u32 {
 
 /// Get the number of reorderable effects in the chain.
 ///
-/// The limiter is excluded — it is always pinned at the end of the chain
-/// as a protective output stage. Only the other effects can be reordered.
+/// The optional limiter is excluded because it is pinned at the end of the
+/// chain when enabled. Only the other effects can be reordered.
 #[no_mangle]
 pub extern "C" fn gooey_engine_reorderable_effect_count() -> u32 {
     REORDERABLE_EFFECT_COUNT
@@ -4045,8 +4092,8 @@ pub unsafe extern "C" fn gooey_engine_move_effect(
 }
 
 /// Read the current effect-chain order. Writes up to `max_len` IDs into
-/// `out_ids` in chain order (position 0 first, the limiter — always pinned
-/// last — is not written).
+/// `out_ids` in chain order (position 0 first). The optional limiter is pinned
+/// last when enabled and is not written.
 ///
 /// Returns the number of IDs written, which equals `REORDERABLE_EFFECT_COUNT`
 /// when `max_len` is large enough, or `max_len` otherwise. Returns `0` if
@@ -5391,6 +5438,7 @@ impl GooeyEngine {
         for gain in &mut self.instrument_channel_gains {
             gain.snap();
         }
+        self.master_gain.snap();
 
         // Render in chunks using the same path as real-time playback
         let mut output = Vec::with_capacity(total_samples);
