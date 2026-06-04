@@ -868,7 +868,7 @@ impl KickDrum {
 
     /// Apply current smoothed parameters to oscillators (called per-sample)
     ///
-    /// NOTE: Only mix/volume parameters are applied here. Pitch-related parameters
+    /// NOTE: Only mix parameters are applied here. Pitch-related parameters
     /// (frequency, pitch_start_multiplier) are frozen at trigger time to prevent
     /// discontinuities when parameters change during decay.
     #[inline]
@@ -876,18 +876,17 @@ impl KickDrum {
         let punch = self.params.punch.get();
         let sub = self.params.sub.get();
         let click = self.params.click.get();
-        let volume = self.params.volume.get();
 
         // Light velocity scaling for click: range [0.6, 1.0]
         // Higher velocity = more click, lower velocity = less click
         let click_vel_scale = 0.6 + 0.4 * self.current_velocity;
 
-        // Update oscillator volumes (these can change smoothly without pops)
-        self.sub_oscillator.set_volume(sub * volume);
-        self.punch_oscillator.set_volume(punch * volume * 0.7);
+        // Update relative oscillator levels. Master volume is applied once at output.
+        self.sub_oscillator.set_volume(sub);
+        self.punch_oscillator.set_volume(punch * 0.7);
         // Click reduced from 0.3 to 0.15, with velocity scaling
         self.click_oscillator
-            .set_volume(click * volume * 0.15 * click_vel_scale);
+            .set_volume(click * 0.15 * click_vel_scale);
     }
 
     pub fn set_config(&mut self, config: KickConfig) {
@@ -932,7 +931,8 @@ impl KickDrum {
         // Envelope configurations (decay times, curves) are applied on trigger,
         // not during parameter changes. This prevents pops/discontinuities when
         // parameters change while a sound is still decaying.
-        // Smoothable params (volume, filter, mix) update in real-time via apply_params().
+        // Smoothable filter/mix params update in real-time via apply_params().
+        // Master volume is read directly at final output.
     }
 
     /// Snap all smoothed parameters to their targets instantly.
@@ -1089,7 +1089,7 @@ impl KickDrum {
             return 0.0;
         }
 
-        // Apply smoothed parameters to oscillators (mix/volume only)
+        // Apply smoothed mix parameters to oscillators
         self.apply_params();
 
         // Re-apply oscillator decay times each sample so LFO modulation of
@@ -1175,7 +1175,7 @@ impl KickDrum {
             // Apply noise envelope
             // Scale noise_amount by 0.5 to reduce maximum volume
             let noise_env = self.noise_envelope.get_amplitude(current_time);
-            filtered_noise * noise_env * noise_amount * 0.5 * self.params.volume.get()
+            filtered_noise * noise_env * noise_amount * 0.5
         } else {
             0.0
         };

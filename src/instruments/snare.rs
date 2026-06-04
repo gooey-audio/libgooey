@@ -890,7 +890,6 @@ impl SnareDrum {
         // Get current smoothed parameter values (use helper methods for denormalized values)
         let base_freq = self.params.frequency_hz();
         let base_decay = self.params.decay_secs();
-        let volume = self.params.volume.get();
         let brightness = self.params.brightness.get();
         let tonal_amount = self.params.tonal.get();
         let noise_amount = self.params.noise.get();
@@ -926,7 +925,7 @@ impl SnareDrum {
         // Configure tonal oscillator envelope to hold (sustain=1.0)
         // The dedicated tonal_envelope controls the actual decay shape
         self.tonal_oscillator.frequency_hz = base_freq;
-        self.tonal_oscillator.set_volume(tonal_amount * volume);
+        self.tonal_oscillator.set_volume(tonal_amount);
         self.tonal_oscillator.set_adsr(ADSRConfig::new(
             0.001,              // Very fast attack
             0.001,              // Minimal decay (go straight to sustain)
@@ -937,8 +936,7 @@ impl SnareDrum {
         // Configure noise oscillator envelope to hold (sustain=1.0)
         // The dedicated noise envelopes control the actual decay shape
         self.noise_oscillator.frequency_hz = base_freq * 8.0;
-        self.noise_oscillator
-            .set_volume(noise_amount * volume * 0.8);
+        self.noise_oscillator.set_volume(noise_amount * 0.8);
         self.noise_oscillator.set_adsr(ADSRConfig::new(
             0.001,              // Very fast attack
             0.001,              // Minimal decay (go straight to sustain)
@@ -951,7 +949,7 @@ impl SnareDrum {
         let crack_vel_scale = 0.7 + 0.3 * vel;
         self.crack_oscillator.frequency_hz = base_freq * 25.0;
         self.crack_oscillator
-            .set_volume(brightness * volume * 0.4 * crack_vel_scale);
+            .set_volume(brightness * 0.4 * crack_vel_scale);
         self.crack_oscillator.set_adsr(ADSRConfig::new(
             0.001,              // Very fast attack
             scaled_decay * 0.2, // Very short decay for crack (velocity-scaled)
@@ -1206,7 +1204,6 @@ impl SnareDrum {
     /// Apply current smoothed parameters to oscillators (called per-sample)
     #[inline]
     fn apply_params(&mut self) {
-        let volume = self.params.volume.get();
         let brightness = self.params.brightness.get();
         let tonal_amount = self.params.tonal.get();
         let noise_amount = self.params.noise.get();
@@ -1214,12 +1211,11 @@ impl SnareDrum {
         // Crack gets velocity-sensitive volume boost (more snap at high velocity)
         let crack_vel_scale = 0.7 + 0.3 * self.current_velocity;
 
-        // Update oscillator volumes with smoothed values
-        self.tonal_oscillator.set_volume(tonal_amount * volume);
-        self.noise_oscillator
-            .set_volume(noise_amount * volume * 0.8);
+        // Update relative oscillator levels. Master volume is applied once at output.
+        self.tonal_oscillator.set_volume(tonal_amount);
+        self.noise_oscillator.set_volume(noise_amount * 0.8);
         self.crack_oscillator
-            .set_volume(brightness * volume * 0.4 * crack_vel_scale);
+            .set_volume(brightness * 0.4 * crack_vel_scale);
     }
 
     /// Set volume (smoothed, 0-1)
