@@ -784,7 +784,7 @@ impl KickDrum {
             triggered_pitch_multiplier,
             click_filter: ResonantHighpassFilter::new(sample_rate, 8000.0, 4.0),
             phase_modulator: PhaseModulator::new(sample_rate),
-            pink_noise: PinkNoise::new(),
+            pink_noise: PinkNoise::new(sample_rate),
             noise_filter: ResonantLowpassFilter::new(sample_rate, noise_cutoff_hz, noise_res),
             noise_envelope: Envelope::new(),
             waveshaper: FeedbackWaveshaper::new(
@@ -1166,8 +1166,7 @@ impl KickDrum {
             // Update filter parameters from smoothed params (denormalized to actual Hz/resonance)
             let noise_cutoff = self.params.noise_cutoff_hz();
             let noise_resonance = self.params.noise_resonance_value();
-            self.noise_filter.set_cutoff_freq(noise_cutoff);
-            self.noise_filter.set_resonance(noise_resonance);
+            self.noise_filter.set_params(noise_cutoff, noise_resonance);
 
             // Apply resonant lowpass filter
             let filtered_noise = self.noise_filter.process(pink_noise_sample);
