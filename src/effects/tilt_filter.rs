@@ -129,10 +129,19 @@ impl Effect for TiltFilterEffect {
         };
 
         // Engagement crossfade: 0 at exact center (clean bypass detent),
-        // ramping to fully wet at the edge of the narrow dead-zone. The SVF is
-        // still processed even when bypassed so its state stays warm and
-        // re-engaging from center doesn't produce a transient.
+        // ramping to fully wet at the edge of the narrow dead-zone.
         let engage = ((knob - 0.5).abs() / CENTER_DEAD_ZONE).min(1.0);
+
+        // True bypass at the center detent: skip the filter and hold its state
+        // at rest. Driving the SVF here would let resonant energy build silently
+        // (especially with high Q at the near-center cutoff) while the output is
+        // dry, then spike when the knob moves just outside the dead zone. A
+        // filter re-engaging from rest instead ramps up smoothly, so resetting
+        // is the safer choice.
+        if engage <= 0.0 {
+            state.svf.reset();
+            return input;
+        }
 
         // Map resonance (0-1) to Q factor (0.5 to 8.5)
         let q = 0.5 + resonance * 8.0;
@@ -262,6 +271,43 @@ mod tests {
         assert!(
             max_output < 0.25,
             "Mid-travel lowpass should strongly attenuate 12kHz, got peak {}",
+            max_output
+        );
+    }
+
+    #[test]
+    fn test_center_bypass_holds_no_resonant_energy() {
+        // Parked at the center detent with max resonance, the filter must stay
+        // an exact passthrough and must NOT accumulate hidden resonant state
+        // from low-frequency content. Otherwise leaving the dead zone would
+        // dump that stored energy as a spike/tail.
+        let filter = TiltFilterEffect::new(44100.0);
+        filter.set_cutoff(0.5); // center
+        filter.set_resonance(1.0); // max Q
+
+        let freq = 30.0;
+        for i in 0..44100 {
+            let t = i as f32 / 44100.0;
+            let input = (2.0 * std::f32::consts::PI * freq * t).sin();
+            let output = filter.process(input);
+            assert!(
+                (output - input).abs() < 1e-6,
+                "center detent must be exact passthrough, got {} for input {}",
+                output,
+                input
+            );
+        }
+
+        // Leave center toward the lowpass region and feed silence. With the SVF
+        // held at rest there is no stored energy, so nothing should ring out.
+        filter.set_cutoff(0.4);
+        let mut max_output: f32 = 0.0;
+        for _ in 0..2048 {
+            max_output = max_output.max(filter.process(0.0).abs());
+        }
+        assert!(
+            max_output < 1e-6,
+            "no resonant tail should leak from the center detent, got peak {}",
             max_output
         );
     }
