@@ -32,7 +32,8 @@ unsafe fn drain_midi(engine: *mut gooey::ffi::GooeyEngine) -> Vec<(u32, u32)> {
 
 /// Render one buffer of `BUF_FRAMES` samples and return the buffer.
 unsafe fn render_buf(engine: *mut gooey::ffi::GooeyEngine) -> Vec<f32> {
-    let mut buffer = vec![0.0_f32; BUF_FRAMES];
+    // Interleaved stereo: two output samples per frame.
+    let mut buffer = vec![0.0_f32; BUF_FRAMES * 2];
     gooey_engine_render(engine, buffer.as_mut_ptr(), BUF_FRAMES as u32);
     buffer
 }
@@ -170,9 +171,9 @@ fn set_beat_position_does_not_fire_intermediate_steps() {
         // if it fired them).
         gooey_engine_sequencer_set_beat_position(engine, 2.5);
 
-        // Render one sample without starting — set_beat_position alone
-        // must never produce triggers.
-        let mut sample = [0.0_f32; 1];
+        // Render one frame without starting — set_beat_position alone
+        // must never produce triggers. Interleaved stereo: 1 frame = 2 samples.
+        let mut sample = [0.0_f32; 2];
         gooey_engine_render(engine, sample.as_mut_ptr(), 1);
         let events = drain_midi(engine);
         assert!(

@@ -35,7 +35,7 @@ fn test_gain_zero_silences_instrument() {
 
         // Trigger kick with default gain - should have audio
         gooey_engine_trigger_instrument(engine, INSTRUMENT_KICK);
-        let mut buffer = vec![0.0f32; 1024];
+        let mut buffer = vec![0.0f32; 1024 * 2];
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
         let has_audio_before = buffer.iter().any(|&s| s.abs() > 0.001);
 
@@ -67,7 +67,7 @@ fn test_gain_reduces_level() {
 
         // Render kick at full gain
         gooey_engine_trigger_instrument(engine, INSTRUMENT_KICK);
-        let mut buffer_full = vec![0.0f32; 1024];
+        let mut buffer_full = vec![0.0f32; 1024 * 2];
         gooey_engine_render(engine, buffer_full.as_mut_ptr(), 1024);
         let peak_full: f32 = buffer_full.iter().map(|s| s.abs()).fold(0.0, f32::max);
 
@@ -75,7 +75,7 @@ fn test_gain_reduces_level() {
         let engine2 = gooey_engine_new(44100.0);
         gooey_engine_set_instrument_gain(engine2, INSTRUMENT_KICK, 0.5);
         // Let smoothing settle
-        let mut buffer_half = vec![0.0f32; 1024];
+        let mut buffer_half = vec![0.0f32; 1024 * 2];
         for _ in 0..10 {
             gooey_engine_render(engine2, buffer_half.as_mut_ptr(), 1024);
         }
@@ -128,7 +128,7 @@ fn test_gain_with_mute() {
         gooey_engine_set_instrument_mute(engine, INSTRUMENT_KICK, true);
 
         gooey_engine_trigger_instrument(engine, INSTRUMENT_KICK);
-        let mut buffer = vec![0.0f32; 1024];
+        let mut buffer = vec![0.0f32; 1024 * 2];
         for _ in 0..10 {
             gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
         }

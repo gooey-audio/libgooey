@@ -29,7 +29,7 @@ fn test_mute_silences_instrument() {
 
         // Trigger kick and render - should have audio
         gooey_engine_trigger_instrument(engine, INSTRUMENT_KICK);
-        let mut buffer = vec![0.0f32; 1024];
+        let mut buffer = vec![0.0f32; 1024 * 2];
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
         let has_audio_before_mute = buffer.iter().any(|&s| s.abs() > 0.001);
 
@@ -62,7 +62,7 @@ fn test_solo_isolates_instrument() {
 
         // Trigger snare (not soloed) and let gain smoothing settle
         gooey_engine_trigger_instrument(engine, INSTRUMENT_SNARE);
-        let mut buffer = vec![0.0f32; 1024];
+        let mut buffer = vec![0.0f32; 1024 * 2];
         for _ in 0..10 {
             gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
         }
@@ -88,7 +88,7 @@ fn test_solo_allows_soloed_instrument() {
 
         // Trigger kick (soloed)
         gooey_engine_trigger_instrument(engine, INSTRUMENT_KICK);
-        let mut buffer = vec![0.0f32; 1024];
+        let mut buffer = vec![0.0f32; 1024 * 2];
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
 
         // Soloed instrument should produce audio
@@ -112,7 +112,7 @@ fn test_solo_overrides_mute() {
         gooey_engine_trigger_instrument(engine, INSTRUMENT_KICK);
 
         // Render - should have audio (solo overrides mute)
-        let mut buffer = vec![0.0f32; 1024];
+        let mut buffer = vec![0.0f32; 1024 * 2];
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
         let has_audio = buffer.iter().any(|&s| s.abs() > 0.001);
 
@@ -141,7 +141,7 @@ fn test_multiple_solos() {
         gooey_engine_trigger_instrument(engine, INSTRUMENT_KICK);
         gooey_engine_trigger_instrument(engine, INSTRUMENT_SNARE);
 
-        let mut buffer = vec![0.0f32; 1024];
+        let mut buffer = vec![0.0f32; 1024 * 2];
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
 
         // Should have audio from both
@@ -167,7 +167,7 @@ fn test_unmute_restores_audio() {
 
         // Trigger kick
         gooey_engine_trigger_instrument(engine, INSTRUMENT_KICK);
-        let mut buffer = vec![0.0f32; 1024];
+        let mut buffer = vec![0.0f32; 1024 * 2];
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
 
         let has_audio = buffer.iter().any(|&s| s.abs() > 0.001);
@@ -188,7 +188,7 @@ fn test_unsolo_restores_other_instruments() {
 
         // Now trigger snare (which was silenced when kick was soloed)
         gooey_engine_trigger_instrument(engine, INSTRUMENT_SNARE);
-        let mut buffer = vec![0.0f32; 1024];
+        let mut buffer = vec![0.0f32; 1024 * 2];
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
 
         let has_audio = buffer.iter().any(|&s| s.abs() > 0.001);

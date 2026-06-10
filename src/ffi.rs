@@ -9,6 +9,7 @@ use crate::effects::{
 };
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
+use crate::frame::StereoFrame;
 use crate::instruments::{
     BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth,
     PolySynthConfig, SampleBuffer, SnareConfig, SnareDrum, Tom2, Tom2Config,
@@ -905,9 +906,17 @@ impl GooeyEngine {
         }
     }
 
+    /// Render audio into an interleaved stereo `buffer` of `buffer.len() / 2`
+    /// frames. Each frame occupies two consecutive slots: `[left, right]`. The
+    /// signal path is mono, so left and right are currently identical (see the
+    /// "stereo seam" near the end of the per-frame loop), but the engine writes
+    /// two-channel output so hosts (and future stereo features) consume stereo.
     fn render(&mut self, buffer: &mut [f32]) {
         // Clear pending MIDI events from previous render pass
         self.pending_midi_events.clear();
+
+        // Number of stereo frames this buffer holds (two slots per frame).
+        let frame_count = buffer.len() / 2;
 
         // Resolve any host-time-armed start against this buffer's host clock.
         // Possible outcomes:
@@ -917,7 +926,7 @@ impl GooeyEngine {
         // When the arm fires later than this buffer, we zero the whole
         // buffer below and leave `pending_arm_host_time` staged so the next
         // render re-evaluates against its own host time.
-        let arm_state = self.resolve_pending_arm(buffer.len());
+        let arm_state = self.resolve_pending_arm(frame_count);
         let mut arm_fires_at: Option<u32> = match arm_state {
             ArmResolution::FiresAt(n) => Some(n),
             ArmResolution::SilentBuffer => {
@@ -963,14 +972,14 @@ impl GooeyEngine {
         }
 
         let mut sample_offset: u32 = 0;
-        for sample in buffer.iter_mut() {
+        for frame in buffer.chunks_mut(2) {
             // Pre-fire portion of an armed start: emit silence and skip all
             // per-sample work (no sequencer ticks, no instrument ticks, no
             // LFO ticks, no time advance) so the engine stays exactly where
             // it was at arm time.
             if let Some(fire_at) = arm_fires_at {
                 if sample_offset < fire_at {
-                    *sample = 0.0;
+                    frame.fill(0.0);
                     sample_offset += 1;
                     continue;
                 }
@@ -1109,10 +1118,18 @@ impl GooeyEngine {
             }
 
             // Optional limiter (always last when enabled)
-            if self.limiter_enabled {
-                *sample = self.limiter.process(output);
+            let mono_out = if self.limiter_enabled {
+                self.limiter.process(output)
             } else {
-                *sample = output;
+                output
+            };
+
+            // Stereo seam: the signal path is mono, so place the mono sample on
+            // both channels and write the frame interleaved as [left, right].
+            let stereo = StereoFrame::mono(mono_out);
+            frame[0] = stereo.l;
+            if let Some(right) = frame.get_mut(1) {
+                *right = stereo.r;
             }
 
             self.current_time += sample_period;
@@ -1699,19 +1716,27 @@ pub unsafe extern "C" fn gooey_engine_free(engine: *mut GooeyEngine) {
 // Audio rendering
 // =============================================================================
 
-/// Render audio samples into the provided buffer
+/// Number of interleaved output channels produced by `gooey_engine_render`.
+/// The render buffer must hold `frames * GOOEY_OUTPUT_CHANNELS` floats.
+pub const GOOEY_OUTPUT_CHANNELS: u32 = 2;
+
+/// Render interleaved stereo audio into the provided buffer
 ///
 /// This is the main audio callback function. Call this from your audio thread
-/// to generate audio samples.
+/// to generate audio samples. Output is two-channel: the buffer holds `frames`
+/// stereo frames laid out as interleaved `[left, right]` pairs, so the caller
+/// must provide `frames * GOOEY_OUTPUT_CHANNELS` (`frames * 2`) floats. The
+/// signal path is currently mono, so left and right are identical, but callers
+/// should always treat the buffer as stereo.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
-/// * `buffer` - Pointer to a buffer of floats to fill with audio
-/// * `frames` - Number of frames (samples) to render
+/// * `buffer` - Pointer to a buffer of floats to fill with interleaved L/R audio
+/// * `frames` - Number of stereo frames to render
 ///
 /// # Safety
 /// - `engine` must be a valid pointer returned by `gooey_engine_new`
-/// - `buffer` must point to at least `frames` floats of allocated memory
+/// - `buffer` must point to at least `frames * 2` floats of allocated memory
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_render(
     engine: *mut GooeyEngine,
@@ -1723,7 +1748,7 @@ pub unsafe extern "C" fn gooey_engine_render(
     }
 
     let engine_ref = &mut *engine;
-    let buffer_slice = slice::from_raw_parts_mut(buffer, frames as usize);
+    let buffer_slice = slice::from_raw_parts_mut(buffer, frames as usize * 2);
 
     // If engine is already in error state, output silence
     if engine_ref.error_occurred.load(Ordering::Relaxed) {
@@ -1757,8 +1782,8 @@ pub unsafe extern "C" fn gooey_engine_render(
         engine_ref.error_message = Some(c_msg);
         engine_ref.error_occurred.store(true, Ordering::Release);
 
-        // Zero the output buffer
-        let buffer_slice = slice::from_raw_parts_mut(buffer, frames as usize);
+        // Zero the output buffer (interleaved stereo: frames * 2 floats)
+        let buffer_slice = slice::from_raw_parts_mut(buffer, frames as usize * 2);
         for sample in buffer_slice.iter_mut() {
             *sample = 0.0;
         }

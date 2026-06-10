@@ -250,8 +250,10 @@ fn reordering_changes_audio_output() {
         assert!(ok);
 
         gooey_engine_trigger_instrument(engine, INSTRUMENT_KICK);
-        let mut buffer = vec![0.0f32; 16_384];
-        gooey_engine_render(engine, buffer.as_mut_ptr(), buffer.len() as u32);
+        let frames = 16_384u32;
+        // Interleaved stereo: two output samples per frame.
+        let mut buffer = vec![0.0f32; frames as usize * 2];
+        gooey_engine_render(engine, buffer.as_mut_ptr(), frames);
 
         gooey_engine_free(engine);
         buffer

@@ -85,7 +85,7 @@ fn test_swap_produces_audio() {
 
         // Trigger channel 0 (now a tom)
         gooey_engine_trigger_channel(engine, 0);
-        let mut buffer = vec![0.0f32; 1024];
+        let mut buffer = vec![0.0f32; 1024 * 2];
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
 
         let has_audio = buffer.iter().any(|&s| s.abs() > 0.001);
@@ -152,7 +152,7 @@ fn test_trigger_channel_api() {
 
         // Trigger via channel API
         gooey_engine_trigger_channel_with_velocity(engine, 0, 0.8);
-        let mut buffer = vec![0.0f32; 1024];
+        let mut buffer = vec![0.0f32; 1024 * 2];
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
 
         let has_audio = buffer.iter().any(|&s| s.abs() > 0.001);
@@ -178,7 +178,7 @@ fn test_set_channel_param() {
 
         // Trigger and verify audio
         gooey_engine_trigger_channel(engine, 0);
-        let mut buffer = vec![0.0f32; 1024];
+        let mut buffer = vec![0.0f32; 1024 * 2];
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
 
         let has_audio = buffer.iter().any(|&s| s.abs() > 0.001);
@@ -199,7 +199,7 @@ fn test_backward_compat_param_setter() {
         // Default: channel 0 = kick. set_kick_param should work
         gooey_engine_set_kick_param(engine, KICK_PARAM_VOLUME, 0.8);
         gooey_engine_trigger_instrument(engine, INSTRUMENT_KICK);
-        let mut buffer = vec![0.0f32; 1024];
+        let mut buffer = vec![0.0f32; 1024 * 2];
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
         let has_audio = buffer.iter().any(|&s| s.abs() > 0.001);
         assert!(
@@ -231,7 +231,7 @@ fn test_duplicate_instrument_types() {
         // Trigger both channels, both should produce audio
         gooey_engine_trigger_channel(engine, 0);
         gooey_engine_trigger_channel(engine, 2);
-        let mut buffer = vec![0.0f32; 1024];
+        let mut buffer = vec![0.0f32; 1024 * 2];
         gooey_engine_render(engine, buffer.as_mut_ptr(), 1024);
 
         let has_audio = buffer.iter().any(|&s| s.abs() > 0.001);

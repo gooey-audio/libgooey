@@ -21,7 +21,8 @@ const SILENCE: f32 = 0.001;
 
 /// Render `frames` samples and return the buffer.
 unsafe fn render_n(engine: *mut gooey::ffi::GooeyEngine, frames: usize) -> Vec<f32> {
-    let mut buffer = vec![0.0_f32; frames];
+    // Interleaved stereo: two output samples per frame.
+    let mut buffer = vec![0.0_f32; frames * 2];
     gooey_engine_render(engine, buffer.as_mut_ptr(), frames as u32);
     buffer
 }
