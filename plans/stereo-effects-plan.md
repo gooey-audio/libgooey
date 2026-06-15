@@ -127,4 +127,6 @@ Pass 3 complete. The `Effect` trait now carries `process_stereo`, the stereo sea
 
 The mono `Engine::tick()` and the offline bounce stayed byte-identical via the `render_pre_effects` split, so nothing downstream of them changed. The main lesson mirrors the ping-pong discovery: a stereo *plumbing* foundation is cheap and symmetry-preserving, but producing *audible* stereo from mono content requires an intentional asymmetry (here, left-only dry injection in ping-pong) — symmetric processing of equal inputs can never diverge.
 
-What remains for future passes: stereo decorrelation for the reverb (its two tanks currently share allpass lengths, so reverb stays dual-mono even when engaged), per-instrument pan (Pass 2 in `plans/stereo-support-plan.md`), and a stereo offline bounce (still mono by design).
+Reverb stereo decorrelation has since landed (2026-06-15): the two tanks now use different per-channel allpass tables (`ALLPASS_DELAYS_44100_L`/`_R` in `src/effects/reverb.rs`), so a mono input produces genuinely different left and right — verified by `reverb_decorrelates_left_and_right` in `tests/stereo_effects.rs`. The left/mono table is unchanged, so the mono `process` path (bounce, `tick`) stays byte-identical.
+
+What remains for future passes: per-instrument pan (Pass 2 in `plans/stereo-support-plan.md`) and a stereo offline bounce (still mono by design).
