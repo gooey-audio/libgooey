@@ -70,6 +70,9 @@ impl DelayControl {
     fn set_filter_cutoff(&self, cutoff: f32) {
         unsafe { &*self.ptr }.set_filter_cutoff(cutoff);
     }
+    fn set_pingpong(&self, on: bool) {
+        unsafe { &*self.ptr }.set_pingpong(on);
+    }
 }
 
 // Parameter indices
@@ -108,6 +111,7 @@ struct DelayState {
     mix: f32,
     filter_cutoff: f32,
     running: bool,
+    pingpong: bool,
 }
 
 fn make_bar(normalized: f32, width: usize) -> String {
@@ -121,9 +125,10 @@ fn render_display(state: &DelayState, selected: usize) {
     print!("\x1b[2J\x1b[H\x1b[?7l");
 
     print!("=== Delay Lab ===\r\n");
-    print!("SPACE=start/stop Q=quit ↑↓=sel ←→=adj []=fine\r\n");
+    print!("SPACE=start/stop P=pingpong Q=quit ↑↓=sel ←→=adj []=fine\r\n");
     let status = if state.running { "RUNNING" } else { "STOPPED" };
-    print!("Status: {}\r\n", status);
+    let pingpong = if state.pingpong { "ON" } else { "OFF" };
+    print!("Status: {}    Ping-pong: {} (headphones!)\r\n", status, pingpong);
     print!("\r\n");
 
     // BPM
@@ -242,6 +247,7 @@ fn main() -> anyhow::Result<()> {
         mix: 0.4,
         filter_cutoff: 8000.0,
         running: false,
+        pingpong: false,
     };
     let mut selected: usize = 0;
     let mut needs_redraw = true;
@@ -331,6 +337,13 @@ fn main() -> anyhow::Result<()> {
                                 state.running = true;
                             }
                         }
+                        needs_redraw = true;
+                    }
+
+                    // Toggle ping-pong (echoes bounce left/right)
+                    KeyCode::Char('p') | KeyCode::Char('P') => {
+                        state.pingpong = !state.pingpong;
+                        delay_control.set_pingpong(state.pingpong);
                         needs_redraw = true;
                     }
 
