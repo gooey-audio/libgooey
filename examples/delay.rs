@@ -128,7 +128,10 @@ fn render_display(state: &DelayState, selected: usize) {
     print!("SPACE=start/stop P=pingpong Q=quit ↑↓=sel ←→=adj []=fine\r\n");
     let status = if state.running { "RUNNING" } else { "STOPPED" };
     let pingpong = if state.pingpong { "ON" } else { "OFF" };
-    print!("Status: {}    Ping-pong: {} (headphones!)\r\n", status, pingpong);
+    print!(
+        "Status: {}    Ping-pong: {} (headphones!)\r\n",
+        status, pingpong
+    );
     print!("\r\n");
 
     // BPM
