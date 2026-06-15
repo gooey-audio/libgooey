@@ -1,4 +1,5 @@
 use crate::effects::Effect;
+use crate::frame::StereoFrame;
 use crate::utils::smoother::SmoothedParam;
 use std::cell::UnsafeCell;
 use std::f32::consts::FRAC_2_PI;
@@ -30,7 +31,10 @@ struct CompressorState {
 }
 
 pub struct TubeCompressor {
-    state: UnsafeCell<CompressorState>,
+    // Per-channel state (index 0 = mono/left, index 1 = right). The mono
+    // `process`/`process_with_sidechain` paths use only index 0, so their
+    // behavior is unchanged.
+    state: UnsafeCell<[CompressorState; 2]>,
 
     threshold_target: AtomicU32,
     ratio_target: AtomicU32,
@@ -58,19 +62,21 @@ impl TubeCompressor {
         let release_ms = release_ms.clamp(5.0, 1000.0);
         let mix = mix.clamp(0.0, 1.0);
 
+        let make_state = || CompressorState {
+            threshold_smoothed: SmoothedParam::new(threshold_db, -60.0, 0.0, sample_rate, 30.0),
+            ratio_smoothed: SmoothedParam::new(ratio, 1.0, 20.0, sample_rate, 30.0),
+            attack_smoothed: SmoothedParam::new(attack_ms, 0.1, 100.0, sample_rate, 30.0),
+            release_smoothed: SmoothedParam::new(release_ms, 5.0, 1000.0, sample_rate, 30.0),
+            mix_smoothed: SmoothedParam::new(mix, 0.0, 1.0, sample_rate, 30.0),
+            envelope: 0.0,
+            gain_smoothed: 1.0,
+            dc_x1: 0.0,
+            dc_y1: 0.0,
+            sample_rate,
+        };
+
         Self {
-            state: UnsafeCell::new(CompressorState {
-                threshold_smoothed: SmoothedParam::new(threshold_db, -60.0, 0.0, sample_rate, 30.0),
-                ratio_smoothed: SmoothedParam::new(ratio, 1.0, 20.0, sample_rate, 30.0),
-                attack_smoothed: SmoothedParam::new(attack_ms, 0.1, 100.0, sample_rate, 30.0),
-                release_smoothed: SmoothedParam::new(release_ms, 5.0, 1000.0, sample_rate, 30.0),
-                mix_smoothed: SmoothedParam::new(mix, 0.0, 1.0, sample_rate, 30.0),
-                envelope: 0.0,
-                gain_smoothed: 1.0,
-                dc_x1: 0.0,
-                dc_y1: 0.0,
-                sample_rate,
-            }),
+            state: UnsafeCell::new([make_state(), make_state()]),
             threshold_target: AtomicU32::new(threshold_db.to_bits()),
             ratio_target: AtomicU32::new(ratio.to_bits()),
             attack_target: AtomicU32::new(attack_ms.to_bits()),
@@ -115,13 +121,12 @@ impl TubeCompressor {
         output
     }
 
-    /// Core processing: input is the audio to compress, sidechain drives the detector
-    fn process_inner(&self, input: f32, sidechain: f32) -> f32 {
+    /// Core processing: input is the audio to compress, sidechain drives the
+    /// detector. Operates on the supplied per-channel state.
+    fn process_inner(&self, state: &mut CompressorState, input: f32, sidechain: f32) -> f32 {
         if !input.is_finite() || !sidechain.is_finite() {
             return 0.0;
         }
-
-        let state = unsafe { &mut *self.state.get() };
 
         // Read targets and update smoothers
         let threshold_target = f32::from_bits(self.threshold_target.load(Ordering::Relaxed));
@@ -201,10 +206,26 @@ impl TubeCompressor {
         output
     }
 
-    /// Process with an external sidechain signal.
+    /// Process with an external sidechain signal (mono path).
     /// The envelope follower tracks `sidechain` while gain reduction is applied to `input`.
     pub fn process_with_sidechain(&self, input: f32, sidechain: f32) -> f32 {
-        self.process_inner(input, sidechain)
+        let states = unsafe { &mut *self.state.get() };
+        self.process_inner(&mut states[0], input, sidechain)
+    }
+
+    /// Process a stereo frame with an external stereo sidechain signal.
+    /// Each channel's detector tracks its own sidechain value. When the engine's
+    /// sidechain source is mono, the same value is supplied on both channels.
+    pub fn process_stereo_with_sidechain(
+        &self,
+        input: StereoFrame,
+        sidechain: StereoFrame,
+    ) -> StereoFrame {
+        let states = unsafe { &mut *self.state.get() };
+        StereoFrame {
+            l: self.process_inner(&mut states[0], input.l, sidechain.l),
+            r: self.process_inner(&mut states[1], input.r, sidechain.r),
+        }
     }
 
     // Parameter setters (thread-safe, called from control thread)
@@ -261,17 +282,29 @@ impl TubeCompressor {
     }
 
     pub fn reset(&self) {
-        let state = unsafe { &mut *self.state.get() };
-        state.envelope = 0.0;
-        state.gain_smoothed = 1.0;
-        state.dc_x1 = 0.0;
-        state.dc_y1 = 0.0;
+        let states = unsafe { &mut *self.state.get() };
+        for state in states.iter_mut() {
+            state.envelope = 0.0;
+            state.gain_smoothed = 1.0;
+            state.dc_x1 = 0.0;
+            state.dc_y1 = 0.0;
+        }
     }
 }
 
 impl Effect for TubeCompressor {
     fn process(&self, input: f32) -> f32 {
-        self.process_inner(input, input)
+        let states = unsafe { &mut *self.state.get() };
+        self.process_inner(&mut states[0], input, input)
+    }
+
+    fn process_stereo(&self, input: StereoFrame) -> StereoFrame {
+        // No external sidechain: each channel is its own detector.
+        let states = unsafe { &mut *self.state.get() };
+        StereoFrame {
+            l: self.process_inner(&mut states[0], input.l, input.l),
+            r: self.process_inner(&mut states[1], input.r, input.r),
+        }
     }
 }
 

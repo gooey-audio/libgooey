@@ -7,6 +7,7 @@
 //! characteristic "sproingy" dispersion of a spring reverb.
 
 use crate::effects::Effect;
+use crate::frame::StereoFrame;
 use crate::utils::smoother::SmoothedParam;
 
 use std::cell::UnsafeCell;
@@ -56,7 +57,9 @@ struct ReverbState {
 }
 
 pub struct SpringReverbEffect {
-    state: UnsafeCell<ReverbState>,
+    // Per-channel state (index 0 = mono/left, index 1 = right). The mono
+    // `process` path uses only index 0, so its behavior is unchanged.
+    state: UnsafeCell<[ReverbState; 2]>,
     decay_target: AtomicU32,
     mix_target: AtomicU32,
     damping_target: AtomicU32,
@@ -74,23 +77,26 @@ impl SpringReverbEffect {
 
         let scale = sample_rate / 44100.0;
 
-        let allpasses = std::array::from_fn(|i| {
-            let len = ((ALLPASS_DELAYS_44100[i] as f32) * scale).max(1.0) as usize;
-            AllpassFilter {
-                buffer: vec![0.0; len],
-                index: 0,
-            }
-        });
-
-        Self {
-            state: UnsafeCell::new(ReverbState {
+        let make_state = || {
+            let allpasses = std::array::from_fn(|i| {
+                let len = ((ALLPASS_DELAYS_44100[i] as f32) * scale).max(1.0) as usize;
+                AllpassFilter {
+                    buffer: vec![0.0; len],
+                    index: 0,
+                }
+            });
+            ReverbState {
                 allpasses,
                 feedback_sample: 0.0,
                 damping_filter_state: 0.0,
                 decay_smoothed: SmoothedParam::new_normalized(decay, sample_rate),
                 mix_smoothed: SmoothedParam::new_normalized(mix, sample_rate),
                 damping_smoothed: SmoothedParam::new_normalized(damping, sample_rate),
-            }),
+            }
+        };
+
+        Self {
+            state: UnsafeCell::new([make_state(), make_state()]),
             decay_target: AtomicU32::new(decay.to_bits()),
             mix_target: AtomicU32::new(mix.to_bits()),
             damping_target: AtomicU32::new(damping.to_bits()),
@@ -124,24 +130,22 @@ impl SpringReverbEffect {
         f32::from_bits(self.damping_target.load(Ordering::Relaxed))
     }
 
-    /// Reset reverb state (clear allpass buffers and feedback path)
+    /// Reset reverb state (clear allpass buffers and feedback path) on all channels
     pub fn reset(&self) {
         // SAFETY: Called from main thread when reverb is not processing
-        let state = unsafe { &mut *self.state.get() };
-        for ap in state.allpasses.iter_mut() {
-            ap.buffer.fill(0.0);
-            ap.index = 0;
+        let states = unsafe { &mut *self.state.get() };
+        for state in states.iter_mut() {
+            for ap in state.allpasses.iter_mut() {
+                ap.buffer.fill(0.0);
+                ap.index = 0;
+            }
+            state.feedback_sample = 0.0;
+            state.damping_filter_state = 0.0;
         }
-        state.feedback_sample = 0.0;
-        state.damping_filter_state = 0.0;
     }
-}
 
-impl Effect for SpringReverbEffect {
-    fn process(&self, input: f32) -> f32 {
-        // SAFETY: process() is only called from the audio thread
-        let state = unsafe { &mut *self.state.get() };
-
+    /// Process one sample through a single channel's reverb state.
+    fn process_one(&self, state: &mut ReverbState, input: f32) -> f32 {
         let input = if input.is_finite() { input } else { 0.0 };
 
         // Update smoothed parameters from atomic targets
@@ -195,6 +199,23 @@ impl Effect for SpringReverbEffect {
             result
         } else {
             input
+        }
+    }
+}
+
+impl Effect for SpringReverbEffect {
+    fn process(&self, input: f32) -> f32 {
+        // SAFETY: process() is only called from the audio thread
+        let states = unsafe { &mut *self.state.get() };
+        self.process_one(&mut states[0], input)
+    }
+
+    fn process_stereo(&self, input: StereoFrame) -> StereoFrame {
+        // SAFETY: see process(); each channel owns its own reverb tank.
+        let states = unsafe { &mut *self.state.get() };
+        StereoFrame {
+            l: self.process_one(&mut states[0], input.l),
+            r: self.process_one(&mut states[1], input.r),
         }
     }
 }

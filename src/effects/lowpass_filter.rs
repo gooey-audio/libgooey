@@ -4,6 +4,7 @@
 //! Parameters are smoothed to prevent clicks/pops when adjusting cutoff and resonance.
 
 use crate::effects::Effect;
+use crate::frame::StereoFrame;
 use crate::utils::smoother::SmoothedParam;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -30,9 +31,11 @@ struct FilterState {
 pub struct LowpassFilterEffect {
     sample_rate: f32,
 
-    // Mutable state wrapped in UnsafeCell for interior mutability
+    // Per-channel mutable state wrapped in UnsafeCell for interior mutability.
+    // Index 0 is the mono / left channel, index 1 is the right channel; the mono
+    // `process` path uses only index 0, so its behavior is unchanged.
     // SAFETY: This is only accessed from the audio thread during process()
-    state: UnsafeCell<FilterState>,
+    state: UnsafeCell<[FilterState; 2]>,
 
     // Atomic parameters for lock-free updates from control thread
     // Uses bit representation of f32 for atomic operations
@@ -56,27 +59,20 @@ impl LowpassFilterEffect {
         let cutoff_clamped = cutoff_freq.clamp(20.0, 20000.0);
         let resonance_clamped = resonance.clamp(0.0, 0.95);
 
+        // Build one channel's worth of state. Both channels read the same atomic
+        // targets, so duplicating the smoothers is fine — with equal input they
+        // converge identically.
+        let make_state = || FilterState {
+            // Use 30ms smoothing for filter parameters (longer than typical 15ms for smoother sweeps)
+            cutoff_smoothed: SmoothedParam::new(cutoff_clamped, 20.0, 20000.0, sample_rate, 30.0),
+            resonance_smoothed: SmoothedParam::new(resonance_clamped, 0.0, 0.95, sample_rate, 30.0),
+            stage1: 0.0,
+            stage2: 0.0,
+        };
+
         Self {
             sample_rate,
-            state: UnsafeCell::new(FilterState {
-                // Use 30ms smoothing for filter parameters (longer than typical 15ms for smoother sweeps)
-                cutoff_smoothed: SmoothedParam::new(
-                    cutoff_clamped,
-                    20.0,
-                    20000.0,
-                    sample_rate,
-                    30.0,
-                ),
-                resonance_smoothed: SmoothedParam::new(
-                    resonance_clamped,
-                    0.0,
-                    0.95,
-                    sample_rate,
-                    30.0,
-                ),
-                stage1: 0.0,
-                stage2: 0.0,
-            }),
+            state: UnsafeCell::new([make_state(), make_state()]),
             cutoff_target: AtomicU32::new(cutoff_clamped.to_bits()),
             resonance_target: AtomicU32::new(resonance_clamped.to_bits()),
         }
@@ -93,9 +89,11 @@ impl LowpassFilterEffect {
     /// Reset filter state (call when enabling filter or after NaN detection)
     pub fn reset(&self) {
         // SAFETY: Called from main thread when filter is not processing
-        let state = unsafe { &mut *self.state.get() };
-        state.stage1 = 0.0;
-        state.stage2 = 0.0;
+        let states = unsafe { &mut *self.state.get() };
+        for state in states.iter_mut() {
+            state.stage1 = 0.0;
+            state.stage2 = 0.0;
+        }
     }
 
     /// Get current cutoff frequency
@@ -123,13 +121,12 @@ impl LowpassFilterEffect {
     }
 }
 
-impl Effect for LowpassFilterEffect {
-    fn process(&self, input: f32) -> f32 {
-        // SAFETY: We use UnsafeCell for interior mutability. This is safe because:
-        // 1. The audio thread is the only thread that calls process()
-        // 2. Parameter updates via atomics are lock-free and don't conflict
-        let state = unsafe { &mut *self.state.get() };
-
+impl LowpassFilterEffect {
+    /// Process one sample through a single channel's filter state.
+    ///
+    /// All per-sample DSP lives here so both the mono `process` and the stereo
+    /// `process_stereo` can drive it with the correct per-channel state.
+    fn process_one(&self, state: &mut FilterState, input: f32) -> f32 {
         // Read atomic targets and update smoothers
         let cutoff_target = f32::from_bits(self.cutoff_target.load(Ordering::Relaxed));
         let resonance_target = f32::from_bits(self.resonance_target.load(Ordering::Relaxed));
@@ -194,6 +191,25 @@ impl Effect for LowpassFilterEffect {
         }
 
         output
+    }
+}
+
+impl Effect for LowpassFilterEffect {
+    fn process(&self, input: f32) -> f32 {
+        // SAFETY: We use UnsafeCell for interior mutability. This is safe because:
+        // 1. The audio thread is the only thread that calls process()
+        // 2. Parameter updates via atomics are lock-free and don't conflict
+        let states = unsafe { &mut *self.state.get() };
+        self.process_one(&mut states[0], input)
+    }
+
+    fn process_stereo(&self, input: StereoFrame) -> StereoFrame {
+        // SAFETY: see process(); each channel owns its own filter state.
+        let states = unsafe { &mut *self.state.get() };
+        StereoFrame {
+            l: self.process_one(&mut states[0], input.l),
+            r: self.process_one(&mut states[1], input.r),
+        }
     }
 }
 
