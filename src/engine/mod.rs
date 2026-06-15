@@ -1,4 +1,5 @@
 use crate::effects::{Effect, SoftLimiter};
+use crate::frame::StereoFrame;
 use crate::utils::SmoothedParam;
 use std::collections::{HashMap, VecDeque};
 
@@ -338,6 +339,17 @@ impl Engine {
         }
 
         output
+    }
+
+    /// Generate one stereo frame of audio at the given time.
+    ///
+    /// This is the native engine's "stereo seam": the signal path is mono, so
+    /// the mono [`Engine::tick`] output is placed equally on both channels via
+    /// [`StereoFrame::mono`]. Output sinks (CPAL device, offline bounce) call
+    /// this to drive true two-channel output. Future per-instrument panning or
+    /// stereo effects only need to change what this method returns.
+    pub fn tick_stereo(&mut self, current_time: f64) -> StereoFrame {
+        StereoFrame::mono(self.tick(current_time))
     }
 
     pub fn sample_rate(&self) -> f32 {

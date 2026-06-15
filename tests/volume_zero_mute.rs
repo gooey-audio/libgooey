@@ -9,7 +9,7 @@ unsafe fn assert_volume_zero_silences(
     param_setter: unsafe fn(*mut GooeyEngine, u32, f32),
 ) {
     let engine = gooey_engine_new(44100.0);
-    let mut buffer = vec![0.0f32; 1024];
+    let mut buffer = vec![0.0f32; 1024 * 2];
 
     // First, verify the instrument produces audio at default volume
     gooey_engine_trigger_instrument(engine, instrument);
@@ -54,7 +54,7 @@ unsafe fn assert_volume_zero_silences_mid_playback(
     param_setter: unsafe fn(*mut GooeyEngine, u32, f32),
 ) {
     let engine = gooey_engine_new(44100.0);
-    let mut buffer = vec![0.0f32; 1024];
+    let mut buffer = vec![0.0f32; 1024 * 2];
 
     // Trigger at full volume and verify audio is produced
     gooey_engine_trigger_instrument(engine, instrument);

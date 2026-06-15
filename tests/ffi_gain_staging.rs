@@ -7,7 +7,8 @@ const RENDER_FRAMES: usize = 4_096;
 const SETTLE_FRAMES: usize = 16_384;
 
 unsafe fn render(engine: *mut GooeyEngine, frames: usize) -> Vec<f32> {
-    let mut buffer = vec![0.0_f32; frames];
+    // Interleaved stereo: GOOEY_OUTPUT_CHANNELS (2) output samples per frame.
+    let mut buffer = vec![0.0_f32; frames * GOOEY_OUTPUT_CHANNELS as usize];
     gooey_engine_render(engine, buffer.as_mut_ptr(), frames as u32);
     buffer
 }

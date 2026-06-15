@@ -77,7 +77,7 @@ Sequencer ──trigger──▶ Instruments ──tick──▶ Sum ──▶ M
 
 ## Planning Conventions
 
-- Store execution plans in `.context/plans/`.
+- Store execution plans in `./plans/` (the repo-root `plans/` directory). Plans are committed so they can be referenced, continued, and pulled up across PRs.
 - Use dash-separated lowercase filenames for plans, for example `granulator-original-design-gap-plan.md`.
 - When writing an ExecPlan, follow `.agent/PLANS.md` and keep the plan self-contained.
 

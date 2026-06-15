@@ -186,8 +186,9 @@ fn trigger_and_render_produces_finite_nonzero_audio() {
         gooey_engine_granulator_snap_params(engine);
         gooey_engine_granulator_trigger(engine, 1.0);
 
-        let frames = 22_050usize; // ~0.5 seconds
-        let mut buffer = vec![0.0_f32; frames];
+        // ~0.5 seconds; interleaved stereo means two output samples per frame.
+        let frames = 22_050usize;
+        let mut buffer = vec![0.0_f32; frames * 2];
         gooey_engine_render(engine, buffer.as_mut_ptr(), frames as u32);
 
         let max_abs = buffer.iter().fold(0.0_f32, |acc, s| {
@@ -217,8 +218,10 @@ fn active_grain_count_rises_after_trigger() {
         gooey_engine_granulator_snap_params(engine);
         gooey_engine_granulator_trigger(engine, 1.0);
 
-        let mut buffer = vec![0.0_f32; 4096];
-        gooey_engine_render(engine, buffer.as_mut_ptr(), buffer.len() as u32);
+        let frames = 4096u32;
+        // Interleaved stereo: two output samples per frame.
+        let mut buffer = vec![0.0_f32; frames as usize * 2];
+        gooey_engine_render(engine, buffer.as_mut_ptr(), frames);
 
         assert!(
             gooey_engine_granulator_active_grain_count(engine) > 0,
