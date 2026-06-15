@@ -5,6 +5,7 @@
 //! path so each repetition gets progressively darker, like a classic filter delay.
 
 use crate::effects::Effect;
+use crate::frame::StereoFrame;
 use crate::utils::smoother::SmoothedParam;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -131,9 +132,10 @@ struct DelayState {
 pub struct DelayEffect {
     sample_rate: f32,
 
-    // Mutable state wrapped in UnsafeCell for interior mutability
+    // Per-channel mutable state (index 0 = mono/left, index 1 = right). The mono
+    // `process` path uses only index 0, so its behavior is unchanged.
     // SAFETY: This is only accessed from the audio thread during process()
-    state: UnsafeCell<DelayState>,
+    state: UnsafeCell<[DelayState; 2]>,
 
     // Atomic parameters for lock-free updates from control thread
     timing_target: AtomicU32,
@@ -141,6 +143,20 @@ pub struct DelayEffect {
     feedback_target: AtomicU32,
     mix_target: AtomicU32,
     filter_cutoff_target: AtomicU32,
+    // Ping-pong mode (0 = off: independent dual-mono delay; 1 = on: feedback
+    // crosses channels so echoes bounce left/right).
+    pingpong_target: AtomicU32,
+}
+
+/// Values produced by the per-sample read phase ([`DelayEffect::step_read`]) and
+/// consumed by the write phase ([`DelayEffect::step_write`]).
+struct DelayStep {
+    /// The filtered delayed sample (the wet tap heard on this channel).
+    filtered_delay: f32,
+    /// Smoothed feedback amount for this sample.
+    feedback: f32,
+    /// Smoothed wet/dry mix for this sample.
+    mix: f32,
 }
 
 // SAFETY: The UnsafeCell is only accessed from a single audio thread
@@ -174,49 +190,68 @@ impl DelayEffect {
         // Allocate buffer for maximum delay time
         let buffer_size = (sample_rate * MAX_DELAY_TIME) as usize + 1;
 
+        // Build one channel's worth of state. Both channels read the same atomic
+        // targets, so duplicating the smoothers is fine — with equal input they
+        // converge identically.
+        let make_state = || DelayState {
+            buffer: vec![0.0; buffer_size],
+            write_index: 0,
+            filter_z1: 0.0,
+            filter_z2: 0.0,
+            previous_timing: timing.to_timing_constant(),
+            // Use 50ms smoothing for delay time to avoid zipper noise
+            time_smoothed: SmoothedParam::new(time, 0.0, MAX_DELAY_TIME, sample_rate, 50.0),
+            // Use 30ms smoothing for feedback and mix
+            feedback_smoothed: SmoothedParam::new(feedback_clamped, 0.0, 0.95, sample_rate, 30.0),
+            mix_smoothed: SmoothedParam::new(mix_clamped, 0.0, 1.0, sample_rate, 30.0),
+            filter_cutoff_smoothed: SmoothedParam::new(
+                cutoff_clamped,
+                MIN_FILTER_CUTOFF,
+                MAX_FILTER_CUTOFF,
+                sample_rate,
+                30.0,
+            ),
+        };
+
         Self {
             sample_rate,
-            state: UnsafeCell::new(DelayState {
-                buffer: vec![0.0; buffer_size],
-                write_index: 0,
-                filter_z1: 0.0,
-                filter_z2: 0.0,
-                previous_timing: timing.to_timing_constant(),
-                // Use 50ms smoothing for delay time to avoid zipper noise
-                time_smoothed: SmoothedParam::new(time, 0.0, MAX_DELAY_TIME, sample_rate, 50.0),
-                // Use 30ms smoothing for feedback and mix
-                feedback_smoothed: SmoothedParam::new(
-                    feedback_clamped,
-                    0.0,
-                    0.95,
-                    sample_rate,
-                    30.0,
-                ),
-                mix_smoothed: SmoothedParam::new(mix_clamped, 0.0, 1.0, sample_rate, 30.0),
-                filter_cutoff_smoothed: SmoothedParam::new(
-                    cutoff_clamped,
-                    MIN_FILTER_CUTOFF,
-                    MAX_FILTER_CUTOFF,
-                    sample_rate,
-                    30.0,
-                ),
-            }),
+            state: UnsafeCell::new([make_state(), make_state()]),
             timing_target: AtomicU32::new(timing.to_timing_constant()),
             bpm_target: AtomicU32::new(bpm.to_bits()),
             feedback_target: AtomicU32::new(feedback_clamped.to_bits()),
             mix_target: AtomicU32::new(mix_clamped.to_bits()),
             filter_cutoff_target: AtomicU32::new(cutoff_clamped.to_bits()),
+            pingpong_target: AtomicU32::new(0),
         }
     }
 
-    /// Reset delay state (clear buffer and filter)
+    /// Reset delay state (clear buffer and filter) on all channels
     pub fn reset(&self) {
         // SAFETY: Called from main thread when delay is not processing
-        let state = unsafe { &mut *self.state.get() };
-        state.buffer.fill(0.0);
-        state.write_index = 0;
-        state.filter_z1 = 0.0;
-        state.filter_z2 = 0.0;
+        let states = unsafe { &mut *self.state.get() };
+        for state in states.iter_mut() {
+            state.buffer.fill(0.0);
+            state.write_index = 0;
+            state.filter_z1 = 0.0;
+            state.filter_z2 = 0.0;
+        }
+    }
+
+    /// Enable or disable ping-pong mode (thread-safe).
+    ///
+    /// When on, the delay feedback crosses channels: the left buffer is fed from
+    /// the right channel's delayed tap and vice versa, and the dry input is
+    /// injected only into the left delay line — so echoes alternate between the
+    /// left and right speakers. When off, each channel runs an independent
+    /// delay (identical output for mono input).
+    pub fn set_pingpong(&self, on: bool) {
+        self.pingpong_target
+            .store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    }
+
+    /// Get current ping-pong mode (true = on).
+    pub fn get_pingpong(&self) -> bool {
+        self.pingpong_target.load(Ordering::Relaxed) != 0
     }
 
     /// Get current timing division constant
@@ -276,16 +311,14 @@ impl DelayEffect {
     }
 }
 
-impl Effect for DelayEffect {
-    fn process(&self, input: f32) -> f32 {
-        // SAFETY: We use UnsafeCell for interior mutability. This is safe because:
-        // 1. The audio thread is the only thread that calls process()
-        // 2. Parameter updates via atomics are lock-free and don't conflict
-        let state = unsafe { &mut *self.state.get() };
-
-        // NaN/infinity protection at input - treat invalid input as silence
-        let input = if input.is_finite() { input } else { 0.0 };
-
+impl DelayEffect {
+    /// Per-sample read phase for one channel: read the atomic targets, advance
+    /// the smoothers and the feedback-path filter, and produce the filtered
+    /// delayed tap. This does NOT write the delay buffer, so a caller can decide
+    /// (per ping-pong mode) which channel's tap feeds which buffer before the
+    /// write phase runs. Reads happen at `write_index - delay`, writes happen at
+    /// `write_index`, so the read and write phases touch different buffer slots.
+    fn step_read(&self, state: &mut DelayState) -> DelayStep {
         // Read atomic targets and compute delay time from timing + BPM
         let timing_const = self.timing_target.load(Ordering::Relaxed);
         let bpm = f32::from_bits(self.bpm_target.load(Ordering::Relaxed));
@@ -358,14 +391,35 @@ impl Effect for DelayEffect {
             state.filter_z2 = 0.0;
         }
 
+        DelayStep {
+            filtered_delay,
+            feedback,
+            mix,
+        }
+    }
+
+    /// Per-sample write phase for one channel.
+    ///
+    /// `inject_input` is mixed into the delay line (driving the echoes);
+    /// `feedback_tap` is the filtered delayed sample fed back at `step.feedback`
+    /// (normally this channel's own tap, or the partner channel's in ping-pong).
+    /// `dry_input` is the dry signal used in the wet/dry output mix.
+    fn step_write(
+        &self,
+        state: &mut DelayState,
+        dry_input: f32,
+        inject_input: f32,
+        step: &DelayStep,
+        feedback_tap: f32,
+    ) -> f32 {
+        let buffer_len = state.buffer.len();
+
         // Write input plus filtered feedback to delay line
-        let write_sample = input + filtered_delay * feedback;
+        let write_sample = inject_input + feedback_tap * step.feedback;
 
         // Flush denormals and NaN protection
         let write_sample = if write_sample.is_finite() && write_sample.abs() > DENORMAL_THRESHOLD {
             write_sample
-        } else if write_sample.is_finite() {
-            0.0
         } else {
             0.0
         };
@@ -374,14 +428,66 @@ impl Effect for DelayEffect {
         state.write_index = (state.write_index + 1) % buffer_len;
 
         // Mix dry and wet (filtered) signals
-        let output = input * (1.0 - mix) + filtered_delay * mix;
+        let output = dry_input * (1.0 - step.mix) + step.filtered_delay * step.mix;
 
         // Final NaN protection
         if !output.is_finite() {
-            return input;
+            return dry_input;
         }
 
         output
+    }
+
+    /// Process one sample through a single channel's delay (own feedback path).
+    fn process_one(&self, state: &mut DelayState, input: f32) -> f32 {
+        // NaN/infinity protection at input - treat invalid input as silence
+        let input = if input.is_finite() { input } else { 0.0 };
+        let step = self.step_read(state);
+        let tap = step.filtered_delay;
+        self.step_write(state, input, input, &step, tap)
+    }
+}
+
+impl Effect for DelayEffect {
+    fn process(&self, input: f32) -> f32 {
+        // SAFETY: We use UnsafeCell for interior mutability. This is safe because:
+        // 1. The audio thread is the only thread that calls process()
+        // 2. Parameter updates via atomics are lock-free and don't conflict
+        let states = unsafe { &mut *self.state.get() };
+        self.process_one(&mut states[0], input)
+    }
+
+    fn process_stereo(&self, input: StereoFrame) -> StereoFrame {
+        // SAFETY: see process(); each channel owns its own delay line.
+        let states = unsafe { &mut *self.state.get() };
+
+        if !self.get_pingpong() {
+            // Independent dual-mono delay: identical output for mono input.
+            return StereoFrame {
+                l: self.process_one(&mut states[0], input.l),
+                r: self.process_one(&mut states[1], input.r),
+            };
+        }
+
+        // Ping-pong: read both channels' taps first (read phase touches only the
+        // delayed slots), then write each buffer with the PARTNER channel's tap.
+        // The dry input is injected only into the left delay line, so an echo
+        // first appears on the left, then bounces to the right, and so on.
+        let l_in = if input.l.is_finite() { input.l } else { 0.0 };
+        let r_in = if input.r.is_finite() { input.r } else { 0.0 };
+
+        let step_l = self.step_read(&mut states[0]);
+        let step_r = self.step_read(&mut states[1]);
+
+        let tap_l = step_l.filtered_delay;
+        let tap_r = step_r.filtered_delay;
+
+        // Left buffer: dry input + right's delayed tap. Right buffer: no direct
+        // input, fed only by left's delayed tap.
+        let out_l = self.step_write(&mut states[0], l_in, l_in, &step_l, tap_r);
+        let out_r = self.step_write(&mut states[1], r_in, 0.0, &step_r, tap_l);
+
+        StereoFrame { l: out_l, r: out_r }
     }
 }
 

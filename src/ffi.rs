@@ -1086,47 +1086,56 @@ impl GooeyEngine {
             // Apply master headroom before the optional global effects.
             output *= self.master_gain.tick();
 
+            // Stereo seam: the instrument sum is mono, so place it on both
+            // channels here — BEFORE the effects chain — so each effect can
+            // process true left/right. Effects are stereo-aware (per-channel
+            // state); for mono content with no stereo effect engaged the two
+            // channels stay identical.
+            let mut stereo = StereoFrame::mono(output);
+
             // Apply global effects chain (order is user-configurable; limiter is always last)
             for &effect_id in &self.effect_order {
                 match effect_id {
                     EFFECT_SATURATION if self.saturation_enabled => {
-                        output = self.saturation.process(output);
+                        stereo = self.saturation.process_stereo(stereo);
                     }
                     EFFECT_LOWPASS_FILTER if self.lowpass_filter_enabled => {
-                        output = self.lowpass_filter.process(output);
+                        stereo = self.lowpass_filter.process_stereo(stereo);
                     }
                     EFFECT_TILT_FILTER if self.tilt_filter_enabled => {
-                        output = self.tilt_filter.process(output);
+                        stereo = self.tilt_filter.process_stereo(stereo);
                     }
                     EFFECT_DELAY if self.delay_enabled => {
-                        output = self.delay.process(output);
+                        stereo = self.delay.process_stereo(stereo);
                     }
                     EFFECT_COMPRESSOR if self.compressor_enabled => {
                         let sc = self.compressor_sidechain as usize;
-                        output = if sc < NUM_INSTRUMENTS {
-                            self.compressor
-                                .process_with_sidechain(output, channel_outs[sc])
+                        stereo = if sc < NUM_INSTRUMENTS {
+                            // The sidechain source is a mono per-instrument
+                            // sample; feed it to both detectors equally.
+                            self.compressor.process_stereo_with_sidechain(
+                                stereo,
+                                StereoFrame::mono(channel_outs[sc]),
+                            )
                         } else {
-                            self.compressor.process(output)
+                            self.compressor.process_stereo(stereo)
                         };
                     }
                     EFFECT_REVERB if self.reverb_enabled => {
-                        output = self.reverb.process(output);
+                        stereo = self.reverb.process_stereo(stereo);
                     }
                     _ => {}
                 }
             }
 
             // Optional limiter (always last when enabled)
-            let mono_out = if self.limiter_enabled {
-                self.limiter.process(output)
+            let stereo = if self.limiter_enabled {
+                self.limiter.process_stereo(stereo)
             } else {
-                output
+                stereo
             };
 
-            // Stereo seam: the signal path is mono, so place the mono sample on
-            // both channels and write the frame interleaved as [left, right].
-            let stereo = StereoFrame::mono(mono_out);
+            // Write the frame interleaved as [left, right].
             frame[0] = stereo.l;
             if let Some(right) = frame.get_mut(1) {
                 *right = stereo.r;
@@ -1349,6 +1358,9 @@ pub const DELAY_PARAM_FEEDBACK: u32 = 1;
 pub const DELAY_PARAM_MIX: u32 = 2;
 /// Delay parameter: filter cutoff in Hz (20-20000)
 pub const DELAY_PARAM_FILTER_CUTOFF: u32 = 3;
+/// Delay parameter: ping-pong mode (0.0 = off, >= 0.5 = on). When on, the delay
+/// feedback crosses channels so echoes bounce between left and right.
+pub const DELAY_PARAM_PINGPONG: u32 = 4;
 
 // =============================================================================
 // Delay timing constants (must match Swift DelayTiming enum)
@@ -2644,6 +2656,7 @@ pub unsafe extern "C" fn gooey_engine_load_bass_preset(engine: *mut GooeyEngine,
 ///   - DELAY_PARAM_FEEDBACK (1): 0.0-0.95
 ///   - DELAY_PARAM_MIX (2): 0.0-1.0
 ///   - DELAY_PARAM_FILTER_CUTOFF (3): 20-20000 Hz
+///   - DELAY_PARAM_PINGPONG (4): 0.0 = off, >= 0.5 = on
 /// - EFFECT_SATURATION (2):
 ///   - SATURATION_PARAM_DRIVE (0): 0.0-1.0
 ///   - SATURATION_PARAM_WARMTH (1): 0.0-1.0
@@ -2687,6 +2700,7 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
             DELAY_PARAM_FEEDBACK => engine.delay.set_feedback(value),
             DELAY_PARAM_MIX => engine.delay.set_mix(value),
             DELAY_PARAM_FILTER_CUTOFF => engine.delay.set_filter_cutoff(value),
+            DELAY_PARAM_PINGPONG => engine.delay.set_pingpong(value >= 0.5),
             _ => {} // Unknown parameter, ignore
         },
         EFFECT_SATURATION => match param {
@@ -2759,6 +2773,13 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
             DELAY_PARAM_FEEDBACK => engine.delay.get_feedback(),
             DELAY_PARAM_MIX => engine.delay.get_mix(),
             DELAY_PARAM_FILTER_CUTOFF => engine.delay.get_filter_cutoff(),
+            DELAY_PARAM_PINGPONG => {
+                if engine.delay.get_pingpong() {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
             _ => -1.0, // Unknown parameter
         },
         EFFECT_SATURATION => match param {

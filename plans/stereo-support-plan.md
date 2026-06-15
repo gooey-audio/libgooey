@@ -23,7 +23,7 @@ You can see it working by running `cargo test --test ffi_stereo` (asserts the bu
 - [x] (2026-06-10) Pass 1, Step 6: regenerated `include/gooey.h` (cbindgen); audited callers — only `gooey_engine_render` drives `GooeyEngine::render`; offline bounce stays mono (see Decision Log).
 - [x] (2026-06-10) Pass 1, Step 7: this ExecPlan persisted.
 - [ ] Pass 2: per-instrument pan (see roadmap).
-- [ ] Pass 3: stereo-native effects (see roadmap).
+- [x] (2026-06-15) Pass 3: stereo-native effects — `Effect::process_stereo`, seam moved before the chain, per-channel state for all stateful effects, ping-pong delay showcase. See `plans/stereo-effects-plan.md`.
 
 The foundation shipped in two commits on branch `bhurlow/libgooey-stereo-support` (PR #201): first the native-side foundation (StereoFrame + CPAL + `tick_stereo`), then the FFI interleaving + test updates.
 

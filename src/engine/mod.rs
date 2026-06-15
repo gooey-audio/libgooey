@@ -271,9 +271,12 @@ impl Engine {
             .push_back((name.to_string(), velocity.clamp(0.0, 1.0)));
     }
 
-    /// Generate one sample of audio at the given time
-    /// This is called by the audio output on every sample
-    pub fn tick(&mut self, current_time: f64) -> f32 {
+    /// Advance one sample and produce the mono mix BEFORE the global effects
+    /// chain: process LFOs and sequencers, fire queued triggers, sum the
+    /// instruments, and apply the master gain. Both the mono [`Engine::tick`]
+    /// and the stereo [`Engine::tick_stereo`] build on this so the effects chain
+    /// can run either mono (for the offline bounce) or stereo (for realtime).
+    fn render_pre_effects(&mut self, current_time: f64) -> f32 {
         // Process LFOs and apply modulation
         for lfo in &mut self.lfos {
             let lfo_value = lfo.tick();
@@ -333,6 +336,17 @@ impl Engine {
         // Apply master gain before effects
         output *= self.master_gain.tick();
 
+        output
+    }
+
+    /// Generate one mono sample of audio at the given time.
+    ///
+    /// This is the offline / mono path (used by the audio output's mono fallback
+    /// and the offline bounce). It runs the global effects chain mono, leaving
+    /// its behavior unchanged from before stereo effects were introduced.
+    pub fn tick(&mut self, current_time: f64) -> f32 {
+        let mut output = self.render_pre_effects(current_time);
+
         // Apply global effects chain to the final output
         for effect in &self.global_effects {
             output = effect.process(output);
@@ -343,13 +357,20 @@ impl Engine {
 
     /// Generate one stereo frame of audio at the given time.
     ///
-    /// This is the native engine's "stereo seam": the signal path is mono, so
-    /// the mono [`Engine::tick`] output is placed equally on both channels via
-    /// [`StereoFrame::mono`]. Output sinks (CPAL device, offline bounce) call
-    /// this to drive true two-channel output. Future per-instrument panning or
-    /// stereo effects only need to change what this method returns.
+    /// This is the native engine's "stereo seam": the instrument mix is mono, so
+    /// it is placed on both channels via [`StereoFrame::mono`] BEFORE the global
+    /// effects chain, and each effect then processes true left/right through its
+    /// stereo-aware [`Effect::process_stereo`]. Output sinks (CPAL device) call
+    /// this to drive true two-channel output. For mono content with no stereo
+    /// effect engaged, the two channels stay identical.
     pub fn tick_stereo(&mut self, current_time: f64) -> StereoFrame {
-        StereoFrame::mono(self.tick(current_time))
+        let mut stereo = StereoFrame::mono(self.render_pre_effects(current_time));
+
+        for effect in &self.global_effects {
+            stereo = effect.process_stereo(stereo);
+        }
+
+        stereo
     }
 
     pub fn sample_rate(&self) -> f32 {

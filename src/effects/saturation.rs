@@ -6,6 +6,7 @@
 //! generation for a more analog sound than simple tanh.
 
 use crate::effects::Effect;
+use crate::frame::StereoFrame;
 use crate::utils::oversampler::{Oversampler, OversamplingMode};
 use crate::utils::smoother::SmoothedParam;
 use std::cell::UnsafeCell;
@@ -41,8 +42,9 @@ struct SaturationState {
 /// - Built-in DC blocking
 /// - Smooth parameter transitions
 pub struct TubeSaturation {
-    // Mutable state wrapped in UnsafeCell for interior mutability
-    state: UnsafeCell<SaturationState>,
+    // Per-channel mutable state (index 0 = mono/left, index 1 = right). The mono
+    // `process` path uses only index 0, so its behavior is unchanged.
+    state: UnsafeCell<[SaturationState; 2]>,
 
     // Atomic parameters for lock-free updates from control thread
     drive_target: AtomicU32,
@@ -68,15 +70,17 @@ impl TubeSaturation {
         let warmth_clamped = warmth.clamp(0.0, 1.0);
         let mix_clamped = mix.clamp(0.0, 1.0);
 
+        let make_state = || SaturationState {
+            drive_smoothed: SmoothedParam::new(drive_clamped, 0.0, 1.0, sample_rate, 30.0),
+            warmth_smoothed: SmoothedParam::new(warmth_clamped, 0.0, 1.0, sample_rate, 30.0),
+            mix_smoothed: SmoothedParam::new(mix_clamped, 0.0, 1.0, sample_rate, 30.0),
+            dc_x1: 0.0,
+            dc_y1: 0.0,
+            oversampler: Oversampler::default(),
+        };
+
         Self {
-            state: UnsafeCell::new(SaturationState {
-                drive_smoothed: SmoothedParam::new(drive_clamped, 0.0, 1.0, sample_rate, 30.0),
-                warmth_smoothed: SmoothedParam::new(warmth_clamped, 0.0, 1.0, sample_rate, 30.0),
-                mix_smoothed: SmoothedParam::new(mix_clamped, 0.0, 1.0, sample_rate, 30.0),
-                dc_x1: 0.0,
-                dc_y1: 0.0,
-                oversampler: Oversampler::default(),
-            }),
+            state: UnsafeCell::new([make_state(), make_state()]),
             drive_target: AtomicU32::new(drive_clamped.to_bits()),
             warmth_target: AtomicU32::new(warmth_clamped.to_bits()),
             mix_target: AtomicU32::new(mix_clamped.to_bits()),
@@ -184,24 +188,26 @@ impl TubeSaturation {
         OversamplingMode::from_u8(self.oversampling_mode_target.load(Ordering::Relaxed))
     }
 
-    /// Reset internal state (DC blocker)
+    /// Reset internal state (DC blocker) on all channels
     pub fn reset(&self) {
-        let state = unsafe { &mut *self.state.get() };
-        state.dc_x1 = 0.0;
-        state.dc_y1 = 0.0;
-        state.oversampler.reset();
+        let states = unsafe { &mut *self.state.get() };
+        for state in states.iter_mut() {
+            state.dc_x1 = 0.0;
+            state.dc_y1 = 0.0;
+            state.oversampler.reset();
+        }
     }
-}
 
-impl Effect for TubeSaturation {
-    fn process(&self, input: f32) -> f32 {
-        // NaN/infinity protection at input
+    /// Process one sample through a single channel's saturation state.
+    fn process_one(&self, state: &mut SaturationState, input: f32) -> f32 {
+        // NaN/infinity protection at input — scoped to this channel's state so a
+        // NaN on one side does not wipe the other channel's history.
         if !input.is_finite() {
-            self.reset();
+            state.dc_x1 = 0.0;
+            state.dc_y1 = 0.0;
+            state.oversampler.reset();
             return 0.0;
         }
-
-        let state = unsafe { &mut *self.state.get() };
 
         // Read targets and update smoothers
         let drive_target = f32::from_bits(self.drive_target.load(Ordering::Relaxed));
@@ -246,6 +252,21 @@ impl Effect for TubeSaturation {
         }
 
         output
+    }
+}
+
+impl Effect for TubeSaturation {
+    fn process(&self, input: f32) -> f32 {
+        let states = unsafe { &mut *self.state.get() };
+        self.process_one(&mut states[0], input)
+    }
+
+    fn process_stereo(&self, input: StereoFrame) -> StereoFrame {
+        let states = unsafe { &mut *self.state.get() };
+        StereoFrame {
+            l: self.process_one(&mut states[0], input.l),
+            r: self.process_one(&mut states[1], input.r),
+        }
     }
 }
 

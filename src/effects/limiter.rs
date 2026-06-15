@@ -1,4 +1,5 @@
 use super::Effect;
+use crate::frame::StereoFrame;
 
 /// A brick wall limiter that prevents audio signals from exceeding a threshold
 pub struct BrickWallLimiter {
@@ -20,6 +21,14 @@ impl Effect for BrickWallLimiter {
             -self.threshold
         } else {
             input
+        }
+    }
+
+    /// Stateless: each channel is limited independently.
+    fn process_stereo(&self, input: StereoFrame) -> StereoFrame {
+        StereoFrame {
+            l: self.process(input.l),
+            r: self.process(input.r),
         }
     }
 }
@@ -57,5 +66,13 @@ impl SoftLimiter {
 impl Effect for SoftLimiter {
     fn process(&self, input: f32) -> f32 {
         (input * self.inv_threshold).tanh() * self.threshold
+    }
+
+    /// Stateless: each channel is limited independently.
+    fn process_stereo(&self, input: StereoFrame) -> StereoFrame {
+        StereoFrame {
+            l: self.process(input.l),
+            r: self.process(input.r),
+        }
     }
 }

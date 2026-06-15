@@ -18,8 +18,9 @@ use crossterm::{
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
-use gooey::effects::TiltFilterEffect;
+use gooey::effects::{Effect, TiltFilterEffect};
 use gooey::engine::{Engine, EngineOutput, Instrument, Sequencer};
+use gooey::frame::StereoFrame;
 use gooey::instruments::{KickConfig, KickDrum};
 
 struct SharedKick(Arc<Mutex<KickDrum>>);
@@ -42,9 +43,15 @@ impl Instrument for SharedKick {
 /// Wrapper to share the TiltFilterEffect via Arc while implementing Effect
 struct SharedTilt(Arc<TiltFilterEffect>);
 
-impl gooey::effects::Effect for SharedTilt {
+impl Effect for SharedTilt {
     fn process(&self, input: f32) -> f32 {
         self.0.process(input)
+    }
+
+    /// Forward to the inner effect's stereo path so each channel keeps its own
+    /// filter state (the inner TiltFilterEffect holds per-channel state).
+    fn process_stereo(&self, input: StereoFrame) -> StereoFrame {
+        self.0.process_stereo(input)
     }
 }
 
