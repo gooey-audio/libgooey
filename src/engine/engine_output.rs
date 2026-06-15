@@ -17,7 +17,6 @@ pub struct EngineOutput {
     stream: Option<Stream>,
     device: Option<Device>,
     config: Option<StreamConfig>,
-    sample_format: Option<cpal::SampleFormat>,
     sample_rate: f32,
     is_active: bool,
     start_time: Option<Instant>,
@@ -36,7 +35,6 @@ impl EngineOutput {
             stream: None,
             device: None,
             config: None,
-            sample_format: None,
             sample_rate: 44100.0,
             is_active: false,
             start_time: None,
@@ -151,9 +149,7 @@ impl EngineOutput {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Config not initialized"))?;
 
-        let sample_format = self
-            .sample_format
-            .ok_or_else(|| anyhow::anyhow!("Sample format not initialized"))?;
+        let supported_config = device.default_output_config()?;
         let sample_counter = self.sample_counter.clone();
         let overrun_counter = self.overrun_counter.clone();
 
@@ -163,7 +159,7 @@ impl EngineOutput {
         #[cfg(not(feature = "visualization"))]
         let audio_buffer: Option<()> = None;
 
-        let stream = match sample_format {
+        let stream = match supported_config.sample_format() {
             cpal::SampleFormat::I8 => Self::make_stream::<i8>(
                 device,
                 config,
@@ -266,71 +262,14 @@ impl EngineOutput {
 
         println!("Output device: {}", device.name()?);
 
-        let default_config = device.default_output_config()?;
-        println!("Default output config: {:?}", default_config);
+        let config = device.default_output_config()?;
+        println!("Default output config: {:?}", config);
 
-        // Some interfaces (notably multi-channel Thunderbolt/USB devices)
-        // advertise a many-channel default (e.g. 8ch) that CoreAudio then
-        // refuses to open, surfacing as `DeviceNotAvailable`. Prefer a stereo
-        // configuration the device actually lists, so left/right map cleanly to
-        // outputs 1-2. A device whose default is already mono/stereo is left
-        // untouched, so the common built-in-speaker path is unchanged.
-        let chosen = Self::choose_output_config(&device, &default_config);
-        if chosen.channels() != default_config.channels()
-            || chosen.sample_rate() != default_config.sample_rate()
-        {
-            println!("Using output config: {:?}", chosen);
-        }
-
-        self.sample_rate = chosen.sample_rate().0 as f32;
-        self.sample_format = Some(chosen.sample_format());
-        self.config = Some(chosen.config());
+        self.sample_rate = config.sample_rate().0 as f32;
         self.device = Some(device);
+        self.config = Some(config.into());
 
         Ok(())
-    }
-
-    /// Pick an output configuration the device will actually open.
-    ///
-    /// If the default config is already mono or stereo it is used as-is.
-    /// Otherwise we look through the device's supported configurations for a
-    /// stereo one at the default sample rate (preferring the default sample
-    /// format), falling back to the default config if none is found.
-    fn choose_output_config(
-        device: &Device,
-        default_config: &cpal::SupportedStreamConfig,
-    ) -> cpal::SupportedStreamConfig {
-        if default_config.channels() <= 2 {
-            return default_config.clone();
-        }
-
-        let target_rate = default_config.sample_rate();
-        let default_fmt = default_config.sample_format();
-
-        if let Ok(ranges) = device.supported_output_configs() {
-            let stereo: Vec<cpal::SupportedStreamConfigRange> =
-                ranges.filter(|r| r.channels() == 2).collect();
-
-            // Realize a range at the target sample rate when supported, else at
-            // its own maximum rate.
-            let realize = |r: &cpal::SupportedStreamConfigRange| {
-                r.try_with_sample_rate(target_rate)
-                    .or_else(|| Some((*r).with_max_sample_rate()))
-            };
-
-            // Prefer a stereo range matching the default sample format, then any
-            // stereo range.
-            if let Some(cfg) = stereo
-                .iter()
-                .filter(|r| r.sample_format() == default_fmt)
-                .find_map(&realize)
-                .or_else(|| stereo.iter().find_map(&realize))
-            {
-                return cfg;
-            }
-        }
-
-        default_config.clone()
     }
 
     /// Create a typed stream for the given sample format
