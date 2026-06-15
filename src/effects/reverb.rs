@@ -21,7 +21,18 @@ const NUM_ALLPASSES: usize = 6;
 
 /// Allpass delay lengths in samples at 44100 Hz (prime numbers, increasing size).
 /// Total round-trip ≈ 61ms, giving a natural spring bounce period.
-const ALLPASS_DELAYS_44100: [usize; NUM_ALLPASSES] = [131, 251, 389, 521, 617, 787];
+///
+/// The two channels use *different* prime tables so the reverb tanks
+/// decorrelate: fed the same mono signal, the left and right tails diverge,
+/// giving an audibly wider reverb. The left/mono table is unchanged from the
+/// original mono reverb — the mono `process` path (offline bounce, `tick`) runs
+/// only on channel 0, so its output stays byte-identical.
+const ALLPASS_DELAYS_44100_L: [usize; NUM_ALLPASSES] = [131, 251, 389, 521, 617, 787];
+
+/// Right-channel allpass delays: primes near the left values but none equal to
+/// their counterpart, keeping the same spring character (~61ms round-trip)
+/// while decorrelating the two tanks.
+const ALLPASS_DELAYS_44100_R: [usize; NUM_ALLPASSES] = [127, 263, 397, 541, 631, 797];
 
 /// Per-allpass feedback coefficients (decreasing slightly for longer delays
 /// to keep diffusion dense without ringing)
@@ -77,9 +88,9 @@ impl SpringReverbEffect {
 
         let scale = sample_rate / 44100.0;
 
-        let make_state = || {
+        let make_state = |delays: &[usize; NUM_ALLPASSES]| {
             let allpasses = std::array::from_fn(|i| {
-                let len = ((ALLPASS_DELAYS_44100[i] as f32) * scale).max(1.0) as usize;
+                let len = ((delays[i] as f32) * scale).max(1.0) as usize;
                 AllpassFilter {
                     buffer: vec![0.0; len],
                     index: 0,
@@ -96,7 +107,10 @@ impl SpringReverbEffect {
         };
 
         Self {
-            state: UnsafeCell::new([make_state(), make_state()]),
+            state: UnsafeCell::new([
+                make_state(&ALLPASS_DELAYS_44100_L),
+                make_state(&ALLPASS_DELAYS_44100_R),
+            ]),
             decay_target: AtomicU32::new(decay.to_bits()),
             mix_target: AtomicU32::new(mix.to_bits()),
             damping_target: AtomicU32::new(damping.to_bits()),

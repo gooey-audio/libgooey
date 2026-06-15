@@ -50,10 +50,10 @@ fn reorderable_effects() -> Vec<(u32, Vec<(u32, f32)>)> {
             EFFECT_TILT_FILTER,
             vec![(TILT_PARAM_CUTOFF, 0.2), (TILT_PARAM_RESONANCE, 0.5)],
         ),
-        (
-            EFFECT_REVERB,
-            vec![(REVERB_PARAM_DECAY, 0.7), (REVERB_PARAM_MIX, 0.8)],
-        ),
+        // NOTE: the reverb is intentionally excluded here. Its two tanks use
+        // different per-channel allpass tables, so it decorrelates mono content
+        // into genuine L != R — verified separately by
+        // `reverb_decorrelates_left_and_right`.
     ]
 }
 
@@ -137,6 +137,51 @@ fn ping_pong_delay_makes_left_and_right_diverge() {
         assert!(
             max_diff > 1e-4,
             "ping-pong delay should make left and right diverge, max |L-R| was {max_diff}"
+        );
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn reverb_decorrelates_left_and_right() {
+    unsafe {
+        let engine = gooey_engine_new(SAMPLE_RATE);
+
+        gooey_engine_set_global_effect_enabled(engine, EFFECT_REVERB, true);
+        // Long decay and plenty of wet so the decorrelated tails build up.
+        gooey_engine_set_global_effect_param(engine, EFFECT_REVERB, REVERB_PARAM_DECAY, 0.7);
+        gooey_engine_set_global_effect_param(engine, EFFECT_REVERB, REVERB_PARAM_MIX, 0.8);
+
+        // Render a generous window so the spring tails on both channels develop.
+        let frames = 32_768usize;
+        let mut buffer = vec![0.0_f32; frames * 2];
+
+        gooey_engine_trigger_instrument(engine, INSTRUMENT_KICK);
+        gooey_engine_render(engine, buffer.as_mut_ptr(), frames as u32);
+
+        assert!(
+            !gooey_engine_has_error(engine),
+            "render must not set the error flag"
+        );
+
+        let peak = buffer.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
+        assert!(peak > 0.001, "expected audible output, peak was {peak}");
+
+        // The reverb tail must stay finite and bounded.
+        assert!(
+            buffer.iter().all(|s| s.is_finite() && s.abs() < 100.0),
+            "reverb output must stay finite and bounded"
+        );
+
+        // The two tanks use different allpass tables, so a mono input produces
+        // genuinely different left and right.
+        let max_diff = buffer
+            .chunks_exact(2)
+            .fold(0.0_f32, |acc, frame| acc.max((frame[0] - frame[1]).abs()));
+        assert!(
+            max_diff > 1e-4,
+            "reverb should decorrelate left and right, max |L-R| was {max_diff}"
         );
 
         gooey_engine_free(engine);
