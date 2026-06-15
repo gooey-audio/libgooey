@@ -47,6 +47,9 @@ You can see it working by running `cargo test --test stereo_effects`: with ping-
 - Decision: The `Effect::process_stereo` default impl (call `process` per channel) is correct only for stateless effects; every stateful effect overrides it with genuine per-channel state.
   Rationale: The default double-advances a single shared state per frame, corrupting filters/delays. Only `SoftLimiter`/`BrickWallLimiter` are stateless.
   Date/Author: 2026-06-15, Claude.
+- Decision (revised): Make `Effect::process_stereo` REQUIRED (remove the default) instead of relying on a defaulted impl.
+  Rationale: Code review flagged that the default lets any `process`-only `Effect` reached through the `dyn Effect` chain (e.g. the `examples/tilt_filter.rs` `SharedTilt` wrapper, which forwards only `process`) silently run both channels through one internal state back-to-back under `Engine::tick_stereo` — the right channel ends up one state-update ahead of the left. Requiring the method turns that mistake into a compile error. Implemented `process_stereo` for the two stateless limiters (independent per-channel `process`) and forwarded `SharedTilt` to the inner `TiltFilterEffect::process_stereo`.
+  Date/Author: 2026-06-15, Claude (responding to review).
 - Decision: The compressor sidechain detector stays mono, duplicated to both channels via `StereoFrame::mono`.
   Rationale: The sidechain source (`channel_outs[sc]`) is a single mono per-instrument sample; both channels should receive matching gain reduction.
   Date/Author: 2026-06-15, Claude.
