@@ -13,6 +13,13 @@ const LP_FREQ_MAX: f32 = 20000.0;
 const HP_FREQ_MIN: f32 = 20.0;
 const HP_FREQ_MAX: f32 = 8000.0;
 
+// Half-width (in knob units) of the bypass dead-zone around center. Inside
+// this zone the filter crossfades to pure dry so exact center is a clean
+// passthrough detent; outside it the filter runs fully wet. Keeping this
+// narrow means the filter's full slope and resonance are available across
+// essentially the entire travel, instead of being diluted by a dry blend.
+const CENTER_DEAD_ZONE: f32 = 0.02;
+
 struct TiltFilterState {
     cutoff_smoothed: SmoothedParam,
     resonance_smoothed: SmoothedParam,
@@ -25,6 +32,12 @@ struct TiltFilterState {
 /// - 0.5 = no filtering (passthrough)
 /// - Below 0.5 = lowpass, getting darker toward 0.0
 /// - Above 0.5 = highpass, getting brighter toward 1.0
+///
+/// The filter runs fully wet across the whole sweep: transparency at center
+/// comes from parking the cutoff at the edge of the audible range, not from
+/// blending dry signal in. This keeps the full filter slope and resonance
+/// available through the entire mid-band. A narrow dead-zone around 0.5
+/// crossfades to pure dry so exact center is a clean bypass detent.
 pub struct TiltFilterEffect {
     // Per-channel state (index 0 = mono/left, index 1 = right). The mono
     // `process` path uses only index 0, leaving its behavior unchanged.
@@ -95,23 +108,36 @@ impl TiltFilterEffect {
         let knob = state.cutoff_smoothed.tick();
         let resonance = state.resonance_smoothed.tick();
 
-        // Compute mix amount and filter frequency based on knob position
-        let (mix, filter_freq, use_lowpass) = if knob < 0.5 {
-            // LP region: knob 0.0 -> 0.5
-            let mix = 1.0 - (knob * 2.0);
+        // Frequency + filter type from knob position. The filter runs fully
+        // wet across the whole sweep; the center is made transparent by parking
+        // the cutoff at the edge of the audible range (LP near 20 kHz, HP near
+        // 20 Hz) rather than by blending in dry signal. This preserves the full
+        // filter slope and resonance through the entire mid-band, which is where
+        // the old depth-tied-to-position blend washed the filter out.
+        let (filter_freq, use_lowpass) = if knob < 0.5 {
+            // LP region: knob 0.5 -> 0.0 sweeps cutoff 20 kHz -> 80 Hz
             let t = knob * 2.0;
             let freq = LP_FREQ_MIN * (LP_FREQ_MAX / LP_FREQ_MIN).powf(t);
-            (mix, freq, true)
+            (freq, true)
         } else {
-            // HP region: knob 0.5 -> 1.0
-            let mix = (knob - 0.5) * 2.0;
+            // HP region: knob 0.5 -> 1.0 sweeps cutoff 20 Hz -> 8 kHz
             let t = (knob - 0.5) * 2.0;
             let freq = HP_FREQ_MIN * (HP_FREQ_MAX / HP_FREQ_MIN).powf(t);
-            (mix, freq, false)
+            (freq, false)
         };
 
-        // Short-circuit when effectively passthrough
-        if mix < 0.001 {
+        // Engagement crossfade: 0 at exact center (clean bypass detent),
+        // ramping to fully wet at the edge of the narrow dead-zone.
+        let engage = ((knob - 0.5).abs() / CENTER_DEAD_ZONE).min(1.0);
+
+        // True bypass at the center detent: skip the filter and hold its state
+        // at rest. Driving the SVF here would let resonant energy build silently
+        // (especially with high Q at the near-center cutoff) while the output is
+        // dry, then spike when the knob moves just outside the dead zone. A
+        // filter re-engaging from rest instead ramps up smoothly, so resetting
+        // is the safer choice.
+        if engage <= 0.0 {
+            state.svf.reset();
             return input;
         }
 
@@ -122,7 +148,7 @@ impl TiltFilterEffect {
         let (low, _band, high) = state.svf.process_all(input);
 
         let wet = if use_lowpass { low } else { high };
-        let output = input * (1.0 - mix) + wet * mix;
+        let output = input * (1.0 - engage) + wet * engage;
 
         // NaN/infinity protection
         if !output.is_finite() {
@@ -229,6 +255,72 @@ mod tests {
         assert!(
             max_output < 0.1,
             "Highpass should attenuate 100Hz, got peak {}",
+            max_output
+        );
+    }
+
+    #[test]
+    fn test_midband_filters_fully() {
+        // Regression for the depth-tied-to-position blend: a mid-travel
+        // lowpass setting must actually attenuate content well above its
+        // cutoff, not just shelve it down by a fraction. With the cutoff
+        // parked near ~1.3 kHz, a 12 kHz tone should be strongly reduced.
+        let filter = TiltFilterEffect::new(44100.0);
+        filter.set_cutoff(0.25); // mid lowpass region, well inside full-wet zone
+
+        for _ in 0..4410 {
+            filter.process(0.0);
+        }
+
+        let freq = 12000.0;
+        let mut max_output: f32 = 0.0;
+        for i in 0..4410 {
+            let t = i as f32 / 44100.0;
+            let input = (2.0 * std::f32::consts::PI * freq * t).sin();
+            max_output = max_output.max(filter.process(input).abs());
+        }
+
+        // A diluted shelf would leave this near unity; a real lowpass crushes it.
+        assert!(
+            max_output < 0.25,
+            "Mid-travel lowpass should strongly attenuate 12kHz, got peak {}",
+            max_output
+        );
+    }
+
+    #[test]
+    fn test_center_bypass_holds_no_resonant_energy() {
+        // Parked at the center detent with max resonance, the filter must stay
+        // an exact passthrough and must NOT accumulate hidden resonant state
+        // from low-frequency content. Otherwise leaving the dead zone would
+        // dump that stored energy as a spike/tail.
+        let filter = TiltFilterEffect::new(44100.0);
+        filter.set_cutoff(0.5); // center
+        filter.set_resonance(1.0); // max Q
+
+        let freq = 30.0;
+        for i in 0..44100 {
+            let t = i as f32 / 44100.0;
+            let input = (2.0 * std::f32::consts::PI * freq * t).sin();
+            let output = filter.process(input);
+            assert!(
+                (output - input).abs() < 1e-6,
+                "center detent must be exact passthrough, got {} for input {}",
+                output,
+                input
+            );
+        }
+
+        // Leave center toward the lowpass region and feed silence. With the SVF
+        // held at rest there is no stored energy, so nothing should ring out.
+        filter.set_cutoff(0.4);
+        let mut max_output: f32 = 0.0;
+        for _ in 0..2048 {
+            max_output = max_output.max(filter.process(0.0).abs());
+        }
+        assert!(
+            max_output < 1e-6,
+            "no resonant tail should leak from the center detent, got peak {}",
             max_output
         );
     }
