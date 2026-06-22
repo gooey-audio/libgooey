@@ -237,6 +237,77 @@ fn effect_chain_edit_operations() {
 }
 
 #[test]
+fn master_gain_scales_loops() {
+    // Regression: the loop mixer must sit *before* master gain so the master
+    // fader (and headroom) scales loops, not just the synth/drum bus.
+    unsafe {
+        let engine = gooey_engine_new(SAMPLE_RATE);
+        let loop_samples = stereo_sine(0.5, 220.0);
+        let frames = (loop_samples.len() / 2) as u32;
+        gooey_engine_loop_load(engine, 0, loop_samples.as_ptr(), frames, 2, SAMPLE_RATE);
+        gooey_engine_loop_set_playing(engine, 0, true);
+
+        gooey_engine_set_master_gain(engine, 1.0);
+        let loud = render_peak(engine, 8192);
+        assert!(
+            loud > 1e-2,
+            "expected audible loop at unity master gain, got {loud}"
+        );
+
+        gooey_engine_set_master_gain(engine, 0.0);
+        let _ = render_peak(engine, 8192); // let the 30 ms master-gain glide settle
+        let silent = render_peak(engine, 8192);
+        assert!(
+            silent < loud * 0.01,
+            "master gain 0 must silence loops too: loud {loud}, silent {silent}"
+        );
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn bpm_change_retempos_existing_loop_delay() {
+    // Regression: changing the host BPM must re-tempo per-channel delays that
+    // already exist, not only effects added afterwards.
+    unsafe fn render_impulse_through_delay(bpm: f32) -> Vec<f32> {
+        let engine = gooey_engine_new(SAMPLE_RATE);
+        // 1s loop holding a single impulse at frame 0 (won't wrap within render).
+        let n = SAMPLE_RATE as usize;
+        let mut samples = vec![0.0_f32; n * 2];
+        samples[0] = 0.8;
+        samples[1] = 0.8;
+        gooey_engine_loop_load(engine, 0, samples.as_ptr(), n as u32, 2, SAMPLE_RATE);
+        gooey_engine_loop_set_playing(engine, 0, true);
+        gooey_engine_set_master_gain(engine, 1.0);
+
+        // Add a (quarter-note) delay, THEN change BPM — the order that exposes
+        // the bug.
+        assert_eq!(gooey_engine_loop_effect_add(engine, 0, EFFECT_DELAY), 0);
+        gooey_engine_loop_effect_set_param(engine, 0, 0, DELAY_PARAM_MIX, 0.9);
+        gooey_engine_loop_effect_set_param(engine, 0, 0, DELAY_PARAM_FEEDBACK, 0.4);
+        gooey_engine_set_bpm(engine, bpm);
+
+        let frames = 30_000usize;
+        let mut buffer = vec![0.0_f32; frames * 2];
+        gooey_engine_render(engine, buffer.as_mut_ptr(), frames as u32);
+        gooey_engine_free(engine);
+        buffer
+    }
+
+    unsafe {
+        // quarter ≈ 22050 samples at 120 BPM, ≈ 11025 at 240 BPM.
+        let slow = render_impulse_through_delay(120.0);
+        let fast = render_impulse_through_delay(240.0);
+        // If existing delays weren't re-tempo'd both renders would be identical.
+        let diff: f32 = slow.iter().zip(&fast).map(|(a, b)| (a - b).abs()).sum();
+        assert!(
+            diff > 1.0,
+            "BPM change should move an existing delay's echoes (diff {diff})"
+        );
+    }
+}
+
+#[test]
 fn null_engine_is_safe() {
     unsafe {
         let null = std::ptr::null_mut();

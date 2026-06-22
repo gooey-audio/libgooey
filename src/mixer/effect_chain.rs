@@ -159,6 +159,14 @@ impl ChannelEffect {
         }
     }
 
+    /// Update the tempo for note-synced effects. Only the delay's clocked timing
+    /// depends on BPM; the other effects ignore it.
+    pub fn set_bpm(&self, bpm: f32) {
+        if let Self::Delay(e) = self {
+            e.set_bpm(bpm);
+        }
+    }
+
     /// Clear internal DSP state (delay lines, filter memory, envelopes).
     pub fn reset(&self) {
         match self {
@@ -231,6 +239,13 @@ impl EffectChain {
     pub fn set_param(&self, slot: usize, param: u32, value: f32) {
         if let Some(effect) = self.effects.get(slot) {
             effect.set_param(param, value);
+        }
+    }
+
+    /// Re-tempo every note-synced effect in the chain (currently the delay).
+    pub fn set_bpm(&self, bpm: f32) {
+        for effect in &self.effects {
+            effect.set_bpm(bpm);
         }
     }
 

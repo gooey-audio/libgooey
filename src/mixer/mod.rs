@@ -61,9 +61,14 @@ impl Mixer {
         out
     }
 
-    /// Update the tempo used when creating new note-synced per-channel effects.
+    /// Update the tempo for the mixer: re-tempo every existing note-synced
+    /// per-channel effect (so existing delays follow host BPM changes) and seed
+    /// the value used when creating new ones.
     pub fn set_bpm(&mut self, bpm: f32) {
         self.bpm = bpm;
+        for channel in &self.channels {
+            channel.effects().set_bpm(bpm);
+        }
     }
 
     pub fn channel_count(&self) -> usize {

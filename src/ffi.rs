@@ -1091,9 +1091,6 @@ impl GooeyEngine {
             // Mix in granulator output
             output += self.granulator.tick(self.current_time);
 
-            // Apply master headroom before the optional global effects.
-            output *= self.master_gain.tick();
-
             // Stereo seam: the instrument sum is mono, so place it on both
             // channels here — BEFORE the effects chain — so each effect can
             // process true left/right. Effects are stereo-aware (per-channel
@@ -1102,8 +1099,13 @@ impl GooeyEngine {
             let mut stereo = StereoFrame::mono(output);
 
             // Sum the loop mixer (already stereo, with its own per-channel
-            // effects) into the master bus before the global effects + limiter.
+            // effects) into the master bus.
             stereo += self.mixer.tick(self.sample_rate);
+
+            // Apply master headroom to the full mix (instruments + loops) before
+            // the optional global effects + limiter, so the master fader scales
+            // loops too.
+            stereo = stereo.scaled(self.master_gain.tick());
 
             // Apply global effects chain (order is user-configurable; limiter is always last)
             for &effect_id in &self.effect_order {

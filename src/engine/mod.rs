@@ -350,9 +350,9 @@ impl Engine {
             output += instrument.tick(current_time);
         }
 
-        // Apply master gain before effects
-        output *= self.master_gain.tick();
-
+        // NOTE: master gain is applied later in `tick`/`tick_stereo`, after the
+        // loop mixer is summed in, so the master fader scales loops too — not
+        // just the instrument sum.
         output
     }
 
@@ -366,6 +366,9 @@ impl Engine {
 
         // Sum the loop mixer into the master bus (downmixed for the mono path).
         output += self.mixer.tick(self.sample_rate).downmix();
+
+        // Apply master gain to the full mix (instruments + loops) before effects.
+        output *= self.master_gain.tick();
 
         // Apply global effects chain to the final output
         for effect in &self.global_effects {
@@ -387,8 +390,12 @@ impl Engine {
         let mut stereo = StereoFrame::mono(self.render_pre_effects(current_time));
 
         // Sum the loop mixer (already stereo, with its own per-channel effects)
-        // into the master bus before the global effects + limiter.
+        // into the master bus.
         stereo += self.mixer.tick(self.sample_rate);
+
+        // Apply master gain to the full mix (instruments + loops) before the
+        // global effects + limiter.
+        stereo = stereo.scaled(self.master_gain.tick());
 
         for effect in &self.global_effects {
             stereo = effect.process_stereo(stereo);
