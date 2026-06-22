@@ -1,9 +1,11 @@
+use crate::effects::waveshaper::Waveshaper;
 use crate::engine::Instrument;
 use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
 use crate::filters::StateVariableFilterTpt;
 use crate::gen::polyblep::{polyblep_saw, polyblep_square};
 use crate::music::note::midi_to_freq;
-use crate::utils::SmoothedParam;
+use crate::utils::{tuning_to_multiplier, Blendable, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
+use std::f64::consts::TAU;
 
 mod ranges {
     pub fn filter_cutoff_hz(normalized: f32) -> f32 {
@@ -20,17 +22,13 @@ mod ranges {
         // Exponential mapping: 0.0 = 0.001s, 1.0 = 5.0s
         0.001 * (5000.0_f32).powf(normalized)
     }
-
-    pub fn detune_ratio(normalized: f32) -> f64 {
-        // 0.0 = no detune, 1.0 = ~30 cents
-        1.0 + normalized as f64 * 0.0175
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct PolySynthConfig {
     pub osc_shape: f32,
-    pub detune_amount: f32,
+    pub sub_level: f32,
+    pub osc_level: f32,
     pub filter_cutoff: f32,
     pub filter_resonance: f32,
     pub filter_env_amount: f32,
@@ -42,109 +40,153 @@ pub struct PolySynthConfig {
     pub filter_decay: f32,
     pub filter_sustain: f32,
     pub filter_release: f32,
+    pub overdrive: f32,
     pub volume: f32,
+    pub tuning: f32,
 }
 
 impl PolySynthConfig {
     pub fn default() -> Self {
         Self {
             osc_shape: 0.0,
-            detune_amount: 0.2,
+            sub_level: 0.3,
+            osc_level: 0.7,
             filter_cutoff: 0.6,
             filter_resonance: 0.15,
             filter_env_amount: 0.3,
-            amp_attack: 0.55, // ~100ms
-            amp_decay: 0.7,   // ~370ms
+            amp_attack: 0.55,
+            amp_decay: 0.7,
             amp_sustain: 0.7,
-            amp_release: 0.8, // ~890ms
+            amp_release: 0.8,
             filter_attack: 0.5,
             filter_decay: 0.65,
             filter_sustain: 0.4,
             filter_release: 0.75,
+            overdrive: 0.0,
             volume: 0.7,
+            tuning: 0.5,
         }
     }
 
     pub fn pad() -> Self {
         Self {
             osc_shape: 0.0,
-            detune_amount: 0.4,
+            sub_level: 0.4,
+            osc_level: 0.6,
             filter_cutoff: 0.45,
             filter_resonance: 0.2,
             filter_env_amount: 0.2,
-            amp_attack: 0.8, // ~890ms
-            amp_decay: 0.75, // ~530ms
+            amp_attack: 0.8,
+            amp_decay: 0.75,
             amp_sustain: 0.8,
-            amp_release: 0.85, // ~1.5s
+            amp_release: 0.85,
             filter_attack: 0.75,
             filter_decay: 0.7,
             filter_sustain: 0.5,
             filter_release: 0.8,
+            overdrive: 0.0,
             volume: 0.6,
+            tuning: 0.5,
         }
     }
 
     pub fn pluck() -> Self {
         Self {
             osc_shape: 0.3,
-            detune_amount: 0.1,
+            sub_level: 0.1,
+            osc_level: 0.8,
             filter_cutoff: 0.7,
             filter_resonance: 0.25,
             filter_env_amount: 0.6,
             amp_attack: 0.0,
-            amp_decay: 0.75, // ~530ms
+            amp_decay: 0.75,
             amp_sustain: 0.0,
-            amp_release: 0.65, // ~280ms
+            amp_release: 0.65,
             filter_attack: 0.0,
             filter_decay: 0.7,
             filter_sustain: 0.1,
             filter_release: 0.65,
+            overdrive: 0.0,
             volume: 0.7,
+            tuning: 0.5,
         }
     }
 
     pub fn keys() -> Self {
         Self {
             osc_shape: 0.5,
-            detune_amount: 0.15,
+            sub_level: 0.25,
+            osc_level: 0.8,
             filter_cutoff: 0.55,
             filter_resonance: 0.1,
             filter_env_amount: 0.4,
-            amp_attack: 0.35, // ~20ms
-            amp_decay: 0.7,   // ~370ms
+            amp_attack: 0.35,
+            amp_decay: 0.7,
             amp_sustain: 0.5,
-            amp_release: 0.75, // ~530ms
+            amp_release: 0.75,
             filter_attack: 0.3,
             filter_decay: 0.65,
             filter_sustain: 0.3,
             filter_release: 0.7,
+            overdrive: 0.0,
             volume: 0.7,
+            tuning: 0.5,
         }
     }
 
     pub fn strings() -> Self {
         Self {
             osc_shape: 0.0,
-            detune_amount: 0.5,
+            sub_level: 0.15,
+            osc_level: 0.7,
             filter_cutoff: 0.5,
             filter_resonance: 0.1,
             filter_env_amount: 0.15,
-            amp_attack: 0.85, // ~1.5s
-            amp_decay: 0.7,   // ~370ms
+            amp_attack: 0.85,
+            amp_decay: 0.7,
             amp_sustain: 0.9,
-            amp_release: 0.85, // ~1.5s
+            amp_release: 0.85,
             filter_attack: 0.8,
             filter_decay: 0.7,
             filter_sustain: 0.6,
             filter_release: 0.8,
+            overdrive: 0.0,
             volume: 0.5,
+            tuning: 0.5,
+        }
+    }
+}
+
+impl Blendable for PolySynthConfig {
+    fn lerp(&self, other: &Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        let inv = 1.0 - t;
+        Self {
+            osc_shape: self.osc_shape * inv + other.osc_shape * t,
+            sub_level: self.sub_level * inv + other.sub_level * t,
+            osc_level: self.osc_level * inv + other.osc_level * t,
+            filter_cutoff: self.filter_cutoff * inv + other.filter_cutoff * t,
+            filter_resonance: self.filter_resonance * inv + other.filter_resonance * t,
+            filter_env_amount: self.filter_env_amount * inv + other.filter_env_amount * t,
+            amp_attack: self.amp_attack * inv + other.amp_attack * t,
+            amp_decay: self.amp_decay * inv + other.amp_decay * t,
+            amp_sustain: self.amp_sustain * inv + other.amp_sustain * t,
+            amp_release: self.amp_release * inv + other.amp_release * t,
+            filter_attack: self.filter_attack * inv + other.filter_attack * t,
+            filter_decay: self.filter_decay * inv + other.filter_decay * t,
+            filter_sustain: self.filter_sustain * inv + other.filter_sustain * t,
+            filter_release: self.filter_release * inv + other.filter_release * t,
+            overdrive: self.overdrive * inv + other.overdrive * t,
+            volume: self.volume * inv + other.volume * t,
+            tuning: self.tuning * inv + other.tuning * t,
         }
     }
 }
 
 pub struct PolySynthParams {
     pub osc_shape: SmoothedParam,
-    pub detune_amount: SmoothedParam,
+    pub sub_level: SmoothedParam,
+    pub osc_level: SmoothedParam,
     pub filter_cutoff: SmoothedParam,
     pub filter_resonance: SmoothedParam,
     pub filter_env_amount: SmoothedParam,
@@ -156,32 +198,39 @@ pub struct PolySynthParams {
     pub filter_decay: SmoothedParam,
     pub filter_sustain: SmoothedParam,
     pub filter_release: SmoothedParam,
+    pub overdrive: SmoothedParam,
     pub volume: SmoothedParam,
+    pub tuning: SmoothedParam,
 }
 
 impl PolySynthParams {
     pub fn from_config(config: &PolySynthConfig, sample_rate: f32) -> Self {
+        let make = |v: f32| SmoothedParam::new(v, 0.0, 1.0, sample_rate, DEFAULT_SMOOTH_TIME_MS);
         Self {
-            osc_shape: SmoothedParam::new_normalized(config.osc_shape, sample_rate),
-            detune_amount: SmoothedParam::new_normalized(config.detune_amount, sample_rate),
-            filter_cutoff: SmoothedParam::new_normalized(config.filter_cutoff, sample_rate),
-            filter_resonance: SmoothedParam::new_normalized(config.filter_resonance, sample_rate),
-            filter_env_amount: SmoothedParam::new_normalized(config.filter_env_amount, sample_rate),
-            amp_attack: SmoothedParam::new_normalized(config.amp_attack, sample_rate),
-            amp_decay: SmoothedParam::new_normalized(config.amp_decay, sample_rate),
-            amp_sustain: SmoothedParam::new_normalized(config.amp_sustain, sample_rate),
-            amp_release: SmoothedParam::new_normalized(config.amp_release, sample_rate),
-            filter_attack: SmoothedParam::new_normalized(config.filter_attack, sample_rate),
-            filter_decay: SmoothedParam::new_normalized(config.filter_decay, sample_rate),
-            filter_sustain: SmoothedParam::new_normalized(config.filter_sustain, sample_rate),
-            filter_release: SmoothedParam::new_normalized(config.filter_release, sample_rate),
-            volume: SmoothedParam::new_normalized(config.volume, sample_rate),
+            osc_shape: make(config.osc_shape),
+            sub_level: make(config.sub_level),
+            osc_level: make(config.osc_level),
+            filter_cutoff: make(config.filter_cutoff),
+            filter_resonance: make(config.filter_resonance),
+            filter_env_amount: make(config.filter_env_amount),
+            amp_attack: make(config.amp_attack),
+            amp_decay: make(config.amp_decay),
+            amp_sustain: make(config.amp_sustain),
+            amp_release: make(config.amp_release),
+            filter_attack: make(config.filter_attack),
+            filter_decay: make(config.filter_decay),
+            filter_sustain: make(config.filter_sustain),
+            filter_release: make(config.filter_release),
+            overdrive: make(config.overdrive),
+            volume: make(config.volume),
+            tuning: make(config.tuning),
         }
     }
 
     pub fn tick(&mut self) {
         self.osc_shape.tick();
-        self.detune_amount.tick();
+        self.sub_level.tick();
+        self.osc_level.tick();
         self.filter_cutoff.tick();
         self.filter_resonance.tick();
         self.filter_env_amount.tick();
@@ -193,14 +242,15 @@ impl PolySynthParams {
         self.filter_decay.tick();
         self.filter_sustain.tick();
         self.filter_release.tick();
+        self.overdrive.tick();
         self.volume.tick();
+        self.tuning.tick();
     }
 
     pub fn snap_all(&mut self) {
         self.osc_shape.snap();
-        self.detune_amount.snap();
-        self.filter_cutoff.snap();
-        self.filter_resonance.snap();
+        self.sub_level.snap();
+        self.osc_level.snap();
         self.filter_cutoff.snap();
         self.filter_resonance.snap();
         self.filter_env_amount.snap();
@@ -212,7 +262,9 @@ impl PolySynthParams {
         self.filter_decay.snap();
         self.filter_sustain.snap();
         self.filter_release.snap();
+        self.overdrive.snap();
         self.volume.snap();
+        self.tuning.snap();
     }
 }
 
@@ -221,11 +273,12 @@ const NUM_VOICES: usize = 6;
 struct Voice {
     midi_note: u8,
     frequency: f64,
+    sub_phase: f64,
     phase_a: f64,
-    phase_b: f64,
     amp_envelope: Envelope,
     filter_envelope: Envelope,
     filter: StateVariableFilterTpt,
+    waveshaper: Waveshaper,
     velocity: f32,
     active: bool,
     trigger_order: u64,
@@ -236,11 +289,12 @@ impl Voice {
         Self {
             midi_note: 0,
             frequency: 440.0,
+            sub_phase: 0.0,
             phase_a: 0.0,
-            phase_b: 0.0,
             amp_envelope: Envelope::new(),
             filter_envelope: Envelope::new(),
             filter: StateVariableFilterTpt::new(sample_rate, 1000.0, 1.0),
+            waveshaper: Waveshaper::new(1.0, 1.0),
             velocity: 1.0,
             active: false,
             trigger_order: 0,
@@ -281,7 +335,8 @@ impl PolySynth {
 
     pub fn set_config(&mut self, config: PolySynthConfig) {
         self.params.osc_shape.set_target(config.osc_shape);
-        self.params.detune_amount.set_target(config.detune_amount);
+        self.params.sub_level.set_target(config.sub_level);
+        self.params.osc_level.set_target(config.osc_level);
         self.params.filter_cutoff.set_target(config.filter_cutoff);
         self.params
             .filter_resonance
@@ -297,7 +352,9 @@ impl PolySynth {
         self.params.filter_decay.set_target(config.filter_decay);
         self.params.filter_sustain.set_target(config.filter_sustain);
         self.params.filter_release.set_target(config.filter_release);
+        self.params.overdrive.set_target(config.overdrive);
         self.params.volume.set_target(config.volume);
+        self.params.tuning.set_target(config.tuning);
     }
 
     pub fn snap_params(&mut self) {
@@ -313,8 +370,8 @@ impl PolySynth {
 
         voice.midi_note = note;
         voice.frequency = midi_to_freq(note);
+        voice.sub_phase = 0.0;
         voice.phase_a = 0.0;
-        voice.phase_b = 0.0;
         voice.velocity = velocity;
         voice.active = true;
         voice.trigger_order = self.trigger_counter;
@@ -379,8 +436,12 @@ impl PolySynth {
         self.params.osc_shape.set_target(value.clamp(0.0, 1.0));
     }
 
-    pub fn set_detune_amount(&mut self, value: f32) {
-        self.params.detune_amount.set_target(value.clamp(0.0, 1.0));
+    pub fn set_sub_level(&mut self, value: f32) {
+        self.params.sub_level.set_target(value.clamp(0.0, 1.0));
+    }
+
+    pub fn set_osc_level(&mut self, value: f32) {
+        self.params.osc_level.set_target(value.clamp(0.0, 1.0));
     }
 
     pub fn set_filter_cutoff(&mut self, value: f32) {
@@ -415,8 +476,34 @@ impl PolySynth {
         self.params.amp_release.set_target(value.clamp(0.0, 1.0));
     }
 
+    pub fn set_filter_attack(&mut self, value: f32) {
+        self.params.filter_attack.set_target(value.clamp(0.0, 1.0));
+    }
+
+    pub fn set_filter_decay(&mut self, value: f32) {
+        self.params.filter_decay.set_target(value.clamp(0.0, 1.0));
+    }
+
+    pub fn set_filter_sustain(&mut self, value: f32) {
+        self.params.filter_sustain.set_target(value.clamp(0.0, 1.0));
+    }
+
+    pub fn set_filter_release(&mut self, value: f32) {
+        self.params.filter_release.set_target(value.clamp(0.0, 1.0));
+    }
+
+    pub fn set_overdrive(&mut self, value: f32) {
+        self.params.overdrive.set_target(value.clamp(0.0, 1.0));
+    }
+
     pub fn set_volume(&mut self, value: f32) {
         self.params.volume.set_target(value.clamp(0.0, 1.0));
+    }
+
+    /// Set tuning offset (smoothed, 0-1: 0=-12 semitones, 0.5=neutral, 1=+12 semitones).
+    /// Applied live to sustaining voices, so sweeping produces pitch glide.
+    pub fn set_tuning(&mut self, value: f32) {
+        self.params.tuning.set_target(value.clamp(0.0, 1.0));
     }
 
     fn allocate_voice(&self) -> usize {
@@ -436,11 +523,14 @@ impl PolySynth {
 
     fn generate_voice(&mut self, voice_idx: usize, current_time: f64) -> f32 {
         let osc_shape = self.params.osc_shape.get();
-        let detune = self.params.detune_amount.get();
+        let sub_level = self.params.sub_level.get();
+        let osc_level = self.params.osc_level.get();
         let cutoff_norm = self.params.filter_cutoff.get();
         let resonance_norm = self.params.filter_resonance.get();
         let filter_env_amount = self.params.filter_env_amount.get();
+        let overdrive = self.params.overdrive.get();
         let volume = self.params.volume.get();
+        let tuning_mult = tuning_to_multiplier(self.params.tuning.get()) as f64;
 
         let voice = &mut self.voices[voice_idx];
 
@@ -459,31 +549,35 @@ impl PolySynth {
         let filter_env = voice.filter_envelope.get_amplitude(current_time);
 
         // Oscillators
-        let freq = voice.frequency;
-        let detune_ratio = ranges::detune_ratio(detune);
+        let freq = voice.frequency * tuning_mult;
         let dt = 1.0 / self.sample_rate as f64;
 
-        let phase_inc_a = freq * dt;
-        let phase_inc_b = freq * detune_ratio * dt;
+        let phase_inc_main = freq * dt;
 
-        // Generate oscillator A
-        let saw_a = polyblep_saw(voice.phase_a, phase_inc_a);
-        let square_a = polyblep_square(voice.phase_a, phase_inc_a);
+        // Sub sine (pure fundamental at the note's frequency)
+        let sub_out = (voice.sub_phase * TAU).sin() as f32;
+
+        // Generate oscillator A (main)
+        let saw_a = polyblep_saw(voice.phase_a, phase_inc_main);
+        let square_a = polyblep_square(voice.phase_a, phase_inc_main);
         let osc_a = saw_a * (1.0 - osc_shape) + square_a * osc_shape;
 
-        // Generate oscillator B (detuned)
-        let saw_b = polyblep_saw(voice.phase_b, phase_inc_b);
-        let square_b = polyblep_square(voice.phase_b, phase_inc_b);
-        let osc_b = saw_b * (1.0 - osc_shape) + square_b * osc_shape;
-
-        // Mix oscillators
-        let osc_mix = (osc_a + osc_b) * 0.5;
+        // Mix oscillator layers with independent levels
+        let mix = sub_out * sub_level + osc_a * osc_level;
 
         // Advance phases
-        voice.phase_a += phase_inc_a;
+        voice.sub_phase += phase_inc_main;
+        voice.sub_phase -= voice.sub_phase.floor();
+        voice.phase_a += phase_inc_main;
         voice.phase_a -= voice.phase_a.floor();
-        voice.phase_b += phase_inc_b;
-        voice.phase_b -= voice.phase_b.floor();
+
+        // Pre-filter saturation
+        voice.waveshaper.set_drive(1.0 + overdrive * 9.0);
+        let saturated = if overdrive > 0.001 {
+            voice.waveshaper.process(mix)
+        } else {
+            mix
+        };
 
         // Filter with envelope modulation
         let base_cutoff = ranges::filter_cutoff_hz(cutoff_norm);
@@ -495,7 +589,7 @@ impl PolySynth {
         voice
             .filter
             .set_params(modulated_cutoff.clamp(20.0, 18000.0), q);
-        let (filtered, _, _) = voice.filter.process_all(osc_mix);
+        let (filtered, _, _) = voice.filter.process_all(saturated);
 
         // Apply amplitude envelope and velocity
         filtered * amp_env * voice.velocity.sqrt() * volume
@@ -533,6 +627,131 @@ impl Instrument for PolySynth {
 
     fn get_frequency(&self) -> Option<f32> {
         None
+    }
+
+    fn as_modulatable(&mut self) -> Option<&mut dyn crate::engine::Modulatable> {
+        Some(self)
+    }
+}
+
+impl crate::engine::Modulatable for PolySynth {
+    fn modulatable_parameters(&self) -> Vec<&'static str> {
+        vec![
+            "osc_shape",
+            "sub_level",
+            "osc_level",
+            "filter_cutoff",
+            "filter_resonance",
+            "filter_env_amount",
+            "amp_attack",
+            "amp_decay",
+            "amp_sustain",
+            "amp_release",
+            "filter_attack",
+            "filter_decay",
+            "filter_sustain",
+            "filter_release",
+            "overdrive",
+            "volume",
+            "tuning",
+        ]
+    }
+
+    fn apply_modulation(&mut self, parameter: &str, value: f32) -> Result<(), String> {
+        match parameter {
+            "osc_shape" => {
+                self.params.osc_shape.set_bipolar(value);
+                Ok(())
+            }
+            "sub_level" => {
+                self.params.sub_level.set_bipolar(value);
+                Ok(())
+            }
+            "osc_level" => {
+                self.params.osc_level.set_bipolar(value);
+                Ok(())
+            }
+            "filter_cutoff" => {
+                self.params.filter_cutoff.set_bipolar(value);
+                Ok(())
+            }
+            "filter_resonance" => {
+                self.params.filter_resonance.set_bipolar(value);
+                Ok(())
+            }
+            "filter_env_amount" => {
+                self.params.filter_env_amount.set_bipolar(value);
+                Ok(())
+            }
+            "amp_attack" => {
+                self.params.amp_attack.set_bipolar(value);
+                Ok(())
+            }
+            "amp_decay" => {
+                self.params.amp_decay.set_bipolar(value);
+                Ok(())
+            }
+            "amp_sustain" => {
+                self.params.amp_sustain.set_bipolar(value);
+                Ok(())
+            }
+            "amp_release" => {
+                self.params.amp_release.set_bipolar(value);
+                Ok(())
+            }
+            "filter_attack" => {
+                self.params.filter_attack.set_bipolar(value);
+                Ok(())
+            }
+            "filter_decay" => {
+                self.params.filter_decay.set_bipolar(value);
+                Ok(())
+            }
+            "filter_sustain" => {
+                self.params.filter_sustain.set_bipolar(value);
+                Ok(())
+            }
+            "filter_release" => {
+                self.params.filter_release.set_bipolar(value);
+                Ok(())
+            }
+            "overdrive" => {
+                self.params.overdrive.set_bipolar(value);
+                Ok(())
+            }
+            "volume" => {
+                self.params.volume.set_bipolar(value);
+                Ok(())
+            }
+            "tuning" => {
+                self.params.tuning.set_bipolar(value);
+                Ok(())
+            }
+            _ => Err(format!("Unknown parameter: {}", parameter)),
+        }
+    }
+
+    fn parameter_range(&self, parameter: &str) -> Option<(f32, f32)> {
+        match parameter {
+            "osc_shape" => Some(self.params.osc_shape.range()),
+            "sub_level" => Some(self.params.sub_level.range()),
+            "osc_level" => Some(self.params.osc_level.range()),
+            "filter_cutoff" => Some(self.params.filter_cutoff.range()),
+            "filter_resonance" => Some(self.params.filter_resonance.range()),
+            "filter_env_amount" => Some(self.params.filter_env_amount.range()),
+            "amp_attack" => Some(self.params.amp_attack.range()),
+            "amp_decay" => Some(self.params.amp_decay.range()),
+            "amp_sustain" => Some(self.params.amp_sustain.range()),
+            "amp_release" => Some(self.params.amp_release.range()),
+            "filter_attack" => Some(self.params.filter_attack.range()),
+            "filter_decay" => Some(self.params.filter_decay.range()),
+            "filter_sustain" => Some(self.params.filter_sustain.range()),
+            "filter_release" => Some(self.params.filter_release.range()),
+            "overdrive" => Some(self.params.overdrive.range()),
+            "volume" => Some(self.params.volume.range()),
+            "tuning" => Some(self.params.tuning.range()),
+            _ => None,
+        }
     }
 }
 
@@ -612,9 +831,152 @@ mod tests {
     #[test]
     fn test_presets() {
         let sample_rate = 44100.0;
-        let _pad = PolySynth::with_config(sample_rate, PolySynthConfig::pad());
-        let _pluck = PolySynth::with_config(sample_rate, PolySynthConfig::pluck());
-        let _keys = PolySynth::with_config(sample_rate, PolySynthConfig::keys());
-        let _strings = PolySynth::with_config(sample_rate, PolySynthConfig::strings());
+        for cfg in [
+            PolySynthConfig::default(),
+            PolySynthConfig::pad(),
+            PolySynthConfig::pluck(),
+            PolySynthConfig::keys(),
+            PolySynthConfig::strings(),
+        ] {
+            let mut synth = PolySynth::with_config(sample_rate, cfg);
+            synth.trigger_note(60, 1.0);
+
+            let mut energy = 0.0_f64;
+            let dt = 1.0 / sample_rate as f64;
+            for i in 0..4410 {
+                let t = i as f64 * dt;
+                let s = synth.tick(t) as f64;
+                energy += s * s;
+            }
+            assert!(energy > 0.0001, "preset should produce audible output");
+        }
+    }
+
+    fn zero_crossings(samples: &[f32]) -> usize {
+        samples
+            .windows(2)
+            .filter(|w| (w[0] <= 0.0 && w[1] > 0.0) || (w[0] >= 0.0 && w[1] < 0.0))
+            .count()
+    }
+
+    #[test]
+    fn test_poly_synth_tuning_shifts_pitch() {
+        let sample_rate = 44100.0;
+        let dt = 1.0 / sample_rate as f64;
+
+        let mut neutral = PolySynth::new(sample_rate);
+        neutral.set_tuning(0.5);
+        neutral.snap_params();
+        neutral.trigger_note(60, 1.0);
+
+        let mut up = PolySynth::new(sample_rate);
+        up.set_tuning(1.0);
+        up.snap_params();
+        up.trigger_note(60, 1.0);
+
+        // Skip the attack portion; sample a steady-state window.
+        let prime = (sample_rate * 0.05) as usize;
+        for i in 0..prime {
+            let t = i as f64 * dt;
+            neutral.tick(t);
+            up.tick(t);
+        }
+
+        let window = 2048;
+        let mut n_samples = Vec::with_capacity(window);
+        let mut u_samples = Vec::with_capacity(window);
+        for i in 0..window {
+            let t = (prime + i) as f64 * dt;
+            n_samples.push(neutral.tick(t));
+            u_samples.push(up.tick(t));
+        }
+
+        let n_zc = zero_crossings(&n_samples);
+        let u_zc = zero_crossings(&u_samples);
+        // +12 semitones doubles pitch, expect roughly 2x zero crossings.
+        assert!(
+            u_zc > n_zc + n_zc / 4,
+            "tuning=1.0 should raise pitch (neutral={}, up={})",
+            n_zc,
+            u_zc
+        );
+    }
+
+    #[test]
+    fn test_poly_synth_sub_layer_adds_energy() {
+        let sample_rate = 44100.0;
+        let dt = 1.0 / sample_rate as f64;
+
+        let mut cfg = PolySynthConfig::default();
+        cfg.sub_level = 0.0;
+        cfg.osc_level = 0.0;
+        let mut silent_cfg = cfg;
+        silent_cfg.sub_level = 0.0;
+        let mut sub_cfg = cfg;
+        sub_cfg.sub_level = 1.0;
+
+        let mut silent = PolySynth::with_config(sample_rate, silent_cfg);
+        silent.snap_params();
+        silent.trigger_note(60, 1.0);
+
+        let mut with_sub = PolySynth::with_config(sample_rate, sub_cfg);
+        with_sub.snap_params();
+        with_sub.trigger_note(60, 1.0);
+
+        let mut silent_energy = 0.0_f64;
+        let mut sub_energy = 0.0_f64;
+        let prime = (sample_rate * 0.02) as usize;
+        for i in 0..(prime + 4096) {
+            let t = i as f64 * dt;
+            let s_sil = silent.tick(t) as f64;
+            let s_sub = with_sub.tick(t) as f64;
+            if i >= prime {
+                silent_energy += s_sil * s_sil;
+                sub_energy += s_sub * s_sub;
+            }
+        }
+        assert!(
+            sub_energy > silent_energy + 0.001,
+            "sub layer should add energy (silent={}, sub={})",
+            silent_energy,
+            sub_energy
+        );
+    }
+
+    #[test]
+    fn test_poly_synth_overdrive_changes_signal() {
+        let sample_rate = 44100.0;
+        let dt = 1.0 / sample_rate as f64;
+
+        let mut clean = PolySynth::new(sample_rate);
+        clean.set_overdrive(0.0);
+        clean.snap_params();
+        clean.trigger_note(60, 1.0);
+
+        let mut driven = PolySynth::new(sample_rate);
+        driven.set_overdrive(0.9);
+        driven.snap_params();
+        driven.trigger_note(60, 1.0);
+
+        let prime = (sample_rate * 0.02) as usize;
+        for i in 0..prime {
+            let t = i as f64 * dt;
+            clean.tick(t);
+            driven.tick(t);
+        }
+
+        let window = 4096;
+        let mut diff = 0.0_f64;
+        for i in 0..window {
+            let t = (prime + i) as f64 * dt;
+            let a = clean.tick(t) as f64;
+            let b = driven.tick(t) as f64;
+            diff += (a - b).abs();
+        }
+        assert!(
+            diff > 1.0,
+            "overdrive should change the waveform (diff={})",
+            diff
+        );
     }
 }

@@ -88,6 +88,7 @@ enum ChannelInstrument {
     HiHat(HiHat2),
     Tom(Tom2),
     Bass(BassSynth),
+    Poly(PolySynth),
 }
 
 impl ChannelInstrument {
@@ -99,6 +100,7 @@ impl ChannelInstrument {
             Self::HiHat(_) => INSTRUMENT_HIHAT,
             Self::Tom(_) => INSTRUMENT_TOM,
             Self::Bass(_) => INSTRUMENT_BASS,
+            Self::Poly(_) => INSTRUMENT_POLY,
         }
     }
 
@@ -110,6 +112,7 @@ impl ChannelInstrument {
             Self::HiHat(h) => h.trigger_with_velocity(time, velocity),
             Self::Tom(t) => t.trigger_with_velocity(time, velocity),
             Self::Bass(b) => b.trigger_with_velocity(time, velocity),
+            Self::Poly(p) => p.trigger_with_velocity(time, velocity),
         }
     }
 
@@ -122,6 +125,7 @@ impl ChannelInstrument {
             Self::HiHat(h) => h.snap_params(),
             Self::Tom(_) => {} // Tom2 uses plain f32, already immediate
             Self::Bass(b) => b.snap_params(),
+            Self::Poly(p) => p.snap_params(),
         }
     }
 
@@ -133,6 +137,7 @@ impl ChannelInstrument {
             Self::HiHat(h) => h.tick(current_time),
             Self::Tom(t) => t.tick(current_time),
             Self::Bass(b) => b.tick(current_time),
+            Self::Poly(p) => p.tick(current_time),
         }
     }
 
@@ -154,6 +159,7 @@ impl ChannelInstrument {
             Self::HiHat(h) => h.params.tuning.get(),
             Self::Tom(t) => t.tuning(),
             Self::Bass(b) => b.params.tuning.get(),
+            Self::Poly(p) => p.params.tuning.get(),
         }
     }
 
@@ -240,6 +246,26 @@ impl ChannelInstrument {
                 BASS_PARAM_TUNING => b.set_tuning(value),
                 _ => {}
             },
+            Self::Poly(p) => match param {
+                POLY_PARAM_OSC_SHAPE => p.set_osc_shape(value),
+                POLY_PARAM_SUB_LEVEL => p.set_sub_level(value),
+                POLY_PARAM_OSC_LEVEL => p.set_osc_level(value),
+                POLY_PARAM_FILTER_CUTOFF => p.set_filter_cutoff(value),
+                POLY_PARAM_FILTER_RESONANCE => p.set_filter_resonance(value),
+                POLY_PARAM_FILTER_ENV_AMOUNT => p.set_filter_env_amount(value),
+                POLY_PARAM_AMP_ATTACK => p.set_amp_attack(value),
+                POLY_PARAM_AMP_DECAY => p.set_amp_decay(value),
+                POLY_PARAM_AMP_SUSTAIN => p.set_amp_sustain(value),
+                POLY_PARAM_AMP_RELEASE => p.set_amp_release(value),
+                POLY_PARAM_FILTER_ATTACK => p.set_filter_attack(value),
+                POLY_PARAM_FILTER_DECAY => p.set_filter_decay(value),
+                POLY_PARAM_FILTER_SUSTAIN => p.set_filter_sustain(value),
+                POLY_PARAM_FILTER_RELEASE => p.set_filter_release(value),
+                POLY_PARAM_OVERDRIVE => p.set_overdrive(value),
+                POLY_PARAM_VOLUME => p.set_volume(value),
+                POLY_PARAM_TUNING => p.set_tuning(value),
+                _ => {}
+            },
         }
     }
 
@@ -324,6 +350,26 @@ impl ChannelInstrument {
                 BASS_PARAM_TUNING => b.params.tuning.set_bipolar(value),
                 _ => {}
             },
+            Self::Poly(p) => match param {
+                POLY_PARAM_OSC_SHAPE => p.params.osc_shape.set_bipolar(value),
+                POLY_PARAM_SUB_LEVEL => p.params.sub_level.set_bipolar(value),
+                POLY_PARAM_OSC_LEVEL => p.params.osc_level.set_bipolar(value),
+                POLY_PARAM_FILTER_CUTOFF => p.params.filter_cutoff.set_bipolar(value),
+                POLY_PARAM_FILTER_RESONANCE => p.params.filter_resonance.set_bipolar(value),
+                POLY_PARAM_FILTER_ENV_AMOUNT => p.params.filter_env_amount.set_bipolar(value),
+                POLY_PARAM_AMP_ATTACK => p.params.amp_attack.set_bipolar(value),
+                POLY_PARAM_AMP_DECAY => p.params.amp_decay.set_bipolar(value),
+                POLY_PARAM_AMP_SUSTAIN => p.params.amp_sustain.set_bipolar(value),
+                POLY_PARAM_AMP_RELEASE => p.params.amp_release.set_bipolar(value),
+                POLY_PARAM_FILTER_ATTACK => p.params.filter_attack.set_bipolar(value),
+                POLY_PARAM_FILTER_DECAY => p.params.filter_decay.set_bipolar(value),
+                POLY_PARAM_FILTER_SUSTAIN => p.params.filter_sustain.set_bipolar(value),
+                POLY_PARAM_FILTER_RELEASE => p.params.filter_release.set_bipolar(value),
+                POLY_PARAM_OVERDRIVE => p.params.overdrive.set_bipolar(value),
+                POLY_PARAM_VOLUME => p.params.volume.set_bipolar(value),
+                POLY_PARAM_TUNING => p.params.tuning.set_bipolar(value),
+                _ => {}
+            },
         }
     }
 }
@@ -335,6 +381,7 @@ enum ChannelBlender {
     HiHat(PresetBlender<HiHat2Config>),
     Tom(PresetBlender<Tom2Config>),
     Bass(PresetBlender<BassConfig>),
+    Poly(PresetBlender<PolySynthConfig>),
 }
 
 impl ChannelBlender {
@@ -346,6 +393,7 @@ impl ChannelBlender {
             (Self::HiHat(b), ChannelInstrument::HiHat(h)) => h.set_config(b.blend(x, y)),
             (Self::Tom(b), ChannelInstrument::Tom(t)) => t.set_config(b.blend(x, y)),
             (Self::Bass(b), ChannelInstrument::Bass(bs)) => bs.set_config(b.blend(x, y)),
+            (Self::Poly(b), ChannelInstrument::Poly(p)) => p.set_config(b.blend(x, y)),
             _ => {} // type mismatch — should not happen if blender/instrument are kept in sync
         }
     }
@@ -408,6 +456,17 @@ impl ChannelBlender {
                     }
                 }
             }
+            Self::Poly(b) => {
+                if let Some(config) = GooeyEngine::poly_preset_by_id(preset_id) {
+                    match corner {
+                        BLEND_CORNER_BOTTOM_LEFT => b.set_bottom_left(config),
+                        BLEND_CORNER_BOTTOM_RIGHT => b.set_bottom_right(config),
+                        BLEND_CORNER_TOP_LEFT => b.set_top_left(config),
+                        BLEND_CORNER_TOP_RIGHT => b.set_top_right(config),
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 
@@ -443,6 +502,12 @@ impl ChannelBlender {
                 BassConfig::sub(),
                 BassConfig::reese(),
                 BassConfig::stab(),
+            )),
+            INSTRUMENT_POLY => Self::Poly(PresetBlender::new(
+                PolySynthConfig::default(),
+                PolySynthConfig::pad(),
+                PolySynthConfig::pluck(),
+                PolySynthConfig::keys(),
             )),
             _ => Self::Kick(PresetBlender::new(
                 KickConfig::tight(),
@@ -485,6 +550,12 @@ impl ChannelBlender {
                 BASS_PRESET_SUB,
                 BASS_PRESET_REESE,
                 BASS_PRESET_STAB,
+            ],
+            INSTRUMENT_POLY => [
+                POLY_PRESET_DEFAULT,
+                POLY_PRESET_PAD,
+                POLY_PRESET_PLUCK,
+                POLY_PRESET_KEYS,
             ],
             _ => [0, 1, 2, 3],
         }
@@ -573,9 +644,6 @@ pub struct GooeyEngine {
     // Used to let host MIDI input drive instruments instead of the internal sequencer.
     sequencer_triggers_enabled: bool,
 
-    // Polyphonic synthesizer for chord playback
-    poly_synth: PolySynth,
-
     // When true, an external source (e.g. Ableton Link) owns the tempo.
     // The host should check this flag to decide whether local BPM changes
     // should be applied directly or routed through the external sync source.
@@ -592,13 +660,14 @@ impl GooeyEngine {
     fn new(sample_rate: f32) -> Self {
         let bpm = 120.0;
 
-        // Create channel instruments (default: ch0=kick, ch1=snare, ch2=hihat, ch3=tom, ch4=bass)
+        // Create channel instruments (default: ch0=kick, ch1=snare, ch2=hihat, ch3=tom, ch4=bass, ch5=poly)
         let channels = [
             ChannelInstrument::Kick(KickDrum::new(sample_rate)),
             ChannelInstrument::Snare(SnareDrum::new(sample_rate)),
             ChannelInstrument::HiHat(HiHat2::new(sample_rate)),
             ChannelInstrument::Tom(Tom2::new(sample_rate)),
             ChannelInstrument::Bass(BassSynth::new(sample_rate)),
+            ChannelInstrument::Poly(PolySynth::new(sample_rate)),
         ];
 
         // Create a 16-step sequencer for each channel
@@ -608,6 +677,7 @@ impl GooeyEngine {
             Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "hihat"),
             Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "tom"),
             Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "bass"),
+            Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "poly"),
         ];
 
         // Create delay with default settings (quarter note timing, no feedback, no mix, filter open)
@@ -640,6 +710,7 @@ impl GooeyEngine {
             ChannelBlender::default_for_type(INSTRUMENT_HIHAT),
             ChannelBlender::default_for_type(INSTRUMENT_TOM),
             ChannelBlender::default_for_type(INSTRUMENT_BASS),
+            ChannelBlender::default_for_type(INSTRUMENT_POLY),
         ];
 
         Self {
@@ -694,6 +765,7 @@ impl GooeyEngine {
                 ChannelBlender::default_corner_preset_ids(INSTRUMENT_HIHAT),
                 ChannelBlender::default_corner_preset_ids(INSTRUMENT_TOM),
                 ChannelBlender::default_corner_preset_ids(INSTRUMENT_BASS),
+                ChannelBlender::default_corner_preset_ids(INSTRUMENT_POLY),
             ],
             // Per-step note override: saved global frequency for restore
             saved_global_freq: [None; NUM_INSTRUMENTS],
@@ -701,8 +773,6 @@ impl GooeyEngine {
             pending_midi_events: Vec::with_capacity(MIDI_EVENT_CAPACITY),
             // Sequencer triggers enabled by default (internal sequencer drives instruments)
             sequencer_triggers_enabled: true,
-            // Polyphonic synthesizer for chord playback
-            poly_synth: PolySynth::new(sample_rate),
             // External sync (e.g. Ableton Link)
             link_enabled: AtomicBool::new(false),
             // Error state
@@ -836,9 +906,6 @@ impl GooeyEngine {
                     self.channel_peaks[ch].store(abs_out.to_bits(), Ordering::Relaxed);
                 }
             }
-
-            // Mix in poly synth output
-            output += self.poly_synth.tick(self.current_time);
 
             // Apply global effects chain
             if self.saturation_enabled {
@@ -974,6 +1041,18 @@ impl GooeyEngine {
             BASS_PRESET_SUB => Some(BassConfig::sub()),
             BASS_PRESET_REESE => Some(BassConfig::reese()),
             BASS_PRESET_STAB => Some(BassConfig::stab()),
+            _ => None,
+        }
+    }
+
+    /// Get a PolySynthConfig preset by ID
+    fn poly_preset_by_id(id: u32) -> Option<PolySynthConfig> {
+        match id {
+            POLY_PRESET_DEFAULT => Some(PolySynthConfig::default()),
+            POLY_PRESET_PAD => Some(PolySynthConfig::pad()),
+            POLY_PRESET_PLUCK => Some(PolySynthConfig::pluck()),
+            POLY_PRESET_KEYS => Some(PolySynthConfig::keys()),
+            POLY_PRESET_STRINGS => Some(PolySynthConfig::strings()),
             _ => None,
         }
     }
@@ -1259,8 +1338,10 @@ pub const INSTRUMENT_HIHAT: u32 = 2;
 pub const INSTRUMENT_TOM: u32 = 3;
 /// Instrument ID: bass synth
 pub const INSTRUMENT_BASS: u32 = 4;
+/// Instrument ID: polyphonic synth
+pub const INSTRUMENT_POLY: u32 = 5;
 /// Total number of instruments
-pub const INSTRUMENT_COUNT: u32 = 5;
+pub const INSTRUMENT_COUNT: u32 = 6;
 /// Internal usize version for array indexing
 const NUM_INSTRUMENTS: usize = INSTRUMENT_COUNT as usize;
 
@@ -1331,6 +1412,45 @@ pub const BASS_PRESET_SUB: u32 = 1;
 pub const BASS_PRESET_REESE: u32 = 2;
 /// Bass preset: Stab - square wave, sharp filter, short decay
 pub const BASS_PRESET_STAB: u32 = 3;
+
+// =============================================================================
+// Poly synth parameter constants
+// =============================================================================
+
+/// Poly parameter: oscillator shape - saw(0) to square(1)
+pub const POLY_PARAM_OSC_SHAPE: u32 = 0;
+/// Poly parameter: sub sine layer level (0-1)
+pub const POLY_PARAM_SUB_LEVEL: u32 = 1;
+/// Poly parameter: main saw/square layer level (0-1)
+pub const POLY_PARAM_OSC_LEVEL: u32 = 2;
+/// Poly parameter: filter cutoff (0-1 -> 20-18000 Hz exp)
+pub const POLY_PARAM_FILTER_CUTOFF: u32 = 3;
+/// Poly parameter: filter resonance (0-1 -> 0.5-15.0 Q)
+pub const POLY_PARAM_FILTER_RESONANCE: u32 = 4;
+/// Poly parameter: filter envelope depth (0-1)
+pub const POLY_PARAM_FILTER_ENV_AMOUNT: u32 = 5;
+/// Poly parameter: amp envelope attack (0-1 -> 0.001-5.0s exp)
+pub const POLY_PARAM_AMP_ATTACK: u32 = 6;
+/// Poly parameter: amp envelope decay (0-1 -> 0.001-5.0s exp)
+pub const POLY_PARAM_AMP_DECAY: u32 = 7;
+/// Poly parameter: amp envelope sustain (0-1)
+pub const POLY_PARAM_AMP_SUSTAIN: u32 = 8;
+/// Poly parameter: amp envelope release (0-1 -> 0.001-5.0s exp)
+pub const POLY_PARAM_AMP_RELEASE: u32 = 9;
+/// Poly parameter: filter envelope attack (0-1 -> 0.001-5.0s exp)
+pub const POLY_PARAM_FILTER_ATTACK: u32 = 10;
+/// Poly parameter: filter envelope decay (0-1 -> 0.001-5.0s exp)
+pub const POLY_PARAM_FILTER_DECAY: u32 = 11;
+/// Poly parameter: filter envelope sustain (0-1)
+pub const POLY_PARAM_FILTER_SUSTAIN: u32 = 12;
+/// Poly parameter: filter envelope release (0-1 -> 0.001-5.0s exp)
+pub const POLY_PARAM_FILTER_RELEASE: u32 = 13;
+/// Poly parameter: pre-filter overdrive/saturation (0-1)
+pub const POLY_PARAM_OVERDRIVE: u32 = 14;
+/// Poly parameter: master volume (0-1)
+pub const POLY_PARAM_VOLUME: u32 = 15;
+/// Poly parameter: tuning offset (0=-12 semitones, 0.5=neutral, 1=+12 semitones)
+pub const POLY_PARAM_TUNING: u32 = 16;
 
 /// Sentinel value indicating no MIDI note is set for a step (use instrument's global frequency)
 pub const STEP_NOTE_NONE: u8 = 255;
@@ -1672,6 +1792,7 @@ pub unsafe extern "C" fn gooey_engine_set_channel_instrument_type(
         INSTRUMENT_HIHAT => ChannelInstrument::HiHat(HiHat2::new(engine.sample_rate)),
         INSTRUMENT_TOM => ChannelInstrument::Tom(Tom2::new(engine.sample_rate)),
         INSTRUMENT_BASS => ChannelInstrument::Bass(BassSynth::new(engine.sample_rate)),
+        INSTRUMENT_POLY => ChannelInstrument::Poly(PolySynth::new(engine.sample_rate)),
         _ => return,
     };
 
@@ -1779,6 +1900,7 @@ pub unsafe extern "C" fn gooey_engine_set_channel_tuning(
         INSTRUMENT_HIHAT => HIHAT_PARAM_TUNING,
         INSTRUMENT_TOM => TOM_PARAM_TUNING,
         INSTRUMENT_BASS => BASS_PARAM_TUNING,
+        INSTRUMENT_POLY => POLY_PARAM_TUNING,
         _ => return,
     };
     engine.channels[idx].set_param(tuning_param, value);
@@ -4353,9 +4475,16 @@ pub unsafe extern "C" fn gooey_engine_poly_trigger_chord(
     let octave = octave.clamp(0, 8) as i8;
     let velocity = velocity.clamp(0.0, 1.0);
 
+    let Some(idx) = engine.find_channel_by_type(INSTRUMENT_POLY) else {
+        return;
+    };
+    let ChannelInstrument::Poly(ref mut poly) = engine.channels[idx] else {
+        return;
+    };
+
     // Apply preset
-    engine.poly_synth.set_config(preset_config(preset));
-    engine.poly_synth.snap_params();
+    poly.set_config(preset_config(preset));
+    poly.snap_params();
 
     // Get diatonic seventh chords and pick the requested degree
     let chords = key.diatonic_sevenths();
@@ -4366,9 +4495,9 @@ pub unsafe extern "C" fn gooey_engine_poly_trigger_chord(
     let midi_notes = apply_voicing(chord, voicing_type, octave);
 
     // Release any currently sounding notes, then trigger the new chord
-    engine.poly_synth.release_all();
+    poly.release_all();
     for note in &midi_notes {
-        engine.poly_synth.trigger_note(*note, velocity);
+        poly.trigger_note(*note, velocity);
     }
 }
 
@@ -4382,7 +4511,12 @@ pub unsafe extern "C" fn gooey_engine_poly_release(engine: *mut GooeyEngine) {
         return;
     }
     let engine = &mut *engine;
-    engine.poly_synth.release_all();
+    let Some(idx) = engine.find_channel_by_type(INSTRUMENT_POLY) else {
+        return;
+    };
+    if let ChannelInstrument::Poly(ref mut poly) = engine.channels[idx] {
+        poly.release_all();
+    }
 }
 
 /// Set the poly synth preset.
@@ -4399,26 +4533,17 @@ pub unsafe extern "C" fn gooey_engine_poly_set_preset(engine: *mut GooeyEngine, 
         return;
     }
     let engine = &mut *engine;
-    engine.poly_synth.set_config(preset_config(preset));
+    let Some(idx) = engine.find_channel_by_type(INSTRUMENT_POLY) else {
+        return;
+    };
+    if let ChannelInstrument::Poly(ref mut poly) = engine.channels[idx] {
+        poly.set_config(preset_config(preset));
+    }
 }
 
 /// Set a single poly synth parameter by index.
 ///
-/// Parameter indices:
-/// - 0: osc_shape (0=saw, 1=square)
-/// - 1: detune_amount
-/// - 2: filter_cutoff
-/// - 3: filter_resonance
-/// - 4: filter_env_amount
-/// - 5: amp_attack
-/// - 6: amp_decay
-/// - 7: amp_sustain
-/// - 8: amp_release
-/// - 9: filter_attack
-/// - 10: filter_decay
-/// - 11: filter_sustain
-/// - 12: filter_release
-/// - 13: volume
+/// See the `POLY_PARAM_*` constants for the full parameter list (0..16).
 ///
 /// All values are normalized 0.0-1.0.
 ///
@@ -4434,24 +4559,69 @@ pub unsafe extern "C" fn gooey_engine_poly_set_param(
         return;
     }
     let engine = &mut *engine;
-    let value = value.clamp(0.0, 1.0);
+    let Some(idx) = engine.find_channel_by_type(INSTRUMENT_POLY) else {
+        return;
+    };
+    engine.channels[idx].set_param(param, value);
+}
 
-    match param {
-        0 => engine.poly_synth.params.osc_shape.set_target(value),
-        1 => engine.poly_synth.params.detune_amount.set_target(value),
-        2 => engine.poly_synth.params.filter_cutoff.set_target(value),
-        3 => engine.poly_synth.params.filter_resonance.set_target(value),
-        4 => engine.poly_synth.params.filter_env_amount.set_target(value),
-        5 => engine.poly_synth.params.amp_attack.set_target(value),
-        6 => engine.poly_synth.params.amp_decay.set_target(value),
-        7 => engine.poly_synth.params.amp_sustain.set_target(value),
-        8 => engine.poly_synth.params.amp_release.set_target(value),
-        9 => engine.poly_synth.params.filter_attack.set_target(value),
-        10 => engine.poly_synth.params.filter_decay.set_target(value),
-        11 => engine.poly_synth.params.filter_sustain.set_target(value),
-        12 => engine.poly_synth.params.filter_release.set_target(value),
-        13 => engine.poly_synth.params.volume.set_target(value),
-        _ => {}
+// =============================================================================
+// Poly Synth — keyboard note play
+// =============================================================================
+
+/// Trigger a single MIDI note on the poly synth. Use for playable keyboards.
+///
+/// Locates the first channel holding a poly synth and starts a voice at the
+/// given MIDI note and velocity. Multiple notes may sound simultaneously
+/// (up to the voice limit); voice stealing kicks in beyond that.
+///
+/// # Arguments
+/// * `engine`    - pointer returned by `gooey_engine_new`
+/// * `midi_note` - 0..127 (typical keyboard range 21..108)
+/// * `velocity`  - 0.0..1.0 (clamped)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+/// Must not be called concurrently with the audio callback.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_note_on(
+    engine: *mut GooeyEngine,
+    midi_note: u8,
+    velocity: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let velocity = velocity.clamp(0.0, 1.0);
+    let Some(idx) = engine.find_channel_by_type(INSTRUMENT_POLY) else {
+        return;
+    };
+    if let ChannelInstrument::Poly(ref mut poly) = engine.channels[idx] {
+        poly.trigger_note(midi_note, velocity);
+    }
+}
+
+/// Release a sounding MIDI note on the poly synth. No-op if the note is not sounding.
+///
+/// # Arguments
+/// * `engine`    - pointer returned by `gooey_engine_new`
+/// * `midi_note` - 0..127, matching the note passed to `gooey_engine_poly_note_on`
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+/// Must not be called concurrently with the audio callback.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_note_off(engine: *mut GooeyEngine, midi_note: u8) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let Some(idx) = engine.find_channel_by_type(INSTRUMENT_POLY) else {
+        return;
+    };
+    if let ChannelInstrument::Poly(ref mut poly) = engine.channels[idx] {
+        poly.release_note(midi_note);
     }
 }
 
