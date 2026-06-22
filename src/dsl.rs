@@ -23,6 +23,8 @@
 
 use std::collections::HashSet;
 
+#[cfg(feature = "spectral")]
+use crate::effects::SpectralResonator;
 use crate::effects::{
     DelayEffect, DelayTiming, Effect, LowpassFilterEffect, SoftLimiter, TubeSaturation,
 };
@@ -536,6 +538,13 @@ enum EffectDef {
     Limiter {
         threshold: f32,
     },
+    #[cfg(feature = "spectral")]
+    SpectralResonator {
+        frequency: f32,
+        resonance: f32,
+        sharpness: f32,
+        mix: f32,
+    },
 }
 
 impl EffectDef {
@@ -625,6 +634,62 @@ impl EffectDef {
                 let threshold = parse_one_f32_arg_named(line_number, &tokens[1..], "threshold")?;
                 Ok(Self::Limiter { threshold })
             }
+            #[cfg(feature = "spectral")]
+            "spectral" | "resonator" => {
+                // Defaults; overridable positionally (freq res sharpness mix) or by key=value.
+                let mut frequency = 220.0_f32;
+                let mut resonance = 0.5_f32;
+                let mut sharpness = 0.5_f32;
+                let mut mix = 0.5_f32;
+                let mut positional: Vec<&str> = Vec::new();
+
+                for arg in &tokens[1..] {
+                    if let Some((k, v)) = arg.split_once('=') {
+                        match k.to_ascii_lowercase().as_str() {
+                            "freq" | "frequency" | "hz" => {
+                                frequency = parse_f32(line_number, "frequency", v)?;
+                            }
+                            "res" | "resonance" => {
+                                resonance = parse_f32(line_number, "resonance", v)?;
+                            }
+                            "sharp" | "sharpness" => {
+                                sharpness = parse_f32(line_number, "sharpness", v)?;
+                            }
+                            "mix" => {
+                                mix = parse_f32(line_number, "mix", v)?;
+                            }
+                            other => {
+                                return Err(format!(
+                                    "line {}: unknown spectral argument '{}'",
+                                    line_number, other
+                                ));
+                            }
+                        }
+                    } else {
+                        positional.push(*arg);
+                    }
+                }
+
+                if !positional.is_empty() {
+                    frequency = parse_f32(line_number, "frequency", positional[0])?;
+                }
+                if positional.len() >= 2 {
+                    resonance = parse_f32(line_number, "resonance", positional[1])?;
+                }
+                if positional.len() >= 3 {
+                    sharpness = parse_f32(line_number, "sharpness", positional[2])?;
+                }
+                if positional.len() >= 4 {
+                    mix = parse_f32(line_number, "mix", positional[3])?;
+                }
+
+                Ok(Self::SpectralResonator {
+                    frequency,
+                    resonance,
+                    sharpness,
+                    mix,
+                })
+            }
             other => Err(format!(
                 "line {}: unknown effect type '{}'",
                 line_number, other
@@ -662,6 +727,19 @@ impl EffectDef {
                 mix,
             ))),
             Self::Limiter { threshold } => Ok(Box::new(SoftLimiter::new(threshold))),
+            #[cfg(feature = "spectral")]
+            Self::SpectralResonator {
+                frequency,
+                resonance,
+                sharpness,
+                mix,
+            } => Ok(Box::new(SpectralResonator::new(
+                sample_rate,
+                frequency,
+                resonance,
+                sharpness,
+                mix,
+            ))),
         }
     }
 }
