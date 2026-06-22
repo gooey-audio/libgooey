@@ -7,7 +7,7 @@
 
 use crate::effects::Waveshaper;
 use crate::engine::{Instrument, Modulatable};
-use crate::utils::SmoothedParam;
+use crate::utils::{cubic_interpolate, SmoothedParam};
 use std::sync::Arc;
 
 const MAX_GRAINS: usize = 64;
@@ -834,15 +834,6 @@ fn raised_sine_window(phase: f32, shape: f32) -> f32 {
         .sin()
         .max(0.0)
         .powf(shape)
-}
-
-#[inline]
-fn cubic_interpolate(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
-    let a0 = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
-    let a1 = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
-    let a2 = -0.5 * p0 + 0.5 * p2;
-    let a3 = p1;
-    ((a0 * t + a1) * t + a2) * t + a3
 }
 
 #[derive(Clone, Copy, Debug)]

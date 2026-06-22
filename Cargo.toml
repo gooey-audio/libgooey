@@ -104,5 +104,9 @@ name = "granulator"
 required-features = ["native", "crossterm", "bounce"]
 
 [[example]]
+name = "loop_mixer"
+required-features = ["native", "crossterm", "bounce"]
+
+[[example]]
 name = "antialias_validation"
 required-features = ["bounce"]
