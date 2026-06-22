@@ -634,6 +634,10 @@ pub struct GooeyEngine {
     // Acts as a mixer fader that the blend system cannot override.
     instrument_channel_gains: [SmoothedParam; NUM_INSTRUMENTS],
 
+    // Per-channel stereo pan (0.0 = left, 0.5 = center, 1.0 = right), applied
+    // at the stereo seam with an equal-power law. Smoothed for click-free moves.
+    instrument_pans: [SmoothedParam; NUM_INSTRUMENTS],
+
     // Per-channel preset blend state (2D X/Y pad interpolation)
     blenders: [ChannelBlender; NUM_INSTRUMENTS],
     blend_enabled: [bool; INSTRUMENT_COUNT as usize],
@@ -813,6 +817,10 @@ impl GooeyEngine {
             // Per-instrument channel gains (default 1.0 = unity, 10ms smoothing)
             instrument_channel_gains: std::array::from_fn(|_| {
                 SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0)
+            }),
+            // Per-instrument stereo pan (default 0.5 = center, 10ms smoothing)
+            instrument_pans: std::array::from_fn(|_| {
+                SmoothedParam::new(0.5, 0.0, 1.0, sample_rate, 10.0)
             }),
             // Preset blend state
             blenders,
@@ -1059,17 +1067,26 @@ impl GooeyEngine {
                 }
             }
 
-            // Generate audio from each channel with gains and mute/solo
+            // Generate audio from each channel with gains and mute/solo, then
+            // spread it across the stereo field via the per-channel pan.
+            // Stereo seam: each instrument's mono output is panned (equal-power,
+            // default center) and summed here — BEFORE the effects chain — so
+            // each effect can process true left/right. Effects are stereo-aware
+            // (per-channel state); with every channel centered and no stereo
+            // effect engaged the two channels stay identical.
             let mut channel_outs = [0.0_f32; NUM_INSTRUMENTS];
-            let mut output = 0.0;
+            let mut stereo_pre = StereoFrame::default();
             for ch in 0..NUM_INSTRUMENTS {
                 let ch_out = self.channels[ch].tick(self.current_time)
                     * self.instrument_channel_gains[ch].tick()
                     * self.instrument_gains[ch].tick();
                 channel_outs[ch] = ch_out;
-                output += ch_out;
 
-                // Track per-channel peak for UI metering
+                let panned = StereoFrame::panned(ch_out, self.instrument_pans[ch].tick());
+                stereo_pre.l += panned.l;
+                stereo_pre.r += panned.r;
+
+                // Track per-channel peak for UI metering (pre-pan mono level)
                 let abs_out = ch_out.abs();
                 let prev_peak = f32::from_bits(self.channel_peaks[ch].load(Ordering::Relaxed));
                 if abs_out > prev_peak {
@@ -1077,21 +1094,20 @@ impl GooeyEngine {
                 }
             }
 
-            // Mix in poly synth output
-            output += self.poly_synth.tick(self.current_time);
-
-            // Mix in granulator output
-            output += self.granulator.tick(self.current_time);
+            // Poly synth and granulator have no pan control yet — place them at
+            // center for consistency with the equal-power law used above.
+            let center =
+                self.poly_synth.tick(self.current_time) + self.granulator.tick(self.current_time);
+            let center = StereoFrame::panned(center, 0.5);
+            stereo_pre.l += center.l;
+            stereo_pre.r += center.r;
 
             // Apply master headroom before the optional global effects.
-            output *= self.master_gain.tick();
-
-            // Stereo seam: the instrument sum is mono, so place it on both
-            // channels here — BEFORE the effects chain — so each effect can
-            // process true left/right. Effects are stereo-aware (per-channel
-            // state); for mono content with no stereo effect engaged the two
-            // channels stay identical.
-            let mut stereo = StereoFrame::mono(output);
+            let master = self.master_gain.tick();
+            let mut stereo = StereoFrame {
+                l: stereo_pre.l * master,
+                r: stereo_pre.r * master,
+            };
 
             // Apply global effects chain (order is user-configurable; limiter is always last)
             for &effect_id in &self.effect_order {
@@ -4722,6 +4738,51 @@ pub unsafe extern "C" fn gooey_engine_get_instrument_gain(
     (*engine).instrument_channel_gains[instrument as usize].target()
 }
 
+/// Set the stereo pan for an instrument.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+/// * `pan` - Pan position, clamped to 0.0 (hard left) – 0.5 (center) – 1.0
+///   (hard right). Uses an equal-power law.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_instrument_pan(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    pan: f32,
+) {
+    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+        return;
+    }
+    let pan = pan.clamp(0.0, 1.0);
+    (*engine).instrument_pans[instrument as usize].set_target(pan);
+}
+
+/// Get the stereo pan for an instrument
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+///
+/// # Returns
+/// The current pan target (0.0–1.0), or 0.5 (center) if invalid instrument
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_instrument_pan(
+    engine: *const GooeyEngine,
+    instrument: u32,
+) -> f32 {
+    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+        return 0.5;
+    }
+    (*engine).instrument_pans[instrument as usize].target()
+}
+
 // =============================================================================
 // Preset blend (2D X/Y pad interpolation)
 // =============================================================================
@@ -5483,6 +5544,9 @@ impl GooeyEngine {
         }
         for gain in &mut self.instrument_channel_gains {
             gain.snap();
+        }
+        for pan in &mut self.instrument_pans {
+            pan.snap();
         }
         self.master_gain.snap();
 
