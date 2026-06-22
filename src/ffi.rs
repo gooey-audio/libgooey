@@ -14,6 +14,7 @@ use crate::instruments::{
     BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth,
     PolySynthConfig, SampleBuffer, SnareConfig, SnareDrum, Tom2, Tom2Config,
 };
+use crate::mixer::{Mixer, StereoSampleBuffer};
 use crate::music::{apply_voicing, available_voicings, Key, NoteName, ScaleType, VoicingType};
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CString};
@@ -661,6 +662,11 @@ pub struct GooeyEngine {
     // Mono granular instrument (sample buffer loaded by the host)
     granulator: Granulator,
 
+    // Multi-channel stereo loop mixer (4 channels, per-channel effects). Summed
+    // into the master bus before the global effects chain. The `gooey_engine_loop_*`
+    // FFI functions expose control over this.
+    mixer: Mixer,
+
     // When true, an external source (e.g. Ableton Link) owns the tempo.
     // The host should check this flag to decide whether local BPM changes
     // should be applied directly or routed through the external sync source.
@@ -843,6 +849,8 @@ impl GooeyEngine {
                 SampleBuffer::from_mono(vec![0.0_f32], 44_100.0)
                     .unwrap_or_else(|_| unreachable!("constant placeholder buffer is valid")),
             ),
+            // Multi-channel stereo loop mixer (empty until the host loads loops).
+            mixer: Mixer::new(sample_rate),
             // External sync (e.g. Ableton Link)
             link_enabled: AtomicBool::new(false),
             // Error state
@@ -1083,15 +1091,21 @@ impl GooeyEngine {
             // Mix in granulator output
             output += self.granulator.tick(self.current_time);
 
-            // Apply master headroom before the optional global effects.
-            output *= self.master_gain.tick();
-
             // Stereo seam: the instrument sum is mono, so place it on both
             // channels here — BEFORE the effects chain — so each effect can
             // process true left/right. Effects are stereo-aware (per-channel
             // state); for mono content with no stereo effect engaged the two
             // channels stay identical.
             let mut stereo = StereoFrame::mono(output);
+
+            // Sum the loop mixer (already stereo, with its own per-channel
+            // effects) into the master bus.
+            stereo += self.mixer.tick(self.sample_rate);
+
+            // Apply master headroom to the full mix (instruments + loops) before
+            // the optional global effects + limiter, so the master fader scales
+            // loops too.
+            stereo = stereo.scaled(self.master_gain.tick());
 
             // Apply global effects chain (order is user-configurable; limiter is always last)
             for &effect_id in &self.effect_order {
@@ -1559,6 +1573,9 @@ pub const INSTRUMENT_COUNT: u32 = 5;
 /// Internal usize version for array indexing
 const NUM_INSTRUMENTS: usize = INSTRUMENT_COUNT as usize;
 const DEFAULT_MASTER_GAIN: f32 = 0.25;
+
+/// Number of stereo loop-mixer channels (see `gooey_engine_loop_*`).
+pub const LOOP_CHANNEL_COUNT: u32 = crate::mixer::LOOP_CHANNEL_COUNT as u32;
 
 // =============================================================================
 // Preset blend constants
@@ -3002,6 +3019,9 @@ pub unsafe extern "C" fn gooey_engine_set_bpm(engine: *mut GooeyEngine, bpm: f32
     for lfo in &mut engine.lfos {
         lfo.set_bpm(bpm);
     }
+
+    // Seed BPM for any future note-synced per-channel loop effects.
+    engine.mixer.set_bpm(bpm);
 }
 
 /// Get the current BPM.
@@ -5283,6 +5303,317 @@ pub unsafe extern "C" fn gooey_engine_granulator_set_buffer(
             true
         }
         Err(_) => false,
+    }
+}
+
+// =============================================================================
+// Loop mixer: 4 stereo loop channels with per-channel effect chains
+// =============================================================================
+//
+// These functions control the engine's `Mixer` (see `src/mixer/`). Each channel
+// is a stereo loop player with its own gain fader, mute/solo, loop window,
+// varispeed, and an ordered chain of effects. The host decodes audio files and
+// passes raw interleaved f32 frames; the engine owns playback and mixing.
+//
+// `channel` is a 0-based index in `[0, LOOP_CHANNEL_COUNT)`; out-of-range
+// indices are ignored (or return a sensible default).
+
+/// Load (or replace) a loop channel's stereo buffer from interleaved f32 frames.
+///
+/// `samples` points to `frames * channels` interleaved values. A `channels`
+/// value of 1 duplicates the mono signal to both sides; 2+ uses channels 0/1 as
+/// left/right. Loading resets the channel's playhead to its loop start.
+///
+/// Returns `true` on success, `false` on a null/short pointer, bad channel
+/// index, or invalid buffer (zero length, non-finite samples, bad sample rate).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`. `samples`
+/// must point to at least `frames * channels` readable `f32` values.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_load(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    samples: *const f32,
+    frames: u32,
+    channels: u32,
+    sample_rate: f32,
+) -> bool {
+    if engine.is_null() || samples.is_null() || frames == 0 || channels == 0 {
+        return false;
+    }
+    let engine = &mut *engine;
+    let total = frames as usize * channels as usize;
+    let slice = slice::from_raw_parts(samples, total);
+    match StereoSampleBuffer::from_interleaved(slice, channels as usize, sample_rate) {
+        Ok(buffer) => engine.mixer.load(channel as usize, buffer),
+        Err(_) => false,
+    }
+}
+
+/// Start or stop playback of a loop channel.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_playing(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    playing: bool,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_playing(channel as usize, playing);
+    }
+}
+
+/// Set a loop channel's fader gain (0.0 = silence, 1.0 = unity, up to 2.0).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_gain(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    gain: f32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_gain(channel as usize, gain);
+    }
+}
+
+/// Mute or unmute a loop channel (click-free, applied to the post-effect signal).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_mute(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    muted: bool,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_muted(channel as usize, muted);
+    }
+}
+
+/// Solo or un-solo a loop channel. While any channel is soloed, only soloed
+/// channels are audible.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_solo(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    soloed: bool,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_soloed(channel as usize, soloed);
+    }
+}
+
+/// Set a loop channel's loop start point as a normalized `[0, 1]` position in
+/// the buffer.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_start(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    normalized: f32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_loop_start(channel as usize, normalized);
+    }
+}
+
+/// Set a loop channel's loop end point as a normalized `[0, 1]` position in
+/// the buffer.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_end(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    normalized: f32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_loop_end(channel as usize, normalized);
+    }
+}
+
+/// Set a loop channel's playback speed (varispeed). 1.0 = normal, 0.5 = half
+/// speed/down an octave, negative = reverse. Clamped to `[-4, 4]`.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_speed(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    speed: f32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_speed(channel as usize, speed);
+    }
+}
+
+/// Restart a loop channel from its loop start point.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_restart(engine: *mut GooeyEngine, channel: u32) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.restart(channel as usize);
+    }
+}
+
+/// Get a loop channel's current playhead as a normalized `[0, 1]` position.
+/// Returns 0.0 for a null engine or empty/out-of-range channel.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_get_position(
+    engine: *const GooeyEngine,
+    channel: u32,
+) -> f32 {
+    match engine.as_ref() {
+        Some(engine) => engine
+            .mixer
+            .channel(channel as usize)
+            .map_or(0.0, |ch| ch.position_normalized()),
+        None => 0.0,
+    }
+}
+
+/// Append an effect (an `EFFECT_*` id) to a loop channel's chain. Returns the
+/// new effect's slot index, or -1 on failure (null engine, bad channel, or an
+/// effect id that is not a per-channel effect, e.g. the master limiter).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_effect_add(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    effect_id: u32,
+) -> i32 {
+    match engine.as_mut() {
+        Some(engine) => engine
+            .mixer
+            .effect_add(channel as usize, effect_id)
+            .map_or(-1, |slot| slot as i32),
+        None => -1,
+    }
+}
+
+/// Remove the effect at `slot` from a loop channel's chain. Returns `true` if an
+/// effect was removed.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_effect_remove(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    slot: u32,
+) -> bool {
+    match engine.as_mut() {
+        Some(engine) => engine.mixer.effect_remove(channel as usize, slot as usize),
+        None => false,
+    }
+}
+
+/// Move the effect at `slot` to `new_position` within a loop channel's chain.
+/// Returns `true` on success.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_effect_move(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    slot: u32,
+    new_position: u32,
+) -> bool {
+    match engine.as_mut() {
+        Some(engine) => {
+            engine
+                .mixer
+                .effect_move(channel as usize, slot as usize, new_position as usize)
+        }
+        None => false,
+    }
+}
+
+/// Remove all effects from a loop channel's chain.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_effect_clear(engine: *mut GooeyEngine, channel: u32) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.effect_clear(channel as usize);
+    }
+}
+
+/// Set a parameter (`*_PARAM_*` id) on the effect at `slot` of a loop channel.
+/// Parameter ids and value ranges match `gooey_engine_set_global_effect_param`.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_effect_set_param(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    slot: u32,
+    param: u32,
+    value: f32,
+) {
+    if let Some(engine) = engine.as_ref() {
+        engine
+            .mixer
+            .effect_set_param(channel as usize, slot as usize, param, value);
+    }
+}
+
+/// Return the number of effects in a loop channel's chain (0 for a null engine
+/// or out-of-range channel).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_effect_count(
+    engine: *const GooeyEngine,
+    channel: u32,
+) -> u32 {
+    match engine.as_ref() {
+        Some(engine) => engine.mixer.effect_count(channel as usize) as u32,
+        None => 0,
+    }
+}
+
+/// Return the `EFFECT_*` id of the effect at `slot` of a loop channel, or -1 if
+/// the engine is null or the channel/slot is out of range.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_effect_type_at(
+    engine: *const GooeyEngine,
+    channel: u32,
+    slot: u32,
+) -> i32 {
+    match engine.as_ref() {
+        Some(engine) => engine
+            .mixer
+            .effect_type_at(channel as usize, slot as usize)
+            .map_or(-1, |id| id as i32),
+        None => -1,
     }
 }
 

@@ -1,5 +1,6 @@
 use crate::effects::{Effect, SoftLimiter};
 use crate::frame::StereoFrame;
+use crate::mixer::Mixer;
 use crate::utils::SmoothedParam;
 use std::collections::{HashMap, VecDeque};
 
@@ -96,6 +97,8 @@ pub struct Engine {
     master_gain: SmoothedParam,
     // Saved global frequency per instrument for restoring after per-step note overrides
     saved_global_freq: HashMap<String, f32>,
+    // Multi-channel stereo loop mixer summed into the master bus before global effects
+    mixer: Mixer,
 }
 
 impl Engine {
@@ -115,7 +118,19 @@ impl Engine {
             // Default of 0.25 provides headroom for mixing multiple instruments
             master_gain: SmoothedParam::new(0.25, 0.0, 2.0, sample_rate, 30.0),
             saved_global_freq: HashMap::new(),
+            mixer: Mixer::new(sample_rate),
         }
+    }
+
+    /// Shared access to the multi-channel loop mixer.
+    pub fn mixer(&self) -> &Mixer {
+        &self.mixer
+    }
+
+    /// Mutable access to the multi-channel loop mixer (load loops, set per-channel
+    /// gain/mute/solo/loop points/speed, and edit per-channel effect chains).
+    pub fn mixer_mut(&mut self) -> &mut Mixer {
+        &mut self.mixer
     }
 
     /// Set the global BPM and update all synced LFOs
@@ -125,6 +140,8 @@ impl Engine {
         for lfo in &mut self.lfos {
             lfo.set_bpm(bpm);
         }
+        // Seed BPM for any future note-synced per-channel loop effects.
+        self.mixer.set_bpm(bpm);
     }
 
     /// Get the global BPM
@@ -333,9 +350,9 @@ impl Engine {
             output += instrument.tick(current_time);
         }
 
-        // Apply master gain before effects
-        output *= self.master_gain.tick();
-
+        // NOTE: master gain is applied later in `tick`/`tick_stereo`, after the
+        // loop mixer is summed in, so the master fader scales loops too — not
+        // just the instrument sum.
         output
     }
 
@@ -346,6 +363,12 @@ impl Engine {
     /// its behavior unchanged from before stereo effects were introduced.
     pub fn tick(&mut self, current_time: f64) -> f32 {
         let mut output = self.render_pre_effects(current_time);
+
+        // Sum the loop mixer into the master bus (downmixed for the mono path).
+        output += self.mixer.tick(self.sample_rate).downmix();
+
+        // Apply master gain to the full mix (instruments + loops) before effects.
+        output *= self.master_gain.tick();
 
         // Apply global effects chain to the final output
         for effect in &self.global_effects {
@@ -365,6 +388,14 @@ impl Engine {
     /// effect engaged, the two channels stay identical.
     pub fn tick_stereo(&mut self, current_time: f64) -> StereoFrame {
         let mut stereo = StereoFrame::mono(self.render_pre_effects(current_time));
+
+        // Sum the loop mixer (already stereo, with its own per-channel effects)
+        // into the master bus.
+        stereo += self.mixer.tick(self.sample_rate);
+
+        // Apply master gain to the full mix (instruments + loops) before the
+        // global effects + limiter.
+        stereo = stereo.scaled(self.master_gain.tick());
 
         for effect in &self.global_effects {
             stereo = effect.process_stereo(stereo);
