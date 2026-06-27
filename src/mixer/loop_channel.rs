@@ -154,6 +154,18 @@ impl LoopChannel {
         }
     }
 
+    /// Set the playhead to a normalized [0, 1] position of the full buffer,
+    /// clamped into the active loop window. Inverse of `position_normalized()`.
+    /// No-op if no buffer is loaded.
+    pub fn set_position(&mut self, normalized: f32) {
+        if let Some(buffer) = &self.buffer {
+            let len = buffer.len() as f64;
+            let (lo, hi) = self.loop_bounds(len);
+            let target = normalized.clamp(0.0, 1.0) as f64 * len;
+            self.cursor = target.clamp(lo, hi);
+        }
+    }
+
     /// Set the mute/solo gate target. Called by the [`Mixer`] each block once
     /// the cross-channel solo state is known.
     pub(crate) fn set_active(&mut self, audible: bool) {
@@ -256,6 +268,27 @@ mod tests {
         ch.set_buffer(ramp_buffer(100));
         // cursor should be at 0.5 * 100 = 50.
         assert!((ch.position_normalized() - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn set_position_round_trips() {
+        let mut ch = LoopChannel::new(SR);
+        ch.set_buffer(ramp_buffer(100));
+        ch.set_position(0.42);
+        assert!((ch.position_normalized() - 0.42).abs() < 1e-2);
+    }
+
+    #[test]
+    fn set_position_clamps_into_loop_window() {
+        let mut ch = LoopChannel::new(SR);
+        ch.set_buffer(ramp_buffer(100));
+        ch.set_loop_start(0.25);
+        ch.set_loop_end(0.75);
+        ch.set_position(0.9); // outside window -> clamped to hi
+        let p = ch.position_normalized();
+        assert!((0.25..=0.75 + 1e-3).contains(&p), "pos {p} out of window");
+        ch.set_position(0.0); // below window -> clamped to lo
+        assert!(ch.position_normalized() >= 0.25 - 1e-3);
     }
 
     #[test]
