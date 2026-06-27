@@ -143,6 +143,12 @@ impl Mixer {
         }
     }
 
+    pub fn set_position(&mut self, channel: usize, normalized: f32) {
+        if let Some(ch) = self.channels.get_mut(channel) {
+            ch.set_position(normalized);
+        }
+    }
+
     // --- Per-channel effects ----------------------------------------------
 
     /// Append an effect to a channel. Returns the new effect's slot index, or

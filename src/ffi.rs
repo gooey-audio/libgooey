@@ -5471,6 +5471,24 @@ pub unsafe extern "C" fn gooey_engine_loop_restart(engine: *mut GooeyEngine, cha
     }
 }
 
+/// Set a loop channel's playhead to a normalized `[0, 1]` position within its
+/// loop region. Clamped into the active loop window; no-op if no buffer is loaded.
+/// Inverse of `gooey_engine_loop_get_position`. Lets a caller swap a channel's
+/// buffer and resume at the same phase instead of restarting at the loop start.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_position(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    normalized: f32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_position(channel as usize, normalized);
+    }
+}
+
 /// Get a loop channel's current playhead as a normalized `[0, 1]` position.
 /// Returns 0.0 for a null engine or empty/out-of-range channel.
 ///
