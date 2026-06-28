@@ -2,10 +2,11 @@
 //!
 //! libgooey's instruments and effects are mono (one `f32` per sample). This
 //! type is the single place the signal becomes two-channel — the "stereo seam".
-//! Today the seam produces dual-mono frames via [`StereoFrame::mono`] (left ==
-//! right), but the rest of the output path (CPAL device write, FFI interleaved
-//! buffer, tests) already treats the signal as stereo. Future work that adds
-//! per-instrument panning or stereo effects only has to change how frames are
+//! The seam either places a mono sample equally on both channels via
+//! [`StereoFrame::mono`] (left == right) or spreads each instrument across the
+//! field with an equal-power pan via [`StereoFrame::panned`]; the rest of the
+//! output path (CPAL device write, FFI interleaved buffer, tests) already
+//! treats the signal as stereo, so it only ever has to change how frames are
 //! produced, not how they are consumed.
 
 /// A single stereo sample: a left and a right channel value.
@@ -21,6 +22,18 @@ impl StereoFrame {
     /// mono signal path to the stereo output path.
     pub const fn mono(x: f32) -> Self {
         Self { l: x, r: x }
+    }
+
+    /// Pan a mono sample to a stereo frame using an equal-power law.
+    /// `pan` is clamped to `[0, 1]`: 0.0 = hard left, 0.5 = center, 1.0 = hard
+    /// right. Center is -3 dB per channel (`0.707`), keeping constant power
+    /// across the sweep.
+    pub fn panned(x: f32, pan: f32) -> Self {
+        let angle = pan.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
+        Self {
+            l: x * angle.cos(),
+            r: x * angle.sin(),
+        }
     }
 
     /// Collapse the frame to a single mono sample (average of both channels).
@@ -95,5 +108,44 @@ mod tests {
     #[test]
     fn default_is_silence() {
         assert_eq!(StereoFrame::default(), StereoFrame { l: 0.0, r: 0.0 });
+    }
+
+    #[test]
+    fn panned_hard_left_silences_right() {
+        let f = StereoFrame::panned(0.8, 0.0);
+        assert!((f.l - 0.8).abs() < 1e-6);
+        assert!(f.r.abs() < 1e-6);
+    }
+
+    #[test]
+    fn panned_hard_right_silences_left() {
+        let f = StereoFrame::panned(0.8, 1.0);
+        assert!(f.l.abs() < 1e-6);
+        assert!((f.r - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn panned_center_is_equal_and_minus_three_db() {
+        let f = StereoFrame::panned(1.0, 0.5);
+        assert!((f.l - f.r).abs() < 1e-6);
+        assert!((f.l - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn panned_preserves_power_across_sweep() {
+        let x = 0.6;
+        for pan in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let f = StereoFrame::panned(x, pan);
+            assert!((f.l * f.l + f.r * f.r - x * x).abs() < 1e-5, "pan {pan}");
+        }
+    }
+
+    #[test]
+    fn panned_clamps_out_of_range() {
+        assert_eq!(
+            StereoFrame::panned(0.5, -1.0),
+            StereoFrame::panned(0.5, 0.0)
+        );
+        assert_eq!(StereoFrame::panned(0.5, 2.0), StereoFrame::panned(0.5, 1.0));
     }
 }

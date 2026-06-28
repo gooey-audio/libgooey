@@ -85,6 +85,10 @@ pub struct Engine {
     sample_rate: f32,
     bpm: f32, // Global BPM for synced LFOs and sequencers
     instruments: HashMap<String, Box<dyn Instrument>>,
+    // Per-instrument stereo pan (0.0 = left, 0.5 = center, 1.0 = right),
+    // smoothed for click-free moves. Absent entries default to center. Only
+    // applied on the stereo path (`tick_stereo`).
+    instrument_pans: HashMap<String, SmoothedParam>,
     // Queue of (instrument_name, velocity) to trigger on next tick
     trigger_queue: VecDeque<(String, f32)>,
     // Active sequencers
@@ -111,6 +115,7 @@ impl Engine {
             sample_rate,
             bpm: 120.0, // Default BPM
             instruments: HashMap::new(),
+            instrument_pans: HashMap::new(),
             trigger_queue: VecDeque::new(),
             sequencers: Vec::new(),
             lfos: Vec::new(),
@@ -194,6 +199,31 @@ impl Engine {
     /// Get a reference to an instrument by name
     pub fn instrument(&self, name: &str) -> Option<&Box<dyn Instrument>> {
         self.instruments.get(name)
+    }
+
+    /// Set the stereo pan for an instrument.
+    ///
+    /// `pan` is clamped to `0.0..=1.0` (0.0 = hard left, 0.5 = center, 1.0 =
+    /// hard right) and uses an equal-power law. The change is smoothed (ramped
+    /// from the current value) so panning a sounding instrument does not click.
+    /// Pan is only applied on the stereo path ([`Engine::tick_stereo`]); the
+    /// mono [`Engine::tick`] / bounce path ignores it.
+    pub fn set_instrument_pan(&mut self, name: &str, pan: f32) {
+        let pan = pan.clamp(0.0, 1.0);
+        let sample_rate = self.sample_rate;
+        self.instrument_pans
+            .entry(name.to_string())
+            // Seed at center so the first move ramps from the default position.
+            .or_insert_with(|| SmoothedParam::new(0.5, 0.0, 1.0, sample_rate, 10.0))
+            .set_target(pan);
+    }
+
+    /// Get the stereo pan target for an instrument (defaults to 0.5 = center).
+    pub fn instrument_pan(&self, name: &str) -> f32 {
+        self.instrument_pans
+            .get(name)
+            .map(|p| p.target())
+            .unwrap_or(0.5)
     }
 
     /// Add a sequencer to the engine
@@ -288,12 +318,29 @@ impl Engine {
             .push_back((name.to_string(), velocity.clamp(0.0, 1.0)));
     }
 
-    /// Advance one sample and produce the mono mix BEFORE the global effects
-    /// chain: process LFOs and sequencers, fire queued triggers, sum the
-    /// instruments, and apply the master gain. Both the mono [`Engine::tick`]
-    /// and the stereo [`Engine::tick_stereo`] build on this so the effects chain
-    /// can run either mono (for the offline bounce) or stereo (for realtime).
+    /// Advance one sample and produce the mono instrument mix BEFORE the loop
+    /// mixer, master gain, and global effects: process LFOs and sequencers, fire
+    /// queued triggers, and sum the instruments. The mono [`Engine::tick`] uses
+    /// this directly; the stereo [`Engine::tick_stereo`] sums the instruments
+    /// itself (with per-instrument pan) via the shared [`Engine::advance_control`].
+    /// Master gain is applied later, after the loop mixer is summed in, so the
+    /// master fader scales loops too — not just the instrument sum.
     fn render_pre_effects(&mut self, current_time: f64) -> f32 {
+        self.advance_control(current_time);
+
+        // Sum all instrument outputs (mono)
+        let mut output = 0.0;
+        for instrument in self.instruments.values_mut() {
+            output += instrument.tick(current_time);
+        }
+        output
+    }
+
+    /// Advance the control-rate state for one sample: process LFO modulation,
+    /// fire sample-accurate sequencer triggers, and drain the manual trigger
+    /// queue. Shared by the mono ([`Engine::render_pre_effects`]) and stereo
+    /// ([`Engine::tick_stereo`]) paths so they trigger instruments identically.
+    fn advance_control(&mut self, current_time: f64) {
         // Process LFOs and apply modulation
         for lfo in &mut self.lfos {
             let lfo_value = lfo.tick();
@@ -342,18 +389,6 @@ impl Engine {
                 eprintln!("Warning: Instrument '{}' not found", name);
             }
         }
-
-        // Sum all instrument outputs
-        let mut output = 0.0;
-
-        for instrument in self.instruments.values_mut() {
-            output += instrument.tick(current_time);
-        }
-
-        // NOTE: master gain is applied later in `tick`/`tick_stereo`, after the
-        // loop mixer is summed in, so the master fader scales loops too — not
-        // just the instrument sum.
-        output
     }
 
     /// Generate one mono sample of audio at the given time.
@@ -361,6 +396,7 @@ impl Engine {
     /// This is the offline / mono path (used by the audio output's mono fallback
     /// and the offline bounce). It runs the global effects chain mono, leaving
     /// its behavior unchanged from before stereo effects were introduced.
+    /// Per-instrument pan is a stereo-only feature and is ignored here.
     pub fn tick(&mut self, current_time: f64) -> f32 {
         let mut output = self.render_pre_effects(current_time);
 
@@ -380,14 +416,28 @@ impl Engine {
 
     /// Generate one stereo frame of audio at the given time.
     ///
-    /// This is the native engine's "stereo seam": the instrument mix is mono, so
-    /// it is placed on both channels via [`StereoFrame::mono`] BEFORE the global
-    /// effects chain, and each effect then processes true left/right through its
-    /// stereo-aware [`Effect::process_stereo`]. Output sinks (CPAL device) call
-    /// this to drive true two-channel output. For mono content with no stereo
-    /// effect engaged, the two channels stay identical.
+    /// This is the native engine's "stereo seam": each instrument's mono output
+    /// is spread across the stereo field by its per-instrument pan (equal-power,
+    /// default center) and summed, the stereo loop mixer is added in, and the
+    /// master gain is applied to the full mix BEFORE the global effects chain,
+    /// so each effect then processes true left/right through its stereo-aware
+    /// [`Effect::process_stereo`]. Output sinks (CPAL device) call this to drive
+    /// true two-channel output. With every instrument centered, no loops, and no
+    /// stereo effect engaged, the two channels stay identical.
     pub fn tick_stereo(&mut self, current_time: f64) -> StereoFrame {
-        let mut stereo = StereoFrame::mono(self.render_pre_effects(current_time));
+        self.advance_control(current_time);
+
+        // Sum each instrument into the stereo field via its (smoothed) pan.
+        let mut stereo = StereoFrame::default();
+        for (name, instrument) in self.instruments.iter_mut() {
+            let sample = instrument.tick(current_time);
+            let pan = self
+                .instrument_pans
+                .get_mut(name)
+                .map(|p| p.tick())
+                .unwrap_or(0.5);
+            stereo += StereoFrame::panned(sample, pan);
+        }
 
         // Sum the loop mixer (already stereo, with its own per-channel effects)
         // into the master bus.
