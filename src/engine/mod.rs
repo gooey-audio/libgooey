@@ -85,9 +85,10 @@ pub struct Engine {
     sample_rate: f32,
     bpm: f32, // Global BPM for synced LFOs and sequencers
     instruments: HashMap<String, Box<dyn Instrument>>,
-    // Per-instrument stereo pan (0.0 = left, 0.5 = center, 1.0 = right). Absent
-    // entries default to center. Only applied on the stereo path (`tick_stereo`).
-    instrument_pans: HashMap<String, f32>,
+    // Per-instrument stereo pan (0.0 = left, 0.5 = center, 1.0 = right),
+    // smoothed for click-free moves. Absent entries default to center. Only
+    // applied on the stereo path (`tick_stereo`).
+    instrument_pans: HashMap<String, SmoothedParam>,
     // Queue of (instrument_name, velocity) to trigger on next tick
     trigger_queue: VecDeque<(String, f32)>,
     // Active sequencers
@@ -203,17 +204,26 @@ impl Engine {
     /// Set the stereo pan for an instrument.
     ///
     /// `pan` is clamped to `0.0..=1.0` (0.0 = hard left, 0.5 = center, 1.0 =
-    /// hard right) and uses an equal-power law. Pan is only applied on the
-    /// stereo path ([`Engine::tick_stereo`]); the mono [`Engine::tick`] / bounce
-    /// path ignores it.
+    /// hard right) and uses an equal-power law. The change is smoothed (ramped
+    /// from the current value) so panning a sounding instrument does not click.
+    /// Pan is only applied on the stereo path ([`Engine::tick_stereo`]); the
+    /// mono [`Engine::tick`] / bounce path ignores it.
     pub fn set_instrument_pan(&mut self, name: &str, pan: f32) {
+        let pan = pan.clamp(0.0, 1.0);
+        let sample_rate = self.sample_rate;
         self.instrument_pans
-            .insert(name.to_string(), pan.clamp(0.0, 1.0));
+            .entry(name.to_string())
+            // Seed at center so the first move ramps from the default position.
+            .or_insert_with(|| SmoothedParam::new(0.5, 0.0, 1.0, sample_rate, 10.0))
+            .set_target(pan);
     }
 
-    /// Get the stereo pan for an instrument (defaults to 0.5 = center).
+    /// Get the stereo pan target for an instrument (defaults to 0.5 = center).
     pub fn instrument_pan(&self, name: &str) -> f32 {
-        self.instrument_pans.get(name).copied().unwrap_or(0.5)
+        self.instrument_pans
+            .get(name)
+            .map(|p| p.target())
+            .unwrap_or(0.5)
     }
 
     /// Add a sequencer to the engine
@@ -417,11 +427,15 @@ impl Engine {
     pub fn tick_stereo(&mut self, current_time: f64) -> StereoFrame {
         self.advance_control(current_time);
 
-        // Sum each instrument into the stereo field via its pan.
+        // Sum each instrument into the stereo field via its (smoothed) pan.
         let mut stereo = StereoFrame::default();
         for (name, instrument) in self.instruments.iter_mut() {
             let sample = instrument.tick(current_time);
-            let pan = self.instrument_pans.get(name).copied().unwrap_or(0.5);
+            let pan = self
+                .instrument_pans
+                .get_mut(name)
+                .map(|p| p.tick())
+                .unwrap_or(0.5);
             stereo += StereoFrame::panned(sample, pan);
         }
 

@@ -5898,21 +5898,27 @@ impl GooeyEngine {
         }
         self.master_gain.snap();
 
-        // Render in chunks using the same path as real-time playback
+        // Render in chunks using the same path as real-time playback. `render`
+        // writes interleaved stereo (`[l, r]` per frame), so each frame is
+        // downmixed to a single mono sample for this mono bounce buffer —
+        // otherwise a panned channel (e.g. hard-left `[l, 0]`) would be written
+        // as alternating samples and zeros.
         let mut output = Vec::with_capacity(total_samples);
-        let chunk_size = 512;
-        let mut chunk_buf = vec![0.0_f32; chunk_size];
+        let frames_per_chunk = 512;
+        let mut chunk_buf = vec![0.0_f32; frames_per_chunk * 2];
 
         let mut remaining = total_samples;
         while remaining > 0 {
-            let n = remaining.min(chunk_size);
-            let slice = &mut chunk_buf[..n];
+            let frames = remaining.min(frames_per_chunk);
+            let slice = &mut chunk_buf[..frames * 2];
             for s in slice.iter_mut() {
                 *s = 0.0;
             }
             self.render(slice);
-            output.extend_from_slice(slice);
-            remaining -= n;
+            for frame in slice.chunks_exact(2) {
+                output.push(0.5 * (frame[0] + frame[1]));
+            }
+            remaining -= frames;
         }
 
         for seq in &mut self.sequencers {

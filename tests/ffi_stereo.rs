@@ -144,3 +144,40 @@ fn hard_left_pan_steers_audio_to_the_left_channel() {
         gooey_engine_free(engine);
     }
 }
+
+#[test]
+fn offline_bounce_downmixes_panned_audio_to_continuous_mono() {
+    unsafe {
+        // A hard-left pan produces `[l, 0]` stereo frames. The mono bounce must
+        // downmix each frame, not dump the interleaved buffer as mono — which
+        // would zero every other sample.
+        let engine = gooey_engine_new(SAMPLE_RATE);
+        gooey_engine_sequencer_set_step(engine, 0, true);
+        gooey_engine_set_instrument_pan(engine, INSTRUMENT_KICK, 0.0);
+
+        let mut len = 0;
+        let ptr = gooey_engine_bounce_to_buffer(engine, 1, &mut len);
+        let buffer = std::slice::from_raw_parts(ptr, len as usize).to_vec();
+        gooey_engine_free_buffer(ptr, len);
+
+        let peak = buffer.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
+        assert!(peak > 0.001, "bounce should contain audio, peak was {peak}");
+
+        // Even- and odd-indexed samples must both carry audio. If the bounce had
+        // written interleaved stereo as mono, the odd (right) samples would be
+        // ~zero for a hard-left pan.
+        let even: f64 = buffer.iter().step_by(2).map(|s| (s * s) as f64).sum();
+        let odd: f64 = buffer
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|s| (s * s) as f64)
+            .sum();
+        assert!(
+            odd > even * 0.25,
+            "downmixed mono must be continuous, not every-other-zero (even={even}, odd={odd})"
+        );
+
+        gooey_engine_free(engine);
+    }
+}

@@ -14,14 +14,27 @@ fn render_kick_energy(pan: f32) -> (f64, f64) {
     let mut engine = Engine::new(SAMPLE_RATE);
     engine.add_instrument("kick", Box::new(KickDrum::new(SAMPLE_RATE)));
     engine.set_instrument_pan("kick", pan);
+
+    let step = 1.0 / SAMPLE_RATE as f64;
+    let mut t = 0.0_f64;
+
+    // Settle the smoothed pan before triggering, so the kick's loud attack is
+    // measured at the final pan position, not mid-ramp. The one-pole smoother
+    // needs several thousand samples to snap fully onto the target.
+    for _ in 0..8192 {
+        engine.tick_stereo(t);
+        t += step;
+    }
+
     engine.trigger_instrument("kick");
 
     let mut left = 0.0_f64;
     let mut right = 0.0_f64;
-    for i in 0..4096 {
-        let frame = engine.tick_stereo(i as f64 / SAMPLE_RATE as f64);
+    for _ in 0..4096 {
+        let frame = engine.tick_stereo(t);
         left += (frame.l * frame.l) as f64;
         right += (frame.r * frame.r) as f64;
+        t += step;
     }
     (left, right)
 }
