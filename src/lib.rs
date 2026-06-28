@@ -12,6 +12,7 @@ pub mod ffi;
 pub mod frame;
 pub mod gen;
 pub mod instruments;
+pub mod mixer;
 pub mod music;
 pub mod sequencer;
 pub mod utils;

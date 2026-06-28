@@ -42,6 +42,44 @@ impl StereoFrame {
     pub fn downmix(self) -> f32 {
         0.5 * (self.l + self.r)
     }
+
+    /// Scale both channels by a single gain factor.
+    #[inline]
+    pub fn scaled(self, gain: f32) -> Self {
+        Self {
+            l: self.l * gain,
+            r: self.r * gain,
+        }
+    }
+}
+
+impl std::ops::Add for StereoFrame {
+    type Output = StereoFrame;
+
+    #[inline]
+    fn add(self, rhs: StereoFrame) -> StereoFrame {
+        StereoFrame {
+            l: self.l + rhs.l,
+            r: self.r + rhs.r,
+        }
+    }
+}
+
+impl std::ops::AddAssign for StereoFrame {
+    #[inline]
+    fn add_assign(&mut self, rhs: StereoFrame) {
+        self.l += rhs.l;
+        self.r += rhs.r;
+    }
+}
+
+impl std::ops::Mul<f32> for StereoFrame {
+    type Output = StereoFrame;
+
+    #[inline]
+    fn mul(self, gain: f32) -> StereoFrame {
+        self.scaled(gain)
+    }
 }
 
 #[cfg(test)]

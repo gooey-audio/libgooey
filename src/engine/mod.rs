@@ -1,5 +1,6 @@
 use crate::effects::{Effect, SoftLimiter};
 use crate::frame::StereoFrame;
+use crate::mixer::Mixer;
 use crate::utils::SmoothedParam;
 use std::collections::{HashMap, VecDeque};
 
@@ -99,6 +100,8 @@ pub struct Engine {
     master_gain: SmoothedParam,
     // Saved global frequency per instrument for restoring after per-step note overrides
     saved_global_freq: HashMap<String, f32>,
+    // Multi-channel stereo loop mixer summed into the master bus before global effects
+    mixer: Mixer,
 }
 
 impl Engine {
@@ -119,7 +122,19 @@ impl Engine {
             // Default of 0.25 provides headroom for mixing multiple instruments
             master_gain: SmoothedParam::new(0.25, 0.0, 2.0, sample_rate, 30.0),
             saved_global_freq: HashMap::new(),
+            mixer: Mixer::new(sample_rate),
         }
+    }
+
+    /// Shared access to the multi-channel loop mixer.
+    pub fn mixer(&self) -> &Mixer {
+        &self.mixer
+    }
+
+    /// Mutable access to the multi-channel loop mixer (load loops, set per-channel
+    /// gain/mute/solo/loop points/speed, and edit per-channel effect chains).
+    pub fn mixer_mut(&mut self) -> &mut Mixer {
+        &mut self.mixer
     }
 
     /// Set the global BPM and update all synced LFOs
@@ -129,6 +144,8 @@ impl Engine {
         for lfo in &mut self.lfos {
             lfo.set_bpm(bpm);
         }
+        // Seed BPM for any future note-synced per-channel loop effects.
+        self.mixer.set_bpm(bpm);
     }
 
     /// Get the global BPM
@@ -291,11 +308,13 @@ impl Engine {
             .push_back((name.to_string(), velocity.clamp(0.0, 1.0)));
     }
 
-    /// Advance one sample and produce the mono mix BEFORE the global effects
-    /// chain: process LFOs and sequencers, fire queued triggers, sum the
-    /// instruments, and apply the master gain. Both the mono [`Engine::tick`]
-    /// and the stereo [`Engine::tick_stereo`] build on this so the effects chain
-    /// can run either mono (for the offline bounce) or stereo (for realtime).
+    /// Advance one sample and produce the mono instrument mix BEFORE the loop
+    /// mixer, master gain, and global effects: process LFOs and sequencers, fire
+    /// queued triggers, and sum the instruments. The mono [`Engine::tick`] uses
+    /// this directly; the stereo [`Engine::tick_stereo`] sums the instruments
+    /// itself (with per-instrument pan) via the shared [`Engine::advance_control`].
+    /// Master gain is applied later, after the loop mixer is summed in, so the
+    /// master fader scales loops too — not just the instrument sum.
     fn render_pre_effects(&mut self, current_time: f64) -> f32 {
         self.advance_control(current_time);
 
@@ -304,9 +323,7 @@ impl Engine {
         for instrument in self.instruments.values_mut() {
             output += instrument.tick(current_time);
         }
-
-        // Apply master gain before effects
-        output * self.master_gain.tick()
+        output
     }
 
     /// Advance the control-rate state for one sample: process LFO modulation,
@@ -373,6 +390,12 @@ impl Engine {
     pub fn tick(&mut self, current_time: f64) -> f32 {
         let mut output = self.render_pre_effects(current_time);
 
+        // Sum the loop mixer into the master bus (downmixed for the mono path).
+        output += self.mixer.tick(self.sample_rate).downmix();
+
+        // Apply master gain to the full mix (instruments + loops) before effects.
+        output *= self.master_gain.tick();
+
         // Apply global effects chain to the final output
         for effect in &self.global_effects {
             output = effect.process(output);
@@ -385,30 +408,30 @@ impl Engine {
     ///
     /// This is the native engine's "stereo seam": each instrument's mono output
     /// is spread across the stereo field by its per-instrument pan (equal-power,
-    /// default center) and summed BEFORE the global effects chain, so each
-    /// effect then processes true left/right through its stereo-aware
+    /// default center) and summed, the stereo loop mixer is added in, and the
+    /// master gain is applied to the full mix BEFORE the global effects chain,
+    /// so each effect then processes true left/right through its stereo-aware
     /// [`Effect::process_stereo`]. Output sinks (CPAL device) call this to drive
-    /// true two-channel output. With every instrument centered and no stereo
-    /// effect engaged, the two channels stay identical.
+    /// true two-channel output. With every instrument centered, no loops, and no
+    /// stereo effect engaged, the two channels stay identical.
     pub fn tick_stereo(&mut self, current_time: f64) -> StereoFrame {
         self.advance_control(current_time);
 
         // Sum each instrument into the stereo field via its pan.
-        let mut frame = StereoFrame::default();
+        let mut stereo = StereoFrame::default();
         for (name, instrument) in self.instruments.iter_mut() {
             let sample = instrument.tick(current_time);
             let pan = self.instrument_pans.get(name).copied().unwrap_or(0.5);
-            let panned = StereoFrame::panned(sample, pan);
-            frame.l += panned.l;
-            frame.r += panned.r;
+            stereo += StereoFrame::panned(sample, pan);
         }
 
-        // Apply master gain before effects.
-        let gain = self.master_gain.tick();
-        let mut stereo = StereoFrame {
-            l: frame.l * gain,
-            r: frame.r * gain,
-        };
+        // Sum the loop mixer (already stereo, with its own per-channel effects)
+        // into the master bus.
+        stereo += self.mixer.tick(self.sample_rate);
+
+        // Apply master gain to the full mix (instruments + loops) before the
+        // global effects + limiter.
+        stereo = stereo.scaled(self.master_gain.tick());
 
         for effect in &self.global_effects {
             stereo = effect.process_stereo(stereo);

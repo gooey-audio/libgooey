@@ -13,6 +13,11 @@ pub struct Oscillator {
     pub volume: f32,
     pub modulator_frequency_hz: f32,
     pub enabled: bool,
+    /// When `false`, Square/Saw/Triangle are generated naively (no band-limiting), so the
+    /// aliasing that the band-limited path suppresses becomes audible/visible for comparison.
+    /// Sine, RingMod, and Noise are unaffected (they have no band-limited variant here).
+    /// Defaults to `true`.
+    pub antialias: bool,
 }
 
 impl Oscillator {
@@ -26,6 +31,7 @@ impl Oscillator {
             volume: 1.0,
             modulator_frequency_hz: frequency_hz * 0.5, // Default modulator at half carrier frequency
             enabled: true,
+            antialias: true,
         }
     }
 
@@ -144,6 +150,34 @@ impl Oscillator {
         self.generative_waveform_time_based(2, 2.0)
     }
 
+    // Naive (non-band-limited) variants used when `antialias` is false. These generate the
+    // discontinuous waveform directly from the phase, so harmonics above Nyquist fold back
+    // as aliasing — useful for hearing/seeing exactly what the band-limited path removes.
+    fn naive_square_time_based(&self) -> f32 {
+        let (phase, _) = self.polyblep_phase();
+        if phase < 0.5 {
+            1.0
+        } else {
+            -1.0
+        }
+    }
+
+    fn naive_saw_time_based(&self) -> f32 {
+        let (phase, _) = self.polyblep_phase();
+        (2.0 * phase - 1.0) as f32
+    }
+
+    fn naive_triangle_time_based(&self) -> f32 {
+        let (phase, _) = self.polyblep_phase();
+        let p = phase as f32;
+        // /\ shape over one period: -1 at phase 0, +1 at phase 0.5, back to -1 at phase 1.
+        if p < 0.5 {
+            4.0 * p - 1.0
+        } else {
+            3.0 - 4.0 * p
+        }
+    }
+
     fn ring_mod_wave_time_based(&self) -> f32 {
         let carrier = self.calculate_sine_output_from_freq(self.frequency_hz);
         let modulator = self.calculate_sine_output_from_freq(self.modulator_frequency_hz);
@@ -195,6 +229,16 @@ impl Oscillator {
         self.enabled
     }
 
+    /// Enable or disable band-limiting for Square/Saw/Triangle. When disabled, these
+    /// waveforms are generated naively and will alias above Nyquist.
+    pub fn set_antialias(&mut self, antialias: bool) {
+        self.antialias = antialias;
+    }
+
+    pub fn is_antialiased(&self) -> bool {
+        self.antialias
+    }
+
     pub fn tick(&mut self, current_time: f64) -> f32 {
         if !self.enabled {
             return 0.0;
@@ -212,9 +256,27 @@ impl Oscillator {
 
         let raw_output = match self.waveform {
             Waveform::Sine => self.sine_wave_time_based(),
-            Waveform::Square => self.square_wave_time_based(),
-            Waveform::Saw => self.saw_wave_time_based(),
-            Waveform::Triangle => self.triangle_wave_time_based(),
+            Waveform::Square => {
+                if self.antialias {
+                    self.square_wave_time_based()
+                } else {
+                    self.naive_square_time_based()
+                }
+            }
+            Waveform::Saw => {
+                if self.antialias {
+                    self.saw_wave_time_based()
+                } else {
+                    self.naive_saw_time_based()
+                }
+            }
+            Waveform::Triangle => {
+                if self.antialias {
+                    self.triangle_wave_time_based()
+                } else {
+                    self.naive_triangle_time_based()
+                }
+            }
             Waveform::RingMod => self.ring_mod_wave_time_based(),
             Waveform::Noise => self.noise_wave_time_based(),
         };
