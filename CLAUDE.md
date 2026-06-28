@@ -61,3 +61,7 @@ cargo clippy --all-targets --all-features          # Clippy
 #[cfg(feature = "native")]
 pub mod engine_output;
 ```
+
+## Exec Plans
+
+When the user asks to create or manage an exec plan, read .agent/PLANS.md for more information

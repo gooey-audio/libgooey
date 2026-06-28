@@ -3,20 +3,20 @@
 //! Provides soft-clipping waveshaping similar to Max MSP's overdrive~ object,
 //! with adjustable drive and mix for saturation and warmth.
 
-use crate::utils::oversampler::Oversampler2x;
+use crate::utils::oversampler::{Oversampler, OversamplingMode};
 
 /// Waveshaper distortion with configurable drive
 ///
 /// Uses soft clipping (tanh) for smooth saturation similar to tube overdrive.
 /// Matches the behavior of Max MSP's overdrive~ object.
-/// Includes 2x oversampling to reduce aliasing from the nonlinear processing.
+/// Defaults to 4x oversampling to reduce aliasing from the nonlinear processing.
 pub struct Waveshaper {
     /// Distortion amount (1.0-10.0, 1.0 = bypass)
     drive: f32,
     /// Dry/wet mix (0.0-1.0)
     mix: f32,
-    /// 2x oversampler for alias reduction
-    oversampler: Oversampler2x,
+    /// Selectable oversampler for alias reduction
+    oversampler: Oversampler,
 }
 
 impl Waveshaper {
@@ -29,7 +29,7 @@ impl Waveshaper {
         Self {
             drive: drive.clamp(1.0, 10.0),
             mix: mix.clamp(0.0, 1.0),
-            oversampler: Oversampler2x::new(),
+            oversampler: Oversampler::default(),
         }
     }
 
@@ -46,6 +46,11 @@ impl Waveshaper {
     /// 3. Mix with dry signal
     #[inline]
     pub fn process(&mut self, input: f32) -> f32 {
+        if !input.is_finite() {
+            self.reset();
+            return 0.0;
+        }
+
         // Bypass if no effect or drive is 1.0
         if self.mix <= 0.0001 || self.drive <= 1.0 {
             return input;
@@ -57,7 +62,7 @@ impl Waveshaper {
         let reference = 0.5_f32;
         let compensation = reference.tanh() / (reference * drive).tanh();
 
-        // Apply drive gain and soft-clip using tanh with 2x oversampling
+        // Apply drive gain and soft-clip using tanh at the selected oversampling rate
         let saturated = self
             .oversampler
             .process(input, |x| (x * drive).tanh() * compensation);
@@ -84,6 +89,21 @@ impl Waveshaper {
     /// Get the current mix amount
     pub fn mix(&self) -> f32 {
         self.mix
+    }
+
+    /// Set the oversampling rate. Changing it clears oversampling filter history.
+    pub fn set_oversampling_mode(&mut self, mode: OversamplingMode) {
+        self.oversampler.set_mode(mode);
+    }
+
+    /// Get the current oversampling rate.
+    pub fn oversampling_mode(&self) -> OversamplingMode {
+        self.oversampler.mode()
+    }
+
+    /// Reset the oversampling filter history.
+    pub fn reset(&mut self) {
+        self.oversampler.reset();
     }
 }
 
@@ -153,6 +173,15 @@ mod tests {
     }
 
     #[test]
+    fn test_configurable_oversampling_defaults_to_4x() {
+        let mut ws = Waveshaper::new(5.0, 1.0);
+        assert_eq!(ws.oversampling_mode(), OversamplingMode::X4);
+
+        ws.set_oversampling_mode(OversamplingMode::Off);
+        assert_eq!(ws.oversampling_mode(), OversamplingMode::Off);
+    }
+
+    #[test]
     fn test_zero_input() {
         let mut ws = Waveshaper::new(5.0, 1.0);
         // Warm up oversampler
@@ -161,5 +190,32 @@ mod tests {
         }
         let output = ws.process(0.0);
         assert_eq!(output, 0.0);
+    }
+
+    #[test]
+    fn test_reset_matches_fresh_instance() {
+        let mut reset = Waveshaper::new(5.0, 1.0);
+        for i in 0..1000 {
+            reset.process((i as f32 * 0.1).sin());
+        }
+        reset.reset();
+
+        let mut fresh = Waveshaper::new(5.0, 1.0);
+        for i in 0..100 {
+            let input = (i as f32 * 0.27).sin();
+            assert_eq!(reset.process(input), fresh.process(input));
+        }
+    }
+
+    #[test]
+    fn test_nan_protection_resets_state() {
+        let mut reset = Waveshaper::new(5.0, 1.0);
+        for i in 0..1000 {
+            reset.process((i as f32 * 0.1).sin());
+        }
+        assert_eq!(reset.process(f32::NAN), 0.0);
+
+        let mut fresh = Waveshaper::new(5.0, 1.0);
+        assert_eq!(reset.process(0.5), fresh.process(0.5));
     }
 }

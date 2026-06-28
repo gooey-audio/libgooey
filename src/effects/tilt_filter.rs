@@ -1,5 +1,6 @@
 use crate::effects::Effect;
 use crate::filters::state_variable_tpt::StateVariableFilterTpt;
+use crate::frame::StereoFrame;
 use crate::utils::smoother::SmoothedParam;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -25,7 +26,9 @@ struct TiltFilterState {
 /// - Below 0.5 = lowpass, getting darker toward 0.0
 /// - Above 0.5 = highpass, getting brighter toward 1.0
 pub struct TiltFilterEffect {
-    state: UnsafeCell<TiltFilterState>,
+    // Per-channel state (index 0 = mono/left, index 1 = right). The mono
+    // `process` path uses only index 0, leaving its behavior unchanged.
+    state: UnsafeCell<[TiltFilterState; 2]>,
     cutoff_target: AtomicU32,
     resonance_target: AtomicU32,
 }
@@ -40,18 +43,14 @@ impl TiltFilterEffect {
         let default_cutoff: f32 = 0.5;
         let default_resonance: f32 = 0.0;
 
+        let make_state = || TiltFilterState {
+            cutoff_smoothed: SmoothedParam::new(default_cutoff, 0.0, 1.0, sample_rate, 30.0),
+            resonance_smoothed: SmoothedParam::new(default_resonance, 0.0, 1.0, sample_rate, 30.0),
+            svf: StateVariableFilterTpt::new(sample_rate, 1000.0, 0.5),
+        };
+
         Self {
-            state: UnsafeCell::new(TiltFilterState {
-                cutoff_smoothed: SmoothedParam::new(default_cutoff, 0.0, 1.0, sample_rate, 30.0),
-                resonance_smoothed: SmoothedParam::new(
-                    default_resonance,
-                    0.0,
-                    1.0,
-                    sample_rate,
-                    30.0,
-                ),
-                svf: StateVariableFilterTpt::new(sample_rate, 1000.0, 0.5),
-            }),
+            state: UnsafeCell::new([make_state(), make_state()]),
             cutoff_target: AtomicU32::new(default_cutoff.to_bits()),
             resonance_target: AtomicU32::new(default_resonance.to_bits()),
         }
@@ -78,15 +77,14 @@ impl TiltFilterEffect {
     }
 
     pub fn reset(&self) {
-        let state = unsafe { &mut *self.state.get() };
-        state.svf.reset();
+        let states = unsafe { &mut *self.state.get() };
+        for state in states.iter_mut() {
+            state.svf.reset();
+        }
     }
-}
 
-impl Effect for TiltFilterEffect {
-    fn process(&self, input: f32) -> f32 {
-        let state = unsafe { &mut *self.state.get() };
-
+    /// Process one sample through a single channel's filter state.
+    fn process_one(&self, state: &mut TiltFilterState, input: f32) -> f32 {
         // Read atomic targets and update smoothers
         let cutoff_target = f32::from_bits(self.cutoff_target.load(Ordering::Relaxed));
         let resonance_target = f32::from_bits(self.resonance_target.load(Ordering::Relaxed));
@@ -138,6 +136,21 @@ impl Effect for TiltFilterEffect {
         }
 
         output
+    }
+}
+
+impl Effect for TiltFilterEffect {
+    fn process(&self, input: f32) -> f32 {
+        let states = unsafe { &mut *self.state.get() };
+        self.process_one(&mut states[0], input)
+    }
+
+    fn process_stereo(&self, input: StereoFrame) -> StereoFrame {
+        let states = unsafe { &mut *self.state.get() };
+        StereoFrame {
+            l: self.process_one(&mut states[0], input.l),
+            r: self.process_one(&mut states[1], input.r),
+        }
     }
 }
 

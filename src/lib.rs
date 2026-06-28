@@ -9,13 +9,17 @@ pub mod max_curve;
 pub mod effects;
 pub mod engine;
 pub mod ffi;
+pub mod frame;
 pub mod gen;
 pub mod instruments;
+pub mod mixer;
 pub mod music;
 pub mod sequencer;
 pub mod utils;
 
 pub mod bounce;
+
+pub use frame::StereoFrame;
 
 // Visualization module (optional)
 #[cfg(feature = "visualization")]

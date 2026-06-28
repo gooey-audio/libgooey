@@ -369,7 +369,7 @@ impl HiHat2 {
             hpf_stage_2: BiquadHighpass::new(sample_rate),
             svf: StateVariableFilterTpt::new(sample_rate, tone_hz, 0.5),
             white_noise_state: 0x1234_5678_9abc_def0,
-            pink_noise: PinkNoise::new(),
+            pink_noise: PinkNoise::new(sample_rate),
             is_active: false,
             current_velocity: 1.0,
         }
@@ -456,6 +456,11 @@ impl HiHat2 {
         if !self.is_active {
             return 0.0;
         }
+
+        self.envelope
+            .set_segment_duration_ms(0, self.params.attack_ms());
+        self.envelope
+            .set_segment_duration_ms(1, self.params.decay_ms());
 
         let pitch_hz = self.params.pitch_hz() * tuning_to_multiplier(self.params.tuning.get());
         let mod_freq = pitch_hz * 0.1;

@@ -1,8 +1,8 @@
 // Integration tests for LFO modulation on all instruments
 // Based on the lfo_verify example code
 
-use gooey::engine::{Engine, Lfo, MusicalDivision};
-use gooey::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
+use gooey::engine::{Engine, Lfo, Modulatable, MusicalDivision};
+use gooey::instruments::{HiHat, HiHat2, KickDrum, SnareDrum, Tom2, TomDrum};
 
 #[test]
 fn test_kick_drum_modulation() {
@@ -23,7 +23,7 @@ fn test_kick_drum_modulation() {
         "sub",
         "click",
         "oscillator_decay",
-        "pitch_envelope_amount",
+        "tuning",
     ];
     for param in params {
         let result = engine.map_lfo_to_parameter(lfo_idx, "kick", param, 1.0);
@@ -171,8 +171,231 @@ fn test_multiple_lfos_on_same_instrument() {
 
     // Map different parameters to different LFOs
     let result1 = engine.map_lfo_to_parameter(lfo1_idx, "kick", "frequency", 1.0);
-    let result2 = engine.map_lfo_to_parameter(lfo2_idx, "kick", "pitch_envelope_amount", 0.5);
+    let result2 = engine.map_lfo_to_parameter(lfo2_idx, "kick", "tuning", 0.5);
 
     assert!(result1.is_ok(), "First LFO mapping should succeed");
     assert!(result2.is_ok(), "Second LFO mapping should succeed");
+}
+
+// ---------------------------------------------------------------------------
+// Audio-output regression tests
+//
+// The tests above only verify that LFO routing accepts a parameter name.
+// These tests render actual audio and confirm that LFO modulation produces
+// different output than the unmodulated baseline. They guard the bug where
+// instrument code snapshotted parameters at trigger time and never re-read
+// them, leaving LFO modulation silently inert.
+// ---------------------------------------------------------------------------
+
+const SR: f32 = 44100.0;
+const RENDER_SAMPLES: usize = 4096;
+const DIFF_THRESHOLD: f32 = 1e-3;
+
+/// Render `RENDER_SAMPLES` samples of a kick after applying a single bipolar
+/// modulation value to `param`. Returns the rendered buffer.
+fn render_kick_with_mod(param: &str, mod_value: f32) -> Vec<f32> {
+    let mut kick = KickDrum::new(SR);
+    // Apply the modulation BEFORE trigger so the smoothed param has time to
+    // settle for trigger-time reads. Subsequent ticks keep applying the same
+    // modulation so per-sample reads pick it up too.
+    kick.apply_modulation(param, mod_value).unwrap();
+    // Settle smoothers
+    for _ in 0..2048 {
+        kick.tick(0.0);
+    }
+    kick.trigger_with_velocity(0.0, 1.0);
+    let mut out = Vec::with_capacity(RENDER_SAMPLES);
+    for i in 0..RENDER_SAMPLES {
+        kick.apply_modulation(param, mod_value).unwrap();
+        let t = i as f64 / SR as f64;
+        out.push(kick.tick(t));
+    }
+    out
+}
+
+fn render_snare_with_mod(param: &str, mod_value: f32) -> Vec<f32> {
+    let mut snare = SnareDrum::new(SR);
+    snare.apply_modulation(param, mod_value).unwrap();
+    for _ in 0..2048 {
+        snare.tick(0.0);
+    }
+    snare.trigger_with_velocity(0.0, 1.0);
+    let mut out = Vec::with_capacity(RENDER_SAMPLES);
+    for i in 0..RENDER_SAMPLES {
+        snare.apply_modulation(param, mod_value).unwrap();
+        let t = i as f64 / SR as f64;
+        out.push(snare.tick(t));
+    }
+    out
+}
+
+/// Mean-absolute difference between two equal-length buffers.
+fn mean_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    let total: f32 = a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum();
+    total / a.len() as f32
+}
+
+#[test]
+fn audio_kick_frequency_lfo_changes_output() {
+    // Regression: kick `frequency` was cached in `triggered_frequency` at
+    // trigger time, so LFO modulation never reached the audio.
+    let low = render_kick_with_mod("frequency", -1.0);
+    let high = render_kick_with_mod("frequency", 1.0);
+    let diff = mean_abs_diff(&low, &high);
+    assert!(
+        diff > DIFF_THRESHOLD,
+        "kick frequency LFO produced no audible change (mean abs diff = {})",
+        diff
+    );
+}
+
+#[test]
+fn audio_kick_oscillator_decay_lfo_changes_output() {
+    // Regression: kick `oscillator_decay` was baked into ADSR configs at
+    // trigger time. tick() now re-applies decay times each sample.
+    let low = render_kick_with_mod("oscillator_decay", -1.0);
+    let high = render_kick_with_mod("oscillator_decay", 1.0);
+    let diff = mean_abs_diff(&low, &high);
+    assert!(
+        diff > DIFF_THRESHOLD,
+        "kick oscillator_decay LFO produced no audible change (mean abs diff = {})",
+        diff
+    );
+}
+
+#[test]
+fn audio_snare_decay_lfo_changes_output() {
+    // Regression: snare `decay` was baked into multiple ADSR configs at
+    // trigger time. tick() now re-applies the dependent decay/release times.
+    let low = render_snare_with_mod("decay", -1.0);
+    let high = render_snare_with_mod("decay", 1.0);
+    let diff = mean_abs_diff(&low, &high);
+    assert!(
+        diff > DIFF_THRESHOLD,
+        "snare decay LFO produced no audible change (mean abs diff = {})",
+        diff
+    );
+}
+
+#[test]
+fn audio_kick_pitch_targets_no_longer_modulatable() {
+    // pitch_envelope_amount and pitch_start_ratio were removed as LFO
+    // targets — `tuning` covers live pitch modulation instead.
+    let mut kick = KickDrum::new(SR);
+    assert!(kick.apply_modulation("pitch_envelope_amount", 1.0).is_err());
+    assert!(kick.apply_modulation("pitch_start_ratio", 1.0).is_err());
+    assert!(kick.apply_modulation("tuning", 1.0).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// HiHat2 attack/decay LFO modulation. Like kick/snare, hihat now re-applies
+// MaxCurveEnvelope segment durations every tick so modulation is audible
+// both at trigger time and mid-note.
+// ---------------------------------------------------------------------------
+
+fn render_hihat_with_mod(param: &str, mod_value: f32) -> Vec<f32> {
+    let mut h = HiHat2::new(SR);
+    h.apply_modulation(param, mod_value).unwrap();
+    for _ in 0..2048 {
+        h.tick(0.0);
+    }
+    h.trigger_with_velocity(0.0, 1.0);
+    let mut out = Vec::with_capacity(RENDER_SAMPLES);
+    for i in 0..RENDER_SAMPLES {
+        h.apply_modulation(param, mod_value).unwrap();
+        let t = i as f64 / SR as f64;
+        out.push(h.tick(t));
+    }
+    out
+}
+
+#[test]
+fn audio_hihat_attack_lfo_changes_output() {
+    let short = render_hihat_with_mod("attack", -1.0);
+    let long = render_hihat_with_mod("attack", 1.0);
+    let diff = mean_abs_diff(&short, &long);
+    assert!(
+        diff > DIFF_THRESHOLD,
+        "hihat attack LFO produced no audible change (mean abs diff = {})",
+        diff
+    );
+}
+
+#[test]
+fn audio_hihat_decay_lfo_changes_output() {
+    let short = render_hihat_with_mod("decay", -1.0);
+    let long = render_hihat_with_mod("decay", 1.0);
+    let diff = mean_abs_diff(&short, &long);
+    assert!(
+        diff > DIFF_THRESHOLD,
+        "hihat decay LFO produced no audible change (mean abs diff = {})",
+        diff
+    );
+}
+
+#[test]
+fn audio_hihat_decay_lfo_changes_output_mid_note() {
+    // Specifically verify the fix: trigger first with no modulation, then
+    // start modulating decay only after the note is in flight. Output must
+    // diverge from a baseline that triggers identically with no modulation.
+    fn render(decay_mod_after_trigger: f32) -> Vec<f32> {
+        let mut h = HiHat2::new(SR);
+        for _ in 0..2048 {
+            h.tick(0.0);
+        }
+        h.trigger_with_velocity(0.0, 1.0);
+        // First few samples with no mod so trigger-time attack/decay match.
+        let mut out = Vec::with_capacity(RENDER_SAMPLES);
+        for i in 0..16 {
+            let t = i as f64 / SR as f64;
+            out.push(h.tick(t));
+        }
+        h.apply_modulation("decay", decay_mod_after_trigger)
+            .unwrap();
+        for i in 16..RENDER_SAMPLES {
+            h.apply_modulation("decay", decay_mod_after_trigger)
+                .unwrap();
+            let t = i as f64 / SR as f64;
+            out.push(h.tick(t));
+        }
+        out
+    }
+
+    let baseline = render(0.0);
+    let modulated = render(1.0);
+    let diff = mean_abs_diff(&baseline, &modulated);
+    assert!(
+        diff > DIFF_THRESHOLD,
+        "hihat decay LFO had no mid-note effect (mean abs diff = {})",
+        diff
+    );
+}
+
+#[test]
+fn audio_tom2_decay_pickup_at_next_trigger() {
+    // Tom2 reads `self.decay` directly when rebuilding its MaxCurveEnvelope on
+    // trigger. Setting different decay values before each trigger must produce
+    // audibly different envelopes.
+    use gooey::engine::Instrument;
+    fn render_tom(decay_value: f32) -> Vec<f32> {
+        let mut t = Tom2::new(SR);
+        t.set_decay(decay_value);
+        let mut out = Vec::with_capacity(RENDER_SAMPLES);
+        t.trigger_with_velocity(0.0, 1.0);
+        for i in 0..RENDER_SAMPLES {
+            let now = i as f64 / SR as f64;
+            out.push(t.tick(now));
+        }
+        out
+    }
+
+    let short = render_tom(5.0);
+    let long = render_tom(95.0);
+    let diff = mean_abs_diff(&short, &long);
+    assert!(
+        diff > DIFF_THRESHOLD,
+        "tom2 decay change between triggers produced no audible difference (mean abs diff = {})",
+        diff
+    );
 }

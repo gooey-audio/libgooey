@@ -1,4 +1,5 @@
 use super::Engine;
+use crate::frame::StereoFrame;
 #[cfg(feature = "native")]
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -388,19 +389,15 @@ impl EngineOutput {
             let current_sample = start_sample + frame_index as u64;
             let current_time = current_sample as f64 / sample_rate;
 
-            // Call engine.tick() to generate audio
-            let audio_sample = engine_guard.tick(current_time);
-            let value: SampleType = SampleType::from_sample(audio_sample);
+            // Call engine.tick_stereo() to generate a stereo frame
+            let stereo = engine_guard.tick_stereo(current_time);
 
-            // Capture audio sample for visualization
+            // Capture audio for visualization (mono downmix; one value per sample)
             if let Some(buffer) = audio_buffer {
-                buffer.push(audio_sample);
+                buffer.push(stereo.downmix());
             }
 
-            // Copy the same value to all channels
-            for sample in frame.iter_mut() {
-                *sample = value;
-            }
+            Self::write_stereo_frame(frame, stereo);
         }
     }
 
@@ -433,13 +430,37 @@ impl EngineOutput {
             let current_sample = start_sample + frame_index as u64;
             let current_time = current_sample as f64 / sample_rate;
 
-            // Call engine.tick() to generate audio
-            let audio_sample = engine_guard.tick(current_time);
-            let value: SampleType = SampleType::from_sample(audio_sample);
+            // Call engine.tick_stereo() to generate a stereo frame
+            let stereo = engine_guard.tick_stereo(current_time);
 
-            // Copy the same value to all channels
-            for sample in frame.iter_mut() {
-                *sample = value;
+            Self::write_stereo_frame(frame, stereo);
+        }
+    }
+
+    /// Write a stereo frame into one device frame (a slice of `num_channels`
+    /// interleaved samples).
+    ///
+    /// - 1 channel: the mono downmix.
+    /// - 2+ channels: left to channel 0, right to channel 1; any further
+    ///   channels (surround layouts) receive the mono downmix.
+    fn write_stereo_frame<SampleType>(frame: &mut [SampleType], stereo: StereoFrame)
+    where
+        SampleType: Sample + FromSample<f32>,
+    {
+        match frame.len() {
+            0 => {}
+            1 => {
+                frame[0] = SampleType::from_sample(stereo.downmix());
+            }
+            _ => {
+                frame[0] = SampleType::from_sample(stereo.l);
+                frame[1] = SampleType::from_sample(stereo.r);
+                if frame.len() > 2 {
+                    let fill = SampleType::from_sample(stereo.downmix());
+                    for sample in &mut frame[2..] {
+                        *sample = fill;
+                    }
+                }
             }
         }
     }

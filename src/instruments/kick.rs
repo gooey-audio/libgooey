@@ -5,7 +5,9 @@ use crate::gen::oscillator::Oscillator;
 use crate::gen::pink_noise::PinkNoise;
 use crate::gen::waveform::Waveform;
 use crate::instruments::fm_snap::PhaseModulator;
-use crate::utils::{tuning_to_multiplier, Blendable, SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
+use crate::utils::{
+    tuning_to_multiplier, Blendable, OversamplingMode, SmoothedParam, DEFAULT_SMOOTH_TIME_MS,
+};
 
 /// Normalization ranges for kick drum parameters
 /// All external-facing parameters use 0.0-1.0 normalized values
@@ -54,6 +56,17 @@ pub(crate) mod ranges {
     pub fn normalize(value: f32, min: f32, max: f32) -> f32 {
         ((value - min) / (max - min)).clamp(0.0, 1.0)
     }
+}
+
+/// Map normalized overdrive (0.0-1.0) to waveshaper drive (1.0-41.0).
+///
+/// A cubic curve keeps the bottom of the range gentle so default presets only
+/// lightly saturate (0.2 -> ~1.32x, 0.3 -> ~2.08x) while still reaching strong
+/// drive at the top (1.0 -> 41x). Used by both the constructor and `process()`
+/// so the two stay in sync.
+#[inline]
+fn overdrive_to_drive(overdrive_amount: f32) -> f32 {
+    1.0 + overdrive_amount * overdrive_amount * overdrive_amount * 40.0
 }
 
 /// Static configuration for kick drum presets
@@ -304,7 +317,7 @@ impl KickConfig {
             0.07, // noise_amount
             0.01, // noise_cutoff
             0.02, // noise_res
-            0.30, // overdrive
+            0.25, // overdrive
             0.00, // feedback
             0.47, // fb_cutoff
             0.12, // amp_decay
@@ -719,8 +732,6 @@ pub struct KickDrum {
     pub pitch_envelope: Envelope,
     /// Pitch start multiplier snapshot (frozen at trigger time)
     triggered_pitch_multiplier: f32,
-    /// Base frequency snapshot in Hz (frozen at trigger time)
-    triggered_frequency: f32,
 
     // High-pass filter for click oscillator
     pub click_filter: ResonantHighpassFilter,
@@ -784,15 +795,14 @@ impl KickDrum {
             click_oscillator: Oscillator::new(sample_rate, freq_hz * 40.0),
             pitch_envelope: Envelope::new(),
             triggered_pitch_multiplier,
-            triggered_frequency: freq_hz,
             click_filter: ResonantHighpassFilter::new(sample_rate, 8000.0, 4.0),
             phase_modulator: PhaseModulator::new(sample_rate),
-            pink_noise: PinkNoise::new(),
+            pink_noise: PinkNoise::new(sample_rate),
             noise_filter: ResonantLowpassFilter::new(sample_rate, noise_cutoff_hz, noise_res),
             noise_envelope: Envelope::new(),
             waveshaper: FeedbackWaveshaper::new(
                 sample_rate,
-                1.0 + config.overdrive_amount * config.overdrive_amount * 99.0,
+                overdrive_to_drive(config.overdrive_amount),
                 config.feedback_amount * 0.98,
                 200.0 + config.feedback_cutoff * 3800.0,
                 1.0,
@@ -871,7 +881,7 @@ impl KickDrum {
 
     /// Apply current smoothed parameters to oscillators (called per-sample)
     ///
-    /// NOTE: Only mix/volume parameters are applied here. Pitch-related parameters
+    /// NOTE: Only mix parameters are applied here. Pitch-related parameters
     /// (frequency, pitch_start_multiplier) are frozen at trigger time to prevent
     /// discontinuities when parameters change during decay.
     #[inline]
@@ -879,18 +889,17 @@ impl KickDrum {
         let punch = self.params.punch.get();
         let sub = self.params.sub.get();
         let click = self.params.click.get();
-        let volume = self.params.volume.get();
 
         // Light velocity scaling for click: range [0.6, 1.0]
         // Higher velocity = more click, lower velocity = less click
         let click_vel_scale = 0.6 + 0.4 * self.current_velocity;
 
-        // Update oscillator volumes (these can change smoothly without pops)
-        self.sub_oscillator.set_volume(sub * volume);
-        self.punch_oscillator.set_volume(punch * volume * 0.7);
+        // Update relative oscillator levels. Master volume is applied once at output.
+        self.sub_oscillator.set_volume(sub);
+        self.punch_oscillator.set_volume(punch * 0.7);
         // Click reduced from 0.3 to 0.15, with velocity scaling
         self.click_oscillator
-            .set_volume(click * volume * 0.15 * click_vel_scale);
+            .set_volume(click * 0.15 * click_vel_scale);
     }
 
     pub fn set_config(&mut self, config: KickConfig) {
@@ -935,7 +944,8 @@ impl KickDrum {
         // Envelope configurations (decay times, curves) are applied on trigger,
         // not during parameter changes. This prevents pops/discontinuities when
         // parameters change while a sound is still decaying.
-        // Smoothable params (volume, filter, mix) update in real-time via apply_params().
+        // Smoothable filter/mix params update in real-time via apply_params().
+        // Master volume is read directly at final output.
     }
 
     /// Snap all smoothed parameters to their targets instantly.
@@ -984,8 +994,9 @@ impl KickDrum {
         let base_freq = self.params.frequency_hz();
 
         // Snapshot pitch parameters at trigger time
-        // These values are frozen for the entire decay to prevent discontinuities
-        self.triggered_frequency = base_freq;
+        // These values are frozen for the entire decay to prevent discontinuities.
+        // (`pitch_envelope_amount` and `pitch_start_ratio` are intentionally not
+        // exposed as LFO targets — use `tuning` for live pitch modulation.)
         let pitch_envelope_amount = self.params.pitch_envelope_amount.get();
         let pitch_start_ratio = self.params.pitch_start_ratio_value();
         self.triggered_pitch_multiplier = 1.0 + (pitch_start_ratio - 1.0) * pitch_envelope_amount;
@@ -1091,12 +1102,43 @@ impl KickDrum {
             return 0.0;
         }
 
-        // Apply smoothed parameters to oscillators (mix/volume only)
+        // Apply smoothed mix parameters to oscillators
         self.apply_params();
 
-        // Use triggered (snapshot) frequency with live tuning multiplier
+        // Re-apply oscillator decay times each sample so LFO modulation of
+        // `oscillator_decay` audibly affects an in-flight note. Mirrors the
+        // scaling used in trigger_with_velocity().
+        let vel_squared = self.current_velocity * self.current_velocity;
+        let decay_scale = 1.0 - (self.velocity_to_decay * vel_squared);
+        let base_decay = self.params.oscillator_decay_secs() * decay_scale;
+
+        self.sub_oscillator.envelope.set_decay_time(base_decay);
+        self.sub_oscillator
+            .envelope
+            .set_release_time(base_decay * 0.2);
+
+        self.punch_oscillator.envelope.set_decay_time(base_decay);
+        self.punch_oscillator
+            .envelope
+            .set_release_time(base_decay * 0.2);
+
+        self.click_oscillator
+            .envelope
+            .set_decay_time(base_decay * 0.2);
+        self.click_oscillator
+            .envelope
+            .set_release_time(base_decay * 0.02);
+
+        self.noise_envelope.set_decay_time(base_decay);
+        self.noise_envelope.set_release_time(base_decay * 0.2);
+
+        self.pitch_envelope.set_decay_time(base_decay);
+        self.pitch_envelope.set_release_time(base_decay * 0.2);
+
+        // Read frequency per-sample so LFO modulation of `frequency` is audible
+        // mid-note. Tuning was already live; frequency now matches.
         let base_frequency =
-            self.triggered_frequency * tuning_to_multiplier(self.params.tuning.get());
+            self.params.frequency_hz() * tuning_to_multiplier(self.params.tuning.get());
 
         // Calculate pitch modulation from envelope using triggered pitch multiplier
         let pitch_envelope_value = self.pitch_envelope.get_amplitude(current_time);
@@ -1137,8 +1179,7 @@ impl KickDrum {
             // Update filter parameters from smoothed params (denormalized to actual Hz/resonance)
             let noise_cutoff = self.params.noise_cutoff_hz();
             let noise_resonance = self.params.noise_resonance_value();
-            self.noise_filter.set_cutoff_freq(noise_cutoff);
-            self.noise_filter.set_resonance(noise_resonance);
+            self.noise_filter.set_params(noise_cutoff, noise_resonance);
 
             // Apply resonant lowpass filter
             let filtered_noise = self.noise_filter.process(pink_noise_sample);
@@ -1146,16 +1187,16 @@ impl KickDrum {
             // Apply noise envelope
             // Scale noise_amount by 0.5 to reduce maximum volume
             let noise_env = self.noise_envelope.get_amplitude(current_time);
-            filtered_noise * noise_env * noise_amount * 0.5 * self.params.volume.get()
+            filtered_noise * noise_env * noise_amount * 0.5
         } else {
             0.0
         };
 
         let total_output = sub_output + punch_output + filtered_click_output + noise_output;
 
-        // Map overdrive amount (0.0-1.0) to drive (1.0-100.0) with quadratic curve
+        // Map overdrive amount (0.0-1.0) to drive (1.0-41.0) with a gentle cubic curve
         let overdrive_amount = self.params.overdrive.get();
-        let drive = 1.0 + (overdrive_amount * overdrive_amount * 99.0);
+        let drive = overdrive_to_drive(overdrive_amount);
         self.waveshaper.set_drive(drive);
 
         // Map feedback amount (0.0-1.0) to feedback gain (0.0-0.98)
@@ -1281,6 +1322,16 @@ impl KickDrum {
         self.params.overdrive.set_target(amount.clamp(0.0, 1.0));
     }
 
+    /// Set the oversampling rate used by the kick's feedback waveshaper.
+    pub fn set_oversampling_mode(&mut self, mode: OversamplingMode) {
+        self.waveshaper.set_oversampling_mode(mode);
+    }
+
+    /// Get the oversampling rate used by the kick's feedback waveshaper.
+    pub fn oversampling_mode(&self) -> OversamplingMode {
+        self.waveshaper.oversampling_mode()
+    }
+
     /// Set feedback waveshaper amount (smoothed, 0-1 → 0.0-0.9 gain)
     pub fn set_feedback(&mut self, amount: f32) {
         self.params.feedback.set_target(amount.clamp(0.0, 1.0));
@@ -1342,10 +1393,7 @@ impl crate::engine::Modulatable for KickDrum {
             "sub",
             "click",
             "oscillator_decay",
-            "pitch_envelope_amount",
-            "pitch_envelope_curve",
             "volume",
-            "pitch_start_ratio",
             "phase_mod_amount",
             "noise_amount",
             "noise_cutoff",
@@ -1382,20 +1430,8 @@ impl crate::engine::Modulatable for KickDrum {
                 self.params.oscillator_decay.set_bipolar(value);
                 Ok(())
             }
-            "pitch_envelope_amount" => {
-                self.params.pitch_envelope_amount.set_bipolar(value);
-                Ok(())
-            }
-            "pitch_envelope_curve" => {
-                self.params.pitch_envelope_curve.set_bipolar(value);
-                Ok(())
-            }
             "volume" => {
                 self.params.volume.set_bipolar(value);
-                Ok(())
-            }
-            "pitch_start_ratio" => {
-                self.params.pitch_start_ratio.set_bipolar(value);
                 Ok(())
             }
             "phase_mod_amount" => {
@@ -1450,10 +1486,7 @@ impl crate::engine::Modulatable for KickDrum {
             "sub" => Some(self.params.sub.range()),
             "click" => Some(self.params.click.range()),
             "oscillator_decay" => Some(self.params.oscillator_decay.range()),
-            "pitch_envelope_amount" => Some(self.params.pitch_envelope_amount.range()),
-            "pitch_envelope_curve" => Some(self.params.pitch_envelope_curve.range()),
             "volume" => Some(self.params.volume.range()),
-            "pitch_start_ratio" => Some(self.params.pitch_start_ratio.range()),
             "phase_mod_amount" => Some(self.params.phase_mod_amount.range()),
             "noise_amount" => Some(self.params.noise_amount.range()),
             "noise_cutoff" => Some(self.params.noise_cutoff.range()),
@@ -1466,5 +1499,19 @@ impl crate::engine::Modulatable for KickDrum {
             "tuning" => Some(self.params.tuning.range()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kick_oversampling_mode_defaults_to_4x_and_is_configurable() {
+        let mut kick = KickDrum::new(48_000.0);
+        assert_eq!(kick.oversampling_mode(), OversamplingMode::X4);
+
+        kick.set_oversampling_mode(OversamplingMode::Off);
+        assert_eq!(kick.oversampling_mode(), OversamplingMode::Off);
     }
 }

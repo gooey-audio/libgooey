@@ -9,10 +9,12 @@ use crate::effects::{
 };
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
+use crate::frame::StereoFrame;
 use crate::instruments::{
-    BassConfig, BassSynth, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth, PolySynthConfig,
-    SnareConfig, SnareDrum, Tom2, Tom2Config,
+    BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth,
+    PolySynthConfig, SampleBuffer, SnareConfig, SnareDrum, Tom2, Tom2Config,
 };
+use crate::mixer::{Mixer, StereoSampleBuffer};
 use crate::music::{apply_voicing, available_voicings, Key, NoteName, ScaleType, VoicingType};
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CString};
@@ -269,6 +271,76 @@ impl ChannelInstrument {
         }
     }
 
+    /// Read the most-recently-set value of a parameter, in the same normalized 0-1
+    /// range used by `set_param`. Returns `f32::NAN` if `param` is not recognized
+    /// for the current variant.
+    ///
+    /// Uses `SmoothedParam::target()` (not `.get()`) so callers see the value they
+    /// set, independent of any in-flight smoothing — appropriate for state recovery.
+    fn get_param(&self, param: u32) -> f32 {
+        match self {
+            Self::Kick(k) => match param {
+                KICK_PARAM_FREQUENCY => k.params.frequency.target(),
+                KICK_PARAM_PUNCH => k.params.punch.target(),
+                KICK_PARAM_SUB => k.params.sub.target(),
+                KICK_PARAM_CLICK => k.params.click.target(),
+                KICK_PARAM_DECAY => k.params.oscillator_decay.target(),
+                KICK_PARAM_PITCH_ENVELOPE => k.params.pitch_envelope_amount.target(),
+                KICK_PARAM_VOLUME => k.params.volume.target(),
+                KICK_PARAM_TUNING => k.params.tuning.target(),
+                _ => f32::NAN,
+            },
+            Self::Snare(s) => match param {
+                SNARE_PARAM_FREQUENCY => s.params.frequency.target(),
+                SNARE_PARAM_DECAY => s.params.decay.target(),
+                SNARE_PARAM_BRIGHTNESS => s.params.brightness.target(),
+                SNARE_PARAM_VOLUME => s.params.volume.target(),
+                SNARE_PARAM_TONAL => s.params.tonal.target(),
+                SNARE_PARAM_NOISE => s.params.noise.target(),
+                SNARE_PARAM_PITCH_DROP => s.params.pitch_drop.target(),
+                SNARE_PARAM_TONAL_DECAY => s.params.tonal_decay.target(),
+                SNARE_PARAM_NOISE_DECAY => s.params.noise_decay.target(),
+                SNARE_PARAM_NOISE_TAIL_DECAY => s.params.noise_tail_decay.target(),
+                SNARE_PARAM_FILTER_CUTOFF => s.params.filter_cutoff.target(),
+                SNARE_PARAM_FILTER_RESONANCE => s.params.filter_resonance.target(),
+                SNARE_PARAM_FILTER_TYPE => s.params.filter_type as f32,
+                SNARE_PARAM_XFADE => s.params.xfade.target(),
+                SNARE_PARAM_PHASE_MOD_AMOUNT => s.params.phase_mod_amount.target(),
+                SNARE_PARAM_OVERDRIVE => s.params.overdrive.target(),
+                SNARE_PARAM_AMP_DECAY => s.params.amp_decay.target(),
+                SNARE_PARAM_AMP_DECAY_CURVE => s.params.amp_decay_curve.target(),
+                SNARE_PARAM_TONAL_DECAY_CURVE => s.params.tonal_decay_curve.target(),
+                SNARE_PARAM_TUNING => s.params.tuning.target(),
+                _ => f32::NAN,
+            },
+            Self::HiHat(h) => match param {
+                HIHAT_PARAM_PITCH => h.params.pitch.target(),
+                HIHAT_PARAM_DECAY => h.params.decay.target(),
+                HIHAT_PARAM_ATTACK => h.params.attack.target(),
+                HIHAT_PARAM_VOLUME => h.params.volume.target(),
+                HIHAT_PARAM_TONE => h.params.tone.target(),
+                HIHAT_PARAM_TUNING => h.params.tuning.target(),
+                _ => f32::NAN,
+            },
+            Self::Tom(t) => match param {
+                // Tom2 stores 0-100 internally; renormalize to 0-1 for the FFI surface.
+                TOM_PARAM_TUNE => t.tune() / 100.0,
+                TOM_PARAM_BEND => t.bend() / 100.0,
+                TOM_PARAM_TONE => t.tone() / 100.0,
+                TOM_PARAM_COLOR => t.color() / 100.0,
+                TOM_PARAM_DECAY => t.decay() / 100.0,
+                TOM_PARAM_MEMBRANE => t.membrane() / 100.0,
+                TOM_PARAM_MEMBRANE_Q => t.membrane_q() / 100.0,
+                TOM_PARAM_VOLUME => t.volume() / 100.0,
+                // Tuning is stored 0-1 directly, mirroring the setter exception.
+                TOM_PARAM_TUNING => t.tuning(),
+                _ => f32::NAN,
+            },
+            Self::Bass(_) => f32::NAN,
+            Self::Poly(_) => f32::NAN,
+        }
+    }
+
     /// Apply LFO modulation to a parameter. Uses bipolar modulation for smoothed params.
     fn apply_modulation(&mut self, param: u32, value: f32) {
         match self {
@@ -278,7 +350,9 @@ impl ChannelInstrument {
                 KICK_PARAM_SUB => k.params.sub.set_bipolar(value),
                 KICK_PARAM_CLICK => k.params.click.set_bipolar(value),
                 KICK_PARAM_DECAY => k.params.oscillator_decay.set_bipolar(value),
-                KICK_PARAM_PITCH_ENVELOPE => k.params.pitch_envelope_amount.set_bipolar(value),
+                // KICK_PARAM_PITCH_ENVELOPE is no longer modulatable: it was
+                // baked at trigger time and never re-read. Use KICK_PARAM_TUNING
+                // for live pitch modulation instead.
                 KICK_PARAM_VOLUME => k.params.volume.set_bipolar(value),
                 KICK_PARAM_TUNING => k.params.tuning.set_bipolar(value),
                 _ => {}
@@ -578,7 +652,9 @@ pub struct GooeyEngine {
     // Per-channel sequencers (sample-accurate, synchronized)
     sequencers: [Sequencer; NUM_INSTRUMENTS],
 
-    /// Global effects (applied in order: saturation -> lowpass filter -> tilt filter -> delay -> compressor -> reverb -> limiter)
+    /// Global effects. Applied in the order described by `effect_order`,
+    /// followed by the optional limiter which is always last.
+    /// Processing order when enabled: saturation -> lowpass filter -> tilt filter -> delay -> compressor -> reverb -> limiter.
     delay: DelayEffect,
     delay_enabled: bool,
     lowpass_filter: LowpassFilterEffect,
@@ -595,11 +671,17 @@ pub struct GooeyEngine {
     limiter: SoftLimiter,
     limiter_enabled: bool,
 
+    /// Order in which the reorderable effects are applied. Stores `EFFECT_*`
+    /// IDs (excluding `EFFECT_LIMITER`, which is pinned at the end of the chain).
+    effect_order: [u32; REORDERABLE_EFFECT_COUNT as usize],
+
     // Engine state
     sample_rate: f32,
     bpm: f32,
     swing: f32,
     current_time: f64,
+    /// Smoothed gain applied to the complete instrument sum before global effects.
+    master_gain: SmoothedParam,
 
     // Per-channel manual trigger flags and velocities
     trigger_pending: [AtomicBool; NUM_INSTRUMENTS],
@@ -642,7 +724,17 @@ pub struct GooeyEngine {
 
     // When false, sequencers still advance position but don't trigger instruments or emit MIDI events.
     // Used to let host MIDI input drive instruments instead of the internal sequencer.
-    sequencer_triggers_enabled: bool,
+    // Atomic so the host thread (FFI setter) and audio thread (render read) don't race;
+    // mirrors the `instrument_muted` thread-safety pattern.
+    sequencer_triggers_enabled: AtomicBool,
+
+    // Mono granular instrument (sample buffer loaded by the host)
+    granulator: Granulator,
+
+    // Multi-channel stereo loop mixer (4 channels, per-channel effects). Summed
+    // into the master bus before the global effects chain. The `gooey_engine_loop_*`
+    // FFI functions expose control over this.
+    mixer: Mixer,
 
     // When true, an external source (e.g. Ableton Link) owns the tempo.
     // The host should check this flag to decide whether local BPM changes
@@ -654,6 +746,49 @@ pub struct GooeyEngine {
     error_message: Option<CString>,
     error_callback: Option<extern "C" fn(*mut c_void, *const c_char)>,
     error_callback_context: *mut c_void,
+
+    // Host-clock state for scheduled (Link-synced) sequencer start.
+    // `host_clock_anchor` is set by `gooey_engine_set_render_host_time` once
+    // per buffer in the audio callback. `pending_arm_host_time` is staged by
+    // `gooey_engine_sequencer_start_at_host_time` and resolved at the top of
+    // each render call against `host_clock_anchor`.
+    host_clock_anchor: Option<HostClockAnchor>,
+    pending_arm_host_time: Option<PendingArm>,
+}
+
+/// Host-clock reference for the next render buffer. The audio callback sets
+/// this just before calling `gooey_engine_render` so the engine can convert
+/// absolute host times into per-buffer sample offsets.
+#[derive(Clone, Copy, Debug)]
+struct HostClockAnchor {
+    /// Host time (e.g. mach_absolute_time) of sample 0 of the buffer.
+    host_time_first_sample: u64,
+    /// Host-clock ticks per audio sample (host_ticks_per_second / sample_rate).
+    host_ticks_per_sample: f64,
+}
+
+/// A pending scheduled start. Resolved at render time using the current
+/// `HostClockAnchor`; if the buffer ends before the start time, the arm
+/// stays staged for the next render.
+#[derive(Clone, Copy, Debug)]
+struct PendingArm {
+    /// Absolute host time at which the sequencer should start.
+    start_host_time: u64,
+    /// Cursor position (in quarter notes) at the moment the arm fires.
+    beat_position: f64,
+}
+
+/// Outcome of resolving `pending_arm_host_time` against `host_clock_anchor`
+/// at the start of a render call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArmResolution {
+    /// No arm pending — render normally.
+    NotPending,
+    /// Arm fires at this sample offset within the buffer (0-based).
+    FiresAt(u32),
+    /// Arm fires later than this buffer — emit silence for the whole buffer
+    /// and leave the arm staged for the next render.
+    SilentBuffer,
 }
 
 impl GooeyEngine {
@@ -723,18 +858,21 @@ impl GooeyEngine {
             tilt_filter,
             tilt_filter_enabled: false,
             saturation,
-            saturation_enabled: true,
+            saturation_enabled: false,
             compressor,
-            compressor_enabled: true,
+            compressor_enabled: false,
             compressor_sidechain: COMPRESSOR_SIDECHAIN_NONE,
             reverb,
             reverb_enabled: false,
             limiter: SoftLimiter::new(1.0),
-            limiter_enabled: true,
+            limiter_enabled: false,
+            effect_order: DEFAULT_EFFECT_ORDER,
             sample_rate,
             bpm,
             swing: 0.5,
             current_time: 0.0,
+            // Match the native Engine's default summing headroom.
+            master_gain: SmoothedParam::new(DEFAULT_MASTER_GAIN, 0.0, 2.0, sample_rate, 30.0),
             trigger_pending: std::array::from_fn(|_| AtomicBool::new(false)),
             trigger_velocity: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
             channel_peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
@@ -772,7 +910,18 @@ impl GooeyEngine {
             // MIDI event buffer (pre-allocated for audio thread safety)
             pending_midi_events: Vec::with_capacity(MIDI_EVENT_CAPACITY),
             // Sequencer triggers enabled by default (internal sequencer drives instruments)
-            sequencer_triggers_enabled: true,
+            sequencer_triggers_enabled: AtomicBool::new(true),
+            // Granulator with a silent placeholder buffer until the host loads samples.
+            // The placeholder uses a hardcoded sample rate so this constructor cannot
+            // fail on a non-finite or non-positive `sample_rate` argument — `gooey_engine_new`
+            // is an `extern "C"` entry point and must never panic on user input.
+            granulator: Granulator::new(
+                sample_rate,
+                SampleBuffer::from_mono(vec![0.0_f32], 44_100.0)
+                    .unwrap_or_else(|_| unreachable!("constant placeholder buffer is valid")),
+            ),
+            // Multi-channel stereo loop mixer (empty until the host loads loops).
+            mixer: Mixer::new(sample_rate),
             // External sync (e.g. Ableton Link)
             link_enabled: AtomicBool::new(false),
             // Error state
@@ -780,6 +929,47 @@ impl GooeyEngine {
             error_message: None,
             error_callback: None,
             error_callback_context: std::ptr::null_mut(),
+            // Scheduled-start state (used for Ableton Link Sync Start/Stop)
+            host_clock_anchor: None,
+            pending_arm_host_time: None,
+        }
+    }
+
+    /// Resolve any `pending_arm_host_time` against the current
+    /// `host_clock_anchor` for a buffer of `frames` samples. Called once at
+    /// the top of `render`; the result drives whether (and at which sample
+    /// offset within this buffer) the arm fires.
+    fn resolve_pending_arm(&self, frames: usize) -> ArmResolution {
+        let pending = match self.pending_arm_host_time {
+            Some(p) => p,
+            None => return ArmResolution::NotPending,
+        };
+
+        let anchor = match self.host_clock_anchor {
+            Some(a) if a.host_ticks_per_sample > 0.0 => a,
+            // No host-clock reference — fail-safe to immediate fire so
+            // callers that arm but forget to set the host clock get a
+            // working sequencer rather than silence forever.
+            _ => return ArmResolution::FiresAt(0),
+        };
+
+        // Use i128 to safely express the (signed) delta between two u64
+        // host times when the start time may be earlier than the anchor.
+        let delta_ticks = pending.start_host_time as i128 - anchor.host_time_first_sample as i128;
+        if delta_ticks <= 0 {
+            return ArmResolution::FiresAt(0);
+        }
+
+        let samples_until = (delta_ticks as f64 / anchor.host_ticks_per_sample).ceil();
+        if !samples_until.is_finite() || samples_until <= 0.0 {
+            return ArmResolution::FiresAt(0);
+        }
+
+        let samples_until = samples_until as u64;
+        if (samples_until as usize) < frames {
+            ArmResolution::FiresAt(samples_until as u32)
+        } else {
+            ArmResolution::SilentBuffer
         }
     }
 
@@ -795,9 +985,44 @@ impl GooeyEngine {
         }
     }
 
+    /// Render audio into an interleaved stereo `buffer` of `buffer.len() / 2`
+    /// frames. Each frame occupies two consecutive slots: `[left, right]`. The
+    /// signal path is mono, so left and right are currently identical (see the
+    /// "stereo seam" near the end of the per-frame loop), but the engine writes
+    /// two-channel output so hosts (and future stereo features) consume stereo.
     fn render(&mut self, buffer: &mut [f32]) {
         // Clear pending MIDI events from previous render pass
         self.pending_midi_events.clear();
+
+        // Number of stereo frames this buffer holds (two slots per frame).
+        let frame_count = buffer.len() / 2;
+
+        // Resolve any host-time-armed start against this buffer's host clock.
+        // Possible outcomes:
+        //   `Some(0)`  → arm fires on sample 0 of this buffer.
+        //   `Some(N)`  → samples 0..N produce silence; arm fires on sample N.
+        //   `None`     → no arm pending OR arm fires later than this buffer.
+        // When the arm fires later than this buffer, we zero the whole
+        // buffer below and leave `pending_arm_host_time` staged so the next
+        // render re-evaluates against its own host time.
+        let arm_state = self.resolve_pending_arm(frame_count);
+        let mut arm_fires_at: Option<u32> = match arm_state {
+            ArmResolution::FiresAt(n) => Some(n),
+            ArmResolution::SilentBuffer => {
+                // Whole buffer is silent — pre-fire countdown spans this entire buffer.
+                // Drain any pending manual triggers so they don't latch and fire
+                // late once the arm resolves; the trigger API contract is "fires
+                // on the next render call", and this render produced silence.
+                for ch in 0..NUM_INSTRUMENTS {
+                    self.trigger_pending[ch].store(false, Ordering::Release);
+                }
+                for sample in buffer.iter_mut() {
+                    *sample = 0.0;
+                }
+                return;
+            }
+            ArmResolution::NotPending => None,
+        };
 
         // Check for pending manual triggers with velocity (all channels)
         // Manual triggers fire at sample_offset 0 (start of buffer)
@@ -826,7 +1051,31 @@ impl GooeyEngine {
         }
 
         let mut sample_offset: u32 = 0;
-        for sample in buffer.iter_mut() {
+        for frame in buffer.chunks_mut(2) {
+            // Pre-fire portion of an armed start: emit silence and skip all
+            // per-sample work (no sequencer ticks, no instrument ticks, no
+            // LFO ticks, no time advance) so the engine stays exactly where
+            // it was at arm time.
+            if let Some(fire_at) = arm_fires_at {
+                if sample_offset < fire_at {
+                    frame.fill(0.0);
+                    sample_offset += 1;
+                    continue;
+                }
+                // sample_offset == fire_at — arm fires this sample. Apply
+                // the staged seek+start to all sequencers so they begin
+                // running at the requested beat position. Clearing
+                // arm_fires_at locally and pending_arm_host_time on the
+                // engine ensures we only fire once per render.
+                if let Some(pending) = self.pending_arm_host_time.take() {
+                    for seq in &mut self.sequencers {
+                        seq.set_beat_position(pending.beat_position);
+                        seq.start();
+                    }
+                }
+                arm_fires_at = None;
+            }
+
             // Tick ALL sequencers first to ensure sample-accurate synchronization
             let mut seq_triggers: [Option<(f32, Option<SequencerBlendSetting>, Option<u8>)>;
                 NUM_INSTRUMENTS] = [None; NUM_INSTRUMENTS];
@@ -837,7 +1086,7 @@ impl GooeyEngine {
             }
 
             // Apply triggers with velocity after all sequencers have been ticked.
-            if self.sequencer_triggers_enabled {
+            if self.sequencer_triggers_enabled.load(Ordering::Relaxed) {
                 for ch in 0..NUM_INSTRUMENTS {
                     if let Some((velocity, blend, note)) = seq_triggers[ch] {
                         self.apply_sequencer_blend_setting(ch as u32, blend);
@@ -907,41 +1156,71 @@ impl GooeyEngine {
                 }
             }
 
-            // Apply global effects chain
-            if self.saturation_enabled {
-                output = self.saturation.process(output);
-            }
-            if self.lowpass_filter_enabled {
-                output = self.lowpass_filter.process(output);
-            }
-            if self.tilt_filter_enabled {
-                output = self.tilt_filter.process(output);
-            }
-            if self.delay_enabled {
-                output = self.delay.process(output);
+            // Mix in granulator output
+            output += self.granulator.tick(self.current_time);
+
+            // Stereo seam: the instrument sum is mono, so place it on both
+            // channels here — BEFORE the effects chain — so each effect can
+            // process true left/right. Effects are stereo-aware (per-channel
+            // state); for mono content with no stereo effect engaged the two
+            // channels stay identical.
+            let mut stereo = StereoFrame::mono(output);
+
+            // Sum the loop mixer (already stereo, with its own per-channel
+            // effects) into the master bus.
+            stereo += self.mixer.tick(self.sample_rate);
+
+            // Apply master headroom to the full mix (instruments + loops) before
+            // the optional global effects + limiter, so the master fader scales
+            // loops too.
+            stereo = stereo.scaled(self.master_gain.tick());
+
+            // Apply global effects chain (order is user-configurable; limiter is always last)
+            for &effect_id in &self.effect_order {
+                match effect_id {
+                    EFFECT_SATURATION if self.saturation_enabled => {
+                        stereo = self.saturation.process_stereo(stereo);
+                    }
+                    EFFECT_LOWPASS_FILTER if self.lowpass_filter_enabled => {
+                        stereo = self.lowpass_filter.process_stereo(stereo);
+                    }
+                    EFFECT_TILT_FILTER if self.tilt_filter_enabled => {
+                        stereo = self.tilt_filter.process_stereo(stereo);
+                    }
+                    EFFECT_DELAY if self.delay_enabled => {
+                        stereo = self.delay.process_stereo(stereo);
+                    }
+                    EFFECT_COMPRESSOR if self.compressor_enabled => {
+                        let sc = self.compressor_sidechain as usize;
+                        stereo = if sc < NUM_INSTRUMENTS {
+                            // The sidechain source is a mono per-instrument
+                            // sample; feed it to both detectors equally.
+                            self.compressor.process_stereo_with_sidechain(
+                                stereo,
+                                StereoFrame::mono(channel_outs[sc]),
+                            )
+                        } else {
+                            self.compressor.process_stereo(stereo)
+                        };
+                    }
+                    EFFECT_REVERB if self.reverb_enabled => {
+                        stereo = self.reverb.process_stereo(stereo);
+                    }
+                    _ => {}
+                }
             }
 
-            // Compressor (if enabled), with optional sidechain from individual channel
-            if self.compressor_enabled {
-                let sc = self.compressor_sidechain as usize;
-                output = if sc < NUM_INSTRUMENTS {
-                    self.compressor
-                        .process_with_sidechain(output, channel_outs[sc])
-                } else {
-                    self.compressor.process(output)
-                };
-            }
-
-            // Reverb (if enabled)
-            if self.reverb_enabled {
-                output = self.reverb.process(output);
-            }
-
-            // Limiter (protects output from clipping)
-            if self.limiter_enabled {
-                *sample = self.limiter.process(output);
+            // Optional limiter (always last when enabled)
+            let stereo = if self.limiter_enabled {
+                self.limiter.process_stereo(stereo)
             } else {
-                *sample = output;
+                stereo
+            };
+
+            // Write the frame interleaved as [left, right].
+            frame[0] = stereo.l;
+            if let Some(right) = frame.get_mut(1) {
+                *right = stereo.r;
             }
 
             self.current_time += sample_period;
@@ -972,6 +1251,19 @@ impl GooeyEngine {
         if idx < NUM_INSTRUMENTS {
             self.blenders[idx].blend_and_apply(&mut self.channels[idx], x, y);
         }
+    }
+
+    /// Clear internal state of all reorderable effects so a new chain order
+    /// does not inherit stale buffers/envelopes from the previous routing.
+    /// Limiter is intentionally skipped — keeping its gain-reduction state
+    /// stable avoids transients if the optional final stage is enabled.
+    fn reset_effect_states(&self) {
+        self.saturation.reset();
+        self.lowpass_filter.reset();
+        self.tilt_filter.reset();
+        self.delay.reset();
+        self.compressor.reset();
+        self.reverb.reset();
     }
 
     /// Apply LFO modulation to a channel's instrument parameter by index
@@ -1110,7 +1402,7 @@ pub const EFFECT_SATURATION: u32 = 2;
 pub const EFFECT_COMPRESSOR: u32 = 3;
 /// Global effect: Tilt filter (unified lowpass/highpass)
 pub const EFFECT_TILT_FILTER: u32 = 4;
-/// Global effect: Limiter (soft limiter, protects output from clipping)
+/// Global effect: Optional soft limiter
 pub const EFFECT_LIMITER: u32 = 5;
 
 // =============================================================================
@@ -1123,6 +1415,21 @@ pub const LIMITER_PARAM_THRESHOLD: u32 = 0;
 pub const EFFECT_REVERB: u32 = 6;
 /// Total number of global effects
 pub const EFFECT_COUNT: u32 = 7;
+
+/// Number of reorderable effects in the chain. Excludes the optional limiter,
+/// which is pinned at the end of the chain when enabled.
+pub const REORDERABLE_EFFECT_COUNT: u32 = 6;
+
+/// Default order for the reorderable effects, matching the historical
+/// hardcoded chain (saturation -> lowpass -> tilt -> delay -> compressor -> reverb).
+const DEFAULT_EFFECT_ORDER: [u32; REORDERABLE_EFFECT_COUNT as usize] = [
+    EFFECT_SATURATION,
+    EFFECT_LOWPASS_FILTER,
+    EFFECT_TILT_FILTER,
+    EFFECT_DELAY,
+    EFFECT_COMPRESSOR,
+    EFFECT_REVERB,
+];
 
 // =============================================================================
 // Lowpass filter parameter indices (must match Swift FilterParam enum)
@@ -1145,6 +1452,9 @@ pub const DELAY_PARAM_FEEDBACK: u32 = 1;
 pub const DELAY_PARAM_MIX: u32 = 2;
 /// Delay parameter: filter cutoff in Hz (20-20000)
 pub const DELAY_PARAM_FILTER_CUTOFF: u32 = 3;
+/// Delay parameter: ping-pong mode (0.0 = off, >= 0.5 = on). When on, the delay
+/// feedback crosses channels so echoes bounce between left and right.
+pub const DELAY_PARAM_PINGPONG: u32 = 4;
 
 // =============================================================================
 // Delay timing constants (must match Swift DelayTiming enum)
@@ -1344,6 +1654,10 @@ pub const INSTRUMENT_POLY: u32 = 5;
 pub const INSTRUMENT_COUNT: u32 = 6;
 /// Internal usize version for array indexing
 const NUM_INSTRUMENTS: usize = INSTRUMENT_COUNT as usize;
+const DEFAULT_MASTER_GAIN: f32 = 0.25;
+
+/// Number of stereo loop-mixer channels (see `gooey_engine_loop_*`).
+pub const LOOP_CHANNEL_COUNT: u32 = crate::mixer::LOOP_CHANNEL_COUNT as u32;
 
 // =============================================================================
 // Preset blend constants
@@ -1403,6 +1717,40 @@ pub const BASS_PARAM_OVERDRIVE: u32 = 13;
 pub const BASS_PARAM_VOLUME: u32 = 14;
 /// Bass parameter: tuning offset (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
 pub const BASS_PARAM_TUNING: u32 = 15;
+
+// =============================================================================
+// Granulator parameter constants
+// =============================================================================
+//
+// All values are normalized 0.0-1.0. Mapping to internal units (ms, Hz, ratio)
+// happens inside `Granulator`; see `src/instruments/granulator.rs`.
+
+/// Granulator parameter: scan position into the loaded buffer (0=start, 1=end)
+pub const GRANULATOR_PARAM_SCAN_POSITION: u32 = 0;
+/// Granulator parameter: grain length (0-1 -> 5-3000 ms, quadratic curve)
+pub const GRANULATOR_PARAM_GRAIN_LENGTH: u32 = 1;
+/// Granulator parameter: spray / randomization of grain start (0-1 -> 0-10 s, cubic)
+pub const GRANULATOR_PARAM_SPRAY: u32 = 2;
+/// Granulator parameter: playback pitch (0-1 -> 0.25x-4x, exponential)
+pub const GRANULATOR_PARAM_PITCH: u32 = 3;
+/// Granulator parameter: density of grains per second (0-1 -> 0-80 g/s)
+pub const GRANULATOR_PARAM_DENSITY: u32 = 4;
+/// Granulator parameter: window shape / texture (0=soft, 1=hard)
+pub const GRANULATOR_PARAM_TEXTURE: u32 = 5;
+/// Granulator parameter: probability a grain plays in reverse (0=forward only, 1=reverse only)
+pub const GRANULATOR_PARAM_DIRECTION: u32 = 6;
+/// Granulator parameter: cloud duration after a trigger (0-1 -> 50-8000 ms, quadratic)
+pub const GRANULATOR_PARAM_CLOUD_DURATION: u32 = 7;
+/// Granulator parameter: output volume (0-1)
+pub const GRANULATOR_PARAM_VOLUME: u32 = 8;
+/// Granulator parameter: per-grain spawn-time jitter (0=periodic, 1=±100% of interval)
+pub const GRANULATOR_PARAM_RANDOM_TIMING: u32 = 9;
+/// Granulator parameter: per-grain random amplitude (0=uniform, 1=full random duck to 0)
+pub const GRANULATOR_PARAM_RANDOM_AMP: u32 = 10;
+/// Granulator parameter: output soft-saturation drive (0=clean, 1=heavy tanh)
+pub const GRANULATOR_PARAM_DRIVE: u32 = 11;
+/// Total number of granulator parameters
+pub const GRANULATOR_PARAM_COUNT: u32 = 12;
 
 /// Bass preset: Acid - TB-303-style, high resonance, short filter sweep
 pub const BASS_PRESET_ACID: u32 = 0;
@@ -1518,19 +1866,27 @@ pub unsafe extern "C" fn gooey_engine_free(engine: *mut GooeyEngine) {
 // Audio rendering
 // =============================================================================
 
-/// Render audio samples into the provided buffer
+/// Number of interleaved output channels produced by `gooey_engine_render`.
+/// The render buffer must hold `frames * GOOEY_OUTPUT_CHANNELS` floats.
+pub const GOOEY_OUTPUT_CHANNELS: u32 = 2;
+
+/// Render interleaved stereo audio into the provided buffer
 ///
 /// This is the main audio callback function. Call this from your audio thread
-/// to generate audio samples.
+/// to generate audio samples. Output is two-channel: the buffer holds `frames`
+/// stereo frames laid out as interleaved `[left, right]` pairs, so the caller
+/// must provide `frames * GOOEY_OUTPUT_CHANNELS` (`frames * 2`) floats. The
+/// signal path is currently mono, so left and right are identical, but callers
+/// should always treat the buffer as stereo.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
-/// * `buffer` - Pointer to a buffer of floats to fill with audio
-/// * `frames` - Number of frames (samples) to render
+/// * `buffer` - Pointer to a buffer of floats to fill with interleaved L/R audio
+/// * `frames` - Number of stereo frames to render
 ///
 /// # Safety
 /// - `engine` must be a valid pointer returned by `gooey_engine_new`
-/// - `buffer` must point to at least `frames` floats of allocated memory
+/// - `buffer` must point to at least `frames * 2` floats of allocated memory
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_render(
     engine: *mut GooeyEngine,
@@ -1542,7 +1898,7 @@ pub unsafe extern "C" fn gooey_engine_render(
     }
 
     let engine_ref = &mut *engine;
-    let buffer_slice = slice::from_raw_parts_mut(buffer, frames as usize);
+    let buffer_slice = slice::from_raw_parts_mut(buffer, frames as usize * 2);
 
     // If engine is already in error state, output silence
     if engine_ref.error_occurred.load(Ordering::Relaxed) {
@@ -1576,8 +1932,8 @@ pub unsafe extern "C" fn gooey_engine_render(
         engine_ref.error_message = Some(c_msg);
         engine_ref.error_occurred.store(true, Ordering::Release);
 
-        // Zero the output buffer
-        let buffer_slice = slice::from_raw_parts_mut(buffer, frames as usize);
+        // Zero the output buffer (interleaved stereo: frames * 2 floats)
+        let buffer_slice = slice::from_raw_parts_mut(buffer, frames as usize * 2);
         for sample in buffer_slice.iter_mut() {
             *sample = 0.0;
         }
@@ -1660,7 +2016,9 @@ pub unsafe extern "C" fn gooey_engine_set_sequencer_triggers_enabled(
     if engine.is_null() {
         return;
     }
-    (*engine).sequencer_triggers_enabled = enabled;
+    (*engine)
+        .sequencer_triggers_enabled
+        .store(enabled, Ordering::Release);
 }
 
 /// Query whether sequencer triggers are currently enabled.
@@ -1676,7 +2034,7 @@ pub unsafe extern "C" fn gooey_engine_get_sequencer_triggers_enabled(
     if engine.is_null() {
         return true;
     }
-    (*engine).sequencer_triggers_enabled
+    (*engine).sequencer_triggers_enabled.load(Ordering::Acquire)
 }
 
 // =============================================================================
@@ -2103,6 +2461,40 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
     }
 }
 
+/// Read a kick drum parameter in the same normalized form used by
+/// `gooey_engine_set_kick_param`.
+///
+/// Returns the most-recently-set target value (not the in-flight smoothed sample),
+/// so set→get round-trips exactly. Use this to capture mutations applied by
+/// randomize/mutate flows for snapshot/undo.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `param` - Parameter index (see KICK_PARAM_* constants)
+///
+/// # Returns
+/// The current parameter value, or `f32::NAN` if `engine` is null, the kick
+/// channel is missing, or `param` is unrecognized. Note that
+/// `KICK_PARAM_PITCH_ENVELOPE` reports the value set via the setter; it only
+/// takes audible effect at the next trigger.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_kick_param(
+    engine: *const GooeyEngine,
+    param: u32,
+) -> f32 {
+    if engine.is_null() {
+        return f32::NAN;
+    }
+    let engine = &*engine;
+    match engine.find_channel_by_type(INSTRUMENT_KICK) {
+        Some(ch) => engine.channels[ch].get_param(param),
+        None => f32::NAN,
+    }
+}
+
 /// Set a hi-hat parameter
 ///
 /// All parameters are automatically smoothed to prevent clicks/pops.
@@ -2132,6 +2524,37 @@ pub unsafe extern "C" fn gooey_engine_set_hihat_param(
     let engine = &mut *engine;
     if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_HIHAT) {
         engine.channels[ch].set_param(param, value);
+    }
+}
+
+/// Read a hi-hat parameter in the same normalized form used by
+/// `gooey_engine_set_hihat_param`.
+///
+/// Returns the most-recently-set target value (not the in-flight smoothed sample),
+/// so set→get round-trips exactly.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `param` - Parameter index (see HIHAT_PARAM_* constants)
+///
+/// # Returns
+/// The current parameter value, or `f32::NAN` if `engine` is null, the hi-hat
+/// channel is missing, or `param` is unrecognized.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_hihat_param(
+    engine: *const GooeyEngine,
+    param: u32,
+) -> f32 {
+    if engine.is_null() {
+        return f32::NAN;
+    }
+    let engine = &*engine;
+    match engine.find_channel_by_type(INSTRUMENT_HIHAT) {
+        Some(ch) => engine.channels[ch].get_param(param),
+        None => f32::NAN,
     }
 }
 
@@ -2182,6 +2605,38 @@ pub unsafe extern "C" fn gooey_engine_set_snare_param(
     }
 }
 
+/// Read a snare drum parameter in the same normalized form used by
+/// `gooey_engine_set_snare_param`.
+///
+/// Returns the most-recently-set target value (not the in-flight smoothed sample),
+/// so set→get round-trips exactly. `SNARE_PARAM_FILTER_TYPE` is reported as the
+/// raw 0-3 enum value cast to `f32`.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `param` - Parameter index (see SNARE_PARAM_* constants)
+///
+/// # Returns
+/// The current parameter value, or `f32::NAN` if `engine` is null, the snare
+/// channel is missing, or `param` is unrecognized.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_snare_param(
+    engine: *const GooeyEngine,
+    param: u32,
+) -> f32 {
+    if engine.is_null() {
+        return f32::NAN;
+    }
+    let engine = &*engine;
+    match engine.find_channel_by_type(INSTRUMENT_SNARE) {
+        Some(ch) => engine.channels[ch].get_param(param),
+        None => f32::NAN,
+    }
+}
+
 /// Set a tom drum parameter
 ///
 /// All parameters use normalized 0-1 range. Values are internally scaled
@@ -2215,6 +2670,35 @@ pub unsafe extern "C" fn gooey_engine_set_tom_param(
     let engine = &mut *engine;
     if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_TOM) {
         engine.channels[ch].set_param(param, value);
+    }
+}
+
+/// Read a tom drum parameter in the same normalized form used by
+/// `gooey_engine_set_tom_param`.
+///
+/// Tom2 stores parameters 0-7 internally on a 0-100 scale; the getter
+/// renormalizes back to 0-1 to match the setter contract. `TOM_PARAM_TUNING`
+/// (param 8) is the exception: it's already 0-1 in both directions.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `param` - Parameter index (see TOM_PARAM_* constants)
+///
+/// # Returns
+/// The current parameter value, or `f32::NAN` if `engine` is null, the tom
+/// channel is missing, or `param` is unrecognized.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_tom_param(engine: *const GooeyEngine, param: u32) -> f32 {
+    if engine.is_null() {
+        return f32::NAN;
+    }
+    let engine = &*engine;
+    match engine.find_channel_by_type(INSTRUMENT_TOM) {
+        Some(ch) => engine.channels[ch].get_param(param),
+        None => f32::NAN,
     }
 }
 
@@ -2312,6 +2796,7 @@ pub unsafe extern "C" fn gooey_engine_load_bass_preset(engine: *mut GooeyEngine,
 ///   - DELAY_PARAM_FEEDBACK (1): 0.0-0.95
 ///   - DELAY_PARAM_MIX (2): 0.0-1.0
 ///   - DELAY_PARAM_FILTER_CUTOFF (3): 20-20000 Hz
+///   - DELAY_PARAM_PINGPONG (4): 0.0 = off, >= 0.5 = on
 /// - EFFECT_SATURATION (2):
 ///   - SATURATION_PARAM_DRIVE (0): 0.0-1.0
 ///   - SATURATION_PARAM_WARMTH (1): 0.0-1.0
@@ -2355,6 +2840,7 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
             DELAY_PARAM_FEEDBACK => engine.delay.set_feedback(value),
             DELAY_PARAM_MIX => engine.delay.set_mix(value),
             DELAY_PARAM_FILTER_CUTOFF => engine.delay.set_filter_cutoff(value),
+            DELAY_PARAM_PINGPONG => engine.delay.set_pingpong(value >= 0.5),
             _ => {} // Unknown parameter, ignore
         },
         EFFECT_SATURATION => match param {
@@ -2427,6 +2913,13 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
             DELAY_PARAM_FEEDBACK => engine.delay.get_feedback(),
             DELAY_PARAM_MIX => engine.delay.get_mix(),
             DELAY_PARAM_FILTER_CUTOFF => engine.delay.get_filter_cutoff(),
+            DELAY_PARAM_PINGPONG => {
+                if engine.delay.get_pingpong() {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
             _ => -1.0, // Unknown parameter
         },
         EFFECT_SATURATION => match param {
@@ -2466,6 +2959,7 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
 ///
 /// When disabled, the effect is bypassed and does not process audio.
 /// This is useful for A/B comparison or saving CPU when an effect is not needed.
+/// Saturation, compressor, and limiter are disabled by default.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -2578,6 +3072,44 @@ pub unsafe extern "C" fn gooey_engine_get_compressor_sidechain(engine: *mut Gooe
 }
 
 // =============================================================================
+// Master gain
+// =============================================================================
+
+/// Set the master output gain.
+///
+/// This gain is applied to the complete instrument sum before global effects.
+/// It is smoothed over 30ms to prevent clicks.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `gain` - Linear gain, clamped to 0.0-2.0. The default is 0.25.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_master_gain(engine: *mut GooeyEngine, gain: f32) {
+    if engine.is_null() || !gain.is_finite() {
+        return;
+    }
+    (*engine).master_gain.set_target(gain);
+}
+
+/// Get the current master output gain target.
+///
+/// # Returns
+/// The current linear gain target, or 0.25 if `engine` is null.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_master_gain(engine: *const GooeyEngine) -> f32 {
+    if engine.is_null() {
+        return DEFAULT_MASTER_GAIN;
+    }
+    (*engine).master_gain.target()
+}
+
+// =============================================================================
 // BPM control
 // =============================================================================
 
@@ -2610,6 +3142,9 @@ pub unsafe extern "C" fn gooey_engine_set_bpm(engine: *mut GooeyEngine, bpm: f32
     for lfo in &mut engine.lfos {
         lfo.set_bpm(bpm);
     }
+
+    // Seed BPM for any future note-synced per-channel loop effects.
+    engine.mixer.set_bpm(bpm);
 }
 
 /// Get the current BPM.
@@ -2744,7 +3279,9 @@ pub unsafe extern "C" fn gooey_engine_get_swing(engine: *mut GooeyEngine) -> f32
 // Sequencer control (all instruments)
 // =============================================================================
 
-/// Start all sequencers
+/// Start all sequencers.
+///
+/// Cancels any pending `gooey_engine_sequencer_start_at_host_time` arm.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -2755,12 +3292,15 @@ pub unsafe extern "C" fn gooey_engine_sequencer_start(engine: *mut GooeyEngine) 
     }
 
     let engine = &mut *engine;
+    engine.pending_arm_host_time = None;
     for seq in &mut engine.sequencers {
         seq.start();
     }
 }
 
-/// Stop all sequencers
+/// Stop all sequencers.
+///
+/// Cancels any pending `gooey_engine_sequencer_start_at_host_time` arm.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -2771,12 +3311,15 @@ pub unsafe extern "C" fn gooey_engine_sequencer_stop(engine: *mut GooeyEngine) {
     }
 
     let engine = &mut *engine;
+    engine.pending_arm_host_time = None;
     for seq in &mut engine.sequencers {
         seq.stop();
     }
 }
 
-/// Reset all sequencers to step 0
+/// Reset all sequencers to step 0.
+///
+/// Cancels any pending `gooey_engine_sequencer_start_at_host_time` arm.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -2787,6 +3330,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_reset(engine: *mut GooeyEngine) 
     }
 
     let engine = &mut *engine;
+    engine.pending_arm_host_time = None;
     for seq in &mut engine.sequencers {
         seq.reset();
     }
@@ -2794,12 +3338,16 @@ pub unsafe extern "C" fn gooey_engine_sequencer_reset(engine: *mut GooeyEngine) 
 
 /// Set all sequencers to a specific beat position in quarter notes.
 ///
-/// This is used for AUv3 host transport sync. The host provides
-/// `currentBeatPosition` and all sequencers jump to the correct
-/// step and sub-step offset. Call this before `sequencer_start()`
-/// when the host resumes transport.
+/// Silently teleports the cursor — no step is fired by this call, including
+/// the step that the new position lands on. The step at the target position
+/// fires when the cursor next crosses its boundary on the regular tick path.
+/// Suitable for external phase locking (e.g. Ableton Link drift correction)
+/// and for AUv3 host transport sync.
 ///
 /// Each step is a 16th note (4 steps per quarter-note beat).
+///
+/// Cancels any pending `gooey_engine_sequencer_start_at_host_time` arm. Call
+/// this before `sequencer_start()` when the host resumes transport.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -2817,8 +3365,91 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_beat_position(
     }
 
     let engine = &mut *engine;
+    engine.pending_arm_host_time = None;
     for seq in &mut engine.sequencers {
         seq.set_beat_position(beat_position);
+    }
+}
+
+/// Tell the engine the host time corresponding to sample 0 of the next
+/// render call, plus the host-tick-to-sample conversion factor. The engine
+/// uses this to evaluate any pending
+/// `gooey_engine_sequencer_start_at_host_time` arm.
+///
+/// Call this once per buffer from the audio callback, immediately before
+/// `gooey_engine_render`. Only required while a host-time arm is pending;
+/// calling it otherwise is a cheap no-op that simply updates the host-clock
+/// reference.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `host_time_first_sample` - mach_absolute_time of the first sample to be
+///   rendered.
+/// * `host_ticks_per_sample` - Host-clock ticks per audio sample
+///   (e.g. host_ticks_per_second / sample_rate). Must be > 0 to take effect.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_render_host_time(
+    engine: *mut GooeyEngine,
+    host_time_first_sample: u64,
+    host_ticks_per_sample: f64,
+) {
+    if engine.is_null() || !host_ticks_per_sample.is_finite() || host_ticks_per_sample <= 0.0 {
+        return;
+    }
+    let engine = &mut *engine;
+    engine.host_clock_anchor = Some(HostClockAnchor {
+        host_time_first_sample,
+        host_ticks_per_sample,
+    });
+}
+
+/// Arm all sequencers to start playback at `start_host_time` (in
+/// mach_absolute_time units) with the cursor at `beat_position` at that
+/// instant. Until the host clock reaches `start_host_time`, render produces
+/// silence and emits no step events. From `start_host_time` onward the
+/// cursor advances normally starting at `beat_position`.
+///
+/// Requires the audio callback to call `gooey_engine_set_render_host_time`
+/// before each `gooey_engine_render` while armed. Without a host clock
+/// reference the arm fires immediately (fail-safe behaviour).
+///
+/// Safe to call from the main thread; takes effect on the next render call.
+/// If `start_host_time` has already been crossed by the time render reaches
+/// it, behaves like an immediate start at `beat_position`. Subsequent calls
+/// to `sequencer_set_beat_position`, `sequencer_start`, `sequencer_stop`, or
+/// `sequencer_reset` cancel the pending arm.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `start_host_time` - Absolute host time at which the sequencer should
+///   start (mach_absolute_time units).
+/// * `beat_position` - Cursor position in quarter notes at the moment the
+///   arm fires (e.g. 0.0 = bar start).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_start_at_host_time(
+    engine: *mut GooeyEngine,
+    start_host_time: u64,
+    beat_position: f64,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    // Stage the arm; it is resolved against the host clock at render time.
+    // Stop the underlying sequencers so they emit nothing until the arm fires.
+    engine.pending_arm_host_time = Some(PendingArm {
+        start_host_time,
+        beat_position,
+    });
+    for seq in &mut engine.sequencers {
+        seq.cancel_arm();
+        seq.stop();
     }
 }
 
@@ -3514,6 +4145,166 @@ pub extern "C" fn gooey_engine_instrument_count() -> u32 {
 #[no_mangle]
 pub extern "C" fn gooey_engine_global_effect_count() -> u32 {
     EFFECT_COUNT
+}
+
+// =============================================================================
+// Effect chain reordering
+// =============================================================================
+
+/// Get the number of reorderable effects in the chain.
+///
+/// The optional limiter is excluded because it is pinned at the end of the
+/// chain when enabled. Only the other effects can be reordered.
+#[no_mangle]
+pub extern "C" fn gooey_engine_reorderable_effect_count() -> u32 {
+    REORDERABLE_EFFECT_COUNT
+}
+
+/// Returns true iff `id` is a valid reorderable effect ID
+/// (any `EFFECT_*` constant except `EFFECT_LIMITER`).
+fn is_reorderable_effect(id: u32) -> bool {
+    matches!(
+        id,
+        EFFECT_LOWPASS_FILTER
+            | EFFECT_DELAY
+            | EFFECT_SATURATION
+            | EFFECT_COMPRESSOR
+            | EFFECT_TILT_FILTER
+            | EFFECT_REVERB
+    )
+}
+
+/// Set the full effect-chain order in one call.
+///
+/// `ids` must point to exactly `REORDERABLE_EFFECT_COUNT` u32 values, each a
+/// distinct reorderable effect ID (any of `EFFECT_LOWPASS_FILTER`,
+/// `EFFECT_DELAY`, `EFFECT_SATURATION`, `EFFECT_COMPRESSOR`,
+/// `EFFECT_TILT_FILTER`, `EFFECT_REVERB`). `EFFECT_LIMITER` is pinned at the
+/// end of the chain and must not appear in `ids`.
+///
+/// On success, the chain order is replaced and the internal state of every
+/// reorderable effect is reset (delay buffer, reverb tail, compressor envelope,
+/// filter poles) so a stale routing does not bleed into the new one.
+///
+/// Returns `true` on success. Returns `false` (leaving the chain unchanged) if
+/// `len != REORDERABLE_EFFECT_COUNT`, any ID is not reorderable, or any ID
+/// appears more than once.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`. `ids` must
+/// point to at least `len` u32 values. Caller must ensure the engine is not
+/// concurrently mutated from another thread.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_effect_order(
+    engine: *mut GooeyEngine,
+    ids: *const u32,
+    len: u32,
+) -> bool {
+    if engine.is_null() || ids.is_null() {
+        return false;
+    }
+    if len != REORDERABLE_EFFECT_COUNT {
+        return false;
+    }
+
+    let slice = std::slice::from_raw_parts(ids, len as usize);
+    let mut new_order = [0u32; REORDERABLE_EFFECT_COUNT as usize];
+    for (i, &id) in slice.iter().enumerate() {
+        if !is_reorderable_effect(id) {
+            return false;
+        }
+        if slice[..i].contains(&id) {
+            return false;
+        }
+        new_order[i] = id;
+    }
+
+    let engine = &mut *engine;
+    engine.effect_order = new_order;
+    engine.reset_effect_states();
+    true
+}
+
+/// Move a single effect to `new_position` (0-indexed within the reorderable
+/// section of the chain). Other effects shift to fill the gap, preserving
+/// their relative order.
+///
+/// On success, internal state of every reorderable effect is reset (see
+/// `gooey_engine_set_effect_order` for rationale).
+///
+/// Returns `false` (leaving the chain unchanged) if `effect_id` is not
+/// reorderable (e.g. `EFFECT_LIMITER`) or `new_position >=
+/// REORDERABLE_EFFECT_COUNT`.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`. Caller
+/// must ensure the engine is not concurrently mutated from another thread.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_move_effect(
+    engine: *mut GooeyEngine,
+    effect_id: u32,
+    new_position: u32,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    if !is_reorderable_effect(effect_id) {
+        return false;
+    }
+    if new_position >= REORDERABLE_EFFECT_COUNT {
+        return false;
+    }
+
+    let engine = &mut *engine;
+    let Some(current_pos) = engine.effect_order.iter().position(|&id| id == effect_id) else {
+        return false;
+    };
+    let new_pos = new_position as usize;
+    if current_pos == new_pos {
+        return true;
+    }
+
+    if new_pos > current_pos {
+        // Shift left: elements (current_pos+1 ..= new_pos) move down by one.
+        for i in current_pos..new_pos {
+            engine.effect_order[i] = engine.effect_order[i + 1];
+        }
+    } else {
+        // Shift right: elements (new_pos .. current_pos) move up by one.
+        for i in (new_pos..current_pos).rev() {
+            engine.effect_order[i + 1] = engine.effect_order[i];
+        }
+    }
+    engine.effect_order[new_pos] = effect_id;
+    engine.reset_effect_states();
+    true
+}
+
+/// Read the current effect-chain order. Writes up to `max_len` IDs into
+/// `out_ids` in chain order (position 0 first). The optional limiter is pinned
+/// last when enabled and is not written.
+///
+/// Returns the number of IDs written, which equals `REORDERABLE_EFFECT_COUNT`
+/// when `max_len` is large enough, or `max_len` otherwise. Returns `0` if
+/// `engine` or `out_ids` is null.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`. `out_ids`
+/// must point to a buffer of at least `max_len` u32 values.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_effect_order(
+    engine: *const GooeyEngine,
+    out_ids: *mut u32,
+    max_len: u32,
+) -> u32 {
+    if engine.is_null() || out_ids.is_null() || max_len == 0 {
+        return 0;
+    }
+    let engine = &*engine;
+    let n = (max_len as usize).min(engine.effect_order.len());
+    let dst = std::slice::from_raw_parts_mut(out_ids, n);
+    dst.copy_from_slice(&engine.effect_order[..n]);
+    n as u32
 }
 
 // =============================================================================
@@ -4646,6 +5437,549 @@ pub unsafe extern "C" fn gooey_engine_poly_available_voicing_count(
 }
 
 // ---------------------------------------------------------------------------
+// Granulator
+// ---------------------------------------------------------------------------
+
+/// Load a mono sample buffer into the granulator.
+///
+/// Copies `len` samples from `samples` into the engine. Replaces any
+/// previously loaded buffer and kills all currently active grains.
+///
+/// The granulator is mono only. Stereo or multichannel hosts should downmix
+/// before calling this function.
+///
+/// Returns `true` on success, `false` if any argument is invalid (null engine,
+/// null `samples`, `len == 0`, non-finite or non-positive `sample_rate`, or
+/// any non-finite value in the sample slice).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`. `samples`
+/// must point to at least `len` valid `f32` values when `len > 0`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_set_buffer(
+    engine: *mut GooeyEngine,
+    samples: *const f32,
+    len: u32,
+    sample_rate: f32,
+) -> bool {
+    if engine.is_null() || samples.is_null() || len == 0 {
+        return false;
+    }
+    let engine = &mut *engine;
+    let slice = slice::from_raw_parts(samples, len as usize);
+    let owned = slice.to_vec();
+    match SampleBuffer::from_mono(owned, sample_rate) {
+        Ok(buffer) => {
+            engine.granulator.set_buffer(buffer);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+// =============================================================================
+// Loop mixer: 4 stereo loop channels with per-channel effect chains
+// =============================================================================
+//
+// These functions control the engine's `Mixer` (see `src/mixer/`). Each channel
+// is a stereo loop player with its own gain fader, mute/solo, loop window,
+// varispeed, and an ordered chain of effects. The host decodes audio files and
+// passes raw interleaved f32 frames; the engine owns playback and mixing.
+//
+// `channel` is a 0-based index in `[0, LOOP_CHANNEL_COUNT)`; out-of-range
+// indices are ignored (or return a sensible default).
+
+/// Load (or replace) a loop channel's stereo buffer from interleaved f32 frames.
+///
+/// `samples` points to `frames * channels` interleaved values. A `channels`
+/// value of 1 duplicates the mono signal to both sides; 2+ uses channels 0/1 as
+/// left/right. Loading resets the channel's playhead to its loop start.
+///
+/// Returns `true` on success, `false` on a null/short pointer, bad channel
+/// index, or invalid buffer (zero length, non-finite samples, bad sample rate).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`. `samples`
+/// must point to at least `frames * channels` readable `f32` values.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_load(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    samples: *const f32,
+    frames: u32,
+    channels: u32,
+    sample_rate: f32,
+) -> bool {
+    if engine.is_null() || samples.is_null() || frames == 0 || channels == 0 {
+        return false;
+    }
+    let engine = &mut *engine;
+    let total = frames as usize * channels as usize;
+    let slice = slice::from_raw_parts(samples, total);
+    match StereoSampleBuffer::from_interleaved(slice, channels as usize, sample_rate) {
+        Ok(buffer) => engine.mixer.load(channel as usize, buffer),
+        Err(_) => false,
+    }
+}
+
+/// Start or stop playback of a loop channel.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_playing(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    playing: bool,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_playing(channel as usize, playing);
+    }
+}
+
+/// Set a loop channel's fader gain (0.0 = silence, 1.0 = unity, up to 2.0).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_gain(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    gain: f32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_gain(channel as usize, gain);
+    }
+}
+
+/// Mute or unmute a loop channel (click-free, applied to the post-effect signal).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_mute(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    muted: bool,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_muted(channel as usize, muted);
+    }
+}
+
+/// Solo or un-solo a loop channel. While any channel is soloed, only soloed
+/// channels are audible.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_solo(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    soloed: bool,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_soloed(channel as usize, soloed);
+    }
+}
+
+/// Set a loop channel's loop start point as a normalized `[0, 1]` position in
+/// the buffer.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_start(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    normalized: f32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_loop_start(channel as usize, normalized);
+    }
+}
+
+/// Set a loop channel's loop end point as a normalized `[0, 1]` position in
+/// the buffer.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_end(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    normalized: f32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_loop_end(channel as usize, normalized);
+    }
+}
+
+/// Set a loop channel's playback speed (varispeed). 1.0 = normal, 0.5 = half
+/// speed/down an octave, negative = reverse. Clamped to `[-4, 4]`.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_speed(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    speed: f32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_speed(channel as usize, speed);
+    }
+}
+
+/// Restart a loop channel from its loop start point.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_restart(engine: *mut GooeyEngine, channel: u32) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.restart(channel as usize);
+    }
+}
+
+/// Set a loop channel's playhead to a normalized `[0, 1]` position within its
+/// loop region. Clamped into the active loop window; no-op if no buffer is loaded.
+/// Inverse of `gooey_engine_loop_get_position`. Lets a caller swap a channel's
+/// buffer and resume at the same phase instead of restarting at the loop start.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_position(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    normalized: f32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.set_position(channel as usize, normalized);
+    }
+}
+
+/// Get a loop channel's current playhead as a normalized `[0, 1]` position.
+/// Returns 0.0 for a null engine or empty/out-of-range channel.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_get_position(
+    engine: *const GooeyEngine,
+    channel: u32,
+) -> f32 {
+    match engine.as_ref() {
+        Some(engine) => engine
+            .mixer
+            .channel(channel as usize)
+            .map_or(0.0, |ch| ch.position_normalized()),
+        None => 0.0,
+    }
+}
+
+/// Append an effect (an `EFFECT_*` id) to a loop channel's chain. Returns the
+/// new effect's slot index, or -1 on failure (null engine, bad channel, or an
+/// effect id that is not a per-channel effect, e.g. the master limiter).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_effect_add(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    effect_id: u32,
+) -> i32 {
+    match engine.as_mut() {
+        Some(engine) => engine
+            .mixer
+            .effect_add(channel as usize, effect_id)
+            .map_or(-1, |slot| slot as i32),
+        None => -1,
+    }
+}
+
+/// Remove the effect at `slot` from a loop channel's chain. Returns `true` if an
+/// effect was removed.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_effect_remove(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    slot: u32,
+) -> bool {
+    match engine.as_mut() {
+        Some(engine) => engine.mixer.effect_remove(channel as usize, slot as usize),
+        None => false,
+    }
+}
+
+/// Move the effect at `slot` to `new_position` within a loop channel's chain.
+/// Returns `true` on success.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_effect_move(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    slot: u32,
+    new_position: u32,
+) -> bool {
+    match engine.as_mut() {
+        Some(engine) => {
+            engine
+                .mixer
+                .effect_move(channel as usize, slot as usize, new_position as usize)
+        }
+        None => false,
+    }
+}
+
+/// Remove all effects from a loop channel's chain.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_effect_clear(engine: *mut GooeyEngine, channel: u32) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.effect_clear(channel as usize);
+    }
+}
+
+/// Set a parameter (`*_PARAM_*` id) on the effect at `slot` of a loop channel.
+/// Parameter ids and value ranges match `gooey_engine_set_global_effect_param`.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_effect_set_param(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    slot: u32,
+    param: u32,
+    value: f32,
+) {
+    if let Some(engine) = engine.as_ref() {
+        engine
+            .mixer
+            .effect_set_param(channel as usize, slot as usize, param, value);
+    }
+}
+
+/// Return the number of effects in a loop channel's chain (0 for a null engine
+/// or out-of-range channel).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_effect_count(
+    engine: *const GooeyEngine,
+    channel: u32,
+) -> u32 {
+    match engine.as_ref() {
+        Some(engine) => engine.mixer.effect_count(channel as usize) as u32,
+        None => 0,
+    }
+}
+
+/// Return the `EFFECT_*` id of the effect at `slot` of a loop channel, or -1 if
+/// the engine is null or the channel/slot is out of range.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_effect_type_at(
+    engine: *const GooeyEngine,
+    channel: u32,
+    slot: u32,
+) -> i32 {
+    match engine.as_ref() {
+        Some(engine) => engine
+            .mixer
+            .effect_type_at(channel as usize, slot as usize)
+            .map_or(-1, |id| id as i32),
+        None => -1,
+    }
+}
+
+/// Return the length, in samples, of the granulator's currently loaded buffer.
+///
+/// Returns 0 if `engine` is null. Immediately after `gooey_engine_new`, the
+/// granulator holds a 1-sample silent placeholder, so a return value of 1
+/// (with no `set_buffer` call) indicates "no host buffer loaded yet".
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_buffer_len(engine: *const GooeyEngine) -> u32 {
+    if engine.is_null() {
+        return 0;
+    }
+    let engine = &*engine;
+    engine.granulator.buffer_len() as u32
+}
+
+/// Return the sample rate of the granulator's currently loaded buffer.
+///
+/// Returns 0.0 if `engine` is null.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_buffer_sample_rate(
+    engine: *const GooeyEngine,
+) -> f32 {
+    if engine.is_null() {
+        return 0.0;
+    }
+    let engine = &*engine;
+    engine.granulator.buffer_sample_rate()
+}
+
+/// Trigger the granulator with a velocity, starting a cloud of grains.
+///
+/// Unlike drum-channel triggers, granulator triggers are applied immediately
+/// against the engine's current time and are not deferred through an atomic
+/// pending flag. The caller is expected to invoke this from the host thread
+/// (e.g. UI / MIDI input handler), not from inside the audio render callback.
+///
+/// `velocity` is clamped to 0.0-1.0.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_trigger(engine: *mut GooeyEngine, velocity: f32) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let velocity = velocity.clamp(0.0, 1.0);
+    engine
+        .granulator
+        .trigger_with_velocity(engine.current_time, velocity);
+}
+
+/// Set a granulator parameter by index. All values are normalized 0.0-1.0.
+///
+/// Parameter indices: see the `GRANULATOR_PARAM_*` constants. Unknown indices
+/// are silently ignored, matching the pattern used by other instrument
+/// setters in this file.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_set_param(
+    engine: *mut GooeyEngine,
+    param: u32,
+    value: f32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    let value = value.clamp(0.0, 1.0);
+    match param {
+        GRANULATOR_PARAM_SCAN_POSITION => engine.granulator.set_scan_position(value),
+        GRANULATOR_PARAM_GRAIN_LENGTH => engine.granulator.set_grain_length(value),
+        GRANULATOR_PARAM_SPRAY => engine.granulator.set_spray(value),
+        GRANULATOR_PARAM_PITCH => engine.granulator.set_pitch(value),
+        GRANULATOR_PARAM_DENSITY => engine.granulator.set_density(value),
+        GRANULATOR_PARAM_TEXTURE => engine.granulator.set_texture(value),
+        GRANULATOR_PARAM_DIRECTION => engine.granulator.set_direction(value),
+        GRANULATOR_PARAM_CLOUD_DURATION => engine.granulator.set_cloud_duration(value),
+        GRANULATOR_PARAM_VOLUME => engine.granulator.set_volume(value),
+        GRANULATOR_PARAM_RANDOM_TIMING => engine.granulator.set_random_timing(value),
+        GRANULATOR_PARAM_RANDOM_AMP => engine.granulator.set_random_amp(value),
+        GRANULATOR_PARAM_DRIVE => engine.granulator.set_drive(value),
+        _ => {}
+    }
+}
+
+/// Read the most-recently-set value of a granulator parameter, in the same
+/// normalized 0.0-1.0 range used by `gooey_engine_granulator_set_param`.
+///
+/// Returns `f32::NAN` if `engine` is null or `param` is unrecognized.
+/// Reads the `SmoothedParam::target()` so callers see the value they last
+/// wrote even before the audio thread has finished smoothing into it.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_get_param(
+    engine: *const GooeyEngine,
+    param: u32,
+) -> f32 {
+    if engine.is_null() {
+        return f32::NAN;
+    }
+    let engine = &*engine;
+    match param {
+        GRANULATOR_PARAM_SCAN_POSITION => engine.granulator.scan_position(),
+        GRANULATOR_PARAM_GRAIN_LENGTH => engine.granulator.grain_length(),
+        GRANULATOR_PARAM_SPRAY => engine.granulator.spray(),
+        GRANULATOR_PARAM_PITCH => engine.granulator.pitch(),
+        GRANULATOR_PARAM_DENSITY => engine.granulator.density(),
+        GRANULATOR_PARAM_TEXTURE => engine.granulator.texture(),
+        GRANULATOR_PARAM_DIRECTION => engine.granulator.direction(),
+        GRANULATOR_PARAM_CLOUD_DURATION => engine.granulator.cloud_duration(),
+        GRANULATOR_PARAM_VOLUME => engine.granulator.volume(),
+        GRANULATOR_PARAM_RANDOM_TIMING => engine.granulator.random_timing(),
+        GRANULATOR_PARAM_RANDOM_AMP => engine.granulator.random_amp(),
+        GRANULATOR_PARAM_DRIVE => engine.granulator.drive(),
+        _ => f32::NAN,
+    }
+}
+
+/// Seed the granulator's grain-spray PRNG. Used for reproducible output in
+/// tests; callers that don't need determinism can ignore this.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_set_seed(engine: *mut GooeyEngine, seed: u32) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    engine.granulator.set_seed(seed);
+}
+
+/// Return the number of grains currently sounding inside the granulator.
+/// Returns 0 if `engine` is null. Useful for UI metering.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_active_grain_count(
+    engine: *const GooeyEngine,
+) -> u32 {
+    if engine.is_null() {
+        return 0;
+    }
+    let engine = &*engine;
+    engine.granulator.active_grain_count() as u32
+}
+
+/// Snap all granulator smoothed parameters to their target values, bypassing
+/// the usual ~15 ms exponential smoothing. Useful when loading a preset or
+/// resetting state between songs without introducing audible glides.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_granulator_snap_params(engine: *mut GooeyEngine) {
+    if engine.is_null() {
+        return;
+    }
+    let engine = &mut *engine;
+    engine.granulator.snap_params();
+}
+
+// ---------------------------------------------------------------------------
 // Offline bounce
 // ---------------------------------------------------------------------------
 
@@ -4670,6 +6004,7 @@ impl GooeyEngine {
         for gain in &mut self.instrument_channel_gains {
             gain.snap();
         }
+        self.master_gain.snap();
 
         // Render in chunks using the same path as real-time playback
         let mut output = Vec::with_capacity(total_samples);
