@@ -126,3 +126,6 @@ benches/target/
 test-results/ 
 
 .opencode/**
+
+# Generated aliasing validation plots/WAVs (examples/aliasing_plots.rs)
+/aliasing-plots/
