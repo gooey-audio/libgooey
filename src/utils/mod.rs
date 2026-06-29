@@ -3,6 +3,8 @@
 pub mod blendable;
 pub mod oversampler;
 pub mod smoother;
+#[cfg(feature = "spectral")]
+pub mod stft;
 
 pub use blendable::{Blendable, PresetBlender};
 pub use oversampler::{Oversampler, Oversampler2x, Oversampler4x, OversamplingMode};

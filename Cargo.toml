@@ -9,11 +9,12 @@ name = "gooey"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-default = ["native"]
+default = ["native", "spectral"]
 native = ["cpal"]
-ios = ["bounce"]  # iOS target - no native audio output, just the engine
+ios = ["bounce", "spectral"]  # iOS target - no native audio output, just the engine
 crossterm = ["dep:crossterm"]
-visualization = ["glfw", "gl", "rustfft"]
+spectral = ["dep:rustfft"]  # STFT-based spectral effects (e.g. SpectralResonator)
+visualization = ["glfw", "gl", "spectral"]  # pulls rustfft in via the spectral feature
 midi = ["midir"]  # MIDI input support for examples
 bounce = ["hound"]  # Offline audio bounce/export to WAV
 plots = ["rustfft", "plotters", "hound"]  # Offline aliasing spectrum/spectrogram PNGs
@@ -92,6 +93,10 @@ required-features = ["native", "crossterm"]
 [[example]]
 name = "reverb"
 required-features = ["native", "crossterm"]
+
+[[example]]
+name = "spectral"
+required-features = ["native", "crossterm", "spectral"]
 
 [[example]]
 name = "chords"

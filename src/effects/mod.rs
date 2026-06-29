@@ -5,6 +5,8 @@ pub mod limiter;
 pub mod lowpass_filter;
 pub mod reverb;
 pub mod saturation;
+#[cfg(feature = "spectral")]
+pub mod spectral_resonator;
 pub mod tilt_filter;
 pub mod waveshaper;
 
@@ -15,6 +17,8 @@ pub use self::limiter::*;
 pub use self::lowpass_filter::*;
 pub use self::reverb::*;
 pub use self::saturation::*;
+#[cfg(feature = "spectral")]
+pub use self::spectral_resonator::*;
 pub use self::tilt_filter::*;
 pub use self::waveshaper::*;
 
