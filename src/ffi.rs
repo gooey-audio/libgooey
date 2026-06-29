@@ -4,8 +4,8 @@
 //! Designed for integration with iOS (and other platforms in the future).
 
 use crate::effects::{
-    DelayEffect, DelayTiming, Effect, LowpassFilterEffect, SoftLimiter, SpringReverbEffect,
-    TiltFilterEffect, TubeCompressor, TubeSaturation,
+    DelayEffect, DelayTiming, Effect, FeedbackWaveshaper, LowpassFilterEffect, SoftLimiter,
+    SpringReverbEffect, TiltFilterEffect, TubeCompressor, TubeSaturation, Waveshaper,
 };
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
@@ -596,6 +596,10 @@ pub struct GooeyEngine {
     compressor_sidechain: u32,
     reverb: SpringReverbEffect,
     reverb_enabled: bool,
+    waveshaper: Waveshaper,
+    waveshaper_enabled: bool,
+    feedback_waveshaper: FeedbackWaveshaper,
+    feedback_waveshaper_enabled: bool,
     limiter: SoftLimiter,
     limiter_enabled: bool,
 
@@ -763,6 +767,12 @@ impl GooeyEngine {
         // Create spring reverb with default settings (decay: 0.5, mix: 0.0 = dry, damping: 0.5)
         let reverb = SpringReverbEffect::new(sample_rate, 0.5, 0.0, 0.5);
 
+        // Create waveshaper with default bypass settings (drive: 1.0, mix: 0.0)
+        let waveshaper = Waveshaper::new(1.0, 0.0);
+
+        // Create feedback waveshaper with default bypass settings
+        let feedback_waveshaper = FeedbackWaveshaper::new(sample_rate, 1.0, 0.0, 2000.0, 0.0);
+
         // Create LFO pool (8 LFOs, all disabled by default with quarter note timing)
         let lfos = std::array::from_fn(|_| Lfo::with_sample_rate(sample_rate));
         let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] = std::array::from_fn(|_| Vec::new());
@@ -792,6 +802,10 @@ impl GooeyEngine {
             compressor_sidechain: COMPRESSOR_SIDECHAIN_NONE,
             reverb,
             reverb_enabled: false,
+            waveshaper,
+            waveshaper_enabled: false,
+            feedback_waveshaper,
+            feedback_waveshaper_enabled: false,
             limiter: SoftLimiter::new(1.0),
             limiter_enabled: false,
             effect_order: DEFAULT_EFFECT_ORDER,
@@ -1135,6 +1149,18 @@ impl GooeyEngine {
                             self.compressor.process_stereo(stereo)
                         };
                     }
+                    EFFECT_WAVESHAPER if self.waveshaper_enabled => {
+                        stereo = StereoFrame {
+                            l: self.waveshaper.process(stereo.l),
+                            r: self.waveshaper.process(stereo.r),
+                        };
+                    }
+                    EFFECT_FEEDBACK_WAVESHAPER if self.feedback_waveshaper_enabled => {
+                        stereo = StereoFrame {
+                            l: self.feedback_waveshaper.process(stereo.l),
+                            r: self.feedback_waveshaper.process(stereo.r),
+                        };
+                    }
                     EFFECT_REVERB if self.reverb_enabled => {
                         stereo = self.reverb.process_stereo(stereo);
                     }
@@ -1333,21 +1359,27 @@ pub const EFFECT_LIMITER: u32 = 5;
 pub const LIMITER_PARAM_THRESHOLD: u32 = 0;
 /// Global effect: Spring reverb
 pub const EFFECT_REVERB: u32 = 6;
+/// Global effect: Waveshaper (tanh soft-clip distortion)
+pub const EFFECT_WAVESHAPER: u32 = 7;
+/// Global effect: Feedback waveshaper (self-exciting distortion)
+pub const EFFECT_FEEDBACK_WAVESHAPER: u32 = 8;
 /// Total number of global effects
-pub const EFFECT_COUNT: u32 = 7;
+pub const EFFECT_COUNT: u32 = 9;
 
 /// Number of reorderable effects in the chain. Excludes the optional limiter,
 /// which is pinned at the end of the chain when enabled.
-pub const REORDERABLE_EFFECT_COUNT: u32 = 6;
+pub const REORDERABLE_EFFECT_COUNT: u32 = 8;
 
 /// Default order for the reorderable effects, matching the historical
 /// hardcoded chain (saturation -> lowpass -> tilt -> delay -> compressor -> reverb).
 const DEFAULT_EFFECT_ORDER: [u32; REORDERABLE_EFFECT_COUNT as usize] = [
+    EFFECT_WAVESHAPER,
     EFFECT_SATURATION,
     EFFECT_LOWPASS_FILTER,
     EFFECT_TILT_FILTER,
     EFFECT_DELAY,
     EFFECT_COMPRESSOR,
+    EFFECT_FEEDBACK_WAVESHAPER,
     EFFECT_REVERB,
 ];
 
@@ -1447,6 +1479,28 @@ pub const REVERB_PARAM_DECAY: u32 = 0;
 pub const REVERB_PARAM_MIX: u32 = 1;
 /// Reverb parameter: high-frequency damping (0.0-1.0)
 pub const REVERB_PARAM_DAMPING: u32 = 2;
+
+// =============================================================================
+// Waveshaper parameter indices
+// =============================================================================
+
+/// Waveshaper parameter: drive amount (1.0-10.0)
+pub const WAVESHAPER_PARAM_DRIVE: u32 = 0;
+/// Waveshaper parameter: dry/wet mix (0.0-1.0)
+pub const WAVESHAPER_PARAM_MIX: u32 = 1;
+
+// =============================================================================
+// Feedback waveshaper parameter indices
+// =============================================================================
+
+/// Feedback waveshaper parameter: drive amount (1.0-100.0)
+pub const FEEDBACK_WAVESHAPER_PARAM_DRIVE: u32 = 0;
+/// Feedback waveshaper parameter: feedback gain (0.0-0.98)
+pub const FEEDBACK_WAVESHAPER_PARAM_FEEDBACK: u32 = 1;
+/// Feedback waveshaper parameter: feedback lowpass cutoff (200-20000 Hz)
+pub const FEEDBACK_WAVESHAPER_PARAM_FILTER_CUTOFF: u32 = 2;
+/// Feedback waveshaper parameter: dry/wet mix (0.0-1.0)
+pub const FEEDBACK_WAVESHAPER_PARAM_MIX: u32 = 3;
 
 // =============================================================================
 // Kick drum parameter indices (must match Swift KickParam enum)
@@ -2738,6 +2792,20 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
             TILT_PARAM_CUTOFF => engine.tilt_filter.set_cutoff(value),
             TILT_PARAM_RESONANCE => engine.tilt_filter.set_resonance(value),
             _ => {} // Unknown parameter, ignore
+        },
+        EFFECT_WAVESHAPER => match param {
+            WAVESHAPER_PARAM_DRIVE => engine.waveshaper.set_drive(value),
+            WAVESHAPER_PARAM_MIX => engine.waveshaper.set_mix(value),
+            _ => {}
+        },
+        EFFECT_FEEDBACK_WAVESHAPER => match param {
+            FEEDBACK_WAVESHAPER_PARAM_DRIVE => engine.feedback_waveshaper.set_drive(value),
+            FEEDBACK_WAVESHAPER_PARAM_FEEDBACK => engine.feedback_waveshaper.set_feedback(value),
+            FEEDBACK_WAVESHAPER_PARAM_FILTER_CUTOFF => {
+                engine.feedback_waveshaper.set_filter_cutoff(value)
+            }
+            FEEDBACK_WAVESHAPER_PARAM_MIX => engine.feedback_waveshaper.set_mix(value),
+            _ => {}
         },
         EFFECT_REVERB => match param {
             REVERB_PARAM_DECAY => engine.reverb.set_decay(value),
