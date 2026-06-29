@@ -707,6 +707,10 @@ pub struct GooeyEngine {
     // Acts as a mixer fader that the blend system cannot override.
     instrument_channel_gains: [SmoothedParam; NUM_INSTRUMENTS],
 
+    // Per-channel stereo pan (0.0 = left, 0.5 = center, 1.0 = right), applied
+    // at the stereo seam with an equal-power law. Smoothed for click-free moves.
+    instrument_pans: [SmoothedParam; NUM_INSTRUMENTS],
+
     // Per-channel preset blend state (2D X/Y pad interpolation)
     blenders: [ChannelBlender; NUM_INSTRUMENTS],
     blend_enabled: [bool; INSTRUMENT_COUNT as usize],
@@ -891,6 +895,10 @@ impl GooeyEngine {
             // Per-instrument channel gains (default 1.0 = unity, 10ms smoothing)
             instrument_channel_gains: std::array::from_fn(|_| {
                 SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0)
+            }),
+            // Per-instrument stereo pan (default 0.5 = center, 10ms smoothing)
+            instrument_pans: std::array::from_fn(|_| {
+                SmoothedParam::new(0.5, 0.0, 1.0, sample_rate, 10.0)
             }),
             // Preset blend state
             blenders,
@@ -1138,17 +1146,26 @@ impl GooeyEngine {
                 }
             }
 
-            // Generate audio from each channel with gains and mute/solo
+            // Generate audio from each channel with gains and mute/solo, then
+            // spread it across the stereo field via the per-channel pan.
+            // Stereo seam: each instrument's mono output is panned (equal-power,
+            // default center) and summed here — BEFORE the effects chain — so
+            // each effect can process true left/right. Effects are stereo-aware
+            // (per-channel state); with every channel centered and no stereo
+            // effect engaged the two channels stay identical.
             let mut channel_outs = [0.0_f32; NUM_INSTRUMENTS];
-            let mut output = 0.0;
+            let mut stereo_pre = StereoFrame::default();
             for ch in 0..NUM_INSTRUMENTS {
                 let ch_out = self.channels[ch].tick(self.current_time)
                     * self.instrument_channel_gains[ch].tick()
                     * self.instrument_gains[ch].tick();
                 channel_outs[ch] = ch_out;
-                output += ch_out;
 
-                // Track per-channel peak for UI metering
+                let panned = StereoFrame::panned(ch_out, self.instrument_pans[ch].tick());
+                stereo_pre.l += panned.l;
+                stereo_pre.r += panned.r;
+
+                // Track per-channel peak for UI metering (pre-pan mono level)
                 let abs_out = ch_out.abs();
                 let prev_peak = f32::from_bits(self.channel_peaks[ch].load(Ordering::Relaxed));
                 if abs_out > prev_peak {
@@ -1156,15 +1173,15 @@ impl GooeyEngine {
                 }
             }
 
-            // Mix in granulator output
-            output += self.granulator.tick(self.current_time);
+            // Granulator has no pan control yet — place it at center for
+            // consistency with the equal-power law used above. (The poly synth
+            // is a regular channel now, already summed and panned in the loop.)
+            let center = StereoFrame::panned(self.granulator.tick(self.current_time), 0.5);
+            stereo_pre.l += center.l;
+            stereo_pre.r += center.r;
 
-            // Stereo seam: the instrument sum is mono, so place it on both
-            // channels here — BEFORE the effects chain — so each effect can
-            // process true left/right. Effects are stereo-aware (per-channel
-            // state); for mono content with no stereo effect engaged the two
-            // channels stay identical.
-            let mut stereo = StereoFrame::mono(output);
+            // Panned instrument sum is the pre-master mix.
+            let mut stereo = stereo_pre;
 
             // Sum the loop mixer (already stereo, with its own per-channel
             // effects) into the master bus.
@@ -4865,6 +4882,51 @@ pub unsafe extern "C" fn gooey_engine_get_instrument_gain(
     (*engine).instrument_channel_gains[instrument as usize].target()
 }
 
+/// Set the stereo pan for an instrument.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+/// * `pan` - Pan position, clamped to 0.0 (hard left) – 0.5 (center) – 1.0
+///   (hard right). Uses an equal-power law.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_instrument_pan(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    pan: f32,
+) {
+    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+        return;
+    }
+    let pan = pan.clamp(0.0, 1.0);
+    (*engine).instrument_pans[instrument as usize].set_target(pan);
+}
+
+/// Get the stereo pan for an instrument
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `instrument` - Instrument ID (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+///
+/// # Returns
+/// The current pan target (0.0–1.0), or 0.5 (center) if invalid instrument
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_instrument_pan(
+    engine: *const GooeyEngine,
+    instrument: u32,
+) -> f32 {
+    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+        return 0.5;
+    }
+    (*engine).instrument_pans[instrument as usize].target()
+}
+
 // =============================================================================
 // Preset blend (2D X/Y pad interpolation)
 // =============================================================================
@@ -6004,23 +6066,32 @@ impl GooeyEngine {
         for gain in &mut self.instrument_channel_gains {
             gain.snap();
         }
+        for pan in &mut self.instrument_pans {
+            pan.snap();
+        }
         self.master_gain.snap();
 
-        // Render in chunks using the same path as real-time playback
+        // Render in chunks using the same path as real-time playback. `render`
+        // writes interleaved stereo (`[l, r]` per frame), so each frame is
+        // downmixed to a single mono sample for this mono bounce buffer —
+        // otherwise a panned channel (e.g. hard-left `[l, 0]`) would be written
+        // as alternating samples and zeros.
         let mut output = Vec::with_capacity(total_samples);
-        let chunk_size = 512;
-        let mut chunk_buf = vec![0.0_f32; chunk_size];
+        let frames_per_chunk = 512;
+        let mut chunk_buf = vec![0.0_f32; frames_per_chunk * 2];
 
         let mut remaining = total_samples;
         while remaining > 0 {
-            let n = remaining.min(chunk_size);
-            let slice = &mut chunk_buf[..n];
+            let frames = remaining.min(frames_per_chunk);
+            let slice = &mut chunk_buf[..frames * 2];
             for s in slice.iter_mut() {
                 *s = 0.0;
             }
             self.render(slice);
-            output.extend_from_slice(slice);
-            remaining -= n;
+            for frame in slice.chunks_exact(2) {
+                output.push(0.5 * (frame[0] + frame[1]));
+            }
+            remaining -= frames;
         }
 
         for seq in &mut self.sequencers {
