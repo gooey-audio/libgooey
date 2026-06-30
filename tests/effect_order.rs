@@ -20,11 +20,13 @@ fn default_order_matches_legacy_chain() {
         assert_eq!(
             order,
             [
+                EFFECT_WAVESHAPER,
                 EFFECT_SATURATION,
                 EFFECT_LOWPASS_FILTER,
                 EFFECT_TILT_FILTER,
                 EFFECT_DELAY,
                 EFFECT_COMPRESSOR,
+                EFFECT_FEEDBACK_WAVESHAPER,
                 EFFECT_REVERB,
             ]
         );
@@ -34,8 +36,8 @@ fn default_order_matches_legacy_chain() {
 }
 
 #[test]
-fn reorderable_count_is_six() {
-    assert_eq!(gooey_engine_reorderable_effect_count(), 6);
+fn reorderable_count_is_eight() {
+    assert_eq!(gooey_engine_reorderable_effect_count(), 8);
 }
 
 #[test]
@@ -50,6 +52,8 @@ fn bulk_set_then_get_round_trips() {
             EFFECT_SATURATION,
             EFFECT_TILT_FILTER,
             EFFECT_LOWPASS_FILTER,
+            EFFECT_WAVESHAPER,
+            EFFECT_FEEDBACK_WAVESHAPER,
         ];
         let ok = gooey_engine_set_effect_order(engine, new_order.as_ptr(), N as u32);
         assert!(ok);
@@ -64,18 +68,20 @@ fn move_effect_to_front_shifts_others_right() {
     unsafe {
         let engine = gooey_engine_new(44100.0);
 
-        // Move REVERB (last) to position 0; others should shift right preserving order.
+        // Move REVERB (last reorderable) to position 0; others should shift right preserving order.
         let ok = gooey_engine_move_effect(engine, EFFECT_REVERB, 0);
         assert!(ok);
         assert_eq!(
             read_order(engine),
             [
                 EFFECT_REVERB,
+                EFFECT_WAVESHAPER,
                 EFFECT_SATURATION,
                 EFFECT_LOWPASS_FILTER,
                 EFFECT_TILT_FILTER,
                 EFFECT_DELAY,
                 EFFECT_COMPRESSOR,
+                EFFECT_FEEDBACK_WAVESHAPER,
             ]
         );
 
@@ -88,16 +94,18 @@ fn move_effect_to_back_shifts_others_left() {
     unsafe {
         let engine = gooey_engine_new(44100.0);
 
-        // Move SATURATION (first) to last reorderable position.
+        // Move SATURATION (second, index 1) to last reorderable position.
         let ok = gooey_engine_move_effect(engine, EFFECT_SATURATION, N as u32 - 1);
         assert!(ok);
         assert_eq!(
             read_order(engine),
             [
+                EFFECT_WAVESHAPER,
                 EFFECT_LOWPASS_FILTER,
                 EFFECT_TILT_FILTER,
                 EFFECT_DELAY,
                 EFFECT_COMPRESSOR,
+                EFFECT_FEEDBACK_WAVESHAPER,
                 EFFECT_REVERB,
                 EFFECT_SATURATION,
             ]
@@ -113,7 +121,7 @@ fn move_effect_to_same_position_is_noop() {
         let engine = gooey_engine_new(44100.0);
         let before = read_order(engine);
 
-        let ok = gooey_engine_move_effect(engine, EFFECT_DELAY, 3);
+        let ok = gooey_engine_move_effect(engine, EFFECT_DELAY, 4);
         assert!(ok);
         assert_eq!(read_order(engine), before);
 
@@ -129,11 +137,13 @@ fn limiter_cannot_be_set_in_order() {
 
         // Replace REVERB with LIMITER — must be rejected.
         let bad = [
+            EFFECT_WAVESHAPER,
             EFFECT_SATURATION,
             EFFECT_LOWPASS_FILTER,
             EFFECT_TILT_FILTER,
             EFFECT_DELAY,
             EFFECT_COMPRESSOR,
+            EFFECT_FEEDBACK_WAVESHAPER,
             EFFECT_LIMITER,
         ];
         let ok = gooey_engine_set_effect_order(engine, bad.as_ptr(), N as u32);
@@ -169,8 +179,10 @@ fn duplicate_ids_rejected() {
         let before = read_order(engine);
 
         let bad = [
+            EFFECT_WAVESHAPER,
+            EFFECT_WAVESHAPER,
             EFFECT_SATURATION,
-            EFFECT_SATURATION,
+            EFFECT_LOWPASS_FILTER,
             EFFECT_TILT_FILTER,
             EFFECT_DELAY,
             EFFECT_COMPRESSOR,
@@ -206,11 +218,13 @@ fn unknown_id_rejected() {
         let before = read_order(engine);
 
         let bad = [
+            EFFECT_WAVESHAPER,
             EFFECT_SATURATION,
             EFFECT_LOWPASS_FILTER,
             EFFECT_TILT_FILTER,
             EFFECT_DELAY,
             EFFECT_COMPRESSOR,
+            EFFECT_FEEDBACK_WAVESHAPER,
             999, // not a real effect
         ];
         let ok = gooey_engine_set_effect_order(engine, bad.as_ptr(), N as u32);
@@ -260,19 +274,23 @@ fn reordering_changes_audio_output() {
     }
 
     let order_a = [
+        EFFECT_WAVESHAPER,
         EFFECT_SATURATION,
         EFFECT_DELAY,
         EFFECT_LOWPASS_FILTER,
         EFFECT_TILT_FILTER,
         EFFECT_COMPRESSOR,
+        EFFECT_FEEDBACK_WAVESHAPER,
         EFFECT_REVERB,
     ];
     let order_b = [
+        EFFECT_WAVESHAPER,
         EFFECT_DELAY,
         EFFECT_SATURATION,
         EFFECT_LOWPASS_FILTER,
         EFFECT_TILT_FILTER,
         EFFECT_COMPRESSOR,
+        EFFECT_FEEDBACK_WAVESHAPER,
         EFFECT_REVERB,
     ];
 
