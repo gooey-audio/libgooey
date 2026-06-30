@@ -8,19 +8,24 @@
 //! `*_PARAM_*` constants and per-effect setters already exported by the FFI.
 
 use crate::effects::{
-    DelayEffect, DelayTiming, Effect, LowpassFilterEffect, SpringReverbEffect, TiltFilterEffect,
-    TubeCompressor, TubeSaturation,
+    DelayEffect, DelayTiming, Effect, FeedbackWaveshaper, LowpassFilterEffect,
+    SpringReverbEffect, TiltFilterEffect, TubeCompressor, TubeSaturation, Waveshaper,
 };
 use crate::ffi::{
     COMPRESSOR_PARAM_ATTACK, COMPRESSOR_PARAM_MIX, COMPRESSOR_PARAM_RATIO,
     COMPRESSOR_PARAM_RELEASE, COMPRESSOR_PARAM_THRESHOLD, DELAY_PARAM_FEEDBACK,
     DELAY_PARAM_FILTER_CUTOFF, DELAY_PARAM_MIX, DELAY_PARAM_PINGPONG, DELAY_PARAM_TIMING,
-    EFFECT_COMPRESSOR, EFFECT_DELAY, EFFECT_LOWPASS_FILTER, EFFECT_REVERB, EFFECT_SATURATION,
-    EFFECT_TILT_FILTER, FILTER_PARAM_CUTOFF, FILTER_PARAM_RESONANCE, REVERB_PARAM_DAMPING,
+    EFFECT_COMPRESSOR, EFFECT_DELAY, EFFECT_FEEDBACK_WAVESHAPER, EFFECT_LOWPASS_FILTER,
+    EFFECT_REVERB, EFFECT_SATURATION, EFFECT_TILT_FILTER, EFFECT_WAVESHAPER,
+    FEEDBACK_WAVESHAPER_PARAM_DRIVE, FEEDBACK_WAVESHAPER_PARAM_FEEDBACK,
+    FEEDBACK_WAVESHAPER_PARAM_FILTER_CUTOFF, FEEDBACK_WAVESHAPER_PARAM_MIX,
+    FILTER_PARAM_CUTOFF, FILTER_PARAM_RESONANCE, REVERB_PARAM_DAMPING,
     REVERB_PARAM_DECAY, REVERB_PARAM_MIX, SATURATION_PARAM_DRIVE, SATURATION_PARAM_MIX,
     SATURATION_PARAM_WARMTH, TILT_PARAM_CUTOFF, TILT_PARAM_RESONANCE,
+    WAVESHAPER_PARAM_DRIVE, WAVESHAPER_PARAM_MIX,
 };
 use crate::frame::StereoFrame;
+use std::cell::UnsafeCell;
 
 /// A single effect on a loop channel. The variants intentionally match the
 /// reorderable `EFFECT_*` ids used everywhere else in the engine.
@@ -38,6 +43,8 @@ pub enum ChannelEffect {
     Compressor(TubeCompressor),
     Tilt(TiltFilterEffect),
     Reverb(SpringReverbEffect),
+    Waveshaper(UnsafeCell<[Waveshaper; 2]>),
+    FeedbackWaveshaper(UnsafeCell<[FeedbackWaveshaper; 2]>),
 }
 
 impl ChannelEffect {
@@ -81,6 +88,14 @@ impl ChannelEffect {
                 0.3,
                 0.5,
             ))),
+            EFFECT_WAVESHAPER => Some(Self::Waveshaper(UnsafeCell::new([
+                Waveshaper::new(1.0, 0.0),
+                Waveshaper::new(1.0, 0.0),
+            ]))),
+            EFFECT_FEEDBACK_WAVESHAPER => Some(Self::FeedbackWaveshaper(UnsafeCell::new([
+                FeedbackWaveshaper::new(sample_rate, 1.0, 0.0, 2000.0, 0.0),
+                FeedbackWaveshaper::new(sample_rate, 1.0, 0.0, 2000.0, 0.0),
+            ]))),
             _ => None,
         }
     }
@@ -94,6 +109,8 @@ impl ChannelEffect {
             Self::Compressor(_) => EFFECT_COMPRESSOR,
             Self::Tilt(_) => EFFECT_TILT_FILTER,
             Self::Reverb(_) => EFFECT_REVERB,
+            Self::Waveshaper(_) => EFFECT_WAVESHAPER,
+            Self::FeedbackWaveshaper(_) => EFFECT_FEEDBACK_WAVESHAPER,
         }
     }
 
@@ -107,6 +124,20 @@ impl ChannelEffect {
             Self::Compressor(e) => e.process_stereo(input),
             Self::Tilt(e) => e.process_stereo(input),
             Self::Reverb(e) => e.process_stereo(input),
+            Self::Waveshaper(ws) => {
+                let ws = unsafe { &mut *ws.get() };
+                StereoFrame {
+                    l: ws[0].process(input.l),
+                    r: ws[1].process(input.r),
+                }
+            }
+            Self::FeedbackWaveshaper(fb) => {
+                let fb = unsafe { &mut *fb.get() };
+                StereoFrame {
+                    l: fb[0].process(input.l),
+                    r: fb[1].process(input.r),
+                }
+            }
         }
     }
 
@@ -150,6 +181,43 @@ impl ChannelEffect {
                 TILT_PARAM_RESONANCE => e.set_resonance(value),
                 _ => {}
             },
+            Self::Waveshaper(ws) => {
+                let ws = unsafe { &mut *ws.get() };
+                // Apply param to both channels
+                match param {
+                    WAVESHAPER_PARAM_DRIVE => {
+                        ws[0].set_drive(value);
+                        ws[1].set_drive(value);
+                    }
+                    WAVESHAPER_PARAM_MIX => {
+                        ws[0].set_mix(value);
+                        ws[1].set_mix(value);
+                    }
+                    _ => {}
+                }
+            }
+            Self::FeedbackWaveshaper(fb) => {
+                let fb = unsafe { &mut *fb.get() };
+                match param {
+                    FEEDBACK_WAVESHAPER_PARAM_DRIVE => {
+                        fb[0].set_drive(value);
+                        fb[1].set_drive(value);
+                    }
+                    FEEDBACK_WAVESHAPER_PARAM_FEEDBACK => {
+                        fb[0].set_feedback(value);
+                        fb[1].set_feedback(value);
+                    }
+                    FEEDBACK_WAVESHAPER_PARAM_FILTER_CUTOFF => {
+                        fb[0].set_filter_cutoff(value);
+                        fb[1].set_filter_cutoff(value);
+                    }
+                    FEEDBACK_WAVESHAPER_PARAM_MIX => {
+                        fb[0].set_mix(value);
+                        fb[1].set_mix(value);
+                    }
+                    _ => {}
+                }
+            }
             Self::Reverb(e) => match param {
                 REVERB_PARAM_DECAY => e.set_decay(value),
                 REVERB_PARAM_MIX => e.set_mix(value),
@@ -176,6 +244,16 @@ impl ChannelEffect {
             Self::Compressor(e) => e.reset(),
             Self::Tilt(e) => e.reset(),
             Self::Reverb(e) => e.reset(),
+            Self::Waveshaper(ws) => {
+                let ws = unsafe { &mut *ws.get() };
+                ws[0].reset();
+                ws[1].reset();
+            }
+            Self::FeedbackWaveshaper(fb) => {
+                let fb = unsafe { &mut *fb.get() };
+                fb[0].reset();
+                fb[1].reset();
+            }
         }
     }
 }
