@@ -194,8 +194,15 @@ impl TubeCompressor {
             OversamplingMode::from_u8(self.oversampling_mode_target.load(Ordering::Relaxed));
         state.oversampler.set_mode(oversampling_mode);
 
+        // Always feed the oversampler so its half-band filter history stays in
+        // sync with the signal, even when coloring is bypassed. This avoids
+        // stale-state clicks when material drops out of and re-enters
+        // compression.
+        let colored_oversampled = state
+            .oversampler
+            .process(compressed, |x| x.atan() * FRAC_2_PI * 1.1);
         let colored = if state.gain_smoothed < 0.99 {
-            state.oversampler.process(compressed, |x| x.atan() * FRAC_2_PI * 1.1)
+            colored_oversampled
         } else {
             compressed
         };
