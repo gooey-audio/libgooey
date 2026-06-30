@@ -4110,11 +4110,13 @@ pub extern "C" fn gooey_engine_reorderable_effect_count() -> u32 {
 fn is_reorderable_effect(id: u32) -> bool {
     matches!(
         id,
-        EFFECT_LOWPASS_FILTER
+        EFFECT_WAVESHAPER
+            | EFFECT_LOWPASS_FILTER
             | EFFECT_DELAY
             | EFFECT_SATURATION
             | EFFECT_COMPRESSOR
             | EFFECT_TILT_FILTER
+            | EFFECT_FEEDBACK_WAVESHAPER
             | EFFECT_REVERB
     )
 }
