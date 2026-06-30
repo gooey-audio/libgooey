@@ -1,9 +1,10 @@
 use crate::effects::Effect;
 use crate::frame::StereoFrame;
+use crate::utils::oversampler::{Oversampler, OversamplingMode};
 use crate::utils::smoother::SmoothedParam;
 use std::cell::UnsafeCell;
 use std::f32::consts::FRAC_2_PI;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 const DENORMAL_THRESHOLD: f32 = 1e-15;
 const DC_BLOCKER_COEFF: f32 = 0.995;
@@ -28,6 +29,9 @@ struct CompressorState {
     dc_y1: f32,
 
     sample_rate: f32,
+
+    // Selectable oversampler to reduce aliasing from the nonlinear tube-coloring path
+    oversampler: Oversampler,
 }
 
 pub struct TubeCompressor {
@@ -41,6 +45,7 @@ pub struct TubeCompressor {
     attack_target: AtomicU32,
     release_target: AtomicU32,
     mix_target: AtomicU32,
+    oversampling_mode_target: AtomicU8,
 }
 
 // SAFETY: UnsafeCell only accessed from single audio thread
@@ -73,6 +78,7 @@ impl TubeCompressor {
             dc_x1: 0.0,
             dc_y1: 0.0,
             sample_rate,
+            oversampler: Oversampler::default(),
         };
 
         Self {
@@ -82,6 +88,7 @@ impl TubeCompressor {
             attack_target: AtomicU32::new(attack_ms.to_bits()),
             release_target: AtomicU32::new(release_ms.to_bits()),
             mix_target: AtomicU32::new(mix.to_bits()),
+            oversampling_mode_target: AtomicU8::new(OversamplingMode::X4 as u8),
         }
     }
 
@@ -181,9 +188,21 @@ impl TubeCompressor {
         // Apply gain reduction
         let compressed = input * state.gain_smoothed;
 
-        // Subtle tube coloring when compressing (atan soft-clip)
+        // Subtle tube coloring when compressing (atan soft-clip), oversampled
+        // to suppress aliasing from the nonlinear mapping.
+        let oversampling_mode =
+            OversamplingMode::from_u8(self.oversampling_mode_target.load(Ordering::Relaxed));
+        state.oversampler.set_mode(oversampling_mode);
+
+        // Always feed the oversampler so its half-band filter history stays in
+        // sync with the signal, even when coloring is bypassed. This avoids
+        // stale-state clicks when material drops out of and re-enters
+        // compression.
+        let colored_oversampled = state
+            .oversampler
+            .process(compressed, |x| x.atan() * FRAC_2_PI * 1.1);
         let colored = if state.gain_smoothed < 0.99 {
-            compressed.atan() * FRAC_2_PI * 1.1
+            colored_oversampled
         } else {
             compressed
         };
@@ -281,6 +300,17 @@ impl TubeCompressor {
         f32::from_bits(self.mix_target.load(Ordering::Relaxed))
     }
 
+    /// Set the oversampling rate for the tube-coloring nonlinear path.
+    pub fn set_oversampling_mode(&self, mode: OversamplingMode) {
+        self.oversampling_mode_target
+            .store(mode as u8, Ordering::Relaxed);
+    }
+
+    /// Get the current oversampling mode.
+    pub fn oversampling_mode(&self) -> OversamplingMode {
+        OversamplingMode::from_u8(self.oversampling_mode_target.load(Ordering::Relaxed))
+    }
+
     pub fn reset(&self) {
         let states = unsafe { &mut *self.state.get() };
         for state in states.iter_mut() {
@@ -288,6 +318,7 @@ impl TubeCompressor {
             state.gain_smoothed = 1.0;
             state.dc_x1 = 0.0;
             state.dc_y1 = 0.0;
+            state.oversampler.reset();
         }
     }
 }
@@ -422,5 +453,109 @@ mod tests {
         assert!((comp.get_attack() - 10.0).abs() < 0.001);
         assert!((comp.get_release() - 200.0).abs() < 0.001);
         assert!((comp.get_mix() - 0.7).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_compressor_oversampling_defaults_to_4x() {
+        let comp = TubeCompressor::new(44100.0, -12.0, 4.0, 5.0, 100.0, 1.0);
+        assert_eq!(comp.oversampling_mode(), OversamplingMode::X4);
+    }
+
+    #[test]
+    fn test_compressor_oversampling_setter() {
+        let comp = TubeCompressor::new(44100.0, -12.0, 4.0, 5.0, 100.0, 1.0);
+        comp.set_oversampling_mode(OversamplingMode::Off);
+        assert_eq!(comp.oversampling_mode(), OversamplingMode::Off);
+        comp.set_oversampling_mode(OversamplingMode::X2);
+        assert_eq!(comp.oversampling_mode(), OversamplingMode::X2);
+        comp.set_oversampling_mode(OversamplingMode::X4);
+        assert_eq!(comp.oversampling_mode(), OversamplingMode::X4);
+    }
+
+    #[test]
+    fn test_compressor_oversampling_reset_matches_fresh() {
+        let reset = TubeCompressor::new(44100.0, -20.0, 10.0, 0.1, 50.0, 1.0);
+        // Build envelope and oversampler state with a strong signal
+        for i in 0..2000 {
+            let s = (i as f32 * 0.3).sin() * 0.9;
+            reset.process(s);
+        }
+        reset.reset();
+
+        let fresh = TubeCompressor::new(44100.0, -20.0, 10.0, 0.1, 50.0, 1.0);
+        for i in 0..100 {
+            let input = (i as f32 * 0.27).sin() * 0.9;
+            assert_eq!(
+                reset.process(input),
+                fresh.process(input),
+                "mismatch at sample {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compressor_oversampling_reduces_aliasing() {
+        // Compare alias power with oversampling off vs on.
+        // Use aggressive settings to engage the tube-coloring atan path.
+        let sr = 44100.0;
+        let test_freq = 8_000.0;
+        let test_samples = 4800;
+        let warmup = 1024;
+
+        fn render_compressor(
+            comp: &TubeCompressor,
+            test_freq: f32,
+            sr: f32,
+            warmup: usize,
+            samples: usize,
+        ) -> Vec<f32> {
+            (0..warmup + samples)
+                .filter_map(|i| {
+                    let input = (std::f32::consts::TAU * test_freq * i as f32 / sr).sin() * 0.9;
+                    let output = comp.process(input);
+                    (i >= warmup).then_some(output)
+                })
+                .collect()
+        }
+
+        fn alias_power(samples: &[f32], sr: f32, _freq: f32, alias_freqs: &[f32]) -> f64 {
+            alias_freqs
+                .iter()
+                .map(|&af| {
+                    let phase_step = std::f64::consts::TAU * af as f64 / sr as f64;
+                    let (real, imag) = samples.iter().enumerate().fold(
+                        (0.0_f64, 0.0_f64),
+                        |(real, imag), (i, &x)| {
+                            let phase = phase_step * i as f64;
+                            (real + x as f64 * phase.cos(), imag - x as f64 * phase.sin())
+                        },
+                    );
+                    real * real + imag * imag
+                })
+                .sum()
+        }
+
+        // Compressor with oversampling off
+        let comp_off = TubeCompressor::new(sr, -30.0, 20.0, 1.0, 200.0, 1.0);
+        comp_off.set_oversampling_mode(OversamplingMode::Off);
+        let off_samples = render_compressor(&comp_off, test_freq, sr, warmup, test_samples);
+
+        // Compressor with oversampling on (4x)
+        let comp_on = TubeCompressor::new(sr, -30.0, 20.0, 1.0, 200.0, 1.0);
+        let on_samples = render_compressor(&comp_on, test_freq, sr, warmup, test_samples);
+
+        // Aliases of an 8 kHz tone appear at harmonics folded back below Nyquist
+        let alias_frequencies: [f32; 4] = [2_000.0, 14_000.0, 18_000.0, 22_000.0];
+        let off_power = alias_power(&off_samples, sr, test_freq, &alias_frequencies);
+        let on_power = alias_power(&on_samples, sr, test_freq, &alias_frequencies);
+
+        let reduction_db = 10.0 * (off_power / on_power.max(1e-20)).log10();
+        // The compressor's tube-coloring is a subtle nonlinearity, so the alias
+        // reduction is modest compared to heavy waveshaping. The key check is that
+        // oversampling reduces alias power at all (positive dB).
+        assert!(
+            reduction_db > 0.0,
+            "expected positive alias reduction with 4x oversampling, measured {reduction_db:.2} dB"
+        );
     }
 }
