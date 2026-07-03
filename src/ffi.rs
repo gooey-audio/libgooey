@@ -5762,6 +5762,84 @@ pub unsafe extern "C" fn gooey_engine_loop_set_position(
     }
 }
 
+/// Stage a buffer to atomically replace this channel's loop at the next bar-grid
+/// boundary. `divisions` splits the loop region into equal segments (pass the
+/// loop's bar count for bar-quantized swaps; 1 for whole-phrase). When the playing
+/// cursor next crosses a segment boundary, the queued buffer becomes active and its
+/// playhead resets to the loop start (restart from the top on the downbeat).
+/// Replaces any previously-queued buffer on the channel. Returns false on a null
+/// engine, bad channel, or empty buffer. Samples are interleaved, `channels` deep.
+///
+/// `source_bpm` tags the *pending* take so its tempo warp is correct the instant the
+/// swap lands (mirrors [`gooey_engine_loop_set_source_bpm`], which only tags the
+/// currently active buffer). Pass `0.0` (or negative) to leave it untagged, in which
+/// case a warping channel plays the swapped-in loop at its original tempo.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`; `samples` must
+/// point to at least `frames * channels` floats.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_queue_swap(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    samples: *const f32,
+    frames: u32,
+    channels: u32,
+    sample_rate: f32,
+    source_bpm: f32,
+    divisions: u32,
+) -> bool {
+    if engine.is_null() || samples.is_null() || frames == 0 || channels == 0 {
+        return false;
+    }
+    let engine = &mut *engine;
+    let total = frames as usize * channels as usize;
+    let slice = slice::from_raw_parts(samples, total);
+    match StereoSampleBuffer::from_interleaved(slice, channels as usize, sample_rate) {
+        Ok(mut buffer) => {
+            // Tag the pending take so `warp_ratio()` is correct the moment it lands,
+            // rather than falling back to 1.0 until the host retags post-swap.
+            // `set_source_bpm` filters non-finite/<= 0, so 0.0 means "untagged".
+            buffer.set_source_bpm((source_bpm > 0.0).then_some(source_bpm));
+            engine.mixer.queue_swap(channel as usize, buffer, divisions)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Drop a pending queued swap on a loop channel (Cancel / re-select the playing
+/// take / transport stop). No-op if nothing is queued.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_cancel_queued_swap(
+    engine: *mut GooeyEngine,
+    channel: u32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.cancel_queued_swap(channel as usize);
+    }
+}
+
+/// Count of queued swaps that have completed on this channel since engine creation.
+/// The host samples this when it queues and watches it increment to learn the swap
+/// landed (drives the UI's "queued -> playing" flip). Returns 0 for a null engine
+/// or out-of-range channel.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_swaps_completed(
+    engine: *const GooeyEngine,
+    channel: u32,
+) -> u32 {
+    match engine.as_ref() {
+        Some(engine) => engine.mixer.swaps_completed(channel as usize),
+        None => 0,
+    }
+}
+
 /// Get a loop channel's current playhead as a normalized `[0, 1]` position.
 /// Returns 0.0 for a null engine or empty/out-of-range channel.
 ///

@@ -7,6 +7,9 @@
 //! is the hook for the future tempo-warp phase — warping simply multiplies the
 //! advance by `engine_bpm / source_bpm` (see the plan's "Tempo warping" phase).
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
+
 use crate::frame::StereoFrame;
 use crate::mixer::effect_chain::EffectChain;
 use crate::mixer::stereo_buffer::StereoSampleBuffer;
@@ -65,6 +68,15 @@ pub struct LoopChannel {
     /// is externally moved (`set_buffer`/`restart`/`set_position`) so it
     /// re-seeds at the new position instead of playing stale state.
     stretcher: Option<WsolaStretcher>,
+    /// A buffer staged (from the main thread) to atomically replace `buffer` at
+    /// the next bar-grid boundary. Taken by the audio thread in `advance()`.
+    /// `has_pending` gates the audio thread so the common (nothing-queued) path
+    /// never touches the mutex; `pending_divisions` is the swap grid (loop region
+    /// split into this many equal segments — bar count for bar-quantized swaps).
+    pending: Mutex<Option<StereoSampleBuffer>>,
+    pending_divisions: AtomicU32,
+    has_pending: AtomicBool,
+    swaps_completed: AtomicU32,
 }
 
 impl LoopChannel {
@@ -84,6 +96,10 @@ impl LoopChannel {
             pitch_mode: PitchMode::default(),
             engine_bpm: DEFAULT_ENGINE_BPM,
             stretcher: None,
+            pending: Mutex::new(None),
+            pending_divisions: AtomicU32::new(1),
+            has_pending: AtomicBool::new(false),
+            swaps_completed: AtomicU32::new(0),
         }
     }
 
@@ -128,36 +144,94 @@ impl LoopChannel {
         if self.stretcher.is_none() {
             self.stretcher = Some(WsolaStretcher::new(engine_sample_rate, self.cursor));
         }
+        let prev = self.cursor;
+        let mut wrapped = false;
         let stretcher = self.stretcher.as_mut().unwrap();
         if stretcher.needs_refill() {
             self.cursor = stretcher.synthesize_next_hop(&buffer, lo, hi, sr_ratio, speed, warp);
+            // Forward-only path (speed >= 0), so a cursor that moved backward can
+            // only mean the hop wrapped the loop window.
+            wrapped = self.cursor < prev;
         }
-        self.stretcher.as_mut().unwrap().drain()
+        let out = self.stretcher.as_mut().unwrap().drain();
+        // Land any queued audition swap at its bar-grid boundary. `advance` handles
+        // this for the resample/off paths; the WSOLA path bypasses `advance`, so we
+        // check here too — otherwise a queued swap could never land while a channel
+        // is in PreservePitch mode. `maybe_swap_pending` resets the stretcher on a
+        // swap so the next tick re-seeds on the new buffer at its loop start.
+        //
+        // Note: `self.cursor` only advances on hop refills (~`wsola::HOP_MS`), so in
+        // this mode the boundary check is at hop granularity — a queued swap can land
+        // up to one hop after the exact grid sample, whereas the resample/off paths
+        // are sample-accurate. This is accepted: the swap restarts the phrase from the
+        // loop start (already a deliberate discontinuity), and sub-hop precision would
+        // require splitting an overlap-add hop for no meaningful audible gain.
+        let span = (hi - lo).max(1.0);
+        self.maybe_swap_pending(prev, lo, span, wrapped);
+        out
     }
 
     /// Advance the cursor by one output sample, wrapping inside the loop window.
     /// Handles forward and reverse (negative `speed`) playback.
     fn advance(&mut self, engine_sample_rate: f32) {
-        let Some(buffer) = &self.buffer else {
-            return;
+        let (len, source_sr) = match &self.buffer {
+            Some(buffer) => (buffer.len() as f64, buffer.sample_rate() as f64),
+            None => return,
         };
-        let len = buffer.len() as f64;
         let (lo, hi) = self.loop_bounds(len);
         let span = (hi - lo).max(1.0);
 
-        let ratio = buffer.sample_rate() as f64 / engine_sample_rate.max(1.0) as f64;
+        let ratio = source_sr / engine_sample_rate.max(1.0) as f64;
         let warp = if self.pitch_mode == PitchMode::Resample {
             self.warp_ratio()
         } else {
             1.0
         };
+        let prev = self.cursor;
         self.cursor += self.speed as f64 * ratio * warp;
 
+        let mut wrapped = false;
         if self.cursor >= hi {
             self.cursor = lo + (self.cursor - lo).rem_euclid(span);
+            wrapped = true;
         } else if self.cursor < lo {
             // rem_euclid keeps the offset in [0, span); mirror it back from hi.
             self.cursor = hi - (lo - self.cursor).rem_euclid(span);
+            wrapped = true;
+        }
+
+        self.maybe_swap_pending(prev, lo, span, wrapped);
+    }
+
+    /// If a queued buffer is waiting and this sample crossed a bar-grid boundary
+    /// (or wrapped the loop), swap it in and restart the phrase from the loop
+    /// start — the sample-accurate, click-free downbeat swap. Gated by an atomic
+    /// flag so the nothing-queued path never locks.
+    fn maybe_swap_pending(&mut self, prev: f64, lo: f64, span: f64, wrapped: bool) {
+        if !self.has_pending.load(Ordering::Acquire) {
+            return;
+        }
+        let grid = self.pending_divisions.load(Ordering::Relaxed).max(1) as f64;
+        let prev_idx = (((prev - lo) / span) * grid).floor();
+        let new_idx = (((self.cursor - lo) / span) * grid).floor();
+        if !(wrapped || new_idx != prev_idx) {
+            return;
+        }
+        // try_lock, not lock: only contends with a main-thread queue/cancel for the
+        // few ns it holds the mutex, which never realistically coincides with a
+        // boundary; a missed lock just defers the swap to the next boundary.
+        if let Ok(mut pending) = self.pending.try_lock() {
+            if let Some(buffer) = pending.take() {
+                let (new_lo, _) = self.loop_bounds(buffer.len() as f64);
+                self.buffer = Some(buffer);
+                self.cursor = new_lo;
+                // The buffer/cursor moved externally; drop any WSOLA stretcher so
+                // the PreservePitch path re-seeds on the new buffer (mirrors
+                // `set_buffer`/`restart`/`set_position`). No-op for other modes.
+                self.stretcher = None;
+                self.swaps_completed.fetch_add(1, Ordering::Relaxed);
+                self.has_pending.store(false, Ordering::Release);
+            }
         }
     }
 
@@ -274,6 +348,28 @@ impl LoopChannel {
             self.cursor = target.clamp(lo, hi);
             self.stretcher = None;
         }
+    }
+
+    /// Stage a buffer to atomically replace `buffer` at the next bar-grid
+    /// boundary. `divisions` splits the loop region into equal segments (bar
+    /// count for bar-quantized swaps; 1 for whole-phrase). Replaces any buffer
+    /// already queued. See [`Self::maybe_swap_pending`] for when it lands.
+    pub fn queue_swap(&mut self, buffer: StereoSampleBuffer, divisions: u32) {
+        self.pending_divisions
+            .store(divisions.max(1), Ordering::Relaxed);
+        *self.pending.lock().unwrap() = Some(buffer);
+        self.has_pending.store(true, Ordering::Release);
+    }
+
+    /// Drop a pending queued swap. No-op if nothing is queued.
+    pub fn cancel_queued_swap(&mut self) {
+        self.has_pending.store(false, Ordering::Release);
+        *self.pending.lock().unwrap() = None;
+    }
+
+    /// Number of queued swaps that have completed since creation.
+    pub fn swaps_completed(&self) -> u32 {
+        self.swaps_completed.load(Ordering::Relaxed)
     }
 
     /// Set the mute/solo gate target. Called by the [`Mixer`] each block once
@@ -418,5 +514,87 @@ mod tests {
             let p = ch.position_normalized();
             assert!((0.25..0.75 + 1e-2).contains(&p), "pos {p} out of window");
         }
+    }
+
+    fn const_buffer(frames: usize, value: f32) -> StereoSampleBuffer {
+        let left = vec![value; frames];
+        let right = left.clone();
+        StereoSampleBuffer::from_channels(left, right, SR).unwrap()
+    }
+
+    #[test]
+    fn queued_swap_lands_at_first_division_boundary() {
+        let mut ch = LoopChannel::new(SR);
+        ch.set_buffer(ramp_buffer(100)); // A: values 0..100
+        ch.set_playing(true);
+        // Bar grid at frames 25/50/75; queue B (constant 1000).
+        ch.queue_swap(const_buffer(100, 1000.0), 4);
+
+        let mut swapped_at = None;
+        for i in 0..48 {
+            let f = ch.tick(SR);
+            if f.l > 500.0 {
+                swapped_at = Some(i);
+                break;
+            }
+        }
+        let idx = swapped_at.expect("swap should have landed");
+        assert_eq!(ch.swaps_completed(), 1);
+        // First boundary is frame 25 — the swap happens in advance() after the
+        // read, so B is first heard on the tick just past 25.
+        assert!(
+            (24..=27).contains(&idx),
+            "swapped at frame {idx}, expected ~25"
+        );
+    }
+
+    #[test]
+    fn queued_swap_divisions_one_only_swaps_at_wrap() {
+        let mut ch = LoopChannel::new(SR);
+        ch.set_buffer(ramp_buffer(100));
+        ch.set_playing(true);
+        ch.queue_swap(const_buffer(100, 1000.0), 1); // whole-phrase
+
+        // Through most of the loop: no swap yet.
+        for _ in 0..90 {
+            let f = ch.tick(SR);
+            assert!(f.l < 500.0, "swapped before the wrap");
+        }
+        assert_eq!(ch.swaps_completed(), 0);
+        // Cross the wrap -> swap.
+        for _ in 0..20 {
+            ch.tick(SR);
+        }
+        assert_eq!(ch.swaps_completed(), 1);
+    }
+
+    #[test]
+    fn cancel_drops_queued_swap() {
+        let mut ch = LoopChannel::new(SR);
+        ch.set_buffer(ramp_buffer(100));
+        ch.set_playing(true);
+        ch.queue_swap(const_buffer(100, 1000.0), 4);
+        ch.cancel_queued_swap();
+        for _ in 0..150 {
+            let f = ch.tick(SR);
+            assert!(f.l < 500.0, "swap fired after cancel");
+        }
+        assert_eq!(ch.swaps_completed(), 0);
+    }
+
+    #[test]
+    fn requeue_replaces_pending_buffer() {
+        let mut ch = LoopChannel::new(SR);
+        ch.set_buffer(ramp_buffer(100));
+        ch.set_playing(true);
+        ch.queue_swap(const_buffer(100, -1000.0), 4); // B
+        ch.queue_swap(const_buffer(100, 2000.0), 4); // C replaces B
+        for _ in 0..40 {
+            ch.tick(SR);
+        }
+        assert_eq!(ch.swaps_completed(), 1);
+        // Now audible from C (~2000), never B (~-1000).
+        let f = ch.tick(SR);
+        assert!(f.l > 1500.0, "expected C after swap, got {}", f.l);
     }
 }
