@@ -181,7 +181,12 @@ impl Mixer {
 
     /// Stage a buffer to swap into `channel` at the next bar-grid boundary.
     /// Returns false for a bad channel index or an empty buffer.
-    pub fn queue_swap(&mut self, channel: usize, buffer: StereoSampleBuffer, divisions: u32) -> bool {
+    pub fn queue_swap(
+        &mut self,
+        channel: usize,
+        buffer: StereoSampleBuffer,
+        divisions: u32,
+    ) -> bool {
         if buffer.is_empty() {
             return false;
         }
@@ -201,7 +206,9 @@ impl Mixer {
     }
 
     pub fn swaps_completed(&self, channel: usize) -> u32 {
-        self.channels.get(channel).map_or(0, |ch| ch.swaps_completed())
+        self.channels
+            .get(channel)
+            .map_or(0, |ch| ch.swaps_completed())
     }
 
     // --- Per-channel effects ----------------------------------------------

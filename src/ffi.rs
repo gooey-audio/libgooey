@@ -5770,6 +5770,11 @@ pub unsafe extern "C" fn gooey_engine_loop_set_position(
 /// Replaces any previously-queued buffer on the channel. Returns false on a null
 /// engine, bad channel, or empty buffer. Samples are interleaved, `channels` deep.
 ///
+/// `source_bpm` tags the *pending* take so its tempo warp is correct the instant the
+/// swap lands (mirrors [`gooey_engine_loop_set_source_bpm`], which only tags the
+/// currently active buffer). Pass `0.0` (or negative) to leave it untagged, in which
+/// case a warping channel plays the swapped-in loop at its original tempo.
+///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`; `samples` must
 /// point to at least `frames * channels` floats.
@@ -5781,6 +5786,7 @@ pub unsafe extern "C" fn gooey_engine_loop_queue_swap(
     frames: u32,
     channels: u32,
     sample_rate: f32,
+    source_bpm: f32,
     divisions: u32,
 ) -> bool {
     if engine.is_null() || samples.is_null() || frames == 0 || channels == 0 {
@@ -5790,7 +5796,13 @@ pub unsafe extern "C" fn gooey_engine_loop_queue_swap(
     let total = frames as usize * channels as usize;
     let slice = slice::from_raw_parts(samples, total);
     match StereoSampleBuffer::from_interleaved(slice, channels as usize, sample_rate) {
-        Ok(buffer) => engine.mixer.queue_swap(channel as usize, buffer, divisions),
+        Ok(mut buffer) => {
+            // Tag the pending take so `warp_ratio()` is correct the moment it lands,
+            // rather than falling back to 1.0 until the host retags post-swap.
+            // `set_source_bpm` filters non-finite/<= 0, so 0.0 means "untagged".
+            buffer.set_source_bpm((source_bpm > 0.0).then_some(source_bpm));
+            engine.mixer.queue_swap(channel as usize, buffer, divisions)
+        }
         Err(_) => false,
     }
 }

@@ -582,20 +582,37 @@ fn queued_swap_lands_in_preserve_pitch_mode() {
 
         let first = stereo_sine(0.1, 220.0);
         let frames = first.len() / 2;
-        assert!(gooey_engine_loop_load(engine, 0, first.as_ptr(), frames as u32, 2, SAMPLE_RATE));
+        assert!(gooey_engine_loop_load(
+            engine,
+            0,
+            first.as_ptr(),
+            frames as u32,
+            2,
+            SAMPLE_RATE
+        ));
         // Warp on, pitch preserved, and a tempo mismatch so the WSOLA path is live.
         gooey_engine_loop_set_source_bpm(engine, 0, 120.0);
         gooey_engine_set_bpm(engine, 140.0);
         gooey_engine_loop_set_pitch_mode(engine, 0, PITCH_MODE_PRESERVE_PITCH);
         gooey_engine_loop_set_playing(engine, 0, true);
-        assert_eq!(gooey_engine_loop_get_pitch_mode(engine, 0), PITCH_MODE_PRESERVE_PITCH);
+        assert_eq!(
+            gooey_engine_loop_get_pitch_mode(engine, 0),
+            PITCH_MODE_PRESERVE_PITCH
+        );
 
         // Prime the stretcher, then stage a whole-phrase swap (divisions = 1).
         let _ = render_peak(engine, frames);
         let baseline = gooey_engine_loop_swaps_completed(engine, 0);
         let second = stereo_sine(0.1, 330.0);
         assert!(gooey_engine_loop_queue_swap(
-            engine, 0, second.as_ptr(), (second.len() / 2) as u32, 2, SAMPLE_RATE, 1,
+            engine,
+            0,
+            second.as_ptr(),
+            (second.len() / 2) as u32,
+            2,
+            SAMPLE_RATE,
+            120.0,
+            1,
         ));
 
         // Render several loop lengths; the swap must land at a bar boundary.
@@ -603,6 +620,63 @@ fn queued_swap_lands_in_preserve_pitch_mode() {
         assert!(
             gooey_engine_loop_swaps_completed(engine, 0) > baseline,
             "queued swap never completed in PreservePitch mode"
+        );
+
+        gooey_engine_free(engine);
+    }
+}
+
+/// A queued swap tags its pending take with `source_bpm`, so the swapped-in loop's
+/// tempo warp is correct the instant it lands — without the host having to notice
+/// completion and retag. Guards the P1 fix: the buffer built inside `queue_swap`
+/// must carry the caller's tag through the swap onto the active channel.
+#[test]
+fn queued_swap_preserves_source_bpm_tag() {
+    unsafe {
+        let engine = gooey_engine_new(SAMPLE_RATE);
+
+        let first = stereo_sine(0.1, 220.0);
+        let frames = first.len() / 2;
+        assert!(gooey_engine_loop_load(
+            engine,
+            0,
+            first.as_ptr(),
+            frames as u32,
+            2,
+            SAMPLE_RATE
+        ));
+        // Active take tagged at 100 BPM; engine runs at 150 so a warp is in effect.
+        gooey_engine_loop_set_source_bpm(engine, 0, 100.0);
+        gooey_engine_set_bpm(engine, 150.0);
+        gooey_engine_loop_set_pitch_mode(engine, 0, PITCH_MODE_RESAMPLE);
+        gooey_engine_loop_set_playing(engine, 0, true);
+        assert_eq!(gooey_engine_loop_get_source_bpm(engine, 0), 100.0);
+
+        // Queue a take tagged at a different tempo (128 BPM) and let it land.
+        let baseline = gooey_engine_loop_swaps_completed(engine, 0);
+        let second = stereo_sine(0.1, 330.0);
+        assert!(gooey_engine_loop_queue_swap(
+            engine,
+            0,
+            second.as_ptr(),
+            (second.len() / 2) as u32,
+            2,
+            SAMPLE_RATE,
+            128.0,
+            1,
+        ));
+        let _ = render_peak(engine, frames * 4);
+        assert!(
+            gooey_engine_loop_swaps_completed(engine, 0) > baseline,
+            "queued swap never completed"
+        );
+
+        // The active channel now reports the *pending* take's tag, not the old one —
+        // its warp is correct immediately, with no post-swap retag from the host.
+        assert_eq!(
+            gooey_engine_loop_get_source_bpm(engine, 0),
+            128.0,
+            "swapped-in loop lost its queued source_bpm tag"
         );
 
         gooey_engine_free(engine);

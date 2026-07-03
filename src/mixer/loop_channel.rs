@@ -159,6 +159,13 @@ impl LoopChannel {
         // check here too — otherwise a queued swap could never land while a channel
         // is in PreservePitch mode. `maybe_swap_pending` resets the stretcher on a
         // swap so the next tick re-seeds on the new buffer at its loop start.
+        //
+        // Note: `self.cursor` only advances on hop refills (~`wsola::HOP_MS`), so in
+        // this mode the boundary check is at hop granularity — a queued swap can land
+        // up to one hop after the exact grid sample, whereas the resample/off paths
+        // are sample-accurate. This is accepted: the swap restarts the phrase from the
+        // loop start (already a deliberate discontinuity), and sub-hop precision would
+        // require splitting an overlap-add hop for no meaningful audible gain.
         let span = (hi - lo).max(1.0);
         self.maybe_swap_pending(prev, lo, span, wrapped);
         out
@@ -535,7 +542,10 @@ mod tests {
         assert_eq!(ch.swaps_completed(), 1);
         // First boundary is frame 25 — the swap happens in advance() after the
         // read, so B is first heard on the tick just past 25.
-        assert!((24..=27).contains(&idx), "swapped at frame {idx}, expected ~25");
+        assert!(
+            (24..=27).contains(&idx),
+            "swapped at frame {idx}, expected ~25"
+        );
     }
 
     #[test]
