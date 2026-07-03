@@ -439,6 +439,97 @@ fn preserve_pitch_holds_frequency_while_resample_shifts_it() {
 }
 
 #[test]
+fn preserve_pitch_bpm_change_mid_stream_holds_pitch() {
+    // Mirrors the interactive `loop_mixer` example: BPM is changed *while
+    // already playing*, and rendering happens in small chunks (like a real
+    // audio callback), not in one big batch. Only `gooey_engine_set_bpm` is
+    // touched here — `speed` (varispeed) is left at its default 1.0 the
+    // whole time, isolating the BPM-driven warp from the separate varispeed
+    // control (see the companion test below for why varispeed is different).
+    unsafe {
+        let engine = gooey_engine_new(SAMPLE_RATE);
+        let loop_samples = stereo_sine(2.0, 440.0);
+        let n = (loop_samples.len() / 2) as u32;
+        gooey_engine_loop_load(engine, 0, loop_samples.as_ptr(), n, 2, SAMPLE_RATE);
+        gooey_engine_loop_set_source_bpm(engine, 0, 120.0);
+        gooey_engine_loop_set_pitch_mode(engine, 0, PITCH_MODE_PRESERVE_PITCH);
+        gooey_engine_set_bpm(engine, 120.0);
+        gooey_engine_loop_set_playing(engine, 0, true);
+
+        let chunk = 512usize; // ~11.6ms @ 44.1kHz, a realistic CPAL callback size
+        let render_chunk = |frames: usize| -> Vec<f32> {
+            let mut buf = vec![0.0_f32; frames * 2];
+            gooey_engine_render(engine, buf.as_mut_ptr(), frames as u32);
+            buf.chunks_exact(2).map(|f| f[0]).collect()
+        };
+
+        // Warm up at the starting BPM (past the stretcher's first fade-in hop).
+        for _ in 0..8 {
+            render_chunk(chunk);
+        }
+
+        // Sweep BPM up and back down *while playing*, one small chunk per
+        // step — exactly what pressing 'B'/'b' repeatedly in the example does.
+        let mut measured_hz = Vec::new();
+        for bpm in [120.0, 150.0, 200.0, 250.0, 200.0, 150.0, 90.0, 60.0, 120.0] {
+            gooey_engine_set_bpm(engine, bpm);
+            let mut samples = Vec::new();
+            for _ in 0..6 {
+                samples.extend(render_chunk(chunk));
+            }
+            let hz = zero_crossing_frequency(&samples, SAMPLE_RATE);
+            measured_hz.push((bpm, hz));
+        }
+        gooey_engine_free(engine);
+
+        for (bpm, hz) in &measured_hz {
+            assert!(
+                (hz - 440.0).abs() < 440.0 * 0.1,
+                "PreservePitch should hold ~440 Hz across a live BPM change to \
+                 {bpm}, measured {hz}. All measurements: {measured_hz:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn preserve_pitch_varispeed_still_shifts_pitch_by_design() {
+    // `speed` (varispeed) and the BPM-driven tempo warp are two independent
+    // controls. PreservePitch only decouples pitch from the *BPM* warp; the
+    // user's manual varispeed knob keeps its original, always-shifts-pitch
+    // meaning (see `LoopChannel`'s module doc comment and `WsolaStretcher`'s
+    // `step` calculation, which folds in `speed` but never `warp`). This is
+    // easy to confuse with the BPM control in the interactive example, since
+    // both are colloquially "speed" — this test anchors the distinction.
+    unsafe {
+        let engine = gooey_engine_new(SAMPLE_RATE);
+        let loop_samples = stereo_sine(2.0, 440.0);
+        let n = (loop_samples.len() / 2) as u32;
+        gooey_engine_loop_load(engine, 0, loop_samples.as_ptr(), n, 2, SAMPLE_RATE);
+        gooey_engine_loop_set_pitch_mode(engine, 0, PITCH_MODE_PRESERVE_PITCH);
+        // No source_bpm tag and BPM untouched: the warp ratio is 1.0, so any
+        // pitch shift observed here can only come from `speed`.
+        gooey_engine_loop_set_speed(engine, 0, 1.5);
+        gooey_engine_loop_set_playing(engine, 0, true);
+
+        let warmup = 4096;
+        let measure = 8192;
+        let mut buf = vec![0.0_f32; (warmup + measure) * 2];
+        gooey_engine_render(engine, buf.as_mut_ptr(), (warmup + measure) as u32);
+        let left: Vec<f32> = buf.chunks_exact(2).map(|f| f[0]).collect();
+        let hz = zero_crossing_frequency(&left[warmup..], SAMPLE_RATE);
+
+        assert!(
+            (hz - 660.0).abs() < 660.0 * 0.1,
+            "varispeed 1.5x should still shift pitch to ~660 Hz even in \
+             PreservePitch mode (only the BPM warp is pitch-corrected), \
+             measured {hz}"
+        );
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
 fn preserve_pitch_finite_across_loop_seam() {
     // A short loop wraps many times within the render, and at a warped tempo
     // most hops land near the loop boundary — exercises the search-window /

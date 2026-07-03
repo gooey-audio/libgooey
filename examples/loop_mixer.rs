@@ -164,7 +164,7 @@ fn render_display(engine: &Engine, names: &[String], selected: usize, knob: &[f3
             names.get(ch).map(String::as_str).unwrap_or("")
         );
         print!(
-            "    gain [{}] {:.2}  speed {:+.2}  loop {:.2}-{:.2}  pos [{}]\r\n",
+            "    gain [{}] {:.2}  varispeed {:+.2}  loop {:.2}-{:.2}  pos [{}]\r\n",
             bar(c.gain() / 2.0, 16),
             c.gain(),
             c.speed(),
@@ -192,10 +192,12 @@ fn render_display(engine: &Engine, names: &[String], selected: usize, knob: &[f3
         print!("\r\n");
     }
 
-    print!("Up/Down select  Left/Right gain  -/= speed  ,/. loop-start  ;/' loop-end\r\n");
+    print!("Up/Down select  Left/Right gain  -/= varispeed (ALWAYS shifts pitch)  ,/. loop-start  ;/' loop-end\r\n");
     print!("space play/stop  r restart  m mute  s solo\r\n");
     print!("f +filter  d +delay  v +reverb  c clear-fx  k/l tweak last fx  q quit\r\n");
-    print!("b/B engine BPM -/+5  p cycle pitch mode (off -> resample -> preserve-pitch)\r\n");
+    print!(
+        "b/B engine BPM -/+5 (pitch-corrected only in preserve-pitch mode)  p cycle pitch mode\r\n"
+    );
     io::stdout().flush().unwrap();
 }
 
