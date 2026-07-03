@@ -570,3 +570,41 @@ fn null_engine_is_safe() {
         assert_eq!(gooey_engine_loop_effect_type_at(std::ptr::null(), 0, 0), -1);
     }
 }
+
+/// A queued swap must still land while the channel is in PreservePitch (WSOLA)
+/// mode. That path renders through the stretcher and bypasses `advance`, so the
+/// swap-at-boundary check lives in the WSOLA path too — without it, an audition
+/// swap on a pitch-preserving loop would never complete.
+#[test]
+fn queued_swap_lands_in_preserve_pitch_mode() {
+    unsafe {
+        let engine = gooey_engine_new(SAMPLE_RATE);
+
+        let first = stereo_sine(0.1, 220.0);
+        let frames = first.len() / 2;
+        assert!(gooey_engine_loop_load(engine, 0, first.as_ptr(), frames as u32, 2, SAMPLE_RATE));
+        // Warp on, pitch preserved, and a tempo mismatch so the WSOLA path is live.
+        gooey_engine_loop_set_source_bpm(engine, 0, 120.0);
+        gooey_engine_set_bpm(engine, 140.0);
+        gooey_engine_loop_set_pitch_mode(engine, 0, PITCH_MODE_PRESERVE_PITCH);
+        gooey_engine_loop_set_playing(engine, 0, true);
+        assert_eq!(gooey_engine_loop_get_pitch_mode(engine, 0), PITCH_MODE_PRESERVE_PITCH);
+
+        // Prime the stretcher, then stage a whole-phrase swap (divisions = 1).
+        let _ = render_peak(engine, frames);
+        let baseline = gooey_engine_loop_swaps_completed(engine, 0);
+        let second = stereo_sine(0.1, 330.0);
+        assert!(gooey_engine_loop_queue_swap(
+            engine, 0, second.as_ptr(), (second.len() / 2) as u32, 2, SAMPLE_RATE, 1,
+        ));
+
+        // Render several loop lengths; the swap must land at a bar boundary.
+        let _ = render_peak(engine, frames * 4);
+        assert!(
+            gooey_engine_loop_swaps_completed(engine, 0) > baseline,
+            "queued swap never completed in PreservePitch mode"
+        );
+
+        gooey_engine_free(engine);
+    }
+}

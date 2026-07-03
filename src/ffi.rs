@@ -5762,6 +5762,72 @@ pub unsafe extern "C" fn gooey_engine_loop_set_position(
     }
 }
 
+/// Stage a buffer to atomically replace this channel's loop at the next bar-grid
+/// boundary. `divisions` splits the loop region into equal segments (pass the
+/// loop's bar count for bar-quantized swaps; 1 for whole-phrase). When the playing
+/// cursor next crosses a segment boundary, the queued buffer becomes active and its
+/// playhead resets to the loop start (restart from the top on the downbeat).
+/// Replaces any previously-queued buffer on the channel. Returns false on a null
+/// engine, bad channel, or empty buffer. Samples are interleaved, `channels` deep.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`; `samples` must
+/// point to at least `frames * channels` floats.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_queue_swap(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    samples: *const f32,
+    frames: u32,
+    channels: u32,
+    sample_rate: f32,
+    divisions: u32,
+) -> bool {
+    if engine.is_null() || samples.is_null() || frames == 0 || channels == 0 {
+        return false;
+    }
+    let engine = &mut *engine;
+    let total = frames as usize * channels as usize;
+    let slice = slice::from_raw_parts(samples, total);
+    match StereoSampleBuffer::from_interleaved(slice, channels as usize, sample_rate) {
+        Ok(buffer) => engine.mixer.queue_swap(channel as usize, buffer, divisions),
+        Err(_) => false,
+    }
+}
+
+/// Drop a pending queued swap on a loop channel (Cancel / re-select the playing
+/// take / transport stop). No-op if nothing is queued.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_cancel_queued_swap(
+    engine: *mut GooeyEngine,
+    channel: u32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.cancel_queued_swap(channel as usize);
+    }
+}
+
+/// Count of queued swaps that have completed on this channel since engine creation.
+/// The host samples this when it queues and watches it increment to learn the swap
+/// landed (drives the UI's "queued -> playing" flip). Returns 0 for a null engine
+/// or out-of-range channel.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_swaps_completed(
+    engine: *const GooeyEngine,
+    channel: u32,
+) -> u32 {
+    match engine.as_ref() {
+        Some(engine) => engine.mixer.swaps_completed(channel as usize),
+        None => 0,
+    }
+}
+
 /// Get a loop channel's current playhead as a normalized `[0, 1]` position.
 /// Returns 0.0 for a null engine or empty/out-of-range channel.
 ///

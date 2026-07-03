@@ -179,6 +179,31 @@ impl Mixer {
             .unwrap_or_default()
     }
 
+    /// Stage a buffer to swap into `channel` at the next bar-grid boundary.
+    /// Returns false for a bad channel index or an empty buffer.
+    pub fn queue_swap(&mut self, channel: usize, buffer: StereoSampleBuffer, divisions: u32) -> bool {
+        if buffer.is_empty() {
+            return false;
+        }
+        match self.channels.get_mut(channel) {
+            Some(ch) => {
+                ch.queue_swap(buffer, divisions);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn cancel_queued_swap(&mut self, channel: usize) {
+        if let Some(ch) = self.channels.get_mut(channel) {
+            ch.cancel_queued_swap();
+        }
+    }
+
+    pub fn swaps_completed(&self, channel: usize) -> u32 {
+        self.channels.get(channel).map_or(0, |ch| ch.swaps_completed())
+    }
+
     // --- Per-channel effects ----------------------------------------------
 
     /// Append an effect to a channel. Returns the new effect's slot index, or
