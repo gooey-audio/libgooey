@@ -307,6 +307,165 @@ fn bpm_change_retempos_existing_loop_delay() {
     }
 }
 
+/// Estimate a mono signal's dominant frequency from its zero-crossing rate.
+/// Each full cycle of a (roughly) periodic signal produces two zero crossings.
+fn zero_crossing_frequency(samples: &[f32], sample_rate: f32) -> f32 {
+    let crossings = samples
+        .windows(2)
+        .filter(|w| (w[0] <= 0.0 && w[1] > 0.0) || (w[0] >= 0.0 && w[1] < 0.0))
+        .count();
+    (crossings as f32 / 2.0) / (samples.len() as f32 / sample_rate)
+}
+
+#[test]
+fn resample_mode_tempo_ratio_matches_bpm_ratio() {
+    // Naive resample warp: cursor advance scales directly with engine_bpm /
+    // source_bpm, so doubling the engine BPM should double how far the
+    // playhead travels over a fixed render window.
+    unsafe {
+        let position_after = |pitch_mode: u32, engine_bpm: f32| -> f32 {
+            let engine = gooey_engine_new(SAMPLE_RATE);
+            let loop_samples = stereo_sine(2.0, 220.0); // long enough: no wrap
+            let frames = (loop_samples.len() / 2) as u32;
+            gooey_engine_loop_load(engine, 0, loop_samples.as_ptr(), frames, 2, SAMPLE_RATE);
+            gooey_engine_loop_set_source_bpm(engine, 0, 120.0);
+            gooey_engine_loop_set_pitch_mode(engine, 0, pitch_mode);
+            gooey_engine_set_bpm(engine, engine_bpm);
+            gooey_engine_loop_set_playing(engine, 0, true);
+            let mut buf = vec![0.0_f32; 8192 * 2];
+            gooey_engine_render(engine, buf.as_mut_ptr(), 8192);
+            let pos = gooey_engine_loop_get_position(engine, 0);
+            gooey_engine_free(engine);
+            pos
+        };
+
+        let baseline = position_after(PITCH_MODE_OFF, 120.0);
+        let warped = position_after(PITCH_MODE_RESAMPLE, 240.0);
+
+        assert!(baseline > 0.0, "expected the playhead to advance");
+        let ratio = warped / baseline;
+        assert!(
+            (ratio - 2.0).abs() < 0.05,
+            "expected ~2x position advance under a 2x BPM warp, got ratio {ratio} \
+             (baseline {baseline}, warped {warped})"
+        );
+    }
+}
+
+#[test]
+fn preserve_pitch_mode_tempo_ratio_matches_bpm_ratio() {
+    // WSOLA mode: pitch is held, but the *rate of source-material consumption*
+    // (i.e. how far the analysis cursor travels — reported via
+    // gooey_engine_loop_get_position) should still track the BPM ratio, same
+    // as Resample mode. That's what "tempo changed" means even when pitch
+    // doesn't move with it.
+    unsafe {
+        let position_after = |engine_bpm: f32| -> f32 {
+            let engine = gooey_engine_new(SAMPLE_RATE);
+            let loop_samples = stereo_sine(2.0, 220.0);
+            let frames = (loop_samples.len() / 2) as u32;
+            gooey_engine_loop_load(engine, 0, loop_samples.as_ptr(), frames, 2, SAMPLE_RATE);
+            gooey_engine_loop_set_source_bpm(engine, 0, 120.0);
+            gooey_engine_loop_set_pitch_mode(engine, 0, PITCH_MODE_PRESERVE_PITCH);
+            gooey_engine_set_bpm(engine, engine_bpm);
+            gooey_engine_loop_set_playing(engine, 0, true);
+            let mut buf = vec![0.0_f32; 16_384 * 2];
+            gooey_engine_render(engine, buf.as_mut_ptr(), 16_384);
+            let pos = gooey_engine_loop_get_position(engine, 0);
+            gooey_engine_free(engine);
+            pos
+        };
+
+        let baseline = position_after(120.0);
+        let warped = position_after(240.0);
+
+        assert!(baseline > 0.0, "expected the analysis cursor to advance");
+        let ratio = warped / baseline;
+        // Wider tolerance than the resample test: WSOLA's similarity search
+        // deliberately deviates from the naive per-hop jump to keep grains
+        // phase-aligned, which trades a little tempo precision for
+        // continuity — a periodic test tone (many near-equally-good
+        // alignment candidates per hop) is close to a worst case for that
+        // drift, so the achieved ratio is only approximately 2x, not exact.
+        assert!(
+            (ratio - 2.0).abs() < 0.25,
+            "expected ~2x source consumption under a 2x BPM warp in PreservePitch \
+             mode, got ratio {ratio} (baseline {baseline}, warped {warped})"
+        );
+    }
+}
+
+#[test]
+fn preserve_pitch_holds_frequency_while_resample_shifts_it() {
+    // The headline behavioral difference between the two warp modes: at the
+    // same 1.5x BPM ratio, Resample should shift a 440 Hz tone to ~660 Hz,
+    // while PreservePitch should hold ~440 Hz.
+    unsafe {
+        let render_left_channel = |pitch_mode: u32, frames: usize| -> Vec<f32> {
+            let engine = gooey_engine_new(SAMPLE_RATE);
+            let loop_samples = stereo_sine(2.0, 440.0);
+            let n = (loop_samples.len() / 2) as u32;
+            gooey_engine_loop_load(engine, 0, loop_samples.as_ptr(), n, 2, SAMPLE_RATE);
+            gooey_engine_loop_set_source_bpm(engine, 0, 120.0);
+            gooey_engine_loop_set_pitch_mode(engine, 0, pitch_mode);
+            gooey_engine_set_bpm(engine, 180.0); // 1.5x source_bpm
+            gooey_engine_loop_set_playing(engine, 0, true);
+            let mut buf = vec![0.0_f32; frames * 2];
+            gooey_engine_render(engine, buf.as_mut_ptr(), frames as u32);
+            gooey_engine_free(engine);
+            buf.chunks_exact(2).map(|f| f[0]).collect()
+        };
+
+        // Skip past the stretcher's first (fade-in) hop before measuring.
+        let warmup = 4096;
+        let measure = 8192;
+        let total = warmup + measure;
+
+        let preserved = render_left_channel(PITCH_MODE_PRESERVE_PITCH, total);
+        let resampled = render_left_channel(PITCH_MODE_RESAMPLE, total);
+
+        let preserved_hz = zero_crossing_frequency(&preserved[warmup..], SAMPLE_RATE);
+        let resampled_hz = zero_crossing_frequency(&resampled[warmup..], SAMPLE_RATE);
+
+        assert!(
+            (preserved_hz - 440.0).abs() < 440.0 * 0.1,
+            "PreservePitch should hold ~440 Hz, measured {preserved_hz}"
+        );
+        assert!(
+            (resampled_hz - 660.0).abs() < 660.0 * 0.1,
+            "Resample should shift to ~660 Hz (1.5x), measured {resampled_hz}"
+        );
+    }
+}
+
+#[test]
+fn preserve_pitch_finite_across_loop_seam() {
+    // A short loop wraps many times within the render, and at a warped tempo
+    // most hops land near the loop boundary — exercises the search-window /
+    // grain-extraction clamp and the wrap/reseed path in WsolaStretcher.
+    unsafe {
+        let engine = gooey_engine_new(SAMPLE_RATE);
+        let loop_samples = stereo_sine(0.05, 330.0); // 50ms loop
+        let n = (loop_samples.len() / 2) as u32;
+        gooey_engine_loop_load(engine, 0, loop_samples.as_ptr(), n, 2, SAMPLE_RATE);
+        gooey_engine_loop_set_source_bpm(engine, 0, 120.0);
+        gooey_engine_loop_set_pitch_mode(engine, 0, PITCH_MODE_PRESERVE_PITCH);
+        gooey_engine_set_bpm(engine, 150.0);
+        gooey_engine_loop_set_playing(engine, 0, true);
+
+        let frames = SAMPLE_RATE as usize; // 1s: many loop wraps, many hops
+        let mut buf = vec![0.0_f32; frames * 2];
+        gooey_engine_render(engine, buf.as_mut_ptr(), frames as u32);
+        for s in &buf {
+            assert!(
+                s.is_finite(),
+                "non-finite sample in PreservePitch output across a loop seam"
+            );
+        }
+        gooey_engine_free(engine);
+    }
+}
+
 #[test]
 fn null_engine_is_safe() {
     unsafe {

@@ -7,7 +7,7 @@
 
 use crate::effects::Waveshaper;
 use crate::engine::{Instrument, Modulatable};
-use crate::utils::{cubic_interpolate, SmoothedParam};
+use crate::utils::{cubic_interpolate, raised_sine_window, SmoothedParam};
 use std::sync::Arc;
 
 const MAX_GRAINS: usize = 64;
@@ -826,14 +826,6 @@ fn cloud_duration_ms(value: f32) -> f32 {
 #[inline]
 fn window_shape(value: f32) -> f32 {
     0.5 + value.clamp(0.0, 1.0) * 3.5
-}
-
-#[inline]
-fn raised_sine_window(phase: f32, shape: f32) -> f32 {
-    (std::f32::consts::PI * phase.clamp(0.0, 1.0))
-        .sin()
-        .max(0.0)
-        .powf(shape)
 }
 
 #[derive(Clone, Copy, Debug)]

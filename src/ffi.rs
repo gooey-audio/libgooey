@@ -14,7 +14,7 @@ use crate::instruments::{
     BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth,
     PolySynthConfig, SampleBuffer, SnareConfig, SnareDrum, Tom2, Tom2Config,
 };
-use crate::mixer::{Mixer, StereoSampleBuffer};
+use crate::mixer::{Mixer, PitchMode, StereoSampleBuffer};
 use crate::music::{apply_voicing, available_voicings, Key, NoteName, ScaleType, VoicingType};
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CString};
@@ -5318,6 +5318,13 @@ pub unsafe extern "C" fn gooey_engine_granulator_set_buffer(
 // `channel` is a 0-based index in `[0, LOOP_CHANNEL_COUNT)`; out-of-range
 // indices are ignored (or return a sensible default).
 
+/// Pitch mode: no BPM-driven tempo warp; playback rate follows `speed` alone.
+pub const PITCH_MODE_OFF: u32 = 0;
+/// Pitch mode: naive resample warp — tempo changes shift pitch.
+pub const PITCH_MODE_RESAMPLE: u32 = 1;
+/// Pitch mode: WSOLA time-stretch — tempo changes without shifting pitch.
+pub const PITCH_MODE_PRESERVE_PITCH: u32 = 2;
+
 /// Load (or replace) a loop channel's stereo buffer from interleaved f32 frames.
 ///
 /// `samples` points to `frames * channels` interleaved values. A `channels`
@@ -5457,6 +5464,88 @@ pub unsafe extern "C" fn gooey_engine_loop_set_speed(
 ) {
     if let Some(engine) = engine.as_mut() {
         engine.mixer.set_speed(channel as usize, speed);
+    }
+}
+
+/// Tag a loop channel's loaded buffer with the tempo its source material was
+/// authored at. Used by the tempo-warp pitch modes (see
+/// `gooey_engine_loop_set_pitch_mode`) to compute a warp ratio against the
+/// engine's BPM (set via `gooey_engine_set_bpm`). Pass `0.0` to clear the tag
+/// (disables warping for this channel regardless of pitch mode). No-op if no
+/// buffer is loaded — call after `gooey_engine_loop_load`.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_source_bpm(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    source_bpm: f32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        let bpm = if source_bpm > 0.0 {
+            Some(source_bpm)
+        } else {
+            None
+        };
+        engine.mixer.set_source_bpm(channel as usize, bpm);
+    }
+}
+
+/// Get a loop channel's tagged source BPM, or `0.0` if unset, no buffer is
+/// loaded, or the channel index is out of range.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_get_source_bpm(
+    engine: *const GooeyEngine,
+    channel: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|e| e.mixer.source_bpm(channel as usize))
+        .unwrap_or(0.0)
+}
+
+/// Set a loop channel's tempo-warp/pitch mode. See `PITCH_MODE_*` constants.
+/// Out-of-range values are treated as `PITCH_MODE_OFF`.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_set_pitch_mode(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    mode: u32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        let mode = match mode {
+            PITCH_MODE_RESAMPLE => PitchMode::Resample,
+            PITCH_MODE_PRESERVE_PITCH => PitchMode::PreservePitch,
+            _ => PitchMode::Off,
+        };
+        engine.mixer.set_pitch_mode(channel as usize, mode);
+    }
+}
+
+/// Get a loop channel's tempo-warp/pitch mode. See `PITCH_MODE_*` constants.
+/// Returns `PITCH_MODE_OFF` for an out-of-range channel index.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_get_pitch_mode(
+    engine: *const GooeyEngine,
+    channel: u32,
+) -> u32 {
+    match engine
+        .as_ref()
+        .map(|e| e.mixer.pitch_mode(channel as usize))
+    {
+        Some(PitchMode::Resample) => PITCH_MODE_RESAMPLE,
+        Some(PitchMode::PreservePitch) => PITCH_MODE_PRESERVE_PITCH,
+        _ => PITCH_MODE_OFF,
     }
 }
 

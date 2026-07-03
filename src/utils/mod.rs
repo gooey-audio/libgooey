@@ -30,3 +30,15 @@ pub fn cubic_interpolate(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
     let a3 = p1;
     ((a0 * t + a1) * t + a2) * t + a3
 }
+
+/// A raised-sine window: `sin(pi * phase).max(0).powf(shape)` for `phase` in
+/// `[0, 1]`. `shape == 1.0` is a plain sine window; `shape == 2.0` reproduces
+/// a Hann window exactly. Shared by the granulator (grain envelopes) and the
+/// WSOLA time-stretcher (analysis/synthesis windows).
+#[inline]
+pub fn raised_sine_window(phase: f32, shape: f32) -> f32 {
+    (std::f32::consts::PI * phase.clamp(0.0, 1.0))
+        .sin()
+        .max(0.0)
+        .powf(shape)
+}
