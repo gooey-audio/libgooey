@@ -4,8 +4,8 @@
 //! Designed for integration with iOS (and other platforms in the future).
 
 use crate::effects::{
-    DelayEffect, DelayTiming, Effect, FeedbackWaveshaper, LowpassFilterEffect, SoftLimiter,
-    SpringReverbEffect, TiltFilterEffect, TubeCompressor, TubeSaturation, Waveshaper,
+    DelayEffect, DelayTiming, Effect, FeedbackWaveshaper, LowpassFilterEffect, PlateReverbEffect,
+    SoftLimiter, SpringReverbEffect, TiltFilterEffect, TubeCompressor, TubeSaturation, Waveshaper,
 };
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
@@ -596,6 +596,8 @@ pub struct GooeyEngine {
     compressor_sidechain: u32,
     reverb: SpringReverbEffect,
     reverb_enabled: bool,
+    plate_reverb: PlateReverbEffect,
+    plate_reverb_enabled: bool,
     waveshaper: Waveshaper,
     waveshaper_enabled: bool,
     feedback_waveshaper: FeedbackWaveshaper,
@@ -771,6 +773,9 @@ impl GooeyEngine {
         // Create spring reverb with default settings (decay: 0.5, mix: 0.0 = dry, damping: 0.5)
         let reverb = SpringReverbEffect::new(sample_rate, 0.5, 0.0, 0.5);
 
+        // Create plate reverb with default settings (decay: 0.5, mix: 0.0 = dry, damping: 0.5)
+        let plate_reverb = PlateReverbEffect::new(sample_rate, 0.5, 0.0, 0.5);
+
         // Create waveshaper with default bypass settings (drive: 1.0, mix: 0.0)
         let waveshaper = Waveshaper::new(1.0, 0.0);
 
@@ -806,6 +811,8 @@ impl GooeyEngine {
             compressor_sidechain: COMPRESSOR_SIDECHAIN_NONE,
             reverb,
             reverb_enabled: false,
+            plate_reverb,
+            plate_reverb_enabled: false,
             waveshaper,
             waveshaper_enabled: false,
             feedback_waveshaper,
@@ -1179,6 +1186,9 @@ impl GooeyEngine {
                     EFFECT_REVERB if self.reverb_enabled => {
                         stereo = self.reverb.process_stereo(stereo);
                     }
+                    EFFECT_PLATE_REVERB if self.plate_reverb_enabled => {
+                        stereo = self.plate_reverb.process_stereo(stereo);
+                    }
                     _ => {}
                 }
             }
@@ -1237,6 +1247,7 @@ impl GooeyEngine {
         self.delay.reset();
         self.compressor.reset();
         self.reverb.reset();
+        self.plate_reverb.reset();
     }
 
     /// Apply LFO modulation to a channel's instrument parameter by index
@@ -1378,12 +1389,14 @@ pub const EFFECT_REVERB: u32 = 6;
 pub const EFFECT_WAVESHAPER: u32 = 7;
 /// Global effect: Feedback waveshaper (self-exciting distortion)
 pub const EFFECT_FEEDBACK_WAVESHAPER: u32 = 8;
+/// Global effect: Plate reverb (Dattorro figure-eight tank)
+pub const EFFECT_PLATE_REVERB: u32 = 9;
 /// Total number of global effects
-pub const EFFECT_COUNT: u32 = 9;
+pub const EFFECT_COUNT: u32 = 10;
 
 /// Number of reorderable effects in the chain. Excludes the optional limiter,
 /// which is pinned at the end of the chain when enabled.
-pub const REORDERABLE_EFFECT_COUNT: u32 = 8;
+pub const REORDERABLE_EFFECT_COUNT: u32 = 9;
 
 /// Default order for the reorderable effects, matching the historical
 /// hardcoded chain (saturation -> lowpass -> tilt -> delay -> compressor -> reverb).
@@ -1396,6 +1409,7 @@ const DEFAULT_EFFECT_ORDER: [u32; REORDERABLE_EFFECT_COUNT as usize] = [
     EFFECT_COMPRESSOR,
     EFFECT_FEEDBACK_WAVESHAPER,
     EFFECT_REVERB,
+    EFFECT_PLATE_REVERB,
 ];
 
 // =============================================================================
@@ -1494,6 +1508,24 @@ pub const REVERB_PARAM_DECAY: u32 = 0;
 pub const REVERB_PARAM_MIX: u32 = 1;
 /// Reverb parameter: high-frequency damping (0.0-1.0)
 pub const REVERB_PARAM_DAMPING: u32 = 2;
+
+// =============================================================================
+// Plate reverb parameter indices (must match Swift PlateParam enum)
+// =============================================================================
+
+/// Plate reverb parameter: decay amount (0.0-1.0)
+pub const PLATE_PARAM_DECAY: u32 = 0;
+/// Plate reverb parameter: wet/dry mix (0.0-1.0)
+pub const PLATE_PARAM_MIX: u32 = 1;
+/// Plate reverb parameter: high-frequency damping (0.0-1.0)
+pub const PLATE_PARAM_DAMPING: u32 = 2;
+/// Plate reverb parameter: predelay (0.0-1.0, maps linearly to 0-200 ms)
+pub const PLATE_PARAM_PREDELAY: u32 = 3;
+/// Plate reverb parameter: stereo width of the wet signal (0.0 = mono, 1.0 = full)
+pub const PLATE_PARAM_WIDTH: u32 = 4;
+/// Plate reverb parameter: tank size (0.0-1.0; 0.5 = the published Dattorro
+/// plate, endpoints scale the tank from 0.25x to 2.0x)
+pub const PLATE_PARAM_SIZE: u32 = 5;
 
 // =============================================================================
 // Waveshaper parameter indices
@@ -2828,6 +2860,15 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
             REVERB_PARAM_DAMPING => engine.reverb.set_damping(value),
             _ => {} // Unknown parameter, ignore
         },
+        EFFECT_PLATE_REVERB => match param {
+            PLATE_PARAM_DECAY => engine.plate_reverb.set_decay(value),
+            PLATE_PARAM_MIX => engine.plate_reverb.set_mix(value),
+            PLATE_PARAM_DAMPING => engine.plate_reverb.set_damping(value),
+            PLATE_PARAM_PREDELAY => engine.plate_reverb.set_predelay(value),
+            PLATE_PARAM_WIDTH => engine.plate_reverb.set_width(value),
+            PLATE_PARAM_SIZE => engine.plate_reverb.set_size(value),
+            _ => {} // Unknown parameter, ignore
+        },
         EFFECT_LIMITER => match param {
             LIMITER_PARAM_THRESHOLD => engine.limiter.set_threshold(value),
             _ => {} // Unknown parameter, ignore
@@ -2907,6 +2948,15 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
             REVERB_PARAM_DAMPING => engine.reverb.get_damping(),
             _ => -1.0, // Unknown parameter
         },
+        EFFECT_PLATE_REVERB => match param {
+            PLATE_PARAM_DECAY => engine.plate_reverb.get_decay(),
+            PLATE_PARAM_MIX => engine.plate_reverb.get_mix(),
+            PLATE_PARAM_DAMPING => engine.plate_reverb.get_damping(),
+            PLATE_PARAM_PREDELAY => engine.plate_reverb.get_predelay(),
+            PLATE_PARAM_WIDTH => engine.plate_reverb.get_width(),
+            PLATE_PARAM_SIZE => engine.plate_reverb.get_size(),
+            _ => -1.0, // Unknown parameter
+        },
         EFFECT_LIMITER => match param {
             LIMITER_PARAM_THRESHOLD => engine.limiter.get_threshold(),
             _ => -1.0, // Unknown parameter
@@ -2948,6 +2998,7 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_enabled(
         EFFECT_TILT_FILTER => engine.tilt_filter_enabled = enabled,
         EFFECT_LIMITER => engine.limiter_enabled = enabled,
         EFFECT_REVERB => engine.reverb_enabled = enabled,
+        EFFECT_PLATE_REVERB => engine.plate_reverb_enabled = enabled,
         _ => {} // Unknown effect, ignore
     }
 }
@@ -2982,6 +3033,7 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_enabled(
         EFFECT_TILT_FILTER => engine.tilt_filter_enabled,
         EFFECT_LIMITER => engine.limiter_enabled,
         EFFECT_REVERB => engine.reverb_enabled,
+        EFFECT_PLATE_REVERB => engine.plate_reverb_enabled,
         _ => false, // Unknown effect
     }
 }
@@ -4133,6 +4185,7 @@ fn is_reorderable_effect(id: u32) -> bool {
             | EFFECT_TILT_FILTER
             | EFFECT_FEEDBACK_WAVESHAPER
             | EFFECT_REVERB
+            | EFFECT_PLATE_REVERB
     )
 }
 
@@ -4141,8 +4194,9 @@ fn is_reorderable_effect(id: u32) -> bool {
 /// `ids` must point to exactly `REORDERABLE_EFFECT_COUNT` u32 values, each a
 /// distinct reorderable effect ID (any of `EFFECT_LOWPASS_FILTER`,
 /// `EFFECT_DELAY`, `EFFECT_SATURATION`, `EFFECT_COMPRESSOR`,
-/// `EFFECT_TILT_FILTER`, `EFFECT_REVERB`). `EFFECT_LIMITER` is pinned at the
-/// end of the chain and must not appear in `ids`.
+/// `EFFECT_TILT_FILTER`, `EFFECT_REVERB`, `EFFECT_PLATE_REVERB`,
+/// `EFFECT_WAVESHAPER`, `EFFECT_FEEDBACK_WAVESHAPER`). `EFFECT_LIMITER` is
+/// pinned at the end of the chain and must not appear in `ids`.
 ///
 /// On success, the chain order is replaced and the internal state of every
 /// reorderable effect is reset (delay buffer, reverb tail, compressor envelope,

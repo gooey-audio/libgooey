@@ -8,7 +8,7 @@
 //! `*_PARAM_*` constants and per-effect setters already exported by the FFI.
 
 use crate::effects::{
-    DelayEffect, DelayTiming, Effect, FeedbackWaveshaper, LowpassFilterEffect,
+    DelayEffect, DelayTiming, Effect, FeedbackWaveshaper, LowpassFilterEffect, PlateReverbEffect,
     SpringReverbEffect, TiltFilterEffect, TubeCompressor, TubeSaturation, Waveshaper,
 };
 use crate::ffi::{
@@ -16,13 +16,14 @@ use crate::ffi::{
     COMPRESSOR_PARAM_RELEASE, COMPRESSOR_PARAM_THRESHOLD, DELAY_PARAM_FEEDBACK,
     DELAY_PARAM_FILTER_CUTOFF, DELAY_PARAM_MIX, DELAY_PARAM_PINGPONG, DELAY_PARAM_TIMING,
     EFFECT_COMPRESSOR, EFFECT_DELAY, EFFECT_FEEDBACK_WAVESHAPER, EFFECT_LOWPASS_FILTER,
-    EFFECT_REVERB, EFFECT_SATURATION, EFFECT_TILT_FILTER, EFFECT_WAVESHAPER,
+    EFFECT_PLATE_REVERB, EFFECT_REVERB, EFFECT_SATURATION, EFFECT_TILT_FILTER, EFFECT_WAVESHAPER,
     FEEDBACK_WAVESHAPER_PARAM_DRIVE, FEEDBACK_WAVESHAPER_PARAM_FEEDBACK,
-    FEEDBACK_WAVESHAPER_PARAM_FILTER_CUTOFF, FEEDBACK_WAVESHAPER_PARAM_MIX,
-    FILTER_PARAM_CUTOFF, FILTER_PARAM_RESONANCE, REVERB_PARAM_DAMPING,
+    FEEDBACK_WAVESHAPER_PARAM_FILTER_CUTOFF, FEEDBACK_WAVESHAPER_PARAM_MIX, FILTER_PARAM_CUTOFF,
+    FILTER_PARAM_RESONANCE, PLATE_PARAM_DAMPING, PLATE_PARAM_DECAY, PLATE_PARAM_MIX,
+    PLATE_PARAM_PREDELAY, PLATE_PARAM_SIZE, PLATE_PARAM_WIDTH, REVERB_PARAM_DAMPING,
     REVERB_PARAM_DECAY, REVERB_PARAM_MIX, SATURATION_PARAM_DRIVE, SATURATION_PARAM_MIX,
-    SATURATION_PARAM_WARMTH, TILT_PARAM_CUTOFF, TILT_PARAM_RESONANCE,
-    WAVESHAPER_PARAM_DRIVE, WAVESHAPER_PARAM_MIX,
+    SATURATION_PARAM_WARMTH, TILT_PARAM_CUTOFF, TILT_PARAM_RESONANCE, WAVESHAPER_PARAM_DRIVE,
+    WAVESHAPER_PARAM_MIX,
 };
 use crate::frame::StereoFrame;
 use std::cell::UnsafeCell;
@@ -43,6 +44,7 @@ pub enum ChannelEffect {
     Compressor(TubeCompressor),
     Tilt(TiltFilterEffect),
     Reverb(SpringReverbEffect),
+    PlateReverb(PlateReverbEffect),
     Waveshaper(UnsafeCell<[Waveshaper; 2]>),
     FeedbackWaveshaper(UnsafeCell<[FeedbackWaveshaper; 2]>),
 }
@@ -88,6 +90,12 @@ impl ChannelEffect {
                 0.3,
                 0.5,
             ))),
+            EFFECT_PLATE_REVERB => Some(Self::PlateReverb(PlateReverbEffect::new(
+                sample_rate,
+                0.5,
+                0.3,
+                0.5,
+            ))),
             EFFECT_WAVESHAPER => Some(Self::Waveshaper(UnsafeCell::new([
                 Waveshaper::new(1.0, 0.0),
                 Waveshaper::new(1.0, 0.0),
@@ -109,6 +117,7 @@ impl ChannelEffect {
             Self::Compressor(_) => EFFECT_COMPRESSOR,
             Self::Tilt(_) => EFFECT_TILT_FILTER,
             Self::Reverb(_) => EFFECT_REVERB,
+            Self::PlateReverb(_) => EFFECT_PLATE_REVERB,
             Self::Waveshaper(_) => EFFECT_WAVESHAPER,
             Self::FeedbackWaveshaper(_) => EFFECT_FEEDBACK_WAVESHAPER,
         }
@@ -124,6 +133,7 @@ impl ChannelEffect {
             Self::Compressor(e) => e.process_stereo(input),
             Self::Tilt(e) => e.process_stereo(input),
             Self::Reverb(e) => e.process_stereo(input),
+            Self::PlateReverb(e) => e.process_stereo(input),
             Self::Waveshaper(ws) => {
                 let ws = unsafe { &mut *ws.get() };
                 StereoFrame {
@@ -224,6 +234,15 @@ impl ChannelEffect {
                 REVERB_PARAM_DAMPING => e.set_damping(value),
                 _ => {}
             },
+            Self::PlateReverb(e) => match param {
+                PLATE_PARAM_DECAY => e.set_decay(value),
+                PLATE_PARAM_MIX => e.set_mix(value),
+                PLATE_PARAM_DAMPING => e.set_damping(value),
+                PLATE_PARAM_PREDELAY => e.set_predelay(value),
+                PLATE_PARAM_WIDTH => e.set_width(value),
+                PLATE_PARAM_SIZE => e.set_size(value),
+                _ => {}
+            },
         }
     }
 
@@ -244,6 +263,7 @@ impl ChannelEffect {
             Self::Compressor(e) => e.reset(),
             Self::Tilt(e) => e.reset(),
             Self::Reverb(e) => e.reset(),
+            Self::PlateReverb(e) => e.reset(),
             Self::Waveshaper(ws) => {
                 let ws = unsafe { &mut *ws.get() };
                 ws[0].reset();
@@ -352,9 +372,11 @@ mod tests {
         let mut chain = EffectChain::new();
         assert_eq!(chain.add(EFFECT_DELAY, SR, 120.0), Some(0));
         assert_eq!(chain.add(EFFECT_REVERB, SR, 120.0), Some(1));
-        assert_eq!(chain.len(), 2);
+        assert_eq!(chain.add(EFFECT_PLATE_REVERB, SR, 120.0), Some(2));
+        assert_eq!(chain.len(), 3);
         assert_eq!(chain.effect_type_at(0), Some(EFFECT_DELAY));
         assert_eq!(chain.effect_type_at(1), Some(EFFECT_REVERB));
+        assert_eq!(chain.effect_type_at(2), Some(EFFECT_PLATE_REVERB));
     }
 
     #[test]
