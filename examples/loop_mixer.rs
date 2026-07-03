@@ -5,6 +5,12 @@
 //! per-channel effects (filter / delay / reverb). This drives the same core
 //! `Mixer` that the `gooey_engine_loop_*` FFI controls.
 //!
+//! Every loaded loop is tagged with a 120 BPM source tempo, so `b`/`B` (engine
+//! BPM) and `p` (cycle the selected channel's pitch mode: off -> resample ->
+//! preserve-pitch) demonstrate the tempo-warp feature: raise the engine BPM in
+//! `resample` mode and pitch rises with tempo; in `preserve-pitch` mode tempo
+//! changes but pitch holds.
+//!
 //! Run with (any subset of paths; missing channels get a generated demo loop):
 //! cargo run --example loop_mixer --features native,crossterm,bounce -- a.wav b.wav c.wav d.wav
 
@@ -30,10 +36,32 @@ use gooey::ffi::{
     REVERB_PARAM_MIX,
 };
 #[cfg(feature = "native")]
-use gooey::mixer::{StereoSampleBuffer, LOOP_CHANNEL_COUNT};
+use gooey::mixer::{PitchMode, StereoSampleBuffer, LOOP_CHANNEL_COUNT};
 
 #[cfg(feature = "native")]
 const SAMPLE_RATE: f32 = 44_100.0;
+/// Source BPM tagged on every loaded loop (demo or WAV) so `b`/`B` and `p` have
+/// something to warp against — see `gooey_engine_loop_set_source_bpm`.
+#[cfg(feature = "native")]
+const DEMO_SOURCE_BPM: f32 = 120.0;
+
+#[cfg(feature = "native")]
+fn pitch_mode_name(mode: PitchMode) -> &'static str {
+    match mode {
+        PitchMode::Off => "off",
+        PitchMode::Resample => "resample (pitch shifts)",
+        PitchMode::PreservePitch => "preserve-pitch (WSOLA)",
+    }
+}
+
+#[cfg(feature = "native")]
+fn cycle_pitch_mode(mode: PitchMode) -> PitchMode {
+    match mode {
+        PitchMode::Off => PitchMode::Resample,
+        PitchMode::Resample => PitchMode::PreservePitch,
+        PitchMode::PreservePitch => PitchMode::Off,
+    }
+}
 
 /// Build a distinct 2-second stereo demo loop so the example runs with no args.
 /// Each channel gets a different root note and a gentle L/R detune so the stereo
@@ -119,8 +147,10 @@ fn render_display(engine: &Engine, names: &[String], selected: usize, knob: &[f3
     execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0)).unwrap();
     let mixer = engine.mixer();
     print!(
-        "=== Loop Mixer — {} stereo channels ===\r\n\r\n",
-        LOOP_CHANNEL_COUNT
+        "=== Loop Mixer — {} stereo channels — engine {:.0} BPM (source {:.0} BPM) ===\r\n\r\n",
+        LOOP_CHANNEL_COUNT,
+        engine.bpm(),
+        DEMO_SOURCE_BPM,
     );
 
     for (ch, &knob_value) in knob.iter().enumerate().take(mixer.channel_count()) {
@@ -134,7 +164,7 @@ fn render_display(engine: &Engine, names: &[String], selected: usize, knob: &[f3
             names.get(ch).map(String::as_str).unwrap_or("")
         );
         print!(
-            "    gain [{}] {:.2}  speed {:+.2}  loop {:.2}-{:.2}  pos [{}]\r\n",
+            "    gain [{}] {:.2}  varispeed {:+.2}  loop {:.2}-{:.2}  pos [{}]\r\n",
             bar(c.gain() / 2.0, 16),
             c.gain(),
             c.speed(),
@@ -142,6 +172,7 @@ fn render_display(engine: &Engine, names: &[String], selected: usize, knob: &[f3
             c.loop_end(),
             bar(c.position_normalized(), 16),
         );
+        print!("    pitch mode: {}\r\n", pitch_mode_name(c.pitch_mode()));
         // Effect chain.
         let fx_count = c.effects().len();
         if fx_count == 0 {
@@ -161,9 +192,12 @@ fn render_display(engine: &Engine, names: &[String], selected: usize, knob: &[f3
         print!("\r\n");
     }
 
-    print!("Up/Down select  Left/Right gain  -/= speed  ,/. loop-start  ;/' loop-end\r\n");
+    print!("Up/Down select  Left/Right gain  -/= varispeed (ALWAYS shifts pitch)  ,/. loop-start  ;/' loop-end\r\n");
     print!("space play/stop  r restart  m mute  s solo\r\n");
     print!("f +filter  d +delay  v +reverb  c clear-fx  k/l tweak last fx  q quit\r\n");
+    print!(
+        "b/B engine BPM -/+5 (pitch-corrected only in preserve-pitch mode)  p cycle pitch mode\r\n"
+    );
     io::stdout().flush().unwrap();
 }
 
@@ -176,7 +210,8 @@ fn main() -> anyhow::Result<()> {
 
     let mut names = Vec::new();
     for ch in 0..LOOP_CHANNEL_COUNT {
-        let (buffer, name) = load_channel(ch, &paths);
+        let (mut buffer, name) = load_channel(ch, &paths);
+        buffer.set_source_bpm(Some(DEMO_SOURCE_BPM));
         let mixer = engine.mixer_mut();
         mixer.load(ch, buffer);
         mixer.set_gain(ch, 0.6); // headroom for four simultaneous loops
@@ -210,6 +245,22 @@ fn main() -> anyhow::Result<()> {
         if event::poll(Duration::from_millis(16))? {
             if let Event::Key(KeyEvent { code, .. }) = event::read()? {
                 let mut engine = audio_engine.lock().unwrap();
+
+                // BPM keys go through Engine::set_bpm (which propagates to
+                // the mixer itself), so handle them before taking
+                // mixer_mut()'s exclusive borrow below.
+                if matches!(code, KeyCode::Char('b') | KeyCode::Char('B')) {
+                    let delta = if code == KeyCode::Char('b') {
+                        -5.0
+                    } else {
+                        5.0
+                    };
+                    let new_bpm = (engine.bpm() + delta).max(20.0);
+                    engine.set_bpm(new_bpm);
+                    needs_redraw = true;
+                    continue;
+                }
+
                 let mixer = engine.mixer_mut();
                 match code {
                     KeyCode::Up => selected = selected.saturating_sub(1),
@@ -258,6 +309,10 @@ fn main() -> anyhow::Result<()> {
                     KeyCode::Char('s') => {
                         let soloed = mixer.channel(selected).unwrap().is_soloed();
                         mixer.set_soloed(selected, !soloed);
+                    }
+                    KeyCode::Char('p') => {
+                        let mode = mixer.channel(selected).unwrap().pitch_mode();
+                        mixer.set_pitch_mode(selected, cycle_pitch_mode(mode));
                     }
                     KeyCode::Char('f') => {
                         mixer.effect_add(selected, EFFECT_LOWPASS_FILTER);

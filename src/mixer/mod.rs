@@ -11,9 +11,10 @@
 pub mod effect_chain;
 pub mod loop_channel;
 pub mod stereo_buffer;
+mod wsola;
 
 pub use effect_chain::{ChannelEffect, EffectChain};
-pub use loop_channel::LoopChannel;
+pub use loop_channel::{LoopChannel, PitchMode};
 pub use stereo_buffer::StereoSampleBuffer;
 
 use crate::frame::StereoFrame;
@@ -66,8 +67,9 @@ impl Mixer {
     /// the value used when creating new ones.
     pub fn set_bpm(&mut self, bpm: f32) {
         self.bpm = bpm;
-        for channel in &self.channels {
+        for channel in &mut self.channels {
             channel.effects().set_bpm(bpm);
+            channel.set_engine_bpm(bpm);
         }
     }
 
@@ -147,6 +149,34 @@ impl Mixer {
         if let Some(ch) = self.channels.get_mut(channel) {
             ch.set_position(normalized);
         }
+    }
+
+    /// Tag a channel's loaded buffer with its source BPM (`None` clears the
+    /// tag). No-op for a bad channel index or if no buffer is loaded.
+    pub fn set_source_bpm(&mut self, channel: usize, bpm: Option<f32>) {
+        if let Some(ch) = self.channels.get_mut(channel) {
+            ch.set_source_bpm(bpm);
+        }
+    }
+
+    /// A channel's tagged source BPM, or `None` for a bad channel index, no
+    /// buffer, or no tag.
+    pub fn source_bpm(&self, channel: usize) -> Option<f32> {
+        self.channels.get(channel).and_then(LoopChannel::source_bpm)
+    }
+
+    pub fn set_pitch_mode(&mut self, channel: usize, mode: PitchMode) {
+        if let Some(ch) = self.channels.get_mut(channel) {
+            ch.set_pitch_mode(mode);
+        }
+    }
+
+    /// A channel's pitch mode, or `PitchMode::Off` for a bad channel index.
+    pub fn pitch_mode(&self, channel: usize) -> PitchMode {
+        self.channels
+            .get(channel)
+            .map(LoopChannel::pitch_mode)
+            .unwrap_or_default()
     }
 
     // --- Per-channel effects ----------------------------------------------

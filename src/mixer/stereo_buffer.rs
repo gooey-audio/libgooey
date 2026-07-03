@@ -16,6 +16,11 @@ pub struct StereoSampleBuffer {
     left: Arc<[f32]>,
     right: Arc<[f32]>,
     sample_rate: f32,
+    /// The tempo the source material was authored/recorded at, if known. Used
+    /// by [`crate::mixer::loop_channel::LoopChannel`]'s tempo-warp modes to
+    /// compute a warp ratio against the engine's BPM. `None` disables warping
+    /// for this buffer regardless of the channel's pitch mode.
+    source_bpm: Option<f32>,
 }
 
 impl StereoSampleBuffer {
@@ -47,6 +52,7 @@ impl StereoSampleBuffer {
             left: Arc::from(left.into_boxed_slice()),
             right: Arc::from(right.into_boxed_slice()),
             sample_rate,
+            source_bpm: None,
         })
     }
 
@@ -160,6 +166,17 @@ impl StereoSampleBuffer {
 
     pub fn sample_rate(&self) -> f32 {
         self.sample_rate
+    }
+
+    /// Tag this buffer with the tempo its source material was authored at.
+    /// Pass `None` to clear the tag (disables tempo-warp modes for this buffer).
+    pub fn set_source_bpm(&mut self, bpm: Option<f32>) {
+        self.source_bpm = bpm.filter(|b| b.is_finite() && *b > 0.0);
+    }
+
+    /// The tagged source BPM, if any.
+    pub fn source_bpm(&self) -> Option<f32> {
+        self.source_bpm
     }
 
     #[inline]
