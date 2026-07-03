@@ -94,6 +94,10 @@ name = "reverb"
 required-features = ["native", "crossterm"]
 
 [[example]]
+name = "reverb_lab"
+required-features = ["native", "crossterm"]
+
+[[example]]
 name = "chords"
 required-features = ["native", "crossterm"]
 

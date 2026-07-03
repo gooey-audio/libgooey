@@ -28,6 +28,7 @@ fn default_order_matches_legacy_chain() {
                 EFFECT_COMPRESSOR,
                 EFFECT_FEEDBACK_WAVESHAPER,
                 EFFECT_REVERB,
+                EFFECT_PLATE_REVERB,
             ]
         );
 
@@ -36,8 +37,8 @@ fn default_order_matches_legacy_chain() {
 }
 
 #[test]
-fn reorderable_count_is_eight() {
-    assert_eq!(gooey_engine_reorderable_effect_count(), 8);
+fn reorderable_count_is_nine() {
+    assert_eq!(gooey_engine_reorderable_effect_count(), 9);
 }
 
 #[test]
@@ -47,6 +48,7 @@ fn bulk_set_then_get_round_trips() {
 
         let new_order = [
             EFFECT_REVERB,
+            EFFECT_PLATE_REVERB,
             EFFECT_DELAY,
             EFFECT_COMPRESSOR,
             EFFECT_SATURATION,
@@ -82,6 +84,7 @@ fn move_effect_to_front_shifts_others_right() {
                 EFFECT_DELAY,
                 EFFECT_COMPRESSOR,
                 EFFECT_FEEDBACK_WAVESHAPER,
+                EFFECT_PLATE_REVERB,
             ]
         );
 
@@ -107,6 +110,7 @@ fn move_effect_to_back_shifts_others_left() {
                 EFFECT_COMPRESSOR,
                 EFFECT_FEEDBACK_WAVESHAPER,
                 EFFECT_REVERB,
+                EFFECT_PLATE_REVERB,
                 EFFECT_SATURATION,
             ]
         );
@@ -135,7 +139,7 @@ fn limiter_cannot_be_set_in_order() {
         let engine = gooey_engine_new(44100.0);
         let before = read_order(engine);
 
-        // Replace REVERB with LIMITER — must be rejected.
+        // Replace PLATE_REVERB with LIMITER — must be rejected.
         let bad = [
             EFFECT_WAVESHAPER,
             EFFECT_SATURATION,
@@ -144,6 +148,7 @@ fn limiter_cannot_be_set_in_order() {
             EFFECT_DELAY,
             EFFECT_COMPRESSOR,
             EFFECT_FEEDBACK_WAVESHAPER,
+            EFFECT_REVERB,
             EFFECT_LIMITER,
         ];
         let ok = gooey_engine_set_effect_order(engine, bad.as_ptr(), N as u32);
@@ -187,6 +192,7 @@ fn duplicate_ids_rejected() {
             EFFECT_DELAY,
             EFFECT_COMPRESSOR,
             EFFECT_REVERB,
+            EFFECT_PLATE_REVERB,
         ];
         let ok = gooey_engine_set_effect_order(engine, bad.as_ptr(), N as u32);
         assert!(!ok);
@@ -225,6 +231,7 @@ fn unknown_id_rejected() {
             EFFECT_DELAY,
             EFFECT_COMPRESSOR,
             EFFECT_FEEDBACK_WAVESHAPER,
+            EFFECT_REVERB,
             999, // not a real effect
         ];
         let ok = gooey_engine_set_effect_order(engine, bad.as_ptr(), N as u32);
@@ -282,6 +289,7 @@ fn reordering_changes_audio_output() {
         EFFECT_COMPRESSOR,
         EFFECT_FEEDBACK_WAVESHAPER,
         EFFECT_REVERB,
+        EFFECT_PLATE_REVERB,
     ];
     let order_b = [
         EFFECT_WAVESHAPER,
@@ -292,6 +300,7 @@ fn reordering_changes_audio_output() {
         EFFECT_COMPRESSOR,
         EFFECT_FEEDBACK_WAVESHAPER,
         EFFECT_REVERB,
+        EFFECT_PLATE_REVERB,
     ];
 
     let buf_a = unsafe { render_with_order(&order_a) };
