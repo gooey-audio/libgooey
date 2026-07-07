@@ -2999,6 +2999,8 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_enabled(
         EFFECT_LIMITER => engine.limiter_enabled = enabled,
         EFFECT_REVERB => engine.reverb_enabled = enabled,
         EFFECT_PLATE_REVERB => engine.plate_reverb_enabled = enabled,
+        EFFECT_WAVESHAPER => engine.waveshaper_enabled = enabled,
+        EFFECT_FEEDBACK_WAVESHAPER => engine.feedback_waveshaper_enabled = enabled,
         _ => {} // Unknown effect, ignore
     }
 }
@@ -3034,6 +3036,8 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_enabled(
         EFFECT_LIMITER => engine.limiter_enabled,
         EFFECT_REVERB => engine.reverb_enabled,
         EFFECT_PLATE_REVERB => engine.plate_reverb_enabled,
+        EFFECT_WAVESHAPER => engine.waveshaper_enabled,
+        EFFECT_FEEDBACK_WAVESHAPER => engine.feedback_waveshaper_enabled,
         _ => false, // Unknown effect
     }
 }
