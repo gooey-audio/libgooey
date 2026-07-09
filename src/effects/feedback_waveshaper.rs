@@ -26,6 +26,14 @@ const ENV_RELEASE_MS: f32 = 120.0;
 /// blow-up as the envelope approaches zero and prevents extreme boost in silence.
 const ENV_FLOOR: f32 = 0.05;
 
+/// Feedback no longer needs to be fully loudness-neutral at high settings: in
+/// Ripple it is a selectable distortion color next to the tube saturator, so
+/// the top of the range should get comparably loud and aggressive while the
+/// lower range remains controlled.
+const FEEDBACK_COMPENSATION_TAMING: f32 = 0.25;
+const HIGH_END_MAKEUP_DB: f32 = 5.1;
+const MAX_COMPENSATION_GAIN: f32 = 3.0;
+
 /// Waveshaper with feedback loop for richer harmonic distortion
 ///
 /// The feedback path includes a one-pole lowpass filter (controllable cutoff)
@@ -133,13 +141,7 @@ impl FeedbackWaveshaper {
             self.env = 0.0;
         }
 
-        // Gain compensation: maintain consistent output level across all drive values.
-        // Since last_out is already compensated, the loop gain is feedback * compensation.
-        // Solving for equal loudness with and without feedback gives:
-        //   compensation = comp_no_fb / (1 + comp_no_fb * feedback)
-        let reference = self.env.max(ENV_FLOOR);
-        let comp_no_fb = reference.tanh() / (reference * self.drive).tanh();
-        let compensation = comp_no_fb / (1.0 + comp_no_fb * self.feedback);
+        let compensation = Self::gain_compensation(self.env, self.drive, self.feedback);
         let compensated = shaped * compensation;
 
         // DC block the output
@@ -239,6 +241,21 @@ impl FeedbackWaveshaper {
     #[inline]
     fn compute_env_coeff(time_ms: f32, sample_rate: f32) -> f32 {
         (-1.0 / (time_ms / 1000.0 * sample_rate)).exp()
+    }
+
+    #[inline]
+    fn gain_compensation(env: f32, drive: f32, feedback: f32) -> f32 {
+        let reference = env.max(ENV_FLOOR);
+        let driven_reference = (reference * drive).tanh().abs().max(1e-6);
+        let comp_no_fb = reference.tanh() / driven_reference;
+
+        let drive_norm = ((drive - 1.0) / 99.0).clamp(0.0, 1.0);
+        let feedback_norm = (feedback / 0.98).clamp(0.0, 1.0);
+        let high_end = drive_norm.powf(1.35) * feedback_norm.powf(2.0);
+        let high_end_makeup = 10.0_f32.powf(HIGH_END_MAKEUP_DB * high_end / 20.0);
+
+        let feedback_taming = 1.0 / (1.0 + comp_no_fb * feedback * FEEDBACK_COMPENSATION_TAMING);
+        (comp_no_fb * feedback_taming * high_end_makeup).min(MAX_COMPENSATION_GAIN)
     }
 
     #[inline]
@@ -407,11 +424,12 @@ mod tests {
 
     #[test]
     fn test_feedback_gain_compensation() {
-        // Verify that feedback doesn't significantly increase perceived loudness
+        // Feedback is allowed to add intentional loudness at high settings, but
+        // it should remain bounded so the feedback loop is musically useful.
         let input_signal: Vec<f32> = (0..4000).map(|i| (i as f32 * 0.1).sin() * 0.5).collect();
 
         let mut ws_no_fb = FeedbackWaveshaper::new(44100.0, 5.0, 0.0, 2000.0, 1.0);
-        let mut ws_fb = FeedbackWaveshaper::new(44100.0, 5.0, 0.7, 2000.0, 1.0);
+        let mut ws_fb = FeedbackWaveshaper::new(44100.0, 100.0, 0.98, 2000.0, 1.0);
 
         let rms_no_fb: f32 = input_signal
             .iter()
@@ -426,8 +444,9 @@ mod tests {
 
         let rms_ratio = (rms_fb / rms_no_fb).sqrt();
         assert!(
-            rms_ratio < 1.5,
-            "feedback increased RMS by {:.0}%, expected <50%",
+            rms_ratio > 1.0 && rms_ratio < 5.0,
+            "feedback RMS ratio should be intentionally louder but bounded; got {:.2}x ({:.0}%)",
+            rms_ratio,
             (rms_ratio - 1.0) * 100.0
         );
     }
