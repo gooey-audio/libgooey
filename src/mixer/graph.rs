@@ -292,7 +292,9 @@ impl MixerGraph {
     }
 
     pub fn effect_type_at(&self, track: usize, slot: usize) -> Option<u32> {
-        self.tracks.get(track).and_then(|t| t.rack.effect_type_at(slot))
+        self.tracks
+            .get(track)
+            .and_then(|t| t.rack.effect_type_at(slot))
     }
 
     /// Propagate a new tempo to every track's note-synced effects.
@@ -357,5 +359,109 @@ impl MixerGraph {
             master += f;
         }
         master
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffi::{EFFECT_DELAY, EFFECT_LOWPASS_FILTER, EFFECT_REVERB};
+
+    const SR: f32 = 44_100.0;
+    const BPM: f32 = 120.0;
+
+    #[test]
+    fn default_layout_has_expected_tracks_and_routes() {
+        let graph = MixerGraph::with_default_layout(SR, BPM);
+
+        assert_eq!(graph.track_count(), 4);
+        assert_eq!(graph.track_name(0).unwrap().to_str().unwrap(), "Drums");
+        assert_eq!(graph.track_name(1).unwrap().to_str().unwrap(), "Bass");
+        assert_eq!(graph.track_name(2).unwrap().to_str().unwrap(), "Synth");
+        assert_eq!(graph.track_name(3).unwrap().to_str().unwrap(), "Loops");
+        assert_eq!(graph.route_of(SOURCE_DRUMKIT), Some(0));
+        assert_eq!(graph.route_of(SOURCE_BASS), Some(1));
+        assert_eq!(graph.route_of(SOURCE_POLYSYNTH), Some(2));
+        assert_eq!(graph.route_of(SOURCE_GRANULATOR), Some(3));
+        assert_eq!(graph.route_of(SOURCE_LOOPMIXER), Some(3));
+    }
+
+    #[test]
+    fn routing_rejects_invalid_source_or_track() {
+        let mut graph = MixerGraph::new(SR, BPM);
+        let track = graph.add_track(CString::new("A").unwrap());
+
+        assert!(graph.route(SOURCE_DRUMKIT, track));
+        assert!(!graph.route(SOURCE_COUNT as u32, track));
+        assert!(!graph.route(SOURCE_BASS, track + 1));
+        assert_eq!(graph.route_of(SOURCE_COUNT as u32), None);
+        assert!(graph.unroute(SOURCE_DRUMKIT));
+        assert!(!graph.unroute(SOURCE_DRUMKIT));
+        assert!(!graph.unroute(SOURCE_COUNT as u32));
+    }
+
+    #[test]
+    fn strip_controls_clamp_and_default_on_bad_index() {
+        let mut graph = MixerGraph::new(SR, BPM);
+        let track = graph.add_track(CString::new("A").unwrap());
+
+        graph.set_track_gain(track, 3.0);
+        assert_eq!(graph.track_gain(track), 2.0);
+        graph.set_track_gain(track, -1.0);
+        assert_eq!(graph.track_gain(track), 0.0);
+        assert_eq!(graph.track_gain(track + 1), 1.0);
+
+        graph.set_track_pan(track, 2.0);
+        assert_eq!(graph.track_pan(track), 1.0);
+        graph.set_track_pan(track, -1.0);
+        assert_eq!(graph.track_pan(track), 0.0);
+        assert_eq!(graph.track_pan(track + 1), 0.5);
+
+        graph.set_track_mute(track, true);
+        graph.set_track_solo(track, true);
+        assert!(graph.track_mute(track));
+        assert!(graph.track_solo(track));
+        assert!(!graph.track_mute(track + 1));
+        assert!(!graph.track_solo(track + 1));
+    }
+
+    #[test]
+    fn effect_rack_adds_moves_removes_and_clears() {
+        let mut graph = MixerGraph::new(SR, BPM);
+        let track = graph.add_track(CString::new("A").unwrap());
+
+        assert_eq!(graph.effect_add(track, EFFECT_DELAY), Some(0));
+        assert_eq!(graph.effect_add(track, EFFECT_LOWPASS_FILTER), Some(1));
+        assert_eq!(graph.effect_add(track, EFFECT_REVERB), Some(2));
+        assert_eq!(graph.effect_count(track), 3);
+
+        assert!(graph.effect_move(track, 2, 0));
+        assert_eq!(graph.effect_type_at(track, 0), Some(EFFECT_REVERB));
+        assert_eq!(graph.effect_type_at(track, 1), Some(EFFECT_DELAY));
+        assert_eq!(graph.effect_type_at(track, 2), Some(EFFECT_LOWPASS_FILTER));
+
+        assert!(graph.effect_remove(track, 1));
+        assert_eq!(graph.effect_count(track), 2);
+        assert!(!graph.effect_remove(track, 99));
+
+        graph.effect_clear(track);
+        assert_eq!(graph.effect_count(track), 0);
+        assert_eq!(graph.effect_add(track + 1, EFFECT_DELAY), None);
+    }
+
+    #[test]
+    fn mix_down_records_and_resets_track_peak() {
+        let mut graph = MixerGraph::new(SR, BPM);
+        let track = graph.add_track(CString::new("A").unwrap());
+        assert!(graph.route(SOURCE_DRUMKIT, track));
+
+        graph.clear_scratch();
+        graph.scatter(SOURCE_DRUMKIT, StereoFrame { l: 0.25, r: -0.5 });
+        let out = graph.mix_down();
+
+        assert_eq!(out, StereoFrame { l: 0.25, r: -0.5 });
+        assert_eq!(graph.track_peak_swap(track), Some(0.5));
+        assert_eq!(graph.track_peak_swap(track), Some(0.0));
+        assert_eq!(graph.track_peak_swap(track + 1), None);
     }
 }

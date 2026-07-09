@@ -14,9 +14,6 @@ use crate::instruments::{
     BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth,
     PolySynthConfig, SampleBuffer, SnareConfig, SnareDrum, Tom2, Tom2Config,
 };
-use crate::mixer::graph::{
-    SOURCE_BASS, SOURCE_DRUMKIT, SOURCE_GRANULATOR, SOURCE_LOOPMIXER, SOURCE_POLYSYNTH,
-};
 use crate::mixer::{Mixer, MixerGraph, PitchMode, StereoSampleBuffer};
 use crate::music::{apply_voicing, available_voicings, Key, NoteName, ScaleType, VoicingType};
 use crate::utils::{PresetBlender, SmoothedParam};
@@ -1787,6 +1784,19 @@ const DEFAULT_MASTER_GAIN: f32 = 0.25;
 
 /// Number of stereo loop-mixer channels (see `gooey_engine_loop_*`).
 pub const LOOP_CHANNEL_COUNT: u32 = crate::mixer::LOOP_CHANNEL_COUNT as u32;
+
+/// Mixer graph source: the drum kit (kick/snare/hihat/tom summed).
+pub const SOURCE_DRUMKIT: u32 = crate::mixer::graph::SOURCE_DRUMKIT;
+/// Mixer graph source: the bass voice.
+pub const SOURCE_BASS: u32 = crate::mixer::graph::SOURCE_BASS;
+/// Mixer graph source: the polyphonic synth.
+pub const SOURCE_POLYSYNTH: u32 = crate::mixer::graph::SOURCE_POLYSYNTH;
+/// Mixer graph source: the granulator.
+pub const SOURCE_GRANULATOR: u32 = crate::mixer::graph::SOURCE_GRANULATOR;
+/// Mixer graph source: the stereo loop mixer.
+pub const SOURCE_LOOPMIXER: u32 = crate::mixer::graph::SOURCE_LOOPMIXER;
+/// Number of routable mixer graph sources.
+pub const SOURCE_COUNT: u32 = crate::mixer::graph::SOURCE_COUNT as u32;
 
 // =============================================================================
 // Preset blend constants
@@ -5586,6 +5596,417 @@ pub unsafe extern "C" fn gooey_engine_granulator_set_buffer(
         }
         Err(_) => false,
     }
+}
+
+// =============================================================================
+// Mixer graph: host-defined source routing, submix tracks, and track effects
+// =============================================================================
+//
+// The mixer graph sits above the drum kit, bass, poly synth, granulator, and
+// loop mixer. Hosts can create named tracks, route sources to tracks, adjust
+// track strips, and add track-level effects. Graph mutation is intended to be
+// serialized with rendering, matching the existing loop-effect API contract.
+
+/// Restore the default graph layout: Drums, Bass, Synth, Loops.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_reset_default_layout(engine: *mut GooeyEngine) {
+    if let Some(engine) = engine.as_mut() {
+        engine.graph = MixerGraph::with_default_layout(engine.sample_rate, engine.bpm);
+    }
+}
+
+/// Clear every graph track and source route. All graph-routed sources become silent.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_clear_layout(engine: *mut GooeyEngine) {
+    if let Some(engine) = engine.as_mut() {
+        engine.graph.reset();
+    }
+}
+
+/// Add a named mixer track. Returns the new track index, or -1 on failure.
+///
+/// # Safety
+/// `name` must point to a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_add_track(
+    engine: *mut GooeyEngine,
+    name: *const c_char,
+) -> i32 {
+    match (engine.as_mut(), name.as_ref()) {
+        (Some(engine), Some(_)) => {
+            let name = CStr::from_ptr(name).to_owned();
+            engine.graph.add_track(name) as i32
+        }
+        _ => -1,
+    }
+}
+
+/// Return the number of mixer graph tracks.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_get_track_count(engine: *const GooeyEngine) -> u32 {
+    engine
+        .as_ref()
+        .map_or(0, |engine| engine.graph.track_count() as u32)
+}
+
+/// Return a track's engine-owned name pointer, or null for a bad track index.
+///
+/// The pointer remains valid until the track is renamed, the layout is cleared,
+/// or the engine is freed.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_get_track_name(
+    engine: *const GooeyEngine,
+    track: u32,
+) -> *const c_char {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.graph.track_name(track as usize))
+        .map_or(std::ptr::null(), CStr::as_ptr)
+}
+
+/// Rename a mixer track. Returns false for null input or a bad track index.
+///
+/// # Safety
+/// `name` must point to a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_set_track_name(
+    engine: *mut GooeyEngine,
+    track: u32,
+    name: *const c_char,
+) -> bool {
+    match (engine.as_mut(), name.as_ref()) {
+        (Some(engine), Some(_)) => {
+            let name = CStr::from_ptr(name).to_owned();
+            engine.graph.set_track_name(track as usize, name)
+        }
+        _ => false,
+    }
+}
+
+/// Find the first track with `name`. Returns -1 if none is found.
+///
+/// # Safety
+/// `name` must point to a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_find_track(
+    engine: *const GooeyEngine,
+    name: *const c_char,
+) -> i32 {
+    match (engine.as_ref(), name.as_ref()) {
+        (Some(engine), Some(_)) => {
+            let name = CStr::from_ptr(name);
+            engine
+                .graph
+                .track_index_by_name(name)
+                .map_or(-1, |track| track as i32)
+        }
+        _ => -1,
+    }
+}
+
+/// Route an engine source (`SOURCE_*`) to a mixer track.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_route_source(
+    engine: *mut GooeyEngine,
+    source: u32,
+    track: u32,
+) -> bool {
+    match engine.as_mut() {
+        Some(engine) => engine.graph.route(source, track as usize),
+        None => false,
+    }
+}
+
+/// Unroute an engine source. Returns false for invalid or already-unrouted sources.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_unroute_source(
+    engine: *mut GooeyEngine,
+    source: u32,
+) -> bool {
+    match engine.as_mut() {
+        Some(engine) => engine.graph.unroute(source),
+        None => false,
+    }
+}
+
+/// Return the track a source is routed to, or -1 if invalid/unrouted.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_get_source_route(
+    engine: *const GooeyEngine,
+    source: u32,
+) -> i32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.graph.route_of(source))
+        .map_or(-1, |track| track as i32)
+}
+
+/// Set a track fader gain (`0.0..=2.0`).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_set_track_gain(
+    engine: *mut GooeyEngine,
+    track: u32,
+    gain: f32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.graph.set_track_gain(track as usize, gain);
+    }
+}
+
+/// Get a track fader gain, or 1.0 for null/bad track.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_get_track_gain(
+    engine: *const GooeyEngine,
+    track: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .map_or(1.0, |engine| engine.graph.track_gain(track as usize))
+}
+
+/// Set a track stereo balance (`0.0` left, `0.5` center, `1.0` right).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_set_track_pan(
+    engine: *mut GooeyEngine,
+    track: u32,
+    pan: f32,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine.graph.set_track_pan(track as usize, pan);
+    }
+}
+
+/// Get a track stereo balance, or 0.5 for null/bad track.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_get_track_pan(
+    engine: *const GooeyEngine,
+    track: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .map_or(0.5, |engine| engine.graph.track_pan(track as usize))
+}
+
+/// Mute or unmute a track.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_set_track_mute(
+    engine: *mut GooeyEngine,
+    track: u32,
+    muted: bool,
+) {
+    if let Some(engine) = engine.as_ref() {
+        engine.graph.set_track_mute(track as usize, muted);
+    }
+}
+
+/// Return a track's mute state, or false for null/bad track.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_get_track_mute(
+    engine: *const GooeyEngine,
+    track: u32,
+) -> bool {
+    engine
+        .as_ref()
+        .is_some_and(|engine| engine.graph.track_mute(track as usize))
+}
+
+/// Solo or un-solo a track.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_set_track_solo(
+    engine: *mut GooeyEngine,
+    track: u32,
+    soloed: bool,
+) {
+    if let Some(engine) = engine.as_ref() {
+        engine.graph.set_track_solo(track as usize, soloed);
+    }
+}
+
+/// Return a track's solo state, or false for null/bad track.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_get_track_solo(
+    engine: *const GooeyEngine,
+    track: u32,
+) -> bool {
+    engine
+        .as_ref()
+        .is_some_and(|engine| engine.graph.track_solo(track as usize))
+}
+
+/// Read and reset a track's post-strip peak. Returns 0.0 for null/bad track.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_mixer_get_track_peak(
+    engine: *const GooeyEngine,
+    track: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.graph.track_peak_swap(track as usize))
+        .unwrap_or(0.0)
+}
+
+/// Append an effect to a mixer track. Returns the new slot, or -1 on failure.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_track_effect_add(
+    engine: *mut GooeyEngine,
+    track: u32,
+    effect_id: u32,
+) -> i32 {
+    match engine.as_mut() {
+        Some(engine) => engine
+            .graph
+            .effect_add(track as usize, effect_id)
+            .map_or(-1, |slot| slot as i32),
+        None => -1,
+    }
+}
+
+/// Remove an effect from a mixer track.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_track_effect_remove(
+    engine: *mut GooeyEngine,
+    track: u32,
+    slot: u32,
+) -> bool {
+    match engine.as_mut() {
+        Some(engine) => engine.graph.effect_remove(track as usize, slot as usize),
+        None => false,
+    }
+}
+
+/// Move an effect within a mixer track's rack.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_track_effect_move(
+    engine: *mut GooeyEngine,
+    track: u32,
+    slot: u32,
+    new_position: u32,
+) -> bool {
+    match engine.as_mut() {
+        Some(engine) => {
+            engine
+                .graph
+                .effect_move(track as usize, slot as usize, new_position as usize)
+        }
+        None => false,
+    }
+}
+
+/// Clear all effects from a mixer track.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_track_effect_clear(engine: *mut GooeyEngine, track: u32) {
+    if let Some(engine) = engine.as_mut() {
+        engine.graph.effect_clear(track as usize);
+    }
+}
+
+/// Set a parameter on a mixer track effect.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_track_effect_set_param(
+    engine: *mut GooeyEngine,
+    track: u32,
+    slot: u32,
+    param: u32,
+    value: f32,
+) {
+    if let Some(engine) = engine.as_ref() {
+        engine
+            .graph
+            .effect_set_param(track as usize, slot as usize, param, value);
+    }
+}
+
+/// Return the number of effects on a mixer track.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_track_effect_count(
+    engine: *const GooeyEngine,
+    track: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .map_or(0, |engine| engine.graph.effect_count(track as usize) as u32)
+}
+
+/// Return the `EFFECT_*` id at a mixer track effect slot, or -1.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_track_effect_type_at(
+    engine: *const GooeyEngine,
+    track: u32,
+    slot: u32,
+) -> i32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.graph.effect_type_at(track as usize, slot as usize))
+        .map_or(-1, |id| id as i32)
 }
 
 // =============================================================================
