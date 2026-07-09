@@ -118,6 +118,10 @@ name = "multi_channel_submix"
 required-features = ["native", "crossterm"]
 
 [[example]]
+name = "performance_record"
+required-features = ["native", "crossterm"]
+
+[[example]]
 name = "antialias_validation"
 required-features = ["bounce"]
 

@@ -14,6 +14,7 @@ pub mod gen;
 pub mod instruments;
 pub mod mixer;
 pub mod music;
+pub mod performance;
 pub mod sequencer;
 pub mod utils;
 
