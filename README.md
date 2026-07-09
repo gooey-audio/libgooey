@@ -119,6 +119,9 @@ gooey_engine_free(engine);
 
 See `include/gooey.h` for complete API documentation.
 
+For apps migrating from the old flat instrument mix assumption to mixer graph
+submixing, see [docs/mixer-graph-migration.md](docs/mixer-graph-migration.md).
+
 ## License
 
 MIT
