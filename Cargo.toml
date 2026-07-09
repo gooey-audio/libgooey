@@ -114,6 +114,10 @@ name = "loop_mixer"
 required-features = ["native", "crossterm", "bounce"]
 
 [[example]]
+name = "multi_channel_submix"
+required-features = ["native", "crossterm"]
+
+[[example]]
 name = "antialias_validation"
 required-features = ["bounce"]
 

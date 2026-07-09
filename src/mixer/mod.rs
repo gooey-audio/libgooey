@@ -9,11 +9,13 @@
 //! engine adds to its master bus before the global effects + limiter.
 
 pub mod effect_chain;
+pub mod graph;
 pub mod loop_channel;
 pub mod stereo_buffer;
 mod wsola;
 
 pub use effect_chain::{ChannelEffect, EffectChain};
+pub use graph::MixerGraph;
 pub use loop_channel::{LoopChannel, PitchMode};
 pub use stereo_buffer::StereoSampleBuffer;
 
