@@ -16,6 +16,9 @@ use crate::instruments::{
 };
 use crate::mixer::{Mixer, MixerGraph, PitchMode, StereoSampleBuffer};
 use crate::music::{apply_voicing, available_voicings, Key, NoteName, ScaleType, VoicingType};
+use crate::performance::{
+    ChordClipEvent, PerformanceRecorder, PlayerAction, RecordMode,
+};
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::slice;
@@ -755,6 +758,9 @@ pub struct GooeyEngine {
     // each render call against `host_clock_anchor`.
     host_clock_anchor: Option<HostClockAnchor>,
     pending_arm_host_time: Option<PendingArm>,
+
+    // Live performance clip recorder/player (Stage 1: chord pad events).
+    performance: PerformanceRecorder,
 }
 
 /// Host-clock reference for the next render buffer. The audio callback sets
@@ -934,6 +940,8 @@ impl GooeyEngine {
             // Scheduled-start state (used for Ableton Link Sync Start/Stop)
             host_clock_anchor: None,
             pending_arm_host_time: None,
+            // Chord performance clip (disarmed by default)
+            performance: PerformanceRecorder::new(),
         }
     }
 
@@ -1167,6 +1175,19 @@ impl GooeyEngine {
                         }
                         self.push_midi_event(ch as u32, velocity, sample_offset);
                     }
+                }
+            }
+
+            // Advance the performance clip clock and apply any chord trigger/release
+            // from recorded events. Playback must not re-enter the recorder.
+            {
+                let beat = self.compute_beat_position();
+                let running = self
+                    .reference_sequencer()
+                    .map(|s| s.is_running())
+                    .unwrap_or(false);
+                if let Some(action) = self.performance.update_clock(beat, running) {
+                    self.apply_performance_action(action);
                 }
             }
 
@@ -3693,6 +3714,62 @@ impl GooeyEngine {
     fn reference_sequencer(&self) -> Option<&Sequencer> {
         self.voice(0).map(|v| &v.sequencer)
     }
+
+    /// Fractional beat position (quarter notes) from the reference sequencer.
+    /// Same math as `gooey_engine_sequencer_get_beat_position`.
+    fn compute_beat_position(&self) -> f64 {
+        let Some(seq) = self.reference_sequencer() else {
+            return 0.0;
+        };
+        let step = seq.current_step() as f64;
+        let step_start = seq.step_start_sample();
+        let step_end = seq.next_trigger_sample();
+        let step_duration = step_end.saturating_sub(step_start);
+        let frac = if step_duration > 0 {
+            let elapsed = seq.sample_count().saturating_sub(step_start);
+            (elapsed as f64 / step_duration as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (step + frac) / 4.0
+    }
+
+    /// Apply a clip player action to the poly synth without recording.
+    fn apply_performance_action(&mut self, action: PlayerAction) {
+        self.performance.set_applying_playback(true);
+        match action {
+            PlayerAction::Trigger(event) => {
+                self.trigger_poly_chord_from_event(event);
+            }
+            PlayerAction::Release => {
+                self.poly_synth.release_all();
+            }
+        }
+        self.performance.set_applying_playback(false);
+    }
+
+    /// Build and trigger a chord from a recorded pad-parameter event.
+    fn trigger_poly_chord_from_event(&mut self, event: ChordClipEvent) {
+        let root_note = root_from_id(event.root);
+        let scale = scale_from_id(event.scale_type);
+        let key = Key::new(root_note, scale);
+        let voicing_type = voicing_from_id(event.voicing);
+        let octave = event.octave.clamp(0, 8) as i8;
+        let velocity = event.velocity.clamp(0.0, 1.0);
+
+        // Smoothed targets only — avoid snap_params on every clip replay hit.
+        self.poly_synth.set_config(preset_config(event.preset));
+
+        let chords = key.diatonic_sevenths();
+        let degree = event.degree as usize % chords.len().max(1);
+        let chord = &chords[degree];
+        let midi_notes = apply_voicing(chord, voicing_type, octave);
+
+        self.poly_synth.release_all();
+        for note in &midi_notes {
+            self.poly_synth.trigger_note(*note, velocity);
+        }
+    }
 }
 
 /// Set a sequencer step on or off for a specific instrument
@@ -5432,26 +5509,39 @@ pub unsafe extern "C" fn gooey_engine_poly_trigger_chord(
     let scale = scale_from_id(scale_type);
     let key = Key::new(root_note, scale);
     let voicing_type = voicing_from_id(voicing);
-    let octave = octave.clamp(0, 8) as i8;
+    let octave_clamped = octave.clamp(0, 8) as i8;
     let velocity = velocity.clamp(0.0, 1.0);
 
-    // Apply preset
+    // Apply preset only as smoothed targets — do not snap_params here.
+    // Snapping on every chord change forces discontinuous filter/volume jumps
+    // while voices may still be releasing, which clicks.
     engine.poly_synth.set_config(preset_config(preset));
-    engine.poly_synth.snap_params();
 
     // Get diatonic seventh chords and pick the requested degree
     let chords = key.diatonic_sevenths();
-    let degree = degree as usize % chords.len();
-    let chord = &chords[degree];
+    let degree_idx = degree as usize % chords.len();
+    let chord = &chords[degree_idx];
 
     // Apply voicing to get MIDI notes
-    let midi_notes = apply_voicing(chord, voicing_type, octave);
+    let midi_notes = apply_voicing(chord, voicing_type, octave_clamped);
 
     // Release any currently sounding notes, then trigger the new chord
     engine.poly_synth.release_all();
     for note in &midi_notes {
         engine.poly_synth.trigger_note(*note, velocity);
     }
+
+    // Stamp into the performance clip when record-armed and transport is running.
+    // Playback-driven triggers set applying_playback and are ignored.
+    let _ = engine.performance.record_chord_on(
+        root,
+        scale_type,
+        degree,
+        voicing,
+        preset,
+        octave,
+        velocity,
+    );
 }
 
 /// Release all sounding poly synth notes.
@@ -5465,6 +5555,7 @@ pub unsafe extern "C" fn gooey_engine_poly_release(engine: *mut GooeyEngine) {
     }
     let engine = &mut *engine;
     engine.poly_synth.release_all();
+    let _ = engine.performance.record_chord_off();
 }
 
 /// Set the poly synth preset.
@@ -5482,6 +5573,191 @@ pub unsafe extern "C" fn gooey_engine_poly_set_preset(engine: *mut GooeyEngine, 
     }
     let engine = &mut *engine;
     engine.poly_synth.set_config(preset_config(preset));
+}
+
+// =============================================================================
+// Performance recording (live chord clips)
+// =============================================================================
+
+/// Continuous overdub: stay armed across loop wraps.
+pub const PERF_RECORD_MODE_OVERDUB: u32 = crate::performance::PERF_RECORD_MODE_OVERDUB;
+/// Punch-out: auto-disarm after one full clip length of active recording.
+pub const PERF_RECORD_MODE_PUNCH_OUT: u32 = crate::performance::PERF_RECORD_MODE_PUNCH_OUT;
+
+/// Arm or disarm performance recording.
+///
+/// When armed while transport is running, capture begins at the next loop
+/// boundary (tick 0). When armed while stopped, capture begins when transport
+/// starts at tick 0 (or waits for the next loop start if transport starts mid-bar).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_perf_set_record_armed(engine: *mut GooeyEngine, armed: bool) {
+    if engine.is_null() {
+        return;
+    }
+    (*engine).performance.set_armed(armed);
+}
+
+/// Returns true if performance record-arm is on.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_perf_is_record_armed(engine: *const GooeyEngine) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    (*engine).performance.is_armed()
+}
+
+/// Returns true if the engine is currently capturing performance events
+/// (armed, transport running, and inside the active capture window).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_perf_is_recording(engine: *const GooeyEngine) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    (*engine).performance.is_recording()
+}
+
+/// Set the performance record mode.
+///
+/// `mode` is `PERF_RECORD_MODE_OVERDUB` (0) or `PERF_RECORD_MODE_PUNCH_OUT` (1).
+/// Invalid values are ignored.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_perf_set_record_mode(engine: *mut GooeyEngine, mode: u32) {
+    if engine.is_null() {
+        return;
+    }
+    if let Some(m) = RecordMode::from_u32(mode) {
+        (*engine).performance.set_mode(m);
+    }
+}
+
+/// Get the performance record mode (`PERF_RECORD_MODE_*`).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_perf_get_record_mode(engine: *const GooeyEngine) -> u32 {
+    if engine.is_null() {
+        return PERF_RECORD_MODE_PUNCH_OUT;
+    }
+    (*engine).performance.mode().as_u32()
+}
+
+/// Clear all events from the performance clip.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_perf_clear_clip(engine: *mut GooeyEngine) {
+    if engine.is_null() {
+        return;
+    }
+    (*engine).performance.clear_clip();
+}
+
+/// Number of events in the performance clip.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_perf_get_event_count(engine: *const GooeyEngine) -> u32 {
+    if engine.is_null() {
+        return 0;
+    }
+    (*engine).performance.event_count() as u32
+}
+
+/// Read one performance clip event by index.
+///
+/// Returns false if the engine pointer is null or `index` is out of range.
+/// Output pointers may be null to skip fields.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+/// Writable out-pointers must be valid for `T` or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_perf_get_event(
+    engine: *const GooeyEngine,
+    index: u32,
+    start_tick: *mut u32,
+    duration_ticks: *mut u32,
+    root: *mut u32,
+    scale_type: *mut u32,
+    degree: *mut u32,
+    voicing: *mut u32,
+    preset: *mut u32,
+    octave: *mut i32,
+    velocity: *mut f32,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    let Some(event) = (*engine).performance.event(index as usize) else {
+        return false;
+    };
+    if !start_tick.is_null() {
+        *start_tick = event.start_tick;
+    }
+    if !duration_ticks.is_null() {
+        *duration_ticks = event.duration_ticks;
+    }
+    if !root.is_null() {
+        *root = event.root;
+    }
+    if !scale_type.is_null() {
+        *scale_type = event.scale_type;
+    }
+    if !degree.is_null() {
+        *degree = event.degree;
+    }
+    if !voicing.is_null() {
+        *voicing = event.voicing;
+    }
+    if !preset.is_null() {
+        *preset = event.preset;
+    }
+    if !octave.is_null() {
+        *octave = event.octave;
+    }
+    if !velocity.is_null() {
+        *velocity = event.velocity;
+    }
+    true
+}
+
+/// Clip length in ticks (Stage 1: always 384 = 16 steps × 24 ticks).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_perf_get_length_ticks(engine: *const GooeyEngine) -> u32 {
+    if engine.is_null() {
+        return 0;
+    }
+    (*engine).performance.length_ticks()
+}
+
+/// Clip length in sixteenth-note steps (Stage 1: always 16).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_perf_get_length_steps(engine: *const GooeyEngine) -> u32 {
+    if engine.is_null() {
+        return 0;
+    }
+    (*engine).performance.length_steps()
 }
 
 /// Set a single poly synth parameter by index.

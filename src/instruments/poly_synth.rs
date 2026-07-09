@@ -518,9 +518,10 @@ impl Instrument for PolySynth {
             output += self.generate_voice(i, current_time);
         }
 
-        // Scale by inverse of voice count to prevent clipping with chords
-        let active = self.voices.iter().filter(|v| v.active).count().max(1) as f32;
-        output / active
+        // Fixed headroom for a typical 4-note chord. Do NOT divide by the
+        // instantaneous active-voice count — that jumps when notes start/end
+        // and produces zipper/pop artifacts on chord changes and releases.
+        output * (1.0 / 4.0)
     }
 
     fn is_active(&self) -> bool {
