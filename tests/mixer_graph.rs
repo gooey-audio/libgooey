@@ -53,6 +53,19 @@ unsafe fn render_tail_peak(engine: *mut GooeyEngine, frames: usize) -> f32 {
     })
 }
 
+unsafe fn bounce(engine: *mut GooeyEngine, bars: u32) -> Vec<f32> {
+    let mut len = 0;
+    let ptr = gooey_engine_bounce_to_buffer(engine, bars, &mut len);
+    assert!(!ptr.is_null(), "bounce should return a buffer");
+    let out = std::slice::from_raw_parts(ptr, len as usize).to_vec();
+    gooey_engine_free_buffer(ptr, len);
+    out
+}
+
+fn max_abs(buffer: &[f32]) -> f32 {
+    buffer.iter().map(|sample| sample.abs()).fold(0.0, f32::max)
+}
+
 unsafe fn track_name(engine: *const GooeyEngine, track: u32) -> String {
     let ptr = gooey_engine_mixer_get_track_name(engine, track);
     assert!(!ptr.is_null(), "track {track} should have a name");
@@ -365,5 +378,44 @@ fn track_peaks_report_and_reset_after_render() {
         assert_eq!(gooey_engine_mixer_get_track_peak(engine, 0), 0.0);
 
         gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn offline_bounce_snaps_recent_mixer_strip_changes() {
+    unsafe {
+        let gain_engine = gooey_engine_new(SAMPLE_RATE);
+        gooey_engine_sequencer_set_step(gain_engine, 0, true);
+        gooey_engine_mixer_set_track_gain(gain_engine, 0, 0.0);
+        let gain_bounce = bounce(gain_engine, 1);
+        assert_eq!(gain_bounce.len(), 88_200);
+        assert!(
+            max_abs(&gain_bounce) < 1e-6,
+            "track gain should silence from sample zero in offline bounce, peak {}",
+            max_abs(&gain_bounce)
+        );
+        gooey_engine_free(gain_engine);
+
+        let mute_engine = gooey_engine_new(SAMPLE_RATE);
+        gooey_engine_sequencer_set_step(mute_engine, 0, true);
+        gooey_engine_mixer_set_track_mute(mute_engine, 0, true);
+        let mute_bounce = bounce(mute_engine, 1);
+        assert!(
+            max_abs(&mute_bounce) < 1e-6,
+            "track mute should silence from sample zero in offline bounce, peak {}",
+            max_abs(&mute_bounce)
+        );
+        gooey_engine_free(mute_engine);
+
+        let solo_engine = gooey_engine_new(SAMPLE_RATE);
+        gooey_engine_sequencer_set_step(solo_engine, 0, true);
+        gooey_engine_mixer_set_track_solo(solo_engine, 1, true);
+        let solo_bounce = bounce(solo_engine, 1);
+        assert!(
+            max_abs(&solo_bounce) < 1e-6,
+            "soloing another track should silence drums from sample zero in offline bounce, peak {}",
+            max_abs(&solo_bounce)
+        );
+        gooey_engine_free(solo_engine);
     }
 }

@@ -342,6 +342,18 @@ impl MixerGraph {
         }
     }
 
+    /// Snap every track strip smoother to its current target. This is useful for
+    /// offline renders that reset time and should honor just-applied host strip
+    /// changes from sample zero instead of replaying a real-time fade.
+    pub fn snap_strip_params(&mut self) {
+        self.update_mute_solo_targets();
+        for t in &mut self.tracks {
+            t.gain.snap();
+            t.pan.snap();
+            t.mute_gain.snap();
+        }
+    }
+
     /// Apply each track's strip (gain × mute/solo, balance) and effect rack to
     /// its accumulated frame, capture its post-strip peak, and return the summed
     /// master frame. Allocation-free.
@@ -463,5 +475,34 @@ mod tests {
         assert_eq!(graph.track_peak_swap(track), Some(0.5));
         assert_eq!(graph.track_peak_swap(track), Some(0.0));
         assert_eq!(graph.track_peak_swap(track + 1), None);
+    }
+
+    #[test]
+    fn snap_strip_params_applies_current_targets_immediately() {
+        let mut graph = MixerGraph::new(SR, BPM);
+        let track = graph.add_track(CString::new("A").unwrap());
+        assert!(graph.route(SOURCE_DRUMKIT, track));
+
+        graph.set_track_gain(track, 0.5);
+        graph.set_track_pan(track, 0.0);
+        graph.snap_strip_params();
+
+        graph.clear_scratch();
+        graph.scatter(SOURCE_DRUMKIT, StereoFrame::mono(1.0));
+        assert_eq!(graph.mix_down(), StereoFrame { l: 0.5, r: 0.0 });
+
+        graph.set_track_mute(track, true);
+        graph.snap_strip_params();
+        graph.clear_scratch();
+        graph.scatter(SOURCE_DRUMKIT, StereoFrame::mono(1.0));
+        assert_eq!(graph.mix_down(), StereoFrame::default());
+
+        let solo_track = graph.add_track(CString::new("B").unwrap());
+        graph.set_track_mute(track, false);
+        graph.set_track_solo(solo_track, true);
+        graph.snap_strip_params();
+        graph.clear_scratch();
+        graph.scatter(SOURCE_DRUMKIT, StereoFrame::mono(1.0));
+        assert_eq!(graph.mix_down(), StereoFrame::default());
     }
 }

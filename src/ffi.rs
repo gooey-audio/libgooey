@@ -6702,6 +6702,7 @@ impl GooeyEngine {
             voice.channel_gain.snap();
             voice.pan.snap();
         }
+        self.graph.snap_strip_params();
         self.master_gain.snap();
 
         // Render in chunks using the same path as real-time playback. `render`
