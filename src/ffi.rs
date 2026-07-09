@@ -14,10 +14,13 @@ use crate::instruments::{
     BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth,
     PolySynthConfig, SampleBuffer, SnareConfig, SnareDrum, Tom2, Tom2Config,
 };
-use crate::mixer::{Mixer, PitchMode, StereoSampleBuffer};
+use crate::mixer::graph::{
+    SOURCE_BASS, SOURCE_DRUMKIT, SOURCE_GRANULATOR, SOURCE_LOOPMIXER, SOURCE_POLYSYNTH,
+};
+use crate::mixer::{Mixer, MixerGraph, PitchMode, StereoSampleBuffer};
 use crate::music::{apply_voicing, available_voicings, Key, NoteName, ScaleType, VoicingType};
 use crate::utils::{PresetBlender, SmoothedParam};
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -573,12 +576,99 @@ impl ChannelBlender {
 ///
 /// Parameter smoothing is handled internally by each instrument,
 /// so all parameter changes are automatically smoothed to prevent clicks/pops.
-pub struct GooeyEngine {
-    // Per-channel instruments (each can hold any synth type)
-    channels: [ChannelInstrument; NUM_INSTRUMENTS],
+/// Number of drum voices in the kit (kick, snare, hihat, tom). Bass is a
+/// separate top-level voice, so the addressable voice space
+/// (`NUM_INSTRUMENTS` = 5) is the kit voices plus bass at index 4.
+const KIT_VOICE_COUNT: usize = 4;
 
-    // Per-channel sequencers (sample-accurate, synchronized)
-    sequencers: [Sequencer; NUM_INSTRUMENTS],
+/// One voice's complete per-channel state: the instrument plus its sequencer,
+/// preset blender, mixer strip (fader / mute-solo / pan / peak), manual-trigger
+/// latch, and per-step MIDI-note frequency save slot. This bundles what were
+/// previously parallel `[_; NUM_INSTRUMENTS]` arrays into a single owned column
+/// so voices can be grouped into a `DrumKit` collection and routed as sources.
+struct VoiceStrip {
+    instrument: ChannelInstrument,
+    sequencer: Sequencer,
+    blender: ChannelBlender,
+    blend_enabled: bool,
+    blend_x: f32,
+    blend_y: f32,
+    blend_corner_presets: [u32; 4],
+    /// Mixer fader (0.0–1.0), applied after synthesis/blend; the blend system
+    /// cannot override it. Was `instrument_channel_gains[i]`.
+    channel_gain: SmoothedParam,
+    /// Smoothed mute/solo multiplier for click-free transitions. Was
+    /// `instrument_gains[i]`.
+    mute_gain: SmoothedParam,
+    /// Stereo pan (0.0 = left, 0.5 = center, 1.0 = right), equal-power. Was
+    /// `instrument_pans[i]`.
+    pan: SmoothedParam,
+    muted: AtomicBool,
+    soloed: AtomicBool,
+    /// Peak amplitude since last read (f32 bits, read-and-reset by UI). Was
+    /// `channel_peaks[i]`.
+    peak: AtomicU32,
+    trigger_pending: AtomicBool,
+    trigger_velocity: AtomicU32, // f32 bits stored atomically
+    /// Saved global frequency for restoring after per-step MIDI note overrides.
+    saved_global_freq: Option<f32>,
+}
+
+impl VoiceStrip {
+    /// Build a voice from its instrument and a fresh sequencer. `instrument_type`
+    /// selects the default preset blender and corner presets.
+    fn new(
+        instrument: ChannelInstrument,
+        sequencer: Sequencer,
+        instrument_type: u32,
+        sample_rate: f32,
+    ) -> Self {
+        Self {
+            instrument,
+            sequencer,
+            blender: ChannelBlender::default_for_type(instrument_type),
+            blend_enabled: false,
+            blend_x: 0.5,
+            blend_y: 0.5,
+            blend_corner_presets: ChannelBlender::default_corner_preset_ids(instrument_type),
+            channel_gain: SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0),
+            mute_gain: SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0),
+            pan: SmoothedParam::new(0.5, 0.0, 1.0, sample_rate, 10.0),
+            muted: AtomicBool::new(false),
+            soloed: AtomicBool::new(false),
+            peak: AtomicU32::new(0.0_f32.to_bits()),
+            trigger_pending: AtomicBool::new(false),
+            trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
+            saved_global_freq: None,
+        }
+    }
+
+    /// Record a new peak (read-and-reset by the UI). `level` is a pre-pan mono
+    /// magnitude. Uses the same compare-and-store pattern as the old
+    /// `channel_peaks` array.
+    fn record_peak(&self, level: f32) {
+        let prev = f32::from_bits(self.peak.load(Ordering::Relaxed));
+        if level > prev {
+            self.peak.store(level.to_bits(), Ordering::Relaxed);
+        }
+    }
+}
+
+/// A submixable collection of drum voices (kick, snare, hihat, tom). Each voice
+/// keeps its own sequencer, blender, and mixer strip; the whole kit is routed as
+/// one source (`SourceId::DrumKit`) in the mixer graph. Bass is intentionally not
+/// a member — it is a melodic voice routed as its own source.
+struct DrumKit {
+    voices: [VoiceStrip; KIT_VOICE_COUNT],
+}
+
+pub struct GooeyEngine {
+    // Drum voices (kick, snare, hihat, tom) grouped as one submixable kit.
+    kit: DrumKit,
+
+    // Bass voice — a melodic instrument routed as its own source, sibling to the
+    // kit. Addressed as legacy instrument index 4.
+    bass: VoiceStrip,
 
     /// Global effects. Applied in the order described by `effect_order`,
     /// followed by the optional limiter which is always last.
@@ -617,45 +707,11 @@ pub struct GooeyEngine {
     /// Smoothed gain applied to the complete instrument sum before global effects.
     master_gain: SmoothedParam,
 
-    // Per-channel manual trigger flags and velocities
-    trigger_pending: [AtomicBool; NUM_INSTRUMENTS],
-    trigger_velocity: [AtomicU32; NUM_INSTRUMENTS], // f32 bits stored atomically
-
-    // Per-channel peak amplitude since last read (f32 bits stored atomically, read-and-reset by UI)
-    channel_peaks: [AtomicU32; NUM_INSTRUMENTS],
-
     // LFO pool (8 LFOs with multi-target routing)
     lfos: [Lfo; LFO_COUNT],
     lfo_enabled: [bool; LFO_COUNT],
     lfo_routes: [Vec<LfoRoute>; LFO_COUNT],
     lfo_next_route_id: [u32; LFO_COUNT],
-
-    // Per-channel mute/solo state
-    instrument_muted: [AtomicBool; NUM_INSTRUMENTS],
-    instrument_soloed: [AtomicBool; NUM_INSTRUMENTS],
-
-    // Smoothed gain multipliers for click-free mute/solo transitions
-    instrument_gains: [SmoothedParam; NUM_INSTRUMENTS],
-
-    // Per-channel gain (0.0–1.0), applied after synthesis and blending.
-    // Acts as a mixer fader that the blend system cannot override.
-    instrument_channel_gains: [SmoothedParam; NUM_INSTRUMENTS],
-
-    // Per-channel stereo pan (0.0 = left, 0.5 = center, 1.0 = right), applied
-    // at the stereo seam with an equal-power law. Smoothed for click-free moves.
-    instrument_pans: [SmoothedParam; NUM_INSTRUMENTS],
-
-    // Per-channel preset blend state (2D X/Y pad interpolation)
-    blenders: [ChannelBlender; NUM_INSTRUMENTS],
-    blend_enabled: [bool; INSTRUMENT_COUNT as usize],
-    blend_x: [f32; INSTRUMENT_COUNT as usize],
-    blend_y: [f32; INSTRUMENT_COUNT as usize],
-    blend_corner_presets: [[u32; 4]; INSTRUMENT_COUNT as usize],
-
-    // Per-channel saved global frequency for restoring after per-step MIDI note overrides.
-    // When a step with a note fires, the instrument's current frequency param is saved here.
-    // When a step without a note fires, the saved value is restored and cleared.
-    saved_global_freq: [Option<f32>; NUM_INSTRUMENTS],
 
     // Pending MIDI events from the most recent render pass (pre-allocated, no audio-thread alloc)
     pending_midi_events: Vec<GooeyMidiEvent>,
@@ -676,6 +732,13 @@ pub struct GooeyEngine {
     // into the master bus before the global effects chain. The `gooey_engine_loop_*`
     // FFI functions expose control over this.
     mixer: Mixer,
+
+    // Host-defined mixer graph: named submix tracks, each with a strip
+    // (gain / balance / mute-solo / peak) and its own effect rack. Sources
+    // (drum kit, bass, poly, granulator, loop mixer) route into tracks, which
+    // sum to the master bus. Controlled via `gooey_engine_mixer_*` and
+    // `gooey_engine_track_effect_*`.
+    graph: MixerGraph,
 
     // When true, an external source (e.g. Ableton Link) owns the tempo.
     // The host should check this flag to decide whether local BPM changes
@@ -736,23 +799,44 @@ impl GooeyEngine {
     fn new(sample_rate: f32) -> Self {
         let bpm = 120.0;
 
-        // Create channel instruments (default: ch0=kick, ch1=snare, ch2=hihat, ch3=tom, ch4=bass)
-        let channels = [
-            ChannelInstrument::Kick(KickDrum::new(sample_rate)),
-            ChannelInstrument::Snare(SnareDrum::new(sample_rate)),
-            ChannelInstrument::HiHat(HiHat2::new(sample_rate)),
-            ChannelInstrument::Tom(Tom2::new(sample_rate)),
-            ChannelInstrument::Bass(BassSynth::new(sample_rate)),
-        ];
+        // Drum kit: four voices (kick, snare, hihat, tom), each with its own
+        // 16-step sequencer, blender, and mixer strip.
+        let kit = DrumKit {
+            voices: [
+                VoiceStrip::new(
+                    ChannelInstrument::Kick(KickDrum::new(sample_rate)),
+                    Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "kick"),
+                    INSTRUMENT_KICK,
+                    sample_rate,
+                ),
+                VoiceStrip::new(
+                    ChannelInstrument::Snare(SnareDrum::new(sample_rate)),
+                    Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "snare"),
+                    INSTRUMENT_SNARE,
+                    sample_rate,
+                ),
+                VoiceStrip::new(
+                    ChannelInstrument::HiHat(HiHat2::new(sample_rate)),
+                    Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "hihat"),
+                    INSTRUMENT_HIHAT,
+                    sample_rate,
+                ),
+                VoiceStrip::new(
+                    ChannelInstrument::Tom(Tom2::new(sample_rate)),
+                    Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "tom"),
+                    INSTRUMENT_TOM,
+                    sample_rate,
+                ),
+            ],
+        };
 
-        // Create a 16-step sequencer for each channel
-        let sequencers = [
-            Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "kick"),
-            Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "snare"),
-            Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "hihat"),
-            Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "tom"),
+        // Bass voice — routed as its own source (legacy instrument index 4).
+        let bass = VoiceStrip::new(
+            ChannelInstrument::Bass(BassSynth::new(sample_rate)),
             Sequencer::with_pattern(bpm, sample_rate, vec![false; 16], "bass"),
-        ];
+            INSTRUMENT_BASS,
+            sample_rate,
+        );
 
         // Create delay with default settings (quarter note timing, no feedback, no mix, filter open)
         let delay = DelayEffect::new(sample_rate, DelayTiming::Quarter, bpm, 0.0, 0.0, 20000.0);
@@ -786,18 +870,9 @@ impl GooeyEngine {
         let lfos = std::array::from_fn(|_| Lfo::with_sample_rate(sample_rate));
         let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] = std::array::from_fn(|_| Vec::new());
 
-        // Create per-channel preset blenders with default corner presets
-        let blenders = [
-            ChannelBlender::default_for_type(INSTRUMENT_KICK),
-            ChannelBlender::default_for_type(INSTRUMENT_SNARE),
-            ChannelBlender::default_for_type(INSTRUMENT_HIHAT),
-            ChannelBlender::default_for_type(INSTRUMENT_TOM),
-            ChannelBlender::default_for_type(INSTRUMENT_BASS),
-        ];
-
         Self {
-            channels,
-            sequencers,
+            kit,
+            bass,
             delay,
             delay_enabled: false,
             lowpass_filter,
@@ -826,43 +901,11 @@ impl GooeyEngine {
             current_time: 0.0,
             // Match the native Engine's default summing headroom.
             master_gain: SmoothedParam::new(DEFAULT_MASTER_GAIN, 0.0, 2.0, sample_rate, 30.0),
-            trigger_pending: std::array::from_fn(|_| AtomicBool::new(false)),
-            trigger_velocity: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
-            channel_peaks: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             // LFO pool
             lfos,
             lfo_enabled: [false; LFO_COUNT],
             lfo_routes,
             lfo_next_route_id: [0; LFO_COUNT],
-            // Mute/solo state (all unmuted, none soloed by default)
-            instrument_muted: std::array::from_fn(|_| AtomicBool::new(false)),
-            instrument_soloed: std::array::from_fn(|_| AtomicBool::new(false)),
-            // Smoothed gains for click-free mute/solo transitions (10ms smoothing)
-            instrument_gains: std::array::from_fn(|_| {
-                SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0)
-            }),
-            // Per-instrument channel gains (default 1.0 = unity, 10ms smoothing)
-            instrument_channel_gains: std::array::from_fn(|_| {
-                SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, 10.0)
-            }),
-            // Per-instrument stereo pan (default 0.5 = center, 10ms smoothing)
-            instrument_pans: std::array::from_fn(|_| {
-                SmoothedParam::new(0.5, 0.0, 1.0, sample_rate, 10.0)
-            }),
-            // Preset blend state
-            blenders,
-            blend_enabled: [false; INSTRUMENT_COUNT as usize],
-            blend_x: [0.5; INSTRUMENT_COUNT as usize],
-            blend_y: [0.5; INSTRUMENT_COUNT as usize],
-            blend_corner_presets: [
-                ChannelBlender::default_corner_preset_ids(INSTRUMENT_KICK),
-                ChannelBlender::default_corner_preset_ids(INSTRUMENT_SNARE),
-                ChannelBlender::default_corner_preset_ids(INSTRUMENT_HIHAT),
-                ChannelBlender::default_corner_preset_ids(INSTRUMENT_TOM),
-                ChannelBlender::default_corner_preset_ids(INSTRUMENT_BASS),
-            ],
-            // Per-step note override: saved global frequency for restore
-            saved_global_freq: [None; NUM_INSTRUMENTS],
             // MIDI event buffer (pre-allocated for audio thread safety)
             pending_midi_events: Vec::with_capacity(MIDI_EVENT_CAPACITY),
             // Sequencer triggers enabled by default (internal sequencer drives instruments)
@@ -880,6 +923,10 @@ impl GooeyEngine {
             ),
             // Multi-channel stereo loop mixer (empty until the host loads loops).
             mixer: Mixer::new(sample_rate),
+            // Host-defined mixer graph, seeded with the default 4-track layout
+            // (Drums / Bass / Synth / Loops). Bit-identical to the flat mix until
+            // the host adjusts a track strip, rack, or routing.
+            graph: MixerGraph::with_default_layout(sample_rate, bpm),
             // External sync (e.g. Ableton Link)
             link_enabled: AtomicBool::new(false),
             // Error state
@@ -948,6 +995,38 @@ impl GooeyEngine {
     /// signal path is mono, so left and right are currently identical (see the
     /// "stereo seam" near the end of the per-frame loop), but the engine writes
     /// two-channel output so hosts (and future stereo features) consume stereo.
+    /// Borrow a voice by legacy instrument index: 0..=3 are the kit drum voices
+    /// (kick, snare, hihat, tom), 4 is bass. Returns `None` for out-of-range.
+    fn voice(&self, idx: usize) -> Option<&VoiceStrip> {
+        match idx {
+            i if i < KIT_VOICE_COUNT => self.kit.voices.get(i),
+            i if i == KIT_VOICE_COUNT => Some(&self.bass),
+            _ => None,
+        }
+    }
+
+    /// Mutable counterpart to [`voice`](Self::voice).
+    fn voice_mut(&mut self, idx: usize) -> Option<&mut VoiceStrip> {
+        match idx {
+            i if i < KIT_VOICE_COUNT => self.kit.voices.get_mut(i),
+            i if i == KIT_VOICE_COUNT => Some(&mut self.bass),
+            _ => None,
+        }
+    }
+
+    /// Iterate all addressable voices in index order (kit drums then bass).
+    fn voices_iter(&self) -> impl Iterator<Item = &VoiceStrip> {
+        self.kit.voices.iter().chain(std::iter::once(&self.bass))
+    }
+
+    /// Mutable counterpart to [`voices_iter`](Self::voices_iter).
+    fn voices_iter_mut(&mut self) -> impl Iterator<Item = &mut VoiceStrip> {
+        self.kit
+            .voices
+            .iter_mut()
+            .chain(std::iter::once(&mut self.bass))
+    }
+
     fn render(&mut self, buffer: &mut [f32]) {
         // Clear pending MIDI events from previous render pass
         self.pending_midi_events.clear();
@@ -971,8 +1050,8 @@ impl GooeyEngine {
                 // Drain any pending manual triggers so they don't latch and fire
                 // late once the arm resolves; the trigger API contract is "fires
                 // on the next render call", and this render produced silence.
-                for ch in 0..NUM_INSTRUMENTS {
-                    self.trigger_pending[ch].store(false, Ordering::Release);
+                for voice in self.voices_iter() {
+                    voice.trigger_pending.store(false, Ordering::Release);
                 }
                 for sample in buffer.iter_mut() {
                     *sample = 0.0;
@@ -985,28 +1064,36 @@ impl GooeyEngine {
         // Check for pending manual triggers with velocity (all channels)
         // Manual triggers fire at sample_offset 0 (start of buffer)
         for ch in 0..NUM_INSTRUMENTS {
-            if self.trigger_pending[ch].swap(false, Ordering::Acquire) {
-                let velocity = f32::from_bits(self.trigger_velocity[ch].load(Ordering::Acquire));
+            let fired = self.voice(ch).and_then(|v| {
+                if v.trigger_pending.swap(false, Ordering::Acquire) {
+                    Some(f32::from_bits(v.trigger_velocity.load(Ordering::Acquire)))
+                } else {
+                    None
+                }
+            });
+            if let Some(velocity) = fired {
                 self.push_midi_event(ch as u32, velocity, 0);
-                self.channels[ch].trigger_with_velocity(self.current_time, velocity);
+                let time = self.current_time;
+                if let Some(voice) = self.voice_mut(ch) {
+                    voice.instrument.trigger_with_velocity(time, velocity);
+                }
             }
         }
 
         let sample_period = 1.0 / self.sample_rate as f64;
 
         // Update mute/solo gain targets (check once per buffer for efficiency)
-        let any_soloed = self
-            .instrument_soloed
-            .iter()
-            .any(|s| s.load(Ordering::Relaxed));
-        for i in 0..NUM_INSTRUMENTS {
+        let any_soloed = self.voices_iter().any(|v| v.soloed.load(Ordering::Relaxed));
+        for voice in self.voices_iter_mut() {
             let target = Self::calculate_instrument_gain(
-                self.instrument_muted[i].load(Ordering::Relaxed),
-                self.instrument_soloed[i].load(Ordering::Relaxed),
+                voice.muted.load(Ordering::Relaxed),
+                voice.soloed.load(Ordering::Relaxed),
                 any_soloed,
             );
-            self.instrument_gains[i].set_target(target);
+            voice.mute_gain.set_target(target);
         }
+        // Recompute per-track mute/solo targets (scoped across tracks) once per buffer.
+        self.graph.update_mute_solo_targets();
 
         let mut sample_offset: u32 = 0;
         for frame in buffer.chunks_mut(2) {
@@ -1026,9 +1113,9 @@ impl GooeyEngine {
                 // arm_fires_at locally and pending_arm_host_time on the
                 // engine ensures we only fire once per render.
                 if let Some(pending) = self.pending_arm_host_time.take() {
-                    for seq in &mut self.sequencers {
-                        seq.set_beat_position(pending.beat_position);
-                        seq.start();
+                    for voice in self.voices_iter_mut() {
+                        voice.sequencer.set_beat_position(pending.beat_position);
+                        voice.sequencer.start();
                     }
                 }
                 arm_fires_at = None;
@@ -1038,43 +1125,49 @@ impl GooeyEngine {
             let mut seq_triggers: [Option<(f32, Option<SequencerBlendSetting>, Option<u8>)>;
                 NUM_INSTRUMENTS] = [None; NUM_INSTRUMENTS];
             for ch in 0..NUM_INSTRUMENTS {
-                seq_triggers[ch] = self.sequencers[ch]
-                    .tick_with_settings()
-                    .map(|trigger| (trigger.velocity, trigger.blend, trigger.note));
+                if let Some(voice) = self.voice_mut(ch) {
+                    seq_triggers[ch] = voice
+                        .sequencer
+                        .tick_with_settings()
+                        .map(|trigger| (trigger.velocity, trigger.blend, trigger.note));
+                }
             }
 
             // Apply triggers with velocity after all sequencers have been ticked.
             if self.sequencer_triggers_enabled.load(Ordering::Relaxed) {
+                let time = self.current_time;
                 for ch in 0..NUM_INSTRUMENTS {
                     if let Some((velocity, blend, note)) = seq_triggers[ch] {
                         self.apply_sequencer_blend_setting(ch as u32, blend);
-                        // Snap params only when a blend was actually applied,
-                        // so we don't clobber in-flight UI/LFO smoothing.
-                        if blend.is_some() || self.blend_enabled[ch] {
-                            self.channels[ch].snap_params();
-                        }
-                        // Apply per-step MIDI note frequency override (sample-accurate).
-                        // When a step has a note, save the global freq and override.
-                        // When a step has no note, restore the saved global freq.
-                        if let Some(midi_note) = note {
-                            let instr_type = self.channels[ch].instrument_type();
-                            if let Some((freq_min, freq_max)) =
-                                Self::freq_range_for_instrument(instr_type)
-                            {
-                                if self.saved_global_freq[ch].is_none() {
-                                    self.saved_global_freq[ch] = self.channels[ch].get_freq_param();
-                                }
-                                let normalized = Self::midi_note_to_normalized_freq(
-                                    midi_note, freq_min, freq_max,
-                                );
-                                self.channels[ch].set_param(0, normalized);
-                                self.channels[ch].snap_params();
+                        if let Some(voice) = self.voice_mut(ch) {
+                            // Snap params only when a blend was actually applied,
+                            // so we don't clobber in-flight UI/LFO smoothing.
+                            if blend.is_some() || voice.blend_enabled {
+                                voice.instrument.snap_params();
                             }
-                        } else if let Some(saved) = self.saved_global_freq[ch].take() {
-                            self.channels[ch].set_param(0, saved);
-                            self.channels[ch].snap_params();
+                            // Apply per-step MIDI note frequency override (sample-accurate).
+                            // When a step has a note, save the global freq and override.
+                            // When a step has no note, restore the saved global freq.
+                            if let Some(midi_note) = note {
+                                let instr_type = voice.instrument.instrument_type();
+                                if let Some((freq_min, freq_max)) =
+                                    Self::freq_range_for_instrument(instr_type)
+                                {
+                                    if voice.saved_global_freq.is_none() {
+                                        voice.saved_global_freq = voice.instrument.get_freq_param();
+                                    }
+                                    let normalized = Self::midi_note_to_normalized_freq(
+                                        midi_note, freq_min, freq_max,
+                                    );
+                                    voice.instrument.set_param(0, normalized);
+                                    voice.instrument.snap_params();
+                                }
+                            } else if let Some(saved) = voice.saved_global_freq.take() {
+                                voice.instrument.set_param(0, saved);
+                                voice.instrument.snap_params();
+                            }
+                            voice.instrument.trigger_with_velocity(time, velocity);
                         }
-                        self.channels[ch].trigger_with_velocity(self.current_time, velocity);
                         self.push_midi_event(ch as u32, velocity, sample_offset);
                     }
                 }
@@ -1103,40 +1196,47 @@ impl GooeyEngine {
             // each effect can process true left/right. Effects are stereo-aware
             // (per-channel state); with every channel centered and no stereo
             // effect engaged the two channels stay identical.
+            // Sum each voice into its source frame: kit voices (0..KIT_VOICE_COUNT)
+            // form the DrumKit source, bass forms the Bass source. Per-voice gain,
+            // mute/solo, pan, and peak metering are unchanged; only the routing
+            // target differs. `channel_outs` still feeds the compressor sidechain.
             let mut channel_outs = [0.0_f32; NUM_INSTRUMENTS];
-            let mut stereo_pre = StereoFrame::default();
-            for ch in 0..NUM_INSTRUMENTS {
-                let ch_out = self.channels[ch].tick(self.current_time)
-                    * self.instrument_channel_gains[ch].tick()
-                    * self.instrument_gains[ch].tick();
+            let mut kit_frame = StereoFrame::default();
+            let mut bass_frame = StereoFrame::default();
+            let time = self.current_time;
+            for (ch, voice) in self.voices_iter_mut().enumerate() {
+                let ch_out = voice.instrument.tick(time)
+                    * voice.channel_gain.tick()
+                    * voice.mute_gain.tick();
                 channel_outs[ch] = ch_out;
 
-                let panned = StereoFrame::panned(ch_out, self.instrument_pans[ch].tick());
-                stereo_pre.l += panned.l;
-                stereo_pre.r += panned.r;
-
-                // Track per-channel peak for UI metering (pre-pan mono level)
-                let abs_out = ch_out.abs();
-                let prev_peak = f32::from_bits(self.channel_peaks[ch].load(Ordering::Relaxed));
-                if abs_out > prev_peak {
-                    self.channel_peaks[ch].store(abs_out.to_bits(), Ordering::Relaxed);
+                let panned = StereoFrame::panned(ch_out, voice.pan.tick());
+                if ch < KIT_VOICE_COUNT {
+                    kit_frame += panned;
+                } else {
+                    bass_frame += panned;
                 }
+
+                // Track per-voice peak for UI metering (pre-pan mono level)
+                voice.record_peak(ch_out.abs());
             }
 
-            // Poly synth and granulator have no pan control yet — place them at
-            // center for consistency with the equal-power law used above.
-            let center =
-                self.poly_synth.tick(self.current_time) + self.granulator.tick(self.current_time);
-            let center = StereoFrame::panned(center, 0.5);
-            stereo_pre.l += center.l;
-            stereo_pre.r += center.r;
+            // Poly synth and granulator have no pan control yet — center them
+            // for consistency with the equal-power law used above.
+            let poly_frame = StereoFrame::panned(self.poly_synth.tick(time), 0.5);
+            let gran_frame = StereoFrame::panned(self.granulator.tick(time), 0.5);
+            // Loop mixer is already stereo, with its own per-channel effects.
+            let loop_frame = self.mixer.tick(self.sample_rate);
 
-            // Panned instrument sum is the pre-master mix.
-            let mut stereo = stereo_pre;
-
-            // Sum the loop mixer (already stereo, with its own per-channel
-            // effects) into the master bus.
-            stereo += self.mixer.tick(self.sample_rate);
+            // Scatter each source into its routed track, then apply per-track
+            // strip (gain × mute/solo, balance) + effect rack and sum to master.
+            self.graph.clear_scratch();
+            self.graph.scatter(SOURCE_DRUMKIT, kit_frame);
+            self.graph.scatter(SOURCE_BASS, bass_frame);
+            self.graph.scatter(SOURCE_POLYSYNTH, poly_frame);
+            self.graph.scatter(SOURCE_GRANULATOR, gran_frame);
+            self.graph.scatter(SOURCE_LOOPMIXER, loop_frame);
+            let mut stereo = self.graph.mix_down();
 
             // Apply master headroom to the full mix (instruments + loops) before
             // the optional global effects + limiter, so the master fader scales
@@ -1222,8 +1322,12 @@ impl GooeyEngine {
         }
 
         let idx = channel as usize;
-        if idx < NUM_INSTRUMENTS && self.blend_enabled[idx] {
-            self.apply_blend_position(channel, self.blend_x[idx], self.blend_y[idx]);
+        if let Some((x, y)) = self
+            .voice(idx)
+            .filter(|v| v.blend_enabled)
+            .map(|v| (v.blend_x, v.blend_y))
+        {
+            self.apply_blend_position(channel, x, y);
         }
     }
 
@@ -1231,8 +1335,8 @@ impl GooeyEngine {
         let x = x.clamp(0.0, 1.0);
         let y = y.clamp(0.0, 1.0);
         let idx = channel as usize;
-        if idx < NUM_INSTRUMENTS {
-            self.blenders[idx].blend_and_apply(&mut self.channels[idx], x, y);
+        if let Some(voice) = self.voice_mut(idx) {
+            voice.blender.blend_and_apply(&mut voice.instrument, x, y);
         }
     }
 
@@ -1252,9 +1356,8 @@ impl GooeyEngine {
 
     /// Apply LFO modulation to a channel's instrument parameter by index
     fn apply_modulation_by_index(&mut self, channel: u32, param: u32, value: f32) {
-        let idx = channel as usize;
-        if idx < NUM_INSTRUMENTS {
-            self.channels[idx].apply_modulation(param, value);
+        if let Some(voice) = self.voice_mut(channel as usize) {
+            voice.instrument.apply_modulation(param, value);
         }
     }
 
@@ -1281,11 +1384,18 @@ impl GooeyEngine {
         1.0
     }
 
-    /// Find the first channel holding the given instrument type.
-    fn find_channel_by_type(&self, instrument_type: u32) -> Option<usize> {
-        self.channels
-            .iter()
-            .position(|ch| ch.instrument_type() == instrument_type)
+    /// Borrow the first voice's instrument matching the given type.
+    fn instrument_by_type(&self, instrument_type: u32) -> Option<&ChannelInstrument> {
+        self.voices_iter()
+            .map(|v| &v.instrument)
+            .find(|i| i.instrument_type() == instrument_type)
+    }
+
+    /// Mutable counterpart to [`instrument_by_type`](Self::instrument_by_type).
+    fn instrument_by_type_mut(&mut self, instrument_type: u32) -> Option<&mut ChannelInstrument> {
+        self.voices_iter_mut()
+            .map(|v| &mut v.instrument)
+            .find(|i| i.instrument_type() == instrument_type)
     }
 
     /// Get a KickConfig preset by ID
@@ -2114,36 +2224,36 @@ pub unsafe extern "C" fn gooey_engine_set_channel_instrument_type(
         return;
     }
     let engine = &mut *engine;
-    let idx = channel as usize;
-    if idx >= NUM_INSTRUMENTS {
+    let sample_rate = engine.sample_rate;
+    let Some(voice) = engine.voice_mut(channel as usize) else {
         return;
-    }
+    };
 
     // No-op if already the requested type
-    if engine.channels[idx].instrument_type() == instrument_type {
+    if voice.instrument.instrument_type() == instrument_type {
         return;
     }
 
     let new_instrument = match instrument_type {
-        INSTRUMENT_KICK => ChannelInstrument::Kick(KickDrum::new(engine.sample_rate)),
-        INSTRUMENT_SNARE => ChannelInstrument::Snare(SnareDrum::new(engine.sample_rate)),
-        INSTRUMENT_HIHAT => ChannelInstrument::HiHat(HiHat2::new(engine.sample_rate)),
-        INSTRUMENT_TOM => ChannelInstrument::Tom(Tom2::new(engine.sample_rate)),
-        INSTRUMENT_BASS => ChannelInstrument::Bass(BassSynth::new(engine.sample_rate)),
+        INSTRUMENT_KICK => ChannelInstrument::Kick(KickDrum::new(sample_rate)),
+        INSTRUMENT_SNARE => ChannelInstrument::Snare(SnareDrum::new(sample_rate)),
+        INSTRUMENT_HIHAT => ChannelInstrument::HiHat(HiHat2::new(sample_rate)),
+        INSTRUMENT_TOM => ChannelInstrument::Tom(Tom2::new(sample_rate)),
+        INSTRUMENT_BASS => ChannelInstrument::Bass(BassSynth::new(sample_rate)),
         _ => return,
     };
 
-    engine.channels[idx] = new_instrument;
-    engine.blenders[idx] = ChannelBlender::default_for_type(instrument_type);
-    engine.blend_corner_presets[idx] = ChannelBlender::default_corner_preset_ids(instrument_type);
+    voice.instrument = new_instrument;
+    voice.blender = ChannelBlender::default_for_type(instrument_type);
+    voice.blend_corner_presets = ChannelBlender::default_corner_preset_ids(instrument_type);
 
     // If blend is enabled, re-apply position with the new blender
-    if engine.blend_enabled[idx] {
-        let x = engine.blend_x[idx];
-        let y = engine.blend_y[idx];
-        engine.blenders[idx].blend_and_apply(&mut engine.channels[idx], x, y);
+    if voice.blend_enabled {
+        let x = voice.blend_x;
+        let y = voice.blend_y;
+        voice.blender.blend_and_apply(&mut voice.instrument, x, y);
     }
-    // channel gain, mute, solo, sequencer pattern all preserved (separate arrays)
+    // channel gain, mute, solo, sequencer pattern all preserved on the voice
 }
 
 /// Returns the current instrument type for a channel.
@@ -2169,11 +2279,10 @@ pub unsafe extern "C" fn gooey_engine_get_channel_instrument_type(
         return 0xFFFFFFFF;
     }
     let engine = &*engine;
-    let idx = channel as usize;
-    if idx >= NUM_INSTRUMENTS {
-        return 0xFFFFFFFF;
+    match engine.voice(channel as usize) {
+        Some(voice) => voice.instrument.instrument_type(),
+        None => 0xFFFFFFFF,
     }
-    engine.channels[idx].instrument_type()
 }
 
 /// Set a parameter on a channel's instrument, regardless of what synth type it holds.
@@ -2203,11 +2312,9 @@ pub unsafe extern "C" fn gooey_engine_set_channel_param(
         return;
     }
     let engine = &mut *engine;
-    let idx = channel as usize;
-    if idx >= NUM_INSTRUMENTS {
-        return;
+    if let Some(voice) = engine.voice_mut(channel as usize) {
+        voice.instrument.set_param(param, value);
     }
-    engine.channels[idx].set_param(param, value);
 }
 
 /// Set the tuning offset for a channel (0.0 = −12 semitones, 0.5 = neutral, 1.0 = +12 semitones).
@@ -2227,11 +2334,10 @@ pub unsafe extern "C" fn gooey_engine_set_channel_tuning(
         return;
     }
     let engine = &mut *engine;
-    let idx = channel as usize;
-    if idx >= NUM_INSTRUMENTS {
+    let Some(voice) = engine.voice_mut(channel as usize) else {
         return;
-    }
-    let tuning_param = match engine.channels[idx].instrument_type() {
+    };
+    let tuning_param = match voice.instrument.instrument_type() {
         INSTRUMENT_KICK => KICK_PARAM_TUNING,
         INSTRUMENT_SNARE => SNARE_PARAM_TUNING,
         INSTRUMENT_HIHAT => HIHAT_PARAM_TUNING,
@@ -2239,7 +2345,7 @@ pub unsafe extern "C" fn gooey_engine_set_channel_tuning(
         INSTRUMENT_BASS => BASS_PARAM_TUNING,
         _ => return,
     };
-    engine.channels[idx].set_param(tuning_param, value);
+    voice.instrument.set_param(tuning_param, value);
 }
 
 /// Get the current tuning value for a channel (0.0–1.0).
@@ -2257,11 +2363,10 @@ pub unsafe extern "C" fn gooey_engine_get_channel_tuning(
         return 0.5;
     }
     let engine = &*engine;
-    let idx = channel as usize;
-    if idx >= NUM_INSTRUMENTS {
-        return 0.5;
+    match engine.voice(channel as usize) {
+        Some(voice) => voice.instrument.get_tuning(),
+        None => 0.5,
     }
-    engine.channels[idx].get_tuning()
 }
 
 /// Trigger a specific channel (regardless of what instrument type it holds).
@@ -2297,11 +2402,12 @@ pub unsafe extern "C" fn gooey_engine_trigger_channel_with_velocity(
     velocity: f32,
 ) {
     if let Some(engine) = engine.as_ref() {
-        let idx = channel as usize;
-        if idx < NUM_INSTRUMENTS {
+        if let Some(voice) = engine.voice(channel as usize) {
             let vel_clamped = velocity.clamp(0.0, 1.0);
-            engine.trigger_velocity[idx].store(vel_clamped.to_bits(), Ordering::Release);
-            engine.trigger_pending[idx].store(true, Ordering::Release);
+            voice
+                .trigger_velocity
+                .store(vel_clamped.to_bits(), Ordering::Release);
+            voice.trigger_pending.store(true, Ordering::Release);
         }
     }
 }
@@ -2329,11 +2435,12 @@ pub unsafe extern "C" fn gooey_engine_trigger_instrument_with_velocity(
     velocity: f32,
 ) {
     if let Some(engine) = engine.as_ref() {
-        let idx = instrument as usize;
-        if idx < NUM_INSTRUMENTS {
+        if let Some(voice) = engine.voice(instrument as usize) {
             let vel_clamped = velocity.clamp(0.0, 1.0);
-            engine.trigger_velocity[idx].store(vel_clamped.to_bits(), Ordering::Release);
-            engine.trigger_pending[idx].store(true, Ordering::Release);
+            voice
+                .trigger_velocity
+                .store(vel_clamped.to_bits(), Ordering::Release);
+            voice.trigger_pending.store(true, Ordering::Release);
         }
     }
 }
@@ -2383,8 +2490,8 @@ pub unsafe extern "C" fn gooey_engine_get_channel_peaks(
 ) {
     if let Some(engine) = engine.as_ref() {
         let n = (count as usize).min(NUM_INSTRUMENTS);
-        for i in 0..n {
-            let bits = engine.channel_peaks[i].swap(0.0_f32.to_bits(), Ordering::Relaxed);
+        for (i, voice) in engine.voices_iter().take(n).enumerate() {
+            let bits = voice.peak.swap(0.0_f32.to_bits(), Ordering::Relaxed);
             *out_peaks.add(i) = f32::from_bits(bits);
         }
     }
@@ -2400,7 +2507,9 @@ pub unsafe extern "C" fn gooey_engine_get_channel_peaks(
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_trigger_kick(engine: *mut GooeyEngine) {
     if let Some(engine) = engine.as_ref() {
-        engine.trigger_pending[INSTRUMENT_KICK as usize].store(true, Ordering::Release);
+        if let Some(voice) = engine.voice(INSTRUMENT_KICK as usize) {
+            voice.trigger_pending.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -2434,8 +2543,8 @@ pub unsafe extern "C" fn gooey_engine_set_kick_param(
         return;
     }
     let engine = &mut *engine;
-    if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_KICK) {
-        engine.channels[ch].set_param(param, value);
+    if let Some(instr) = engine.instrument_by_type_mut(INSTRUMENT_KICK) {
+        instr.set_param(param, value);
     }
 }
 
@@ -2467,8 +2576,8 @@ pub unsafe extern "C" fn gooey_engine_get_kick_param(
         return f32::NAN;
     }
     let engine = &*engine;
-    match engine.find_channel_by_type(INSTRUMENT_KICK) {
-        Some(ch) => engine.channels[ch].get_param(param),
+    match engine.instrument_by_type(INSTRUMENT_KICK) {
+        Some(instr) => instr.get_param(param),
         None => f32::NAN,
     }
 }
@@ -2500,8 +2609,8 @@ pub unsafe extern "C" fn gooey_engine_set_hihat_param(
         return;
     }
     let engine = &mut *engine;
-    if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_HIHAT) {
-        engine.channels[ch].set_param(param, value);
+    if let Some(instr) = engine.instrument_by_type_mut(INSTRUMENT_HIHAT) {
+        instr.set_param(param, value);
     }
 }
 
@@ -2530,8 +2639,8 @@ pub unsafe extern "C" fn gooey_engine_get_hihat_param(
         return f32::NAN;
     }
     let engine = &*engine;
-    match engine.find_channel_by_type(INSTRUMENT_HIHAT) {
-        Some(ch) => engine.channels[ch].get_param(param),
+    match engine.instrument_by_type(INSTRUMENT_HIHAT) {
+        Some(instr) => instr.get_param(param),
         None => f32::NAN,
     }
 }
@@ -2578,8 +2687,8 @@ pub unsafe extern "C" fn gooey_engine_set_snare_param(
         return;
     }
     let engine = &mut *engine;
-    if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_SNARE) {
-        engine.channels[ch].set_param(param, value);
+    if let Some(instr) = engine.instrument_by_type_mut(INSTRUMENT_SNARE) {
+        instr.set_param(param, value);
     }
 }
 
@@ -2609,8 +2718,8 @@ pub unsafe extern "C" fn gooey_engine_get_snare_param(
         return f32::NAN;
     }
     let engine = &*engine;
-    match engine.find_channel_by_type(INSTRUMENT_SNARE) {
-        Some(ch) => engine.channels[ch].get_param(param),
+    match engine.instrument_by_type(INSTRUMENT_SNARE) {
+        Some(instr) => instr.get_param(param),
         None => f32::NAN,
     }
 }
@@ -2646,8 +2755,8 @@ pub unsafe extern "C" fn gooey_engine_set_tom_param(
         return;
     }
     let engine = &mut *engine;
-    if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_TOM) {
-        engine.channels[ch].set_param(param, value);
+    if let Some(instr) = engine.instrument_by_type_mut(INSTRUMENT_TOM) {
+        instr.set_param(param, value);
     }
 }
 
@@ -2674,8 +2783,8 @@ pub unsafe extern "C" fn gooey_engine_get_tom_param(engine: *const GooeyEngine, 
         return f32::NAN;
     }
     let engine = &*engine;
-    match engine.find_channel_by_type(INSTRUMENT_TOM) {
-        Some(ch) => engine.channels[ch].get_param(param),
+    match engine.instrument_by_type(INSTRUMENT_TOM) {
+        Some(instr) => instr.get_param(param),
         None => f32::NAN,
     }
 }
@@ -2718,8 +2827,8 @@ pub unsafe extern "C" fn gooey_engine_set_bass_param(
         return;
     }
     let engine = &mut *engine;
-    if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_BASS) {
-        engine.channels[ch].set_param(param, value);
+    if let Some(instr) = engine.instrument_by_type_mut(INSTRUMENT_BASS) {
+        instr.set_param(param, value);
     }
 }
 
@@ -2741,10 +2850,9 @@ pub unsafe extern "C" fn gooey_engine_load_bass_preset(engine: *mut GooeyEngine,
     }
     let engine = &mut *engine;
     if let Some(config) = GooeyEngine::bass_preset_by_id(preset_id) {
-        if let Some(ch) = engine.find_channel_by_type(INSTRUMENT_BASS) {
-            if let ChannelInstrument::Bass(ref mut bass) = engine.channels[ch] {
-                bass.set_config(config);
-            }
+        if let Some(ChannelInstrument::Bass(bass)) = engine.instrument_by_type_mut(INSTRUMENT_BASS)
+        {
+            bass.set_config(config);
         }
     }
 }
@@ -3147,7 +3255,7 @@ pub unsafe extern "C" fn gooey_engine_set_bpm(engine: *mut GooeyEngine, bpm: f32
 
     let engine = &mut *engine;
     engine.bpm = bpm;
-    for seq in &mut engine.sequencers {
+    for seq in engine.sequencers_iter_mut() {
         seq.set_bpm(bpm);
     }
 
@@ -3161,6 +3269,9 @@ pub unsafe extern "C" fn gooey_engine_set_bpm(engine: *mut GooeyEngine, bpm: f32
 
     // Seed BPM for any future note-synced per-channel loop effects.
     engine.mixer.set_bpm(bpm);
+
+    // Propagate BPM to note-synced effects in per-track racks.
+    engine.graph.set_bpm(bpm);
 }
 
 /// Get the current BPM.
@@ -3238,7 +3349,9 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_beat_position(
         return 0.0;
     }
     let engine = &*engine;
-    let seq = &engine.sequencers[0];
+    let Some(seq) = engine.reference_sequencer() else {
+        return 0.0;
+    };
 
     let step = seq.current_step() as f64;
 
@@ -3272,7 +3385,7 @@ pub unsafe extern "C" fn gooey_engine_set_swing(engine: *mut GooeyEngine, swing:
     let engine = &mut *engine;
     let clamped = swing.clamp(0.0, 1.0);
     engine.swing = clamped;
-    for seq in &mut engine.sequencers {
+    for seq in engine.sequencers_iter_mut() {
         seq.set_swing(clamped);
     }
 }
@@ -3309,7 +3422,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_start(engine: *mut GooeyEngine) 
 
     let engine = &mut *engine;
     engine.pending_arm_host_time = None;
-    for seq in &mut engine.sequencers {
+    for seq in engine.sequencers_iter_mut() {
         seq.start();
     }
 }
@@ -3328,7 +3441,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_stop(engine: *mut GooeyEngine) {
 
     let engine = &mut *engine;
     engine.pending_arm_host_time = None;
-    for seq in &mut engine.sequencers {
+    for seq in engine.sequencers_iter_mut() {
         seq.stop();
     }
 }
@@ -3347,7 +3460,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_reset(engine: *mut GooeyEngine) 
 
     let engine = &mut *engine;
     engine.pending_arm_host_time = None;
-    for seq in &mut engine.sequencers {
+    for seq in engine.sequencers_iter_mut() {
         seq.reset();
     }
 }
@@ -3382,7 +3495,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_beat_position(
 
     let engine = &mut *engine;
     engine.pending_arm_host_time = None;
-    for seq in &mut engine.sequencers {
+    for seq in engine.sequencers_iter_mut() {
         seq.set_beat_position(beat_position);
     }
 }
@@ -3463,7 +3576,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_start_at_host_time(
         start_host_time,
         beat_position,
     });
-    for seq in &mut engine.sequencers {
+    for seq in engine.sequencers_iter_mut() {
         seq.cancel_arm();
         seq.stop();
     }
@@ -3489,7 +3602,9 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_step(
     }
 
     let engine = &mut *engine;
-    engine.sequencers[INSTRUMENT_KICK as usize].set_step(step as usize, enabled);
+    if let Some(seq) = engine.sequencer_for_instrument(INSTRUMENT_KICK) {
+        seq.set_step(step as usize, enabled);
+    }
 }
 
 /// Get the current sequencer step (uses kick sequencer, all are synchronized)
@@ -3506,10 +3621,9 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_current_step(engine: *mut Go
     }
 
     let engine = &*engine;
-    if engine.sequencers[0].is_running() {
-        engine.sequencers[0].current_step() as i32
-    } else {
-        -1
+    match engine.reference_sequencer() {
+        Some(seq) if seq.is_running() => seq.current_step() as i32,
+        _ => -1,
     }
 }
 
@@ -3538,10 +3652,9 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_step_with_lookahead(
     }
 
     let engine = &*engine;
-    if engine.sequencers[0].is_running() {
-        engine.sequencers[0].step_at_lookahead(lookahead_samples as u64) as i32
-    } else {
-        -1
+    match engine.reference_sequencer() {
+        Some(seq) if seq.is_running() => seq.step_at_lookahead(lookahead_samples as u64) as i32,
+        _ => -1,
     }
 }
 
@@ -3552,21 +3665,23 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_step_with_lookahead(
 /// Helper to get a mutable reference to an instrument's sequencer
 impl GooeyEngine {
     fn sequencer_for_instrument(&mut self, instrument: u32) -> Option<&mut Sequencer> {
-        let idx = instrument as usize;
-        if idx < NUM_INSTRUMENTS {
-            Some(&mut self.sequencers[idx])
-        } else {
-            None
-        }
+        self.voice_mut(instrument as usize)
+            .map(|v| &mut v.sequencer)
     }
 
     fn sequencer_for_instrument_ref(&self, instrument: u32) -> Option<&Sequencer> {
-        let idx = instrument as usize;
-        if idx < NUM_INSTRUMENTS {
-            Some(&self.sequencers[idx])
-        } else {
-            None
-        }
+        self.voice(instrument as usize).map(|v| &v.sequencer)
+    }
+
+    /// Iterate all voice sequencers in index order (kit drums then bass).
+    fn sequencers_iter_mut(&mut self) -> impl Iterator<Item = &mut Sequencer> {
+        self.voices_iter_mut().map(|v| &mut v.sequencer)
+    }
+
+    /// Borrow the reference sequencer (voice 0 / kick). All sequencers are kept
+    /// sample-synchronized, so any voice can serve as the position reference.
+    fn reference_sequencer(&self) -> Option<&Sequencer> {
+        self.voice(0).map(|v| &v.sequencer)
     }
 }
 
@@ -4758,10 +4873,12 @@ pub unsafe extern "C" fn gooey_engine_set_instrument_mute(
     instrument: u32,
     muted: bool,
 ) {
-    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+    if engine.is_null() {
         return;
     }
-    (*engine).instrument_muted[instrument as usize].store(muted, Ordering::Release);
+    if let Some(voice) = (*engine).voice(instrument as usize) {
+        voice.muted.store(muted, Ordering::Release);
+    }
 }
 
 /// Get the mute state for an instrument
@@ -4780,10 +4897,12 @@ pub unsafe extern "C" fn gooey_engine_get_instrument_mute(
     engine: *const GooeyEngine,
     instrument: u32,
 ) -> bool {
-    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+    if engine.is_null() {
         return false;
     }
-    (*engine).instrument_muted[instrument as usize].load(Ordering::Acquire)
+    (*engine)
+        .voice(instrument as usize)
+        .is_some_and(|v| v.muted.load(Ordering::Acquire))
 }
 
 /// Set the solo state for an instrument
@@ -4805,10 +4924,12 @@ pub unsafe extern "C" fn gooey_engine_set_instrument_solo(
     instrument: u32,
     soloed: bool,
 ) {
-    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+    if engine.is_null() {
         return;
     }
-    (*engine).instrument_soloed[instrument as usize].store(soloed, Ordering::Release);
+    if let Some(voice) = (*engine).voice(instrument as usize) {
+        voice.soloed.store(soloed, Ordering::Release);
+    }
 }
 
 /// Get the solo state for an instrument
@@ -4827,10 +4948,12 @@ pub unsafe extern "C" fn gooey_engine_get_instrument_solo(
     engine: *const GooeyEngine,
     instrument: u32,
 ) -> bool {
-    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+    if engine.is_null() {
         return false;
     }
-    (*engine).instrument_soloed[instrument as usize].load(Ordering::Acquire)
+    (*engine)
+        .voice(instrument as usize)
+        .is_some_and(|v| v.soloed.load(Ordering::Acquire))
 }
 
 // =============================================================================
@@ -4856,11 +4979,13 @@ pub unsafe extern "C" fn gooey_engine_set_instrument_gain(
     instrument: u32,
     gain: f32,
 ) {
-    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+    if engine.is_null() {
         return;
     }
     let gain = gain.clamp(0.0, 1.0);
-    (*engine).instrument_channel_gains[instrument as usize].set_target(gain);
+    if let Some(voice) = (*engine).voice_mut(instrument as usize) {
+        voice.channel_gain.set_target(gain);
+    }
 }
 
 /// Get the channel gain for an instrument
@@ -4879,10 +5004,12 @@ pub unsafe extern "C" fn gooey_engine_get_instrument_gain(
     engine: *const GooeyEngine,
     instrument: u32,
 ) -> f32 {
-    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+    if engine.is_null() {
         return 1.0;
     }
-    (*engine).instrument_channel_gains[instrument as usize].target()
+    (*engine)
+        .voice(instrument as usize)
+        .map_or(1.0, |v| v.channel_gain.target())
 }
 
 /// Set the stereo pan for an instrument.
@@ -4901,11 +5028,13 @@ pub unsafe extern "C" fn gooey_engine_set_instrument_pan(
     instrument: u32,
     pan: f32,
 ) {
-    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+    if engine.is_null() {
         return;
     }
     let pan = pan.clamp(0.0, 1.0);
-    (*engine).instrument_pans[instrument as usize].set_target(pan);
+    if let Some(voice) = (*engine).voice_mut(instrument as usize) {
+        voice.pan.set_target(pan);
+    }
 }
 
 /// Get the stereo pan for an instrument
@@ -4924,10 +5053,12 @@ pub unsafe extern "C" fn gooey_engine_get_instrument_pan(
     engine: *const GooeyEngine,
     instrument: u32,
 ) -> f32 {
-    if engine.is_null() || instrument as usize >= NUM_INSTRUMENTS {
+    if engine.is_null() {
         return 0.5;
     }
-    (*engine).instrument_pans[instrument as usize].target()
+    (*engine)
+        .voice(instrument as usize)
+        .map_or(0.5, |v| v.pan.target())
 }
 
 // =============================================================================
@@ -4951,13 +5082,9 @@ pub unsafe extern "C" fn gooey_engine_blend_enable(engine: *mut GooeyEngine, ins
         return;
     }
     let engine = &mut *engine;
-    let idx = instrument as usize;
-
-    if idx >= INSTRUMENT_COUNT as usize {
-        return;
+    if let Some(voice) = engine.voice_mut(instrument as usize) {
+        voice.blend_enabled = true;
     }
-
-    engine.blend_enabled[idx] = true;
 }
 
 /// Disable preset blend mode for an instrument
@@ -4974,13 +5101,9 @@ pub unsafe extern "C" fn gooey_engine_blend_disable(engine: *mut GooeyEngine, in
         return;
     }
     let engine = &mut *engine;
-    let idx = instrument as usize;
-
-    if idx >= INSTRUMENT_COUNT as usize {
-        return;
+    if let Some(voice) = engine.voice_mut(instrument as usize) {
+        voice.blend_enabled = false;
     }
-
-    engine.blend_enabled[idx] = false;
 }
 
 /// Check if preset blend mode is enabled for an instrument
@@ -5003,13 +5126,9 @@ pub unsafe extern "C" fn gooey_engine_blend_is_enabled(
         return false;
     }
     let engine = &*engine;
-    let idx = instrument as usize;
-
-    if idx >= INSTRUMENT_COUNT as usize {
-        return false;
-    }
-
-    engine.blend_enabled[idx]
+    engine
+        .voice(instrument as usize)
+        .is_some_and(|v| v.blend_enabled)
 }
 
 /// Set the X/Y blend position for an instrument
@@ -5047,23 +5166,18 @@ pub unsafe extern "C" fn gooey_engine_blend_set_position(
         return;
     }
     let engine = &mut *engine;
-    let idx = instrument as usize;
-
-    if idx >= INSTRUMENT_COUNT as usize {
+    let Some(voice) = engine.voice_mut(instrument as usize) else {
+        return;
+    };
+    if !voice.blend_enabled {
         return;
     }
-    if !engine.blend_enabled[idx] {
-        return;
-    }
 
-    engine.blend_x[idx] = x.clamp(0.0, 1.0);
-    engine.blend_y[idx] = y.clamp(0.0, 1.0);
+    voice.blend_x = x.clamp(0.0, 1.0);
+    voice.blend_y = y.clamp(0.0, 1.0);
 
-    engine.blenders[idx].blend_and_apply(
-        &mut engine.channels[idx],
-        engine.blend_x[idx],
-        engine.blend_y[idx],
-    );
+    let (x, y) = (voice.blend_x, voice.blend_y);
+    voice.blender.blend_and_apply(&mut voice.instrument, x, y);
 }
 
 /// Get the current X blend position for an instrument
@@ -5086,13 +5200,9 @@ pub unsafe extern "C" fn gooey_engine_blend_get_position_x(
         return -1.0;
     }
     let engine = &*engine;
-    let idx = instrument as usize;
-
-    if idx >= INSTRUMENT_COUNT as usize {
-        return -1.0;
-    }
-
-    engine.blend_x[idx]
+    engine
+        .voice(instrument as usize)
+        .map_or(-1.0, |v| v.blend_x)
 }
 
 /// Get the current Y blend position for an instrument
@@ -5115,13 +5225,9 @@ pub unsafe extern "C" fn gooey_engine_blend_get_position_y(
         return -1.0;
     }
     let engine = &*engine;
-    let idx = instrument as usize;
-
-    if idx >= INSTRUMENT_COUNT as usize {
-        return -1.0;
-    }
-
-    engine.blend_y[idx]
+    engine
+        .voice(instrument as usize)
+        .map_or(-1.0, |v| v.blend_y)
 }
 
 /// Set a corner preset by preset ID
@@ -5148,18 +5254,14 @@ pub unsafe extern "C" fn gooey_engine_blend_set_corner_preset(
         return;
     }
     let engine = &mut *engine;
-    let idx = instrument as usize;
     let corner_idx = corner as usize;
-
-    if idx >= INSTRUMENT_COUNT as usize {
-        return;
-    }
     if corner_idx >= 4 {
         return;
     }
-
-    engine.blend_corner_presets[idx][corner_idx] = preset_id;
-    engine.blenders[idx].set_corner_preset(corner, preset_id);
+    if let Some(voice) = engine.voice_mut(instrument as usize) {
+        voice.blend_corner_presets[corner_idx] = preset_id;
+        voice.blender.set_corner_preset(corner, preset_id);
+    }
 }
 
 /// Get the preset ID at a corner
@@ -5184,17 +5286,13 @@ pub unsafe extern "C" fn gooey_engine_blend_get_corner_preset(
         return 0xFFFFFFFF;
     }
     let engine = &*engine;
-    let idx = instrument as usize;
     let corner_idx = corner as usize;
-
-    if idx >= INSTRUMENT_COUNT as usize {
-        return 0xFFFFFFFF;
-    }
     if corner_idx >= 4 {
         return 0xFFFFFFFF;
     }
-
-    engine.blend_corner_presets[idx][corner_idx]
+    engine
+        .voice(instrument as usize)
+        .map_or(0xFFFFFFFF, |v| v.blend_corner_presets[corner_idx])
 }
 
 /// Reset blend corners to default presets
@@ -5217,15 +5315,11 @@ pub unsafe extern "C" fn gooey_engine_blend_reset_corners(
         return;
     }
     let engine = &mut *engine;
-    let idx = instrument as usize;
-
-    if idx >= INSTRUMENT_COUNT as usize {
-        return;
+    if let Some(voice) = engine.voice_mut(instrument as usize) {
+        let inst_type = voice.instrument.instrument_type();
+        voice.blender = ChannelBlender::default_for_type(inst_type);
+        voice.blend_corner_presets = ChannelBlender::default_corner_preset_ids(inst_type);
     }
-
-    let inst_type = engine.channels[idx].instrument_type();
-    engine.blenders[idx] = ChannelBlender::default_for_type(inst_type);
-    engine.blend_corner_presets[idx] = ChannelBlender::default_corner_preset_ids(inst_type);
 }
 
 // =============================================================================
@@ -6175,21 +6269,17 @@ impl GooeyEngine {
 
         // Reset engine to a clean state
         self.current_time = 0.0;
-        for seq in &mut self.sequencers {
+        for seq in self.sequencers_iter_mut() {
             seq.reset();
             seq.start();
         }
         for lfo in &mut self.lfos {
             lfo.reset();
         }
-        for gain in &mut self.instrument_gains {
-            gain.snap();
-        }
-        for gain in &mut self.instrument_channel_gains {
-            gain.snap();
-        }
-        for pan in &mut self.instrument_pans {
-            pan.snap();
+        for voice in self.voices_iter_mut() {
+            voice.mute_gain.snap();
+            voice.channel_gain.snap();
+            voice.pan.snap();
         }
         self.master_gain.snap();
 
@@ -6216,7 +6306,7 @@ impl GooeyEngine {
             remaining -= frames;
         }
 
-        for seq in &mut self.sequencers {
+        for seq in self.sequencers_iter_mut() {
             seq.stop();
         }
 
