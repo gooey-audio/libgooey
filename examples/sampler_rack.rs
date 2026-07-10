@@ -168,8 +168,16 @@ fn draw(engine: *mut GooeyEngine, running: bool) -> io::Result<()> {
             gooey_engine_sequencer_get_current_step(engine),
             gooey_engine_perf_get_sampler_event_count(engine)
         );
+        println!(
+            "Sequencer hits: {}",
+            if gooey_engine_get_sequencer_triggers_enabled(engine) {
+                "ON"
+            } else {
+                "OFF (transport still runs)"
+            }
+        );
         println!("\n1–4 trigger pads  |  r record arm  |  c clear recording");
-        println!("space play/stop   |  q quit");
+        println!("s toggle sequence hits  |  space play/stop  |  q quit");
         io::stdout().flush()
     }
 }
@@ -217,6 +225,10 @@ fn main() -> anyhow::Result<()> {
                         gooey_engine_perf_set_record_armed(guard.0, !armed);
                     }
                     KeyCode::Char('c') => gooey_engine_perf_clear_clip(guard.0),
+                    KeyCode::Char('s') => {
+                        let enabled = gooey_engine_get_sequencer_triggers_enabled(guard.0);
+                        gooey_engine_set_sequencer_triggers_enabled(guard.0, !enabled);
+                    }
                     KeyCode::Char(ch @ '1'..='4') => {
                         let _ = gooey_engine_sampler_trigger(
                             guard.0,
