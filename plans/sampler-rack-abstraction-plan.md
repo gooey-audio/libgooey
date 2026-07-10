@@ -6,13 +6,13 @@ This ExecPlan is a living document. Maintain it according to `.agent/PLANS.md` w
 
 libgooey hosts can now register up to four sample-pad racks alongside the existing drum kit, bass, poly synth, granulator, and loop mixer. Each rack has sixteen copied PCM slots and a sixteen-step pattern. A host can route a rack into any mixer-graph track, play pads live, and capture those live hits in the same transport-locked performance clip used by chord pads.
 
-The observable validation is `cargo run --example sampler_rack --features native,crossterm`. It constructs two in-memory pads, renders a routed sequence, and prints a non-zero peak plus one recorded sampler hit without requiring an audio file.
+The observable validation is `cargo run --example sampler_rack --features native,crossterm`. It opens an interactive terminal UI backed by the default system audio device, plays a routed in-memory pad sequence, and accepts live pad/record controls without requiring an audio file.
 
 ## Progress
 
 - [x] (2026-07-10) Add fixed-size sampler DSP storage and playback voices.
 - [x] (2026-07-10) Add registered sampler graph sources, FFI, and shared performance capture.
-- [x] (2026-07-10) Add integration tests, CLI validation example, and mixer documentation.
+- [x] (2026-07-10) Add integration tests, an interactive CPAL-backed CLI example, and mixer documentation.
 - [x] (2026-07-10) Run `cargo test`: 269 library tests, 4 sampler integration tests, all other integration tests, and doc tests passed. Existing `tests/performance_recording.rs` emits five `unused_unsafe` warnings.
 
 ## Surprises & Discoveries
@@ -62,7 +62,7 @@ From the repository root run:
     cargo test
     cargo run --example sampler_rack --features native,crossterm
 
-The example should print a non-zero peak and `recorded_sampler_hits=1`.
+The example should show its terminal UI and play the sequence through the default audio device. Press `1` through `4` for live pads, `r` to record them, and `q` to exit.
 
 ## Validation and Acceptance
 
