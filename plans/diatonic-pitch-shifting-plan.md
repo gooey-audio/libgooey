@@ -18,7 +18,7 @@ After this change, a user can run a Python script on a MacBook that takes an inp
 - [x] (2026-07-10) Create test audio generator (`scripts/generate_test_chords.py`).
 - [x] (2026-07-10) Validate STFT mode: non-diatonic notes attenuated 0.11-0.46×, diatonic notes preserved 0.94-0.998×.
 - [x] (2026-07-10) Validate all three modes with multiple keys/scales (Eb natural minor, A dorian, D harmonic minor).
-- [ ] (2026-07-10) Commit, push, open PR.
+- [x] (2026-07-10) Commit, push, open PR (#219).
 - [ ] Future: Port STFT diatonic filter to Rust using rustfft.
 - [ ] Future: Integrate CREPE neural pitch detector as analysis front-end.
 - [ ] Future: Add key detection (Krumhansl-Schmuckler or neural).
@@ -62,7 +62,15 @@ After this change, a user can run a Python script on a MacBook that takes an inp
 
 ## Outcomes & Retrospective
 
-*(to be filled after implementation)*
+The POC successfully demonstrates diatonic pitch quantization of polyphonic audio using a frequency-domain masking approach. The STFT mode (n_fft=8192, ~5.4 Hz/bin resolution) provides clean separation between diatonic and non-diatonic notes: non-diatonic notes are attenuated to 0.11-0.46× their original level while diatonic notes are preserved at 0.94-0.998×.
+
+Key learnings:
+1. Frequency resolution is critical — 12 bins/octave CQT is insufficient at low frequencies; high-resolution STFT works much better.
+2. Mask smoothing must be kept small (≤5 Hz sigma) to preserve discrimination.
+3. HPSS preprocessing protects transients from being affected.
+4. The masking approach (attenuate non-diatonic bins) avoids phase coherence issues that plague energy redistribution approaches.
+
+The path to a Rust/Metal iOS implementation is clear: port the STFT-based mask builder using rustfft (already a dependency), integrate with existing music theory types in `src/music/`, and use vDSP/MPS for FFT acceleration on iOS.
 
 ## Context and Orientation
 
