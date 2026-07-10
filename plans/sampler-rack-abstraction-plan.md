@@ -14,6 +14,7 @@ The observable validation is `cargo run --example sampler_rack --features native
 - [x] (2026-07-10) Add registered sampler graph sources, FFI, and shared performance capture.
 - [x] (2026-07-10) Add integration tests, an interactive CPAL-backed CLI example, and mixer documentation.
 - [x] (2026-07-10) Run `cargo test`: 269 library tests, 4 sampler integration tests, all other integration tests, and doc tests passed. Existing `tests/performance_recording.rs` emits five `unused_unsafe` warnings.
+- [x] (2026-07-10) Address review findings: host-time starts include registered sampler sequencers, and default-layout resets re-enable registered sampler sources; regression tests pass.
 
 ## Surprises & Discoveries
 
@@ -34,9 +35,13 @@ The observable validation is `cargo run --example sampler_rack --features native
   Rationale: The shared transport and record mode remain coherent without breaking existing C callers.
   Date/Author: 2026-07-10 / Codex
 
+- Decision: re-activate every registered sampler source when rebuilding the default graph.
+  Rationale: Rack registration persists for the engine lifetime, so `gooey_engine_mixer_reset_default_layout` must not leave a valid rack permanently unroutable.
+  Date/Author: 2026-07-10 / Codex
+
 ## Outcomes & Retrospective
 
-The implementation and full-suite verification are complete. Racks are configuration-time registrations and the render path walks only fixed arrays; PCM is copied from the host and voices retain an `Arc` reference while playing. The internal gain seam currently provides only a fixed de-click taper, leaving future configurable amplitude envelopes additive.
+The implementation and full-suite verification are complete. Review follow-up added host-time-start and graph-reset regressions. Racks are configuration-time registrations and the render path walks only fixed arrays; PCM is copied from the host and voices retain an `Arc` reference while playing. The internal gain seam currently provides only a fixed de-click taper, leaving future configurable amplitude envelopes additive.
 
 ## Context and Orientation
 

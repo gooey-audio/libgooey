@@ -1124,9 +1124,9 @@ impl GooeyEngine {
                 // arm_fires_at locally and pending_arm_host_time on the
                 // engine ensures we only fire once per render.
                 if let Some(pending) = self.pending_arm_host_time.take() {
-                    for voice in self.voices_iter_mut() {
-                        voice.sequencer.set_beat_position(pending.beat_position);
-                        voice.sequencer.start();
+                    for sequencer in self.sequencers_iter_mut() {
+                        sequencer.set_beat_position(pending.beat_position);
+                        sequencer.start();
                     }
                 }
                 arm_fires_at = None;
@@ -6191,6 +6191,13 @@ pub unsafe extern "C" fn gooey_engine_sampler_get_step(
 pub unsafe extern "C" fn gooey_engine_mixer_reset_default_layout(engine: *mut GooeyEngine) {
     if let Some(engine) = engine.as_mut() {
         engine.graph = MixerGraph::with_default_layout(engine.sample_rate, engine.bpm);
+        for (rack, sampler) in engine.samplers.iter().enumerate() {
+            if sampler.is_some() {
+                let _ = engine
+                    .graph
+                    .register_source(SOURCE_SAMPLER_BASE + rack as u32);
+            }
+        }
     }
 }
 
