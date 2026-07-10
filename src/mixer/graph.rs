@@ -35,6 +35,11 @@ pub const SOURCE_GRANULATOR: u32 = 3;
 pub const SOURCE_LOOPMIXER: u32 = 4;
 /// Number of routable engine sources.
 pub const SOURCE_COUNT: usize = 5;
+/// First dynamically registered sampler source. Legacy source IDs remain stable.
+pub const SOURCE_SAMPLER_BASE: u32 = SOURCE_COUNT as u32;
+/// Maximum sampler racks registered by the FFI engine.
+pub const SAMPLER_SOURCE_COUNT: usize = 4;
+const SOURCE_CAPACITY: usize = SOURCE_COUNT + SAMPLER_SOURCE_COUNT;
 
 /// Maximum track gain (allows up to +6 dB of makeup on a submix).
 const MAX_TRACK_GAIN: f32 = 2.0;
@@ -97,7 +102,8 @@ impl Track {
 pub struct MixerGraph {
     tracks: Vec<Track>,
     /// `routes[source_kind]` = target track index (or `None` = source is muted).
-    routes: [Option<usize>; SOURCE_COUNT],
+    routes: [Option<usize>; SOURCE_CAPACITY],
+    active_sources: [bool; SOURCE_CAPACITY],
     /// Per-track accumulator, always `tracks.len()` long. Resized only when the
     /// layout changes (config time); cleared and summed each sample.
     scratch: Vec<StereoFrame>,
@@ -110,7 +116,8 @@ impl MixerGraph {
     pub fn new(sample_rate: f32, bpm: f32) -> Self {
         Self {
             tracks: Vec::new(),
-            routes: [None; SOURCE_COUNT],
+            routes: [None; SOURCE_CAPACITY],
+            active_sources: std::array::from_fn(|index| index < SOURCE_COUNT),
             scratch: Vec::new(),
             sample_rate,
             bpm,
@@ -139,7 +146,7 @@ impl MixerGraph {
     pub fn reset(&mut self) {
         self.tracks.clear();
         self.scratch.clear();
-        self.routes = [None; SOURCE_COUNT];
+        self.routes = [None; SOURCE_CAPACITY];
     }
 
     /// Append a named track. Returns its index. Grows the render scratch so the
@@ -234,7 +241,7 @@ impl MixerGraph {
     /// Route a source to a track. Returns `false` for a bad source kind or
     /// track index.
     pub fn route(&mut self, source_kind: u32, track: usize) -> bool {
-        if (source_kind as usize) < SOURCE_COUNT && track < self.tracks.len() {
+        if self.source_is_active(source_kind) && track < self.tracks.len() {
             self.routes[source_kind as usize] = Some(track);
             true
         } else {
@@ -244,7 +251,7 @@ impl MixerGraph {
 
     /// Unroute a source (it becomes silent). Returns `true` if it was routed.
     pub fn unroute(&mut self, source_kind: u32) -> bool {
-        if (source_kind as usize) < SOURCE_COUNT {
+        if self.source_is_active(source_kind) {
             self.routes[source_kind as usize].take().is_some()
         } else {
             false
@@ -253,7 +260,25 @@ impl MixerGraph {
 
     /// Track a source currently routes to, if any.
     pub fn route_of(&self, source_kind: u32) -> Option<usize> {
-        self.routes.get(source_kind as usize).copied().flatten()
+        self.source_is_active(source_kind)
+            .then(|| self.routes[source_kind as usize])
+            .flatten()
+    }
+
+    /// Enable one bounded config-time source slot (used by sampler rack registration).
+    pub fn register_source(&mut self, source_kind: u32) -> bool {
+        let Some(active) = self.active_sources.get_mut(source_kind as usize) else {
+            return false;
+        };
+        *active = true;
+        true
+    }
+
+    fn source_is_active(&self, source_kind: u32) -> bool {
+        self.active_sources
+            .get(source_kind as usize)
+            .copied()
+            .unwrap_or(false)
     }
 
     // --- track effect rack (mirrors the loop-effect API) ---

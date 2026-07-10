@@ -122,6 +122,10 @@ name = "performance_record"
 required-features = ["native", "crossterm"]
 
 [[example]]
+name = "sampler_rack"
+required-features = ["native", "crossterm"]
+
+[[example]]
 name = "antialias_validation"
 required-features = ["bounce"]
 

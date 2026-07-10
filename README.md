@@ -22,6 +22,7 @@ cargo build --release
 cargo run --example kick
 cargo run --example snare
 cargo run --example hihat
+cargo run --example sampler_rack --features native,crossterm
 ```
 
 ### iOS
