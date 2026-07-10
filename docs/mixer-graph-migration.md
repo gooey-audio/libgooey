@@ -22,6 +22,11 @@ Default graph layout:
 The default layout is intended to preserve the old app behavior until the host
 starts changing track routing, track gain, mute/solo state, or track effects.
 
+Registered sampler racks are intentionally not part of the default layout.
+Each rack exposes `SOURCE_SAMPLER_BASE + rack_id`; add or choose a track and
+route that source after `gooey_engine_sampler_register`. This keeps existing
+four-track projects and source IDs unchanged.
+
 ## Minimal Migration
 
 Apps that only need the old flat mix can keep their current render path:

@@ -12,13 +12,12 @@ use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepS
 use crate::frame::StereoFrame;
 use crate::instruments::{
     BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth,
-    PolySynthConfig, SampleBuffer, SnareConfig, SnareDrum, Tom2, Tom2Config,
+    PolySynthConfig, SampleBuffer, SamplerBuffer, SamplerRack, SnareConfig, SnareDrum, Tom2,
+    Tom2Config,
 };
 use crate::mixer::{Mixer, MixerGraph, PitchMode, StereoSampleBuffer};
 use crate::music::{apply_voicing, available_voicings, Key, NoteName, ScaleType, VoicingType};
-use crate::performance::{
-    ChordClipEvent, PerformanceRecorder, PlayerAction, RecordMode,
-};
+use crate::performance::{ChordClipEvent, PerformanceRecorder, PlayerAction, RecordMode};
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::slice;
@@ -580,6 +579,10 @@ impl ChannelBlender {
 /// separate top-level voice, so the addressable voice space
 /// (`NUM_INSTRUMENTS` = 5) is the kit voices plus bass at index 4.
 const KIT_VOICE_COUNT: usize = 4;
+/// Maximum independently routable sampler racks in one FFI engine.
+pub const SAMPLER_RACK_MAX: u32 = 4;
+/// PCM pads in each sampler rack and steps in its sequencer.
+pub const SAMPLER_SLOT_COUNT: u32 = crate::instruments::sampler::SAMPLER_SLOT_COUNT as u32;
 
 /// One voice's complete per-channel state: the instrument plus its sequencer,
 /// preset blender, mixer strip (fader / mute-solo / pan / peak), manual-trigger
@@ -761,6 +764,8 @@ pub struct GooeyEngine {
 
     // Live performance clip recorder/player (Stage 1: chord pad events).
     performance: PerformanceRecorder,
+    // Config-time registered sample-pad instruments. Empty entries are not graph sources.
+    samplers: [Option<SamplerRack>; SAMPLER_RACK_MAX as usize],
 }
 
 /// Host-clock reference for the next render buffer. The audio callback sets
@@ -942,6 +947,7 @@ impl GooeyEngine {
             pending_arm_host_time: None,
             // Chord performance clip (disarmed by default)
             performance: PerformanceRecorder::new(),
+            samplers: std::array::from_fn(|_| None),
         }
     }
 
@@ -1118,9 +1124,9 @@ impl GooeyEngine {
                 // arm_fires_at locally and pending_arm_host_time on the
                 // engine ensures we only fire once per render.
                 if let Some(pending) = self.pending_arm_host_time.take() {
-                    for voice in self.voices_iter_mut() {
-                        voice.sequencer.set_beat_position(pending.beat_position);
-                        voice.sequencer.start();
+                    for sequencer in self.sequencers_iter_mut() {
+                        sequencer.set_beat_position(pending.beat_position);
+                        sequencer.start();
                     }
                 }
                 arm_fires_at = None;
@@ -1176,6 +1182,18 @@ impl GooeyEngine {
                         self.push_midi_event(ch as u32, velocity, sample_offset);
                     }
                 }
+                // Sampler patterns share the transport, but their slot hits are
+                // intentionally not performance-recorded.
+                for rack in self.samplers.iter_mut().flatten() {
+                    if let Some((slot, velocity)) = rack.tick_sequencer() {
+                        rack.trigger(slot, velocity);
+                    }
+                }
+            } else {
+                // Keep sampler playheads aligned when internal triggering is disabled.
+                for rack in self.samplers.iter_mut().flatten() {
+                    let _ = rack.tick_sequencer();
+                }
             }
 
             // Advance the performance clip clock and apply any chord trigger/release
@@ -1189,6 +1207,17 @@ impl GooeyEngine {
                 if let Some(action) = self.performance.update_clock(beat, running) {
                     self.apply_performance_action(action);
                 }
+                let sampler_hits = self.performance.take_sampler_hits();
+                for hit in sampler_hits {
+                    if let Some(rack) = self
+                        .samplers
+                        .get_mut(hit.rack as usize)
+                        .and_then(Option::as_mut)
+                    {
+                        rack.trigger(hit.slot as usize, hit.velocity);
+                    }
+                }
+                self.performance.clear_pending_sampler_hits();
             }
 
             // Process LFOs and apply modulation to routed parameters
@@ -1243,6 +1272,12 @@ impl GooeyEngine {
             // for consistency with the equal-power law used above.
             let poly_frame = StereoFrame::panned(self.poly_synth.tick(time), 0.5);
             let gran_frame = StereoFrame::panned(self.granulator.tick(time), 0.5);
+            let sampler_frames: [StereoFrame; SAMPLER_RACK_MAX as usize] =
+                std::array::from_fn(|index| {
+                    self.samplers[index]
+                        .as_mut()
+                        .map_or(StereoFrame::default(), SamplerRack::tick)
+                });
             // Loop mixer is already stereo, with its own per-channel effects.
             let loop_frame = self.mixer.tick(self.sample_rate);
 
@@ -1254,6 +1289,9 @@ impl GooeyEngine {
             self.graph.scatter(SOURCE_POLYSYNTH, poly_frame);
             self.graph.scatter(SOURCE_GRANULATOR, gran_frame);
             self.graph.scatter(SOURCE_LOOPMIXER, loop_frame);
+            for (rack, frame) in sampler_frames.into_iter().enumerate() {
+                self.graph.scatter(SOURCE_SAMPLER_BASE + rack as u32, frame);
+            }
             let mut stereo = self.graph.mix_down();
 
             // Apply master headroom to the full mix (instruments + loops) before
@@ -1816,6 +1854,9 @@ pub const SOURCE_POLYSYNTH: u32 = crate::mixer::graph::SOURCE_POLYSYNTH;
 pub const SOURCE_GRANULATOR: u32 = crate::mixer::graph::SOURCE_GRANULATOR;
 /// Mixer graph source: the stereo loop mixer.
 pub const SOURCE_LOOPMIXER: u32 = crate::mixer::graph::SOURCE_LOOPMIXER;
+/// First source ID reserved for registered sampler racks. Rack `n` uses
+/// `SOURCE_SAMPLER_BASE + n`; only registered racks are routable.
+pub const SOURCE_SAMPLER_BASE: u32 = crate::mixer::graph::SOURCE_SAMPLER_BASE;
 /// Number of routable mixer graph sources.
 pub const SOURCE_COUNT: u32 = crate::mixer::graph::SOURCE_COUNT as u32;
 
@@ -3706,7 +3747,16 @@ impl GooeyEngine {
 
     /// Iterate all voice sequencers in index order (kit drums then bass).
     fn sequencers_iter_mut(&mut self) -> impl Iterator<Item = &mut Sequencer> {
-        self.voices_iter_mut().map(|v| &mut v.sequencer)
+        self.kit
+            .voices
+            .iter_mut()
+            .map(|v| &mut v.sequencer)
+            .chain(std::iter::once(&mut self.bass.sequencer))
+            .chain(
+                self.samplers
+                    .iter_mut()
+                    .filter_map(|rack| rack.as_mut().map(SamplerRack::sequencer_mut)),
+            )
     }
 
     /// Borrow the reference sequencer (voice 0 / kick). All sequencers are kept
@@ -5533,15 +5583,9 @@ pub unsafe extern "C" fn gooey_engine_poly_trigger_chord(
 
     // Stamp into the performance clip when record-armed and transport is running.
     // Playback-driven triggers set applying_playback and are ignored.
-    let _ = engine.performance.record_chord_on(
-        root,
-        scale_type,
-        degree,
-        voicing,
-        preset,
-        octave,
-        velocity,
-    );
+    let _ = engine
+        .performance
+        .record_chord_on(root, scale_type, degree, voicing, preset, octave, velocity);
 }
 
 /// Release all sounding poly synth notes.
@@ -5736,6 +5780,47 @@ pub unsafe extern "C" fn gooey_engine_perf_get_event(
     true
 }
 
+/// Number of recorded live sampler hits in the shared performance clip.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_perf_get_sampler_event_count(
+    engine: *const GooeyEngine,
+) -> u32 {
+    engine
+        .as_ref()
+        .map_or(0, |engine| engine.performance.sampler_event_count() as u32)
+}
+
+/// Read one recorded sampler hit. Output pointers may be null to skip fields.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_perf_get_sampler_event(
+    engine: *const GooeyEngine,
+    index: u32,
+    start_tick: *mut u32,
+    rack: *mut u32,
+    slot: *mut u32,
+    velocity: *mut f32,
+) -> bool {
+    let Some(event) = engine
+        .as_ref()
+        .and_then(|engine| engine.performance.sampler_event(index as usize))
+    else {
+        return false;
+    };
+    if !start_tick.is_null() {
+        *start_tick = event.start_tick;
+    }
+    if !rack.is_null() {
+        *rack = event.rack;
+    }
+    if !slot.is_null() {
+        *slot = event.slot;
+    }
+    if !velocity.is_null() {
+        *velocity = event.velocity;
+    }
+    true
+}
+
 /// Clip length in ticks (Stage 1: always 384 = 16 steps × 24 ticks).
 ///
 /// # Safety
@@ -5883,6 +5968,221 @@ pub unsafe extern "C" fn gooey_engine_granulator_set_buffer(
 // track strips, and add track-level effects. Graph mutation is intended to be
 // serialized with rendering, matching the existing loop-effect API contract.
 
+// =============================================================================
+// Sampler racks
+// =============================================================================
+
+/// Register one sample-pad rack. Returns its stable rack ID (0..3), or -1
+/// when all racks are already in use or the engine is null. A registered rack
+/// is addressed in the mixer graph as `SOURCE_SAMPLER_BASE + rack_id`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_register(engine: *mut GooeyEngine) -> i32 {
+    let Some(engine) = engine.as_mut() else {
+        return -1;
+    };
+    let Some(index) = engine.samplers.iter().position(Option::is_none) else {
+        return -1;
+    };
+    engine.samplers[index] = Some(SamplerRack::new(
+        engine.sample_rate,
+        engine.bpm,
+        format!("sampler-{index}"),
+    ));
+    if !engine
+        .graph
+        .register_source(SOURCE_SAMPLER_BASE + index as u32)
+    {
+        engine.samplers[index] = None;
+        return -1;
+    }
+    index as i32
+}
+
+/// Return a registered rack's mixer source ID, or `u32::MAX` for an invalid rack.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_get_source_id(
+    engine: *const GooeyEngine,
+    rack: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .map_or(u32::MAX, |_| SOURCE_SAMPLER_BASE + rack)
+}
+
+/// Copy finite mono or stereo interleaved PCM into a sampler slot.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_set_slot_buffer(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    slot: u32,
+    samples: *const f32,
+    frames: u32,
+    channels: u32,
+    sample_rate: f32,
+) -> bool {
+    if samples.is_null() {
+        return false;
+    }
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let channels = channels as usize;
+    let frames = frames as usize;
+    let Some(count) = frames.checked_mul(channels) else {
+        return false;
+    };
+    let data = slice::from_raw_parts(samples, count);
+    let Ok(buffer) = SamplerBuffer::from_interleaved(data, frames, channels, sample_rate) else {
+        return false;
+    };
+    engine
+        .samplers
+        .get_mut(rack as usize)
+        .and_then(Option::as_mut)
+        .is_some_and(|rack| rack.set_buffer(slot as usize, buffer))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_clear_slot(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    slot: u32,
+) -> bool {
+    engine
+        .as_mut()
+        .and_then(|engine| engine.samplers.get_mut(rack as usize))
+        .and_then(Option::as_mut)
+        .is_some_and(|rack| rack.clear_slot(slot as usize))
+}
+
+/// Return whether a slot contains a buffer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_slot_is_loaded(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+) -> bool {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .and_then(|rack| rack.slot(slot as usize))
+        .is_some()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_slot_frames(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .and_then(|rack| rack.slot(slot as usize))
+        .map_or(0, |buffer| buffer.frames() as u32)
+}
+
+/// Return a slot's channel count (1 or 2), or 0 when it is not loaded.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_slot_channels(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .and_then(|rack| rack.slot(slot as usize))
+        .map_or(0, |buffer| buffer.channels() as u32)
+}
+
+/// Return a slot's source sample rate, or 0.0 when it is not loaded.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_slot_sample_rate(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .and_then(|rack| rack.slot(slot as usize))
+        .map_or(0.0, |buffer| buffer.sample_rate())
+}
+
+/// Trigger a loaded pad now and stamp it into the shared performance clip when
+/// record-arm is active. Returns false for bad/unloaded rack or slot.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_trigger(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    slot: u32,
+    velocity: f32,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let fired = engine
+        .samplers
+        .get_mut(rack as usize)
+        .and_then(Option::as_mut)
+        .is_some_and(|sampler| sampler.trigger(slot as usize, velocity));
+    if fired {
+        engine.performance.record_sampler_hit(rack, slot, velocity);
+    }
+    fired
+}
+
+/// Configure one 16-step sampler pattern cell. An enabled cell triggers its
+/// selected slot at the shared transport boundary.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_set_step(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    step: u32,
+    enabled: bool,
+    slot: u32,
+    velocity: f32,
+) -> bool {
+    engine
+        .as_mut()
+        .and_then(|engine| engine.samplers.get_mut(rack as usize))
+        .and_then(Option::as_mut)
+        .is_some_and(|sampler| sampler.set_step(step as usize, enabled, slot as usize, velocity))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_get_step(
+    engine: *const GooeyEngine,
+    rack: u32,
+    step: u32,
+    out_enabled: *mut bool,
+    out_slot: *mut u32,
+    out_velocity: *mut f32,
+) -> bool {
+    if out_enabled.is_null() || out_slot.is_null() || out_velocity.is_null() {
+        return false;
+    }
+    let Some((enabled, slot, velocity)) = engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .and_then(|sampler| sampler.step(step as usize))
+    else {
+        return false;
+    };
+    *out_enabled = enabled;
+    *out_slot = slot as u32;
+    *out_velocity = velocity;
+    true
+}
+
 /// Restore the default graph layout: Drums, Bass, Synth, Loops.
 ///
 /// # Safety
@@ -5891,6 +6191,13 @@ pub unsafe extern "C" fn gooey_engine_granulator_set_buffer(
 pub unsafe extern "C" fn gooey_engine_mixer_reset_default_layout(engine: *mut GooeyEngine) {
     if let Some(engine) = engine.as_mut() {
         engine.graph = MixerGraph::with_default_layout(engine.sample_rate, engine.bpm);
+        for (rack, sampler) in engine.samplers.iter().enumerate() {
+            if sampler.is_some() {
+                let _ = engine
+                    .graph
+                    .register_source(SOURCE_SAMPLER_BASE + rack as u32);
+            }
+        }
     }
 }
 

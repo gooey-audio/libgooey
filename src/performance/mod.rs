@@ -60,6 +60,15 @@ pub struct ChordClipEvent {
     pub velocity: f32,
 }
 
+/// One manually played sampler hit captured on the shared performance timeline.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SamplerClipEvent {
+    pub start_tick: u32,
+    pub rack: u32,
+    pub slot: u32,
+    pub velocity: f32,
+}
+
 impl ChordClipEvent {
     pub fn end_tick(&self, length_ticks: u32) -> u32 {
         if length_ticks == 0 {
@@ -108,6 +117,7 @@ struct OpenEvent {
 pub struct PerformanceRecorder {
     length_ticks: u32,
     events: Vec<ChordClipEvent>,
+    sampler_events: Vec<SamplerClipEvent>,
     mode: RecordMode,
     /// Host wants to record when transport allows.
     armed: bool,
@@ -131,6 +141,9 @@ pub struct PerformanceRecorder {
     /// event just stamped. On each loop wrap during overdub the limit advances
     /// to the current event count so the previous pass becomes audible.
     playback_limit: usize,
+    sampler_playback_limit: usize,
+    last_sampler_tick: Option<u32>,
+    pending_sampler_hits: Vec<SamplerClipEvent>,
 }
 
 impl Default for PerformanceRecorder {
@@ -144,6 +157,7 @@ impl PerformanceRecorder {
         Self {
             length_ticks: DEFAULT_LENGTH_TICKS,
             events: Vec::new(),
+            sampler_events: Vec::new(),
             mode: RecordMode::PunchOut,
             armed: false,
             recording_active: false,
@@ -156,6 +170,9 @@ impl PerformanceRecorder {
             playing_index: None,
             applying_playback: false,
             playback_limit: 0,
+            sampler_playback_limit: 0,
+            last_sampler_tick: None,
+            pending_sampler_hits: Vec::with_capacity(16),
         }
     }
 
@@ -217,9 +234,12 @@ impl PerformanceRecorder {
 
     pub fn clear_clip(&mut self) {
         self.events.clear();
+        self.sampler_events.clear();
         self.open = None;
         self.playing_index = None;
         self.playback_limit = 0;
+        self.sampler_playback_limit = 0;
+        self.pending_sampler_hits.clear();
     }
 
     pub fn event_count(&self) -> usize {
@@ -234,9 +254,26 @@ impl PerformanceRecorder {
         &self.events
     }
 
+    pub fn sampler_event_count(&self) -> usize {
+        self.sampler_events.len()
+    }
+    pub fn sampler_event(&self, index: usize) -> Option<SamplerClipEvent> {
+        self.sampler_events.get(index).copied()
+    }
+    pub fn take_sampler_hits(&mut self) -> &[SamplerClipEvent] {
+        &self.pending_sampler_hits
+    }
+    pub fn clear_pending_sampler_hits(&mut self) {
+        self.pending_sampler_hits.clear();
+    }
+
     /// Advance clock from the engine transport. Call once per audio sample (or
     /// whenever beat position is known). Returns at most one player action.
-    pub fn update_clock(&mut self, beat_position: f64, transport_running: bool) -> Option<PlayerAction> {
+    pub fn update_clock(
+        &mut self,
+        beat_position: f64,
+        transport_running: bool,
+    ) -> Option<PlayerAction> {
         let was_running = self.transport_running;
         self.transport_running = transport_running;
         self.last_beat = beat_position;
@@ -251,6 +288,8 @@ impl PerformanceRecorder {
                 // transport start path below.
             }
             self.playing_index = None;
+            self.last_sampler_tick = None;
+            self.pending_sampler_hits.clear();
             return None;
         }
 
@@ -268,6 +307,7 @@ impl PerformanceRecorder {
                     self.recording_active = false;
                 }
             }
+            self.populate_sampler_hits(tick);
             return self.playback_action_at(tick, true);
         }
 
@@ -281,6 +321,7 @@ impl PerformanceRecorder {
                 if wrapped {
                     // Previous-pass events become audible on the next overdub loop.
                     self.playback_limit = self.events.len();
+                    self.sampler_playback_limit = self.sampler_events.len();
                 }
                 if let Some(remaining) = self.punch_ticks_remaining.as_mut() {
                     let advanced = if wrapped {
@@ -297,6 +338,7 @@ impl PerformanceRecorder {
                         self.wait_for_loop_start = false;
                         // Full clip is playable after punch-out completes.
                         self.playback_limit = self.events.len();
+                        self.sampler_playback_limit = self.sampler_events.len();
                     } else {
                         *remaining -= advanced;
                     }
@@ -305,9 +347,11 @@ impl PerformanceRecorder {
         } else if wrapped {
             // Keep limit in sync when not recording so all events play.
             self.playback_limit = self.events.len();
+            self.sampler_playback_limit = self.sampler_events.len();
         }
 
         self.last_tick = tick;
+        self.populate_sampler_hits(tick);
         self.playback_action_at(tick, wrapped)
     }
 
@@ -355,6 +399,21 @@ impl PerformanceRecorder {
         self.finalize_open_at(tick)
     }
 
+    /// Stamp a live sampler hit. Sequencer and clip playback callers set
+    /// `applying_playback`, so only explicit host pad hits are captured.
+    pub fn record_sampler_hit(&mut self, rack: u32, slot: u32, velocity: f32) -> bool {
+        if self.applying_playback || !self.is_recording() {
+            return false;
+        }
+        self.sampler_events.push(SamplerClipEvent {
+            start_tick: beat_to_tick(self.last_beat, self.length_ticks),
+            rack,
+            slot,
+            velocity: velocity.clamp(0.0, 1.0),
+        });
+        true
+    }
+
     /// Mark that subsequent poly actions come from the player (do not record).
     pub fn set_applying_playback(&mut self, applying: bool) {
         self.applying_playback = applying;
@@ -369,6 +428,7 @@ impl PerformanceRecorder {
         self.recording_active = true;
         // Existing events remain playable; newly finalized ones wait for the next wrap.
         self.playback_limit = self.events.len();
+        self.sampler_playback_limit = self.sampler_events.len();
         if self.mode == RecordMode::PunchOut {
             self.punch_ticks_remaining = Some(self.length_ticks);
         } else {
@@ -470,6 +530,26 @@ impl PerformanceRecorder {
             }
             (None, None) => None,
         }
+    }
+
+    fn populate_sampler_hits(&mut self, tick: u32) {
+        self.pending_sampler_hits.clear();
+        if self.last_sampler_tick == Some(tick) {
+            return;
+        }
+        self.last_sampler_tick = Some(tick);
+        let playable = if self.recording_active {
+            self.sampler_playback_limit.min(self.sampler_events.len())
+        } else {
+            self.sampler_events.len()
+        };
+        self.pending_sampler_hits.extend(
+            self.sampler_events
+                .iter()
+                .take(playable)
+                .filter(|event| event.start_tick == tick)
+                .copied(),
+        );
     }
 }
 
