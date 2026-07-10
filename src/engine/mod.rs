@@ -469,6 +469,8 @@ impl Engine {
         for lfo in &mut self.lfos {
             lfo.reset();
         }
+        self.mixer.transport_reset();
+        self.mixer.transport_start();
         self.master_gain.snap();
         self.trigger_queue.clear();
         self.saved_global_freq.clear();
@@ -479,5 +481,6 @@ impl Engine {
         for seq in &mut self.sequencers {
             seq.stop();
         }
+        self.mixer.transport_stop();
     }
 }

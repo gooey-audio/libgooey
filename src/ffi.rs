@@ -15,7 +15,7 @@ use crate::instruments::{
     PolySynthConfig, SampleBuffer, SamplerBuffer, SamplerRack, SnareConfig, SnareDrum, Tom2,
     Tom2Config,
 };
-use crate::mixer::{Mixer, MixerGraph, PitchMode, StereoSampleBuffer};
+use crate::mixer::{LaunchQuantization, Mixer, MixerGraph, PitchMode, StereoSampleBuffer};
 use crate::music::{apply_voicing, available_voicings, Key, NoteName, ScaleType, VoicingType};
 use crate::performance::{ChordClipEvent, PerformanceRecorder, PlayerAction, RecordMode};
 use crate::utils::{PresetBlender, SmoothedParam};
@@ -1128,6 +1128,8 @@ impl GooeyEngine {
                         sequencer.set_beat_position(pending.beat_position);
                         sequencer.start();
                     }
+                    self.mixer.transport_seek(pending.beat_position);
+                    self.mixer.transport_start();
                 }
                 arm_fires_at = None;
             }
@@ -3497,6 +3499,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_start(engine: *mut GooeyEngine) 
     for seq in engine.sequencers_iter_mut() {
         seq.start();
     }
+    engine.mixer.transport_start();
 }
 
 /// Stop all sequencers.
@@ -3516,6 +3519,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_stop(engine: *mut GooeyEngine) {
     for seq in engine.sequencers_iter_mut() {
         seq.stop();
     }
+    engine.mixer.transport_stop();
 }
 
 /// Reset all sequencers to step 0.
@@ -3535,6 +3539,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_reset(engine: *mut GooeyEngine) 
     for seq in engine.sequencers_iter_mut() {
         seq.reset();
     }
+    engine.mixer.transport_reset();
 }
 
 /// Set all sequencers to a specific beat position in quarter notes.
@@ -3570,6 +3575,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_beat_position(
     for seq in engine.sequencers_iter_mut() {
         seq.set_beat_position(beat_position);
     }
+    engine.mixer.transport_seek(beat_position);
 }
 
 /// Tell the engine the host time corresponding to sample 0 of the next
@@ -3648,6 +3654,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_start_at_host_time(
         start_host_time,
         beat_position,
     });
+    engine.mixer.transport_stop();
     for seq in engine.sequencers_iter_mut() {
         seq.cancel_arm();
         seq.stop();
@@ -6590,6 +6597,353 @@ pub unsafe extern "C" fn gooey_engine_track_effect_type_at(
         .as_ref()
         .and_then(|engine| engine.graph.effect_type_at(track as usize, slot as usize))
         .map_or(-1, |id| id as i32)
+}
+
+// =============================================================================
+// Transport-synchronized clip grid: 4 columns x 8 rows
+// =============================================================================
+
+/// Number of clip-grid columns (one per loop mixer channel).
+pub const CLIP_COLUMN_COUNT: u32 = crate::mixer::CLIP_COLUMN_COUNT as u32;
+/// Number of rows in each clip-grid column.
+pub const CLIP_ROW_COUNT: u32 = crate::mixer::CLIP_ROW_COUNT as u32;
+
+/// Launch on the next straight sixteenth-note boundary.
+pub const CLIP_QUANTIZE_SIXTEENTH: u32 = crate::mixer::CLIP_QUANTIZE_SIXTEENTH;
+/// Launch on the next quarter-note boundary.
+pub const CLIP_QUANTIZE_QUARTER: u32 = crate::mixer::CLIP_QUANTIZE_QUARTER;
+/// Launch on the next 4/4 bar boundary (the default).
+pub const CLIP_QUANTIZE_BAR: u32 = crate::mixer::CLIP_QUANTIZE_BAR;
+
+/// Slot contains a preloaded clip buffer.
+pub const CLIP_STATE_LOADED: u32 = crate::mixer::CLIP_STATE_LOADED;
+/// Slot is the active clip for its column (also true while transport is stopped).
+pub const CLIP_STATE_PLAYING: u32 = crate::mixer::CLIP_STATE_PLAYING;
+/// Slot has a pending launch/relaunch/unload action.
+pub const CLIP_STATE_QUEUED: u32 = crate::mixer::CLIP_STATE_QUEUED;
+
+/// Load or replace one clip-grid slot from interleaved audio.
+///
+/// `source_bpm` is required and must be finite and positive. Grid clips always
+/// launch as full-buffer loops using pitch-preserving tempo adaptation.
+/// Replacing the active slot keeps its old buffer sounding and schedules the
+/// replacement using the default launch quantization.
+///
+/// # Safety
+/// `engine` must be valid and `samples` must reference at least
+/// `frames * channels` readable `f32` values.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_load(
+    engine: *mut GooeyEngine,
+    column: u32,
+    row: u32,
+    samples: *const f32,
+    frames: u32,
+    channels: u32,
+    sample_rate: f32,
+    source_bpm: f32,
+) -> bool {
+    if engine.is_null()
+        || samples.is_null()
+        || frames == 0
+        || channels == 0
+        || !source_bpm.is_finite()
+        || source_bpm <= 0.0
+        || column >= CLIP_COLUMN_COUNT
+        || row >= CLIP_ROW_COUNT
+    {
+        return false;
+    }
+    let Some(total) = (frames as usize).checked_mul(channels as usize) else {
+        return false;
+    };
+    let samples = slice::from_raw_parts(samples, total);
+    match StereoSampleBuffer::from_interleaved(samples, channels as usize, sample_rate) {
+        Ok(buffer) => (*engine)
+            .mixer
+            .clip_load(column as usize, row as usize, buffer, source_bpm),
+        Err(_) => false,
+    }
+}
+
+/// Unload a slot. An active slot stops and disappears at the default boundary;
+/// an inactive slot is removed immediately.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_unload(
+    engine: *mut GooeyEngine,
+    column: u32,
+    row: u32,
+) -> bool {
+    engine
+        .as_mut()
+        .is_some_and(|engine| engine.mixer.clip_unload(column as usize, row as usize))
+}
+
+/// Stop all grid-owned columns and unload every slot.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_clear(engine: *mut GooeyEngine) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.clip_clear();
+    }
+}
+
+/// Queue one clip for a musical boundary. Returns false for an invalid slot,
+/// empty slot, or unknown `CLIP_QUANTIZE_*` value.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_launch(
+    engine: *mut GooeyEngine,
+    column: u32,
+    row: u32,
+    quantization: u32,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let Some(quantization) = LaunchQuantization::from_id(quantization) else {
+        return false;
+    };
+    engine
+        .mixer
+        .clip_launch(column as usize, row as usize, quantization)
+}
+
+/// Queue one clip at an absolute future quarter-note position.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_launch_at_beat(
+    engine: *mut GooeyEngine,
+    column: u32,
+    row: u32,
+    beat: f64,
+) -> bool {
+    engine.as_mut().is_some_and(|engine| {
+        engine
+            .mixer
+            .clip_launch_at(column as usize, row as usize, beat)
+    })
+}
+
+/// Queue an entire scene row. Populated cells launch and empty cells stop
+/// their columns on the same sample.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_launch_scene(
+    engine: *mut GooeyEngine,
+    row: u32,
+    quantization: u32,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let Some(quantization) = LaunchQuantization::from_id(quantization) else {
+        return false;
+    };
+    engine.mixer.clip_launch_scene(row as usize, quantization)
+}
+
+/// Queue an entire scene row at an absolute future beat.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_launch_scene_at_beat(
+    engine: *mut GooeyEngine,
+    row: u32,
+    beat: f64,
+) -> bool {
+    engine
+        .as_mut()
+        .is_some_and(|engine| engine.mixer.clip_launch_scene_at(row as usize, beat))
+}
+
+/// Queue a column stop at a musical boundary.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_stop(
+    engine: *mut GooeyEngine,
+    column: u32,
+    quantization: u32,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let Some(quantization) = LaunchQuantization::from_id(quantization) else {
+        return false;
+    };
+    engine.mixer.clip_stop(column as usize, quantization)
+}
+
+/// Queue a column stop at an absolute future beat.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_stop_at_beat(
+    engine: *mut GooeyEngine,
+    column: u32,
+    beat: f64,
+) -> bool {
+    engine
+        .as_mut()
+        .is_some_and(|engine| engine.mixer.clip_stop_at(column as usize, beat))
+}
+
+/// Cancel one column's pending clip action without changing its active clip.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_cancel(engine: *mut GooeyEngine, column: u32) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.clip_cancel(column as usize);
+    }
+}
+
+/// Cancel every pending clip action.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_cancel_all(engine: *mut GooeyEngine) {
+    if let Some(engine) = engine.as_mut() {
+        engine.mixer.clip_cancel_all();
+    }
+}
+
+/// Set the quantization used by active-slot replacement and unload.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_set_default_quantization(
+    engine: *mut GooeyEngine,
+    quantization: u32,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let Some(quantization) = LaunchQuantization::from_id(quantization) else {
+        return false;
+    };
+    engine.mixer.clip_set_default_quantization(quantization);
+    true
+}
+
+/// Return the current default `CLIP_QUANTIZE_*` value (bar for a null engine).
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_get_default_quantization(
+    engine: *const GooeyEngine,
+) -> u32 {
+    engine.as_ref().map_or(CLIP_QUANTIZE_BAR, |engine| {
+        engine.mixer.clip_default_quantization().id()
+    })
+}
+
+/// Return a bitwise combination of `CLIP_STATE_*` for one slot.
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_get_state(
+    engine: *const GooeyEngine,
+    column: u32,
+    row: u32,
+) -> u32 {
+    engine.as_ref().map_or(0, |engine| {
+        engine.mixer.clip_slot_state(column as usize, row as usize)
+    })
+}
+
+/// Return the active row in a column, or `-1` if none/out of range.
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_get_active_row(
+    engine: *const GooeyEngine,
+    column: u32,
+) -> i32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.mixer.clip_active_row(column as usize))
+        .map_or(-1, |row| row as i32)
+}
+
+/// Return the row targeted by a pending launch/unload, or `-1` for none/stop.
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_get_queued_row(
+    engine: *const GooeyEngine,
+    column: u32,
+) -> i32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.mixer.clip_queued_row(column as usize))
+        .map_or(-1, |row| row as i32)
+}
+
+/// Return true when the pending action will stop the column (including unload).
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_is_stop_queued(
+    engine: *const GooeyEngine,
+    column: u32,
+) -> bool {
+    engine
+        .as_ref()
+        .is_some_and(|engine| engine.mixer.clip_is_stop_queued(column as usize))
+}
+
+/// Return a column's scheduled absolute beat, or `-1.0` if no action is queued.
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_get_scheduled_beat(
+    engine: *const GooeyEngine,
+    column: u32,
+) -> f64 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.mixer.clip_scheduled_beat(column as usize))
+        .unwrap_or(-1.0)
+}
+
+/// Return the monotonic absolute transport position in quarter notes.
+/// Unlike `gooey_engine_sequencer_get_beat_position`, this value does not wrap
+/// at the end of the 16-step sequencer pattern.
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_transport_get_beat_position(
+    engine: *const GooeyEngine,
+) -> f64 {
+    engine
+        .as_ref()
+        .map_or(0.0, |engine| engine.mixer.transport_beat())
 }
 
 // =============================================================================
