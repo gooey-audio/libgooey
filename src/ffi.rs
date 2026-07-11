@@ -1136,6 +1136,16 @@ impl GooeyEngine {
                 arm_fires_at = None;
             }
 
+            // A rack start is owned by the render clock, not by the host UI
+            // timer. Applying it before sequencer ticks makes step zero fire on
+            // the same sample as a clip launch at this shared bar boundary.
+            if self.mixer.transport_running() {
+                let beat = self.mixer.transport_beat();
+                for rack in self.samplers.iter_mut().flatten() {
+                    rack.activate_start_if_due(beat);
+                }
+            }
+
             // Tick ALL sequencers first to ensure sample-accurate synchronization
             let mut seq_triggers: [Option<(f32, Option<SequencerBlendSetting>, Option<u8>)>;
                 NUM_INSTRUMENTS] = [None; NUM_INSTRUMENTS];
@@ -3334,6 +3344,9 @@ pub unsafe extern "C" fn gooey_engine_set_bpm(engine: *mut GooeyEngine, bpm: f32
     for seq in engine.sequencers_iter_mut() {
         seq.set_bpm(bpm);
     }
+    for rack in engine.samplers.iter_mut().flatten() {
+        rack.sequencer_mut().set_bpm(bpm);
+    }
 
     // Update delay BPM for clocked timing
     engine.delay.set_bpm(bpm);
@@ -3521,6 +3534,9 @@ pub unsafe extern "C" fn gooey_engine_sequencer_stop(engine: *mut GooeyEngine) {
     for seq in engine.sequencers_iter_mut() {
         seq.stop();
     }
+    for rack in engine.samplers.iter_mut().flatten() {
+        rack.transport_stop();
+    }
     engine.mixer.transport_stop();
 }
 
@@ -3540,6 +3556,9 @@ pub unsafe extern "C" fn gooey_engine_sequencer_reset(engine: *mut GooeyEngine) 
     engine.pending_arm_host_time = None;
     for seq in engine.sequencers_iter_mut() {
         seq.reset();
+    }
+    for rack in engine.samplers.iter_mut().flatten() {
+        rack.transport_reset();
     }
     engine.mixer.transport_reset();
 }
@@ -6166,6 +6185,82 @@ pub unsafe extern "C" fn gooey_engine_sampler_set_step(
         .is_some_and(|sampler| sampler.set_step(step as usize, enabled, slot as usize, velocity))
 }
 
+/// Queue a sampler pattern to start at the next selected shared-transport
+/// boundary. A stopped transport targets beat 0; a running transport always
+/// chooses the strictly future boundary, including when called exactly on one.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_start_pattern(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    quantization: u32,
+) -> bool {
+    let Some(engine) = engine.as_mut() else { return false; };
+    let Some(quantization) = LaunchQuantization::from_id(quantization) else {
+        return false;
+    };
+    let target = engine.mixer.quantized_target(quantization);
+    engine
+        .samplers
+        .get_mut(rack as usize)
+        .and_then(Option::as_mut)
+        .is_some_and(|rack| rack.schedule_start(target))
+}
+
+/// Stop a sampler pattern immediately and cancel a queued pattern start.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_stop_pattern(
+    engine: *mut GooeyEngine,
+    rack: u32,
+) -> bool {
+    engine
+        .as_mut()
+        .and_then(|engine| engine.samplers.get_mut(rack as usize))
+        .and_then(Option::as_mut)
+        .map(|rack| { rack.stop_pattern(); true })
+        .unwrap_or(false)
+}
+
+/// Cancel a queued sampler-pattern start without stopping an already running rack.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_cancel_pattern_start(
+    engine: *mut GooeyEngine,
+    rack: u32,
+) -> bool {
+    engine
+        .as_mut()
+        .and_then(|engine| engine.samplers.get_mut(rack as usize))
+        .and_then(Option::as_mut)
+        .map(|rack| { rack.cancel_pending_start(); true })
+        .unwrap_or(false)
+}
+
+/// Return a rack's pending start beat, or -1.0 when it is invalid or not queued.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_get_pending_start_beat(
+    engine: *const GooeyEngine,
+    rack: u32,
+) -> f64 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .and_then(SamplerRack::pending_start_beat)
+        .unwrap_or(-1.0)
+}
+
+/// Return whether a rack's pattern is currently running.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_is_pattern_running(
+    engine: *const GooeyEngine,
+    rack: u32,
+) -> bool {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .is_some_and(SamplerRack::pattern_running)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_sampler_get_step(
     engine: *const GooeyEngine,
@@ -6934,6 +7029,20 @@ pub unsafe extern "C" fn gooey_engine_clip_get_scheduled_beat(
     engine
         .as_ref()
         .and_then(|engine| engine.mixer.clip_scheduled_beat(column as usize))
+        .unwrap_or(-1.0)
+}
+
+/// Return the active clip's actual normalized source-buffer cursor, or -1.0
+/// when the column is inactive. Unlike a beat-derived estimate this reports the
+/// real loop-channel position, including trimmed and wrapped windows.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_get_active_playhead(
+    engine: *const GooeyEngine,
+    column: u32,
+) -> f64 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.mixer.clip_active_playhead(column as usize))
         .unwrap_or(-1.0)
 }
 

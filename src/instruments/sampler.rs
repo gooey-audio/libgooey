@@ -148,6 +148,11 @@ pub struct SamplerRack {
     voices: [SampleVoice; SAMPLER_VOICE_COUNT],
     next_age: u64,
     sequencer: Sequencer,
+    /// Pattern dispatch is opt-in. A registered rack must remain silent until
+    /// the host explicitly starts it on the shared transport.
+    pattern_running: bool,
+    /// Absolute shared-transport beat at which a requested start lands.
+    pending_start_beat: Option<f64>,
 }
 
 impl SamplerRack {
@@ -163,6 +168,8 @@ impl SamplerRack {
                 vec![false; SAMPLER_SLOT_COUNT],
                 name,
             ),
+            pattern_running: false,
+            pending_start_beat: None,
         }
     }
 
@@ -236,6 +243,9 @@ impl SamplerRack {
     }
 
     pub fn tick_sequencer(&mut self) -> Option<(usize, f32)> {
+        if !self.pattern_running {
+            return None;
+        }
         self.sequencer
             .tick_with_settings()
             .map(|trigger| (trigger.note.unwrap_or(0) as usize, trigger.velocity))
@@ -245,6 +255,67 @@ impl SamplerRack {
     }
     pub fn sequencer(&self) -> &Sequencer {
         &self.sequencer
+    }
+
+    pub fn schedule_start(&mut self, beat: f64) -> bool {
+        if !beat.is_finite() || beat < 0.0 {
+            return false;
+        }
+        self.pattern_running = false;
+        self.sequencer.stop();
+        self.pending_start_beat = Some(beat);
+        true
+    }
+
+    /// Called from the render thread before the sequencer is ticked.
+    pub fn activate_start_if_due(&mut self, transport_beat: f64) {
+        let Some(target) = self.pending_start_beat else { return };
+        if transport_beat + 1.0e-8 < target {
+            return;
+        }
+        self.pending_start_beat = None;
+        self.sequencer.set_beat_position(target);
+        self.sequencer.start();
+        self.pattern_running = true;
+    }
+
+    pub fn stop_pattern(&mut self) {
+        self.pending_start_beat = None;
+        self.pattern_running = false;
+        self.sequencer.stop();
+        self.stop_all();
+    }
+
+    pub fn cancel_pending_start(&mut self) {
+        self.pending_start_beat = None;
+    }
+
+    pub fn pending_start_beat(&self) -> Option<f64> {
+        self.pending_start_beat
+    }
+
+    pub fn pattern_running(&self) -> bool {
+        self.pattern_running
+    }
+
+    pub fn transport_stop(&mut self) {
+        self.pending_start_beat = None;
+        self.pattern_running = false;
+        self.sequencer.stop();
+        self.stop_all();
+    }
+
+    pub fn transport_reset(&mut self) {
+        self.pending_start_beat = None;
+        self.pattern_running = false;
+        self.sequencer.reset();
+        self.stop_all();
+    }
+
+    fn stop_all(&mut self) {
+        for voice in &mut self.voices {
+            voice.buffer = None;
+        }
     }
 
     fn stop_slot(&mut self, slot: usize) {

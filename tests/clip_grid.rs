@@ -131,6 +131,49 @@ fn stopped_launch_starts_empty_column_on_first_transport_sample() {
 }
 
 #[test]
+fn running_bar_requests_are_strictly_future_even_on_a_bar_boundary() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        gooey_engine_set_bpm(engine, 60.0);
+        let _samples = load(engine, 0, 0, 0.5, 8_000, 60.0);
+        gooey_engine_sequencer_start(engine);
+        let _ = render(engine, 4_000); // exactly beat 4
+        assert!((gooey_engine_transport_get_beat_position(engine) - 4.0).abs() < 1e-9);
+        assert!(gooey_engine_clip_launch(engine, 0, 0, CLIP_QUANTIZE_BAR));
+        assert_eq!(gooey_engine_clip_get_scheduled_beat(engine, 0), 8.0);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn active_playhead_reports_the_real_trimmed_source_cursor() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        gooey_engine_set_bpm(engine, 60.0);
+        assert_eq!(gooey_engine_clip_get_active_playhead(engine, 0), -1.0);
+        let _samples = load(engine, 0, 0, 0.5, 44_100, 60.0);
+        // A wrapped window begins at 75% of the full source buffer.
+        assert!(gooey_engine_clip_set_trim(
+            engine,
+            0,
+            0,
+            0.75,
+            0.25,
+            CLIP_QUANTIZE_IMMEDIATE
+        ));
+        assert!(gooey_engine_clip_launch_at_beat(engine, 0, 0, 0.0));
+        gooey_engine_sequencer_start(engine);
+        let _ = render(engine, 1);
+        let playhead = gooey_engine_clip_get_active_playhead(engine, 0);
+        assert!(
+            (0.75..0.752).contains(&playhead),
+            "expected trim-start cursor, got {playhead}"
+        );
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
 fn quantized_and_exact_launches_cross_render_boundaries() {
     unsafe fn assert_launch(quantization: u32, expected_beat: f64) {
         let engine = gooey_engine_new(SR);
