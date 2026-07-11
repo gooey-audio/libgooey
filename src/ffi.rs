@@ -15,7 +15,9 @@ use crate::instruments::{
     PolySynthConfig, SampleBuffer, SamplerBuffer, SamplerRack, SnareConfig, SnareDrum, Tom2,
     Tom2Config,
 };
-use crate::mixer::{LaunchQuantization, Mixer, MixerGraph, PitchMode, StereoSampleBuffer};
+use crate::mixer::{
+    LaunchQuantization, Mixer, MixerGraph, PitchMode, RetrimTiming, StereoSampleBuffer,
+};
 use crate::music::{apply_voicing, available_voicings, Key, NoteName, ScaleType, VoicingType};
 use crate::performance::{ChordClipEvent, PerformanceRecorder, PlayerAction, RecordMode};
 use crate::utils::{PresetBlender, SmoothedParam};
@@ -6614,6 +6616,10 @@ pub const CLIP_QUANTIZE_SIXTEENTH: u32 = crate::mixer::CLIP_QUANTIZE_SIXTEENTH;
 pub const CLIP_QUANTIZE_QUARTER: u32 = crate::mixer::CLIP_QUANTIZE_QUARTER;
 /// Launch on the next 4/4 bar boundary (the default).
 pub const CLIP_QUANTIZE_BAR: u32 = crate::mixer::CLIP_QUANTIZE_BAR;
+/// Trim-only timing: re-window the active loop immediately, ignoring the
+/// transport grid. Accepted by `gooey_engine_clip_set_trim`; the launch/stop
+/// functions still reject it as an unknown quantization.
+pub const CLIP_QUANTIZE_IMMEDIATE: u32 = crate::mixer::CLIP_QUANTIZE_IMMEDIATE;
 
 /// Slot contains a preloaded clip buffer.
 pub const CLIP_STATE_LOADED: u32 = crate::mixer::CLIP_STATE_LOADED;
@@ -6931,6 +6937,94 @@ pub unsafe extern "C" fn gooey_engine_clip_get_scheduled_beat(
         .unwrap_or(-1.0)
 }
 
+/// Set a slot's loop trim as normalized `[0, 1]` start/end markers.
+///
+/// The trim is always stored on the slot, so the next launch of that slot loops
+/// only `[start, end)` and `gooey_engine_clip_get_trim_start/_end` round-trip.
+/// When the slot is its column's active clip, the change also lands on the
+/// sounding loop: `quantization == CLIP_QUANTIZE_IMMEDIATE` re-windows it now
+/// (live marker scrubbing; also works while the transport is stopped), while a
+/// `CLIP_QUANTIZE_*` boundary schedules it for that grid point so the loop never
+/// jumps mid-bar. A queued retrim is independent of a queued launch/stop —
+/// neither cancels the other — and `gooey_engine_clip_cancel` drops both.
+///
+/// `end < start` is intentional: it selects a wrap-around loop region that plays
+/// `[start, 1) ∪ [0, end)`, rotating the phrase downbeat (the same reusable
+/// primitive the legacy `gooey_engine_loop_set_start/end` now exposes).
+///
+/// Reloading a slot with `gooey_engine_clip_load` installs a fresh clip and thus
+/// resets its trim to the full `[0, 1)` buffer.
+///
+/// Returns `false` for a null engine, out-of-range slot, non-finite markers,
+/// markers outside `[0, 1]`, `start == end`, an unknown quantization, or an
+/// empty slot.
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_set_trim(
+    engine: *mut GooeyEngine,
+    column: u32,
+    row: u32,
+    start: f64,
+    end: f64,
+    quantization: u32,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    if column >= CLIP_COLUMN_COUNT
+        || row >= CLIP_ROW_COUNT
+        || !start.is_finite()
+        || !end.is_finite()
+        || !(0.0..=1.0).contains(&start)
+        || !(0.0..=1.0).contains(&end)
+        || start == end
+    {
+        return false;
+    }
+    let Some(timing) = RetrimTiming::from_id(quantization) else {
+        return false;
+    };
+    engine
+        .mixer
+        .clip_set_trim(column as usize, row as usize, start, end, timing)
+}
+
+/// Return a slot's normalized loop-start marker, or `-1.0` for a null engine or
+/// empty/out-of-range slot.
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_get_trim_start(
+    engine: *const GooeyEngine,
+    column: u32,
+    row: u32,
+) -> f64 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.mixer.clip_trim_start(column as usize, row as usize))
+        .unwrap_or(-1.0)
+}
+
+/// Return a slot's normalized loop-end marker, or `-1.0` for a null engine or
+/// empty/out-of-range slot.
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_get_trim_end(
+    engine: *const GooeyEngine,
+    column: u32,
+    row: u32,
+) -> f64 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.mixer.clip_trim_end(column as usize, row as usize))
+        .unwrap_or(-1.0)
+}
+
 /// Return the monotonic absolute transport position in quarter notes.
 /// Unlike `gooey_engine_sequencer_get_beat_position`, this value does not wrap
 /// at the end of the 16-step sequencer pattern.
@@ -7062,6 +7156,10 @@ pub unsafe extern "C" fn gooey_engine_loop_set_solo(
 /// Set a loop channel's loop start point as a normalized `[0, 1]` position in
 /// the buffer.
 ///
+/// Note: when the resulting `end < start`, the loop now plays the wrap-around
+/// region `[start, 1) ∪ [0, end)` instead of silently swapping the two markers
+/// as it did previously — the same reusable primitive used by clip trim.
+///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
 #[no_mangle]
@@ -7077,6 +7175,10 @@ pub unsafe extern "C" fn gooey_engine_loop_set_start(
 
 /// Set a loop channel's loop end point as a normalized `[0, 1]` position in
 /// the buffer.
+///
+/// Note: when the resulting `end < start`, the loop now plays the wrap-around
+/// region `[start, 1) ∪ [0, end)` instead of silently swapping the two markers
+/// as it did previously — the same reusable primitive used by clip trim.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.

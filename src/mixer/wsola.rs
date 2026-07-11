@@ -22,6 +22,7 @@
 //! to call from `LoopChannel::tick()`.
 
 use crate::frame::StereoFrame;
+use crate::mixer::loop_channel::LoopWindow;
 use crate::mixer::stereo_buffer::StereoSampleBuffer;
 use crate::utils::raised_sine_window;
 
@@ -127,6 +128,24 @@ impl WsolaStretcher {
     pub(crate) fn synthesize_next_hop(
         &mut self,
         buffer: &StereoSampleBuffer,
+        window: &LoopWindow,
+        sr_ratio: f64,
+        speed: f64,
+        warp: f64,
+    ) -> f64 {
+        if window.wraps {
+            self.synthesize_next_hop_wrapped(buffer, window, sr_ratio, speed, warp)
+        } else {
+            self.synthesize_next_hop_linear(buffer, window.lo, window.hi, sr_ratio, speed, warp)
+        }
+    }
+
+    /// Non-wrap hop synthesis: physical-frame math, byte-identical to the
+    /// pre-wrap engine. See [`Self::synthesize_next_hop`] for the parameter
+    /// meanings (`loop_lo`/`loop_hi` are `window.lo`/`window.hi`).
+    fn synthesize_next_hop_linear(
+        &mut self,
+        buffer: &StereoSampleBuffer,
         loop_lo: f64,
         loop_hi: f64,
         sr_ratio: f64,
@@ -204,6 +223,158 @@ impl WsolaStretcher {
         self.drain_idx = 0;
         self.analysis_cursor = best_start;
         best_start
+    }
+
+    /// Wrap-window hop synthesis. Works entirely in the window's *virtual*
+    /// coordinates `[0, span)`: the analysis cursor is converted from physical
+    /// on entry, all bounds/search run in virtual space, and each source read
+    /// translates back with `window.to_physical` + [`StereoSampleBuffer::read_wrapped`]
+    /// so a grain that straddles the buffer seam (`len → 0`) stays continuous.
+    /// The *loop* seam (`span → 0`) keeps the linear path's behavior: a fresh,
+    /// non-crossfaded grain restart. The stored/returned cursor is physical.
+    fn synthesize_next_hop_wrapped(
+        &mut self,
+        buffer: &StereoSampleBuffer,
+        window: &LoopWindow,
+        sr_ratio: f64,
+        speed: f64,
+        warp: f64,
+    ) -> f64 {
+        let span = window.span;
+        let step = (sr_ratio * speed.max(0.0)).max(1e-6);
+        let hop_source_span = self.hop_len as f64 * step;
+        let grain_source_span = (self.window_len as f64 - 1.0) * step + 1.0;
+        // Latest virtual start that still fits a whole grain before the loop end.
+        let max_start = (span - grain_source_span).max(0.0);
+
+        let cursor_v = window.to_virtual(self.analysis_cursor);
+        let raw_target = cursor_v + hop_source_span * warp.max(0.0);
+        let (search_center, wrapped) = if raw_target > max_start || max_start <= 0.0 {
+            (0.0, true)
+        } else {
+            (raw_target.max(0.0), false)
+        };
+        if wrapped {
+            // Grain would read past the loop end (or the window is too small to
+            // fit one): restart from the loop start with a fresh grain rather
+            // than correlating across the seam (see linear path).
+            self.have_prev_tail = false;
+        }
+
+        let best_start = if self.have_prev_tail {
+            self.search_best_start_wrapped(buffer, window, search_center, step, max_start)
+        } else {
+            search_center
+        };
+
+        // Extract and window the new grain, reading each tap through the
+        // physical translation so the buffer seam wraps transparently.
+        for (i, slot) in self.grain_scratch.iter_mut().enumerate() {
+            let pos_v = (best_start + i as f64 * step).clamp(0.0, span);
+            let raw = buffer.read_wrapped(window.to_physical(pos_v));
+            let w = self.window[i];
+            *slot = StereoFrame {
+                l: raw.l * w,
+                r: raw.r * w,
+            };
+        }
+
+        // Overlap-add the new grain's first half against the carried tail
+        // (silence on a just-wrapped seam — a brief fade-in, not a hard onset).
+        for i in 0..self.hop_len {
+            let prev = if self.have_prev_tail {
+                self.prev_tail[i]
+            } else {
+                StereoFrame::default()
+            };
+            let new = self.grain_scratch[i];
+            self.out_scratch[i] = StereoFrame {
+                l: prev.l + new.l,
+                r: prev.r + new.r,
+            };
+        }
+
+        // Carry the new grain's second half forward as next hop's tail.
+        for i in 0..self.hop_len {
+            self.prev_tail[i] = self.grain_scratch[self.hop_len + i];
+            let f = self.prev_tail[i];
+            self.prev_tail_mono[i] = f.l + f.r;
+        }
+
+        self.have_prev_tail = true;
+        self.drain_idx = 0;
+        let phys_start = window.to_physical(best_start);
+        self.analysis_cursor = phys_start;
+        phys_start
+    }
+
+    /// Correlation search for [`Self::synthesize_next_hop_wrapped`], mirroring
+    /// [`Self::search_best_start`] but in the window's virtual coordinates and
+    /// reading candidates through `window.to_physical` + `read_wrapped`.
+    fn search_best_start_wrapped(
+        &self,
+        buffer: &StereoSampleBuffer,
+        window: &LoopWindow,
+        center: f64,
+        step: f64,
+        max_start: f64,
+    ) -> f64 {
+        let radius = ((SEARCH_MS as f64 / 1000.0) * buffer.sample_rate() as f64)
+            .round()
+            .max(1.0);
+        let lo_bound = (center - radius).max(0.0);
+        let hi_bound = (center + radius).min(max_start);
+        if hi_bound <= lo_bound {
+            return center.clamp(0.0, max_start);
+        }
+
+        let score_at = |start: f64| -> f32 {
+            let mut num = 0.0f32;
+            let mut ref_energy = 0.0f32;
+            let mut cand_energy = 0.0f32;
+            for (i, reference) in self.prev_tail_mono.iter().enumerate() {
+                let pos_v = (start + i as f64 * step).clamp(0.0, max_start + step);
+                let raw = buffer.read_wrapped(window.to_physical(pos_v));
+                let cand = raw.l + raw.r;
+                num += cand * reference;
+                ref_energy += reference * reference;
+                cand_energy += cand * cand;
+            }
+            if ref_energy <= f32::EPSILON || cand_energy <= f32::EPSILON {
+                0.0
+            } else {
+                num / (ref_energy.sqrt() * cand_energy.sqrt())
+            }
+        };
+
+        let span = hi_bound - lo_bound;
+        let coarse_stride = (span / COARSE_STEPS as f64).max(1.0);
+
+        let mut best = lo_bound;
+        let mut best_score = f32::MIN;
+        let mut c = lo_bound;
+        while c <= hi_bound {
+            let s = score_at(c);
+            if s > best_score {
+                best_score = s;
+                best = c;
+            }
+            c += coarse_stride;
+        }
+
+        let refine_lo = (best - coarse_stride).max(lo_bound);
+        let refine_hi = (best + coarse_stride).min(hi_bound);
+        let mut c = refine_lo;
+        while c <= refine_hi {
+            let s = score_at(c);
+            if s > best_score {
+                best_score = s;
+                best = c;
+            }
+            c += 1.0;
+        }
+
+        best
     }
 
     /// Coarse-to-fine normalized cross-correlation search for the source
@@ -285,6 +456,17 @@ mod tests {
 
     const SR: f32 = 48_000.0;
 
+    /// A full-buffer, non-wrapping loop window spanning `[0, len)`.
+    fn full_window(len: f64) -> LoopWindow {
+        LoopWindow {
+            lo: 0.0,
+            hi: len,
+            span: len,
+            wraps: false,
+            len,
+        }
+    }
+
     fn sine_buffer(seconds: f32, hz: f32, sample_rate: f32) -> StereoSampleBuffer {
         let frames = (sample_rate * seconds) as usize;
         let left: Vec<f32> = (0..frames)
@@ -315,9 +497,9 @@ mod tests {
     fn synthesize_produces_finite_output() {
         let buffer = sine_buffer(2.0, 220.0, SR);
         let mut s = WsolaStretcher::new(SR, 0.0);
-        let loop_hi = buffer.len() as f64;
+        let window = full_window(buffer.len() as f64);
         for _ in 0..50 {
-            s.synthesize_next_hop(&buffer, 0.0, loop_hi, 1.0, 1.0, 1.0);
+            s.synthesize_next_hop(&buffer, &window, 1.0, 1.0, 1.0);
             for frame in &s.out_scratch {
                 assert!(frame.l.is_finite() && frame.r.is_finite());
             }
@@ -327,13 +509,13 @@ mod tests {
     #[test]
     fn warp_ratio_advances_analysis_cursor_faster() {
         let buffer = sine_buffer(4.0, 220.0, SR);
-        let loop_hi = buffer.len() as f64;
+        let window = full_window(buffer.len() as f64);
 
         let mut slow = WsolaStretcher::new(SR, 0.0);
         let mut fast = WsolaStretcher::new(SR, 0.0);
         for _ in 0..20 {
-            slow.synthesize_next_hop(&buffer, 0.0, loop_hi, 1.0, 1.0, 1.0);
-            fast.synthesize_next_hop(&buffer, 0.0, loop_hi, 1.0, 1.0, 2.0);
+            slow.synthesize_next_hop(&buffer, &window, 1.0, 1.0, 1.0);
+            fast.synthesize_next_hop(&buffer, &window, 1.0, 1.0, 2.0);
         }
         assert!(
             fast.analysis_cursor > slow.analysis_cursor,
