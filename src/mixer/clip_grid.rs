@@ -437,7 +437,12 @@ impl ClipGrid {
 
     fn stop_now(&mut self, column: usize, channels: &mut [LoopChannel]) {
         if let Some(channel) = channels.get_mut(column) {
-            channel.set_playing(false);
+            // Drop the grid buffer, not just playback: a stopped column keeps no
+            // sounding material, so a later `clear` or legacy detach cannot
+            // replay a slot the grid already reported as inactive. Transport
+            // freeze keeps its buffer via `transport_stop`, which never routes
+            // through here.
+            channel.clear_buffer();
         }
         self.columns[column].active_row = None;
         self.columns[column].active_clip = None;
@@ -463,10 +468,8 @@ impl ClipGrid {
                 PendingKind::Launch { row } => self.activate(column, row, channels),
                 PendingKind::Stop => self.stop_now(column, channels),
                 PendingKind::StopAndUnload { row } => {
+                    // `stop_now` already drops the channel buffer.
                     self.stop_now(column, channels);
-                    if let Some(channel) = channels.get_mut(column) {
-                        channel.clear_buffer();
-                    }
                     self.slots[column][row] = None;
                 }
             }
@@ -619,5 +622,29 @@ mod tests {
         grid.before_tick(&mut channels);
         assert!(grid.transport_seek(2.0, &mut channels));
         assert!((channels[0].position_normalized() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn stopped_column_drops_channel_buffer_so_clear_leaves_nothing() {
+        let mut grid = ClipGrid::new(SR, 60.0);
+        let mut channels = channels();
+        let (buffer, bpm) = clip(0.5, 100, 60.0);
+        grid.load(0, 0, buffer, bpm);
+        grid.launch_at(0, 0, 0.0);
+        grid.transport_start(&mut channels);
+        grid.before_tick(&mut channels);
+        assert!(channels[0].has_buffer());
+
+        // A plain column stop must leave no sounding material behind.
+        grid.stop_at(0, grid.transport_beat());
+        grid.before_tick(&mut channels);
+        assert_eq!(grid.active_row(0), None);
+        assert!(!channels[0].has_buffer());
+
+        // `clear` after the stop cannot resurrect the buffer via a later
+        // legacy detach + set_playing.
+        grid.clear(&mut channels);
+        assert_eq!(grid.slot_state(0, 0), 0);
+        assert!(!channels[0].has_buffer());
     }
 }
