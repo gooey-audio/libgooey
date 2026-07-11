@@ -273,6 +273,15 @@ impl LoopChannel {
         self.stretcher = None;
     }
 
+    /// Drop the active sample buffer and reset playback state while preserving
+    /// the channel strip (gain, mute/solo, and effects).
+    pub fn clear_buffer(&mut self) {
+        self.buffer = None;
+        self.cursor = 0.0;
+        self.playing = false;
+        self.stretcher = None;
+    }
+
     pub fn set_playing(&mut self, playing: bool) {
         self.playing = playing;
     }

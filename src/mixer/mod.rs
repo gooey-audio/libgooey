@@ -8,12 +8,18 @@
 //! it. The mixer sums its channels into a single stereo frame that the host
 //! engine adds to its master bus before the global effects + limiter.
 
+pub mod clip_grid;
 pub mod effect_chain;
 pub mod graph;
 pub mod loop_channel;
 pub mod stereo_buffer;
 mod wsola;
 
+pub use clip_grid::{
+    ClipGrid, LaunchQuantization, CLIP_COLUMN_COUNT, CLIP_QUANTIZE_BAR, CLIP_QUANTIZE_QUARTER,
+    CLIP_QUANTIZE_SIXTEENTH, CLIP_ROW_COUNT, CLIP_STATE_LOADED, CLIP_STATE_PLAYING,
+    CLIP_STATE_QUEUED,
+};
 pub use effect_chain::{ChannelEffect, EffectChain};
 pub use graph::MixerGraph;
 pub use loop_channel::{LoopChannel, PitchMode};
@@ -30,6 +36,7 @@ const DEFAULT_BPM: f32 = 120.0;
 
 pub struct Mixer {
     channels: Vec<LoopChannel>,
+    clip_grid: ClipGrid,
     sample_rate: f32,
     bpm: f32,
 }
@@ -42,6 +49,7 @@ impl Mixer {
             .collect();
         Self {
             channels,
+            clip_grid: ClipGrid::new(sample_rate, DEFAULT_BPM),
             sample_rate,
             bpm: DEFAULT_BPM,
         }
@@ -50,6 +58,7 @@ impl Mixer {
     /// Sum all channels into one stereo frame, honoring mute/solo: if any channel
     /// is soloed, only soloed channels sound; otherwise all un-muted channels do.
     pub fn tick(&mut self, engine_sample_rate: f32) -> StereoFrame {
+        self.clip_grid.before_tick(&mut self.channels);
         let any_solo = self.channels.iter().any(LoopChannel::is_soloed);
         let mut out = StereoFrame::default();
         for channel in &mut self.channels {
@@ -61,6 +70,7 @@ impl Mixer {
             channel.set_active(audible);
             out += channel.tick(engine_sample_rate);
         }
+        self.clip_grid.after_tick();
         out
     }
 
@@ -69,6 +79,7 @@ impl Mixer {
     /// the value used when creating new ones.
     pub fn set_bpm(&mut self, bpm: f32) {
         self.bpm = bpm;
+        self.clip_grid.set_bpm(bpm);
         for channel in &mut self.channels {
             channel.effects().set_bpm(bpm);
             channel.set_engine_bpm(bpm);
@@ -90,6 +101,7 @@ impl Mixer {
     // --- Channel control (bounds-checked, FFI-friendly) -------------------
 
     pub fn load(&mut self, channel: usize, buffer: StereoSampleBuffer) -> bool {
+        self.clip_grid.detach_column(channel);
         match self.channels.get_mut(channel) {
             Some(ch) => {
                 ch.set_buffer(buffer);
@@ -100,6 +112,7 @@ impl Mixer {
     }
 
     pub fn set_playing(&mut self, channel: usize, playing: bool) {
+        self.clip_grid.detach_column(channel);
         if let Some(ch) = self.channels.get_mut(channel) {
             ch.set_playing(playing);
         }
@@ -124,30 +137,35 @@ impl Mixer {
     }
 
     pub fn set_loop_start(&mut self, channel: usize, normalized: f32) {
+        self.clip_grid.detach_column(channel);
         if let Some(ch) = self.channels.get_mut(channel) {
             ch.set_loop_start(normalized);
         }
     }
 
     pub fn set_loop_end(&mut self, channel: usize, normalized: f32) {
+        self.clip_grid.detach_column(channel);
         if let Some(ch) = self.channels.get_mut(channel) {
             ch.set_loop_end(normalized);
         }
     }
 
     pub fn set_speed(&mut self, channel: usize, speed: f32) {
+        self.clip_grid.detach_column(channel);
         if let Some(ch) = self.channels.get_mut(channel) {
             ch.set_speed(speed);
         }
     }
 
     pub fn restart(&mut self, channel: usize) {
+        self.clip_grid.detach_column(channel);
         if let Some(ch) = self.channels.get_mut(channel) {
             ch.restart();
         }
     }
 
     pub fn set_position(&mut self, channel: usize, normalized: f32) {
+        self.clip_grid.detach_column(channel);
         if let Some(ch) = self.channels.get_mut(channel) {
             ch.set_position(normalized);
         }
@@ -156,6 +174,7 @@ impl Mixer {
     /// Tag a channel's loaded buffer with its source BPM (`None` clears the
     /// tag). No-op for a bad channel index or if no buffer is loaded.
     pub fn set_source_bpm(&mut self, channel: usize, bpm: Option<f32>) {
+        self.clip_grid.detach_column(channel);
         if let Some(ch) = self.channels.get_mut(channel) {
             ch.set_source_bpm(bpm);
         }
@@ -168,6 +187,7 @@ impl Mixer {
     }
 
     pub fn set_pitch_mode(&mut self, channel: usize, mode: PitchMode) {
+        self.clip_grid.detach_column(channel);
         if let Some(ch) = self.channels.get_mut(channel) {
             ch.set_pitch_mode(mode);
         }
@@ -189,6 +209,7 @@ impl Mixer {
         buffer: StereoSampleBuffer,
         divisions: u32,
     ) -> bool {
+        self.clip_grid.detach_column(channel);
         if buffer.is_empty() {
             return false;
         }
@@ -202,6 +223,7 @@ impl Mixer {
     }
 
     pub fn cancel_queued_swap(&mut self, channel: usize) {
+        self.clip_grid.detach_column(channel);
         if let Some(ch) = self.channels.get_mut(channel) {
             ch.cancel_queued_swap();
         }
@@ -211,6 +233,115 @@ impl Mixer {
         self.channels
             .get(channel)
             .map_or(0, |ch| ch.swaps_completed())
+    }
+
+    // --- Transport-synchronized clip grid -------------------------------
+
+    pub fn clip_load(
+        &mut self,
+        column: usize,
+        row: usize,
+        buffer: StereoSampleBuffer,
+        source_bpm: f32,
+    ) -> bool {
+        self.clip_grid.load(column, row, buffer, source_bpm)
+    }
+
+    pub fn clip_unload(&mut self, column: usize, row: usize) -> bool {
+        self.clip_grid.unload(column, row)
+    }
+
+    pub fn clip_clear(&mut self) {
+        self.clip_grid.clear(&mut self.channels);
+    }
+
+    pub fn clip_launch(
+        &mut self,
+        column: usize,
+        row: usize,
+        quantization: LaunchQuantization,
+    ) -> bool {
+        self.clip_grid.launch_quantized(column, row, quantization)
+    }
+
+    pub fn clip_launch_at(&mut self, column: usize, row: usize, beat: f64) -> bool {
+        self.clip_grid.launch_at(column, row, beat)
+    }
+
+    pub fn clip_launch_scene(&mut self, row: usize, quantization: LaunchQuantization) -> bool {
+        self.clip_grid.launch_scene_quantized(row, quantization)
+    }
+
+    pub fn clip_launch_scene_at(&mut self, row: usize, beat: f64) -> bool {
+        self.clip_grid.launch_scene_at(row, beat)
+    }
+
+    pub fn clip_stop(&mut self, column: usize, quantization: LaunchQuantization) -> bool {
+        self.clip_grid.stop_quantized(column, quantization)
+    }
+
+    pub fn clip_stop_at(&mut self, column: usize, beat: f64) -> bool {
+        self.clip_grid.stop_at(column, beat)
+    }
+
+    pub fn clip_cancel(&mut self, column: usize) {
+        self.clip_grid.cancel(column);
+    }
+
+    pub fn clip_cancel_all(&mut self) {
+        self.clip_grid.cancel_all();
+    }
+
+    pub fn clip_set_default_quantization(&mut self, quantization: LaunchQuantization) {
+        self.clip_grid.set_default_quantization(quantization);
+    }
+
+    pub fn clip_default_quantization(&self) -> LaunchQuantization {
+        self.clip_grid.default_quantization()
+    }
+
+    pub fn clip_slot_state(&self, column: usize, row: usize) -> u32 {
+        self.clip_grid.slot_state(column, row)
+    }
+
+    pub fn clip_active_row(&self, column: usize) -> Option<usize> {
+        self.clip_grid.active_row(column)
+    }
+
+    pub fn clip_queued_row(&self, column: usize) -> Option<usize> {
+        self.clip_grid.queued_row(column)
+    }
+
+    pub fn clip_is_stop_queued(&self, column: usize) -> bool {
+        self.clip_grid.is_stop_queued(column)
+    }
+
+    pub fn clip_scheduled_beat(&self, column: usize) -> Option<f64> {
+        self.clip_grid.scheduled_beat(column)
+    }
+
+    pub fn transport_start(&mut self) {
+        self.clip_grid.transport_start(&mut self.channels);
+    }
+
+    pub fn transport_stop(&mut self) {
+        self.clip_grid.transport_stop(&mut self.channels);
+    }
+
+    pub fn transport_seek(&mut self, beat: f64) -> bool {
+        self.clip_grid.transport_seek(beat, &mut self.channels)
+    }
+
+    pub fn transport_reset(&mut self) {
+        self.clip_grid.transport_reset(&mut self.channels);
+    }
+
+    pub fn transport_beat(&self) -> f64 {
+        self.clip_grid.transport_beat()
+    }
+
+    pub fn transport_running(&self) -> bool {
+        self.clip_grid.transport_running()
     }
 
     // --- Per-channel effects ----------------------------------------------
