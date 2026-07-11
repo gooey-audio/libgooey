@@ -209,12 +209,62 @@ fn sampler_sequence_starts_when_host_time_arm_fires() {
             SR
         ));
         assert!(gooey_engine_sampler_set_step(engine, rack, 0, true, 0, 1.0));
+        assert!(gooey_engine_sampler_start_pattern(
+            engine,
+            rack,
+            CLIP_QUANTIZE_BAR
+        ));
         let host_now = 1_000u64;
         gooey_engine_set_render_host_time(engine, host_now, 1.0);
         gooey_engine_sequencer_start_at_host_time(engine, host_now + 100, 0.0);
         let output = render(engine, 256);
         assert!(output[..100 * 2].iter().all(|sample| *sample == 0.0));
         assert!(peak(&output[100 * 2..]) > 0.001);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn pattern_start_is_bar_quantized_and_never_seeks_the_clip_transport() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        gooey_engine_set_bpm(engine, 60.0);
+        let rack = gooey_engine_sampler_register(engine) as u32;
+        let source = gooey_engine_sampler_get_source_id(engine, rack);
+        assert!(gooey_engine_mixer_route_source(engine, source, 3));
+        let pcm = vec![0.5_f32; 4096];
+        assert!(gooey_engine_sampler_set_slot_buffer(
+            engine, rack, 0, pcm.as_ptr(), pcm.len() as u32, 1, SR
+        ));
+        assert!(gooey_engine_sampler_set_step(engine, rack, 0, true, 0, 1.0));
+
+        gooey_engine_sequencer_start(engine);
+        let _ = render(engine, (SR / 10.0) as usize); // beat 0.1
+        assert!(gooey_engine_sampler_start_pattern(
+            engine, rack, CLIP_QUANTIZE_BAR
+        ));
+        assert_eq!(gooey_engine_sampler_get_pending_start_beat(engine, rack), 4.0);
+        assert!(!gooey_engine_sampler_is_pattern_running(engine, rack));
+
+        let _ = render(engine, ((4.0 - 0.1) * SR as f64) as usize);
+        assert!(!gooey_engine_sampler_is_pattern_running(engine, rack));
+        let before = gooey_engine_transport_get_beat_position(engine);
+        let _ = render(engine, 1);
+        assert!(gooey_engine_sampler_is_pattern_running(engine, rack));
+        assert!(
+            peak(&render(engine, 64)) > 0.001,
+            "step zero should fire on the boundary"
+        );
+        assert!(gooey_engine_transport_get_beat_position(engine) > before);
+
+        assert!(gooey_engine_sampler_stop_pattern(engine, rack));
+        assert!(!gooey_engine_sampler_is_pattern_running(engine, rack));
+        assert!(gooey_engine_sampler_start_pattern(
+            engine, rack, CLIP_QUANTIZE_BAR
+        ));
+        assert_eq!(gooey_engine_sampler_get_pending_start_beat(engine, rack), 8.0);
+        assert!(gooey_engine_sampler_cancel_pattern_start(engine, rack));
+        assert_eq!(gooey_engine_sampler_get_pending_start_beat(engine, rack), -1.0);
         gooey_engine_free(engine);
     }
 }

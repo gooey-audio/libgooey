@@ -308,6 +308,10 @@ impl Mixer {
         self.clip_grid.active_row(column)
     }
 
+    pub fn clip_active_playhead(&self, column: usize) -> Option<f64> {
+        self.clip_grid.active_playhead(column, &self.channels)
+    }
+
     pub fn clip_queued_row(&self, column: usize) -> Option<usize> {
         self.clip_grid.queued_row(column)
     }
@@ -318,6 +322,10 @@ impl Mixer {
 
     pub fn clip_scheduled_beat(&self, column: usize) -> Option<f64> {
         self.clip_grid.scheduled_beat(column)
+    }
+
+    pub fn quantized_target(&self, quantization: LaunchQuantization) -> f64 {
+        self.clip_grid.quantized_target(quantization)
     }
 
     /// Set a slot's loop trim. Unlike the legacy `set_loop_start/end` (which

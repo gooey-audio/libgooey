@@ -168,16 +168,26 @@ impl ClipGrid {
         self.bpm.max(0.0) as f64 / (60.0 * self.sample_rate.max(1.0) as f64)
     }
 
-    fn quantized_target(&self, quantization: LaunchQuantization) -> f64 {
+    /// Return the sole scheduling target used by clip-grid actions. A stopped
+    /// transport always accepts the responsive beat-zero launch; once running,
+    /// even a request made exactly on a boundary waits for the *next* boundary.
+    pub fn quantized_target(&self, quantization: LaunchQuantization) -> f64 {
+        if !self.transport_running {
+            return 0.0;
+        }
         let interval = quantization.beats();
         let scaled = self.transport_beat / interval;
+        // The render clock accumulates f64 sample increments, so an exact musical
+        // boundary can be represented as 0.9999999999999999. Treat that small
+        // numerical residue as aligned; "strictly future" then means one whole
+        // additional interval rather than accidentally scheduling the same bar.
         let nearest = scaled.round();
-        let aligned = (scaled - nearest).abs() <= 1.0e-9;
-        if !self.transport_running && aligned {
-            nearest * interval
+        let base = if (scaled - nearest).abs() <= 1.0e-9 {
+            nearest
         } else {
-            (scaled.floor() + 1.0) * interval
-        }
+            scaled.floor()
+        };
+        (base + 1.0) * interval
     }
 
     fn valid_exact_target(&self, beat: f64) -> bool {
@@ -376,6 +386,22 @@ impl ClipGrid {
 
     pub fn active_row(&self, column: usize) -> Option<usize> {
         self.columns.get(column).and_then(|state| state.active_row)
+    }
+
+    /// The actual source-buffer cursor of an active clip. This deliberately
+    /// reads the loop channel instead of deriving a phase from transport beat:
+    /// a launch at beat 4 and a cropped/wrapped window still begin at their
+    /// physical first audible frame.
+    pub fn active_playhead(
+        &self,
+        column: usize,
+        channels: &[LoopChannel],
+    ) -> Option<f64> {
+        self.active_row(column)?;
+        channels
+            .get(column)
+            .filter(|channel| channel.has_buffer())
+            .map(|channel| channel.position_normalized() as f64)
     }
 
     pub fn queued_row(&self, column: usize) -> Option<usize> {
