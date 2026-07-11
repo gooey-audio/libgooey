@@ -185,6 +185,12 @@ impl StereoSampleBuffer {
         channel[index.clamp(0, last) as usize]
     }
 
+    #[inline]
+    fn channel_wrapped(channel: &[f32], index: isize) -> f32 {
+        let len = channel.len() as isize;
+        channel[index.rem_euclid(len) as usize]
+    }
+
     /// Read a stereo frame at a fractional frame position using cubic
     /// interpolation. The position is clamped into the valid range; callers
     /// that loop are responsible for wrapping `position` before calling.
@@ -207,6 +213,42 @@ impl StereoSampleBuffer {
             let p1 = Self::channel_clamped(channel, index);
             let p2 = Self::channel_clamped(channel, index + 1);
             let p3 = Self::channel_clamped(channel, index + 2);
+            cubic_interpolate(p0, p1, p2, p3, frac)
+        };
+
+        StereoFrame {
+            l: read(&self.left),
+            r: read(&self.right),
+        }
+    }
+
+    /// Read a stereo frame like [`Self::read_interpolated`], but with the cubic
+    /// interpolation taps wrapping around the buffer ends
+    /// (`index.rem_euclid(len)`) instead of clamping. Used by
+    /// [`crate::mixer::loop_channel::LoopChannel`] only when the active loop
+    /// window wraps the buffer end, so the seam between the last and first
+    /// frames stays continuous.
+    #[inline]
+    pub fn read_wrapped(&self, position: f64) -> StereoFrame {
+        if self.left.len() == 1 {
+            return StereoFrame {
+                l: self.left[0],
+                r: self.right[0],
+            };
+        }
+
+        let len = self.left.len() as f64;
+        // Fold the read position into [0, len) so the integer index and each of
+        // its cubic neighbors resolve to a valid mod-len tap.
+        let position = position.rem_euclid(len);
+        let index = position.floor() as isize;
+        let frac = (position - index as f64) as f32;
+
+        let read = |channel: &[f32]| {
+            let p0 = Self::channel_wrapped(channel, index - 1);
+            let p1 = Self::channel_wrapped(channel, index);
+            let p2 = Self::channel_wrapped(channel, index + 1);
+            let p3 = Self::channel_wrapped(channel, index + 2);
             cubic_interpolate(p0, p1, p2, p3, frac)
         };
 

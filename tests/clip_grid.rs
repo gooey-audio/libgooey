@@ -389,6 +389,199 @@ fn different_source_tempos_hold_the_same_musical_phase() {
 }
 
 #[test]
+fn trim_validation_and_round_trip() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let _samples = load(engine, 0, 0, 0.5, 1000, 60.0);
+
+        // Fresh slot defaults to the full [0, 1) buffer.
+        assert_eq!(gooey_engine_clip_get_trim_start(engine, 0, 0), 0.0);
+        assert_eq!(gooey_engine_clip_get_trim_end(engine, 0, 0), 1.0);
+
+        // Store and read back.
+        assert!(gooey_engine_clip_set_trim(
+            engine,
+            0,
+            0,
+            0.2,
+            0.8,
+            CLIP_QUANTIZE_IMMEDIATE
+        ));
+        assert_eq!(gooey_engine_clip_get_trim_start(engine, 0, 0), 0.2);
+        assert_eq!(gooey_engine_clip_get_trim_end(engine, 0, 0), 0.8);
+
+        // Rejections: out-of-range slot, start == end, out of [0,1], non-finite,
+        // unknown quantization.
+        assert!(!gooey_engine_clip_set_trim(
+            engine,
+            CLIP_COLUMN_COUNT,
+            0,
+            0.2,
+            0.8,
+            0
+        ));
+        assert!(!gooey_engine_clip_set_trim(engine, 0, 0, 0.5, 0.5, 0));
+        assert!(!gooey_engine_clip_set_trim(engine, 0, 0, -0.1, 0.8, 0));
+        assert!(!gooey_engine_clip_set_trim(engine, 0, 0, 0.2, f64::NAN, 0));
+        assert!(!gooey_engine_clip_set_trim(engine, 0, 0, 0.2, 0.8, 99));
+
+        // Empty slot -> -1.0 sentinel.
+        assert_eq!(gooey_engine_clip_get_trim_start(engine, 0, 1), -1.0);
+        assert_eq!(gooey_engine_clip_get_trim_end(engine, 0, 1), -1.0);
+
+        // Reloading a slot resets its trim to the full buffer.
+        let _reload = load(engine, 0, 0, 0.5, 1000, 60.0);
+        assert_eq!(gooey_engine_clip_get_trim_start(engine, 0, 0), 0.0);
+        assert_eq!(gooey_engine_clip_get_trim_end(engine, 0, 0), 1.0);
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn quantized_retrim_lands_on_boundary_without_detaching() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        gooey_engine_set_bpm(engine, 60.0);
+        let _samples = load(engine, 0, 0, 0.5, 8000, 60.0); // 8 beats
+        gooey_engine_clip_launch_at_beat(engine, 0, 0, 0.0);
+        gooey_engine_sequencer_start(engine);
+        let _ = render(engine, 100); // beat 0.1; playhead early in the full loop
+
+        // Retrim to a window that does not contain the current playhead, on the
+        // next sixteenth (0.25 beat).
+        assert!(gooey_engine_clip_set_trim(
+            engine,
+            0,
+            0,
+            0.8,
+            0.95,
+            CLIP_QUANTIZE_SIXTEENTH
+        ));
+        let target = gooey_engine_clip_get_scheduled_beat(engine, 0);
+        assert_eq!(
+            target, -1.0,
+            "a retrim must not occupy the launch queue slot"
+        );
+
+        // Up to one frame before the boundary: still in the old (full) window.
+        let frames_to_boundary = ((0.25 - 0.1) * SR as f64) as usize;
+        let _ = render(engine, frames_to_boundary - 1);
+        assert!(gooey_engine_loop_get_position(engine, 0) < 0.8);
+        assert_eq!(gooey_engine_clip_get_active_row(engine, 0), 0);
+
+        // Cross the boundary: the playhead snaps into the new window and the
+        // column is still owned by the grid (active row unchanged -> no detach).
+        let _ = render(engine, 2);
+        assert!(gooey_engine_loop_get_position(engine, 0) >= 0.8);
+        assert_eq!(gooey_engine_clip_get_active_row(engine, 0), 0);
+        assert_eq!(
+            gooey_engine_clip_get_state(engine, 0, 0),
+            CLIP_STATE_LOADED | CLIP_STATE_PLAYING
+        );
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn immediate_retrim_applies_playing_and_stopped() {
+    unsafe {
+        // Playing: the retrim lands within the same call.
+        let engine = gooey_engine_new(SR);
+        gooey_engine_set_bpm(engine, 60.0);
+        let _samples = load(engine, 0, 0, 0.5, 8000, 60.0);
+        gooey_engine_clip_launch_at_beat(engine, 0, 0, 0.0);
+        gooey_engine_sequencer_start(engine);
+        let _ = render(engine, 200); // playhead early in the full loop (< 0.8)
+        assert!(gooey_engine_loop_get_position(engine, 0) < 0.8);
+        assert!(gooey_engine_clip_set_trim(
+            engine,
+            0,
+            0,
+            0.8,
+            0.95,
+            CLIP_QUANTIZE_IMMEDIATE
+        ));
+        assert!(gooey_engine_loop_get_position(engine, 0) >= 0.8);
+        assert_eq!(gooey_engine_clip_get_active_row(engine, 0), 0);
+        gooey_engine_free(engine);
+
+        // Transport stopped but a clip is frozen active: immediate still applies.
+        let engine = gooey_engine_new(SR);
+        gooey_engine_set_bpm(engine, 60.0);
+        let _samples = load(engine, 0, 0, 0.5, 8000, 60.0);
+        gooey_engine_clip_launch_at_beat(engine, 0, 0, 0.0);
+        gooey_engine_sequencer_start(engine);
+        let _ = render(engine, 200);
+        gooey_engine_sequencer_stop(engine); // freeze; column stays active
+        assert_eq!(gooey_engine_clip_get_active_row(engine, 0), 0);
+        let before = gooey_engine_loop_get_position(engine, 0);
+        assert!(before < 0.8);
+        assert!(gooey_engine_clip_set_trim(
+            engine,
+            0,
+            0,
+            0.8,
+            0.95,
+            CLIP_QUANTIZE_IMMEDIATE
+        ));
+        assert!(gooey_engine_loop_get_position(engine, 0) >= 0.8);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn wrapped_trim_plays_both_segments() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        gooey_engine_set_bpm(engine, 60.0);
+        // Two-valued buffer: first 200 frames = 0.3, last 200 = 0.9.
+        let mut samples = vec![0.3f32; 400];
+        for s in samples.iter_mut().skip(200) {
+            *s = 0.9;
+        }
+        assert!(gooey_engine_clip_load(
+            engine,
+            0,
+            0,
+            samples.as_ptr(),
+            400,
+            1,
+            SR,
+            60.0,
+        ));
+        // Wrap-around trim: [0.6, 1.0) ∪ [0.0, 0.4) spans the 0.9 tail and the
+        // 0.3 head, so both amplitudes must appear in the output.
+        assert!(gooey_engine_clip_set_trim(
+            engine,
+            0,
+            0,
+            0.6,
+            0.4,
+            CLIP_QUANTIZE_IMMEDIATE
+        ));
+        gooey_engine_clip_launch_at_beat(engine, 0, 0, 0.0);
+        gooey_engine_sequencer_start(engine);
+
+        let out = render(engine, 2000);
+        // The mixer applies master gain, so compare amplitudes relative to the
+        // loudest sample. The 0.9 tail forms a cluster near the max; the 0.3
+        // head forms a distinct cluster at ~1/3 of it.
+        let max_abs = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(max_abs > 0.0);
+        let saw_low = out
+            .iter()
+            .any(|&s| (0.15 * max_abs..0.6 * max_abs).contains(&s.abs()));
+        let saw_high = out.iter().any(|&s| s.abs() > 0.75 * max_abs);
+        assert!(saw_low, "0.3 segment never played");
+        assert!(saw_high, "0.9 segment never played");
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
 fn host_time_arm_starts_transport_and_due_clip_on_same_sample() {
     unsafe {
         let engine = gooey_engine_new(SR);

@@ -16,9 +16,9 @@ pub mod stereo_buffer;
 mod wsola;
 
 pub use clip_grid::{
-    ClipGrid, LaunchQuantization, CLIP_COLUMN_COUNT, CLIP_QUANTIZE_BAR, CLIP_QUANTIZE_QUARTER,
-    CLIP_QUANTIZE_SIXTEENTH, CLIP_ROW_COUNT, CLIP_STATE_LOADED, CLIP_STATE_PLAYING,
-    CLIP_STATE_QUEUED,
+    ClipGrid, LaunchQuantization, RetrimTiming, CLIP_COLUMN_COUNT, CLIP_QUANTIZE_BAR,
+    CLIP_QUANTIZE_IMMEDIATE, CLIP_QUANTIZE_QUARTER, CLIP_QUANTIZE_SIXTEENTH, CLIP_ROW_COUNT,
+    CLIP_STATE_LOADED, CLIP_STATE_PLAYING, CLIP_STATE_QUEUED,
 };
 pub use effect_chain::{ChannelEffect, EffectChain};
 pub use graph::MixerGraph;
@@ -318,6 +318,30 @@ impl Mixer {
 
     pub fn clip_scheduled_beat(&self, column: usize) -> Option<f64> {
         self.clip_grid.scheduled_beat(column)
+    }
+
+    /// Set a slot's loop trim. Unlike the legacy `set_loop_start/end` (which
+    /// evict the column from grid control via `detach_column`), this keeps the
+    /// slot owned by the grid — the trim is a per-slot property the grid
+    /// applies itself.
+    pub fn clip_set_trim(
+        &mut self,
+        column: usize,
+        row: usize,
+        start: f64,
+        end: f64,
+        timing: RetrimTiming,
+    ) -> bool {
+        self.clip_grid
+            .set_trim(column, row, start, end, timing, &mut self.channels)
+    }
+
+    pub fn clip_trim_start(&self, column: usize, row: usize) -> Option<f64> {
+        self.clip_grid.trim_start(column, row)
+    }
+
+    pub fn clip_trim_end(&self, column: usize, row: usize) -> Option<f64> {
+        self.clip_grid.trim_end(column, row)
     }
 
     pub fn transport_start(&mut self) {
