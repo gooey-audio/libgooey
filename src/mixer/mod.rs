@@ -423,6 +423,57 @@ impl Mixer {
             .get(channel)
             .and_then(|ch| ch.effects().effect_type_at(slot))
     }
+
+    // --- Offline single-channel render ------------------------------------
+
+    /// Render a single loop channel offline into `out` as interleaved stereo
+    /// `f32` frames (`[l, r]` per frame), **post channel gain and effects but
+    /// ignoring mute/solo**. The channel's cursor and effect DSP state are
+    /// reset, `preroll` frames are rendered and discarded to warm the effects
+    /// (delay/reverb feedback), the loop cursor is then restarted while the
+    /// warmed effect state is preserved, and exactly `frames` stereo frames are
+    /// written with no appended tail. `out` is cleared first and, on success,
+    /// holds `frames * 2` values.
+    ///
+    /// Returns `false` (leaving `out` untouched) for an out-of-range channel or
+    /// a channel with no loaded buffer.
+    ///
+    /// Not real-time safe: this drives the channel directly and must not run
+    /// concurrently with [`Mixer::tick`] on the same mixer. It is intended for
+    /// a disposable offline engine, never the live realtime engine.
+    pub fn render_channel_to_interleaved(
+        &mut self,
+        channel: usize,
+        frames: usize,
+        preroll: usize,
+        out: &mut Vec<f32>,
+    ) -> bool {
+        let sample_rate = self.sample_rate;
+        let Some(ch) = self.channels.get_mut(channel) else {
+            return false;
+        };
+        if !ch.has_buffer() {
+            return false;
+        }
+
+        // Clean slate: cursor at the loop start, effect DSP cleared, gain snapped.
+        ch.prepare_offline_render();
+        // Warm the effects with one discarded preroll.
+        for _ in 0..preroll {
+            ch.tick(sample_rate);
+        }
+        // Restart the loop cursor at the top, keeping the warmed effect state.
+        ch.restart();
+
+        out.clear();
+        out.reserve(frames * 2);
+        for _ in 0..frames {
+            let frame = ch.tick(sample_rate);
+            out.push(frame.l);
+            out.push(frame.r);
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -490,5 +541,115 @@ mod tests {
         assert_eq!(mixer.effect_count(0), 1);
         assert_eq!(mixer.effect_count(1), 0);
         assert!(mixer.effect_add(99, EFFECT_DELAY).is_none());
+    }
+
+    /// A ramp loop whose left channel is the frame index, useful for detecting
+    /// loop-region periodicity in offline renders.
+    fn ramp_buffer(frames: usize) -> StereoSampleBuffer {
+        let left: Vec<f32> = (0..frames).map(|i| i as f32).collect();
+        let right = left.clone();
+        StereoSampleBuffer::from_channels(left, right, SR).unwrap()
+    }
+
+    #[test]
+    fn render_channel_writes_exact_frame_count() {
+        let mut mixer = Mixer::new(SR);
+        mixer.load(0, dc_buffer(0.5, 4096));
+        let mut out = Vec::new();
+        assert!(mixer.render_channel_to_interleaved(0, 1000, 512, &mut out));
+        assert_eq!(out.len(), 1000 * 2, "interleaved stereo, no tail");
+    }
+
+    #[test]
+    fn render_channel_rejects_bad_channel_or_empty() {
+        let mut mixer = Mixer::new(SR);
+        let mut out = vec![1.0, 2.0, 3.0];
+        // Out-of-range channel.
+        assert!(!mixer.render_channel_to_interleaved(99, 100, 0, &mut out));
+        // Channel with no buffer loaded.
+        assert!(!mixer.render_channel_to_interleaved(0, 100, 0, &mut out));
+        // Left untouched on failure.
+        assert_eq!(out, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn render_channel_repeats_selected_region() {
+        // Region = first quarter of a 400-frame buffer -> 100-frame period.
+        let mut mixer = Mixer::new(SR);
+        mixer.load(0, ramp_buffer(400));
+        mixer.set_loop_start(0, 0.0);
+        mixer.set_loop_end(0, 0.25);
+        let mut out = Vec::new();
+        assert!(mixer.render_channel_to_interleaved(0, 350, 0, &mut out));
+        // Source SR == engine SR and speed 1.0 -> sample-accurate integer steps,
+        // so the left channel tiles the region [0, 100) exactly.
+        for i in 0..350 {
+            let expected = (i % 100) as f32;
+            assert!(
+                (out[i * 2] - expected).abs() < 1e-3,
+                "frame {i}: got {}, want {expected}",
+                out[i * 2]
+            );
+        }
+    }
+
+    #[test]
+    fn render_channel_applies_gain() {
+        let mut mixer = Mixer::new(SR);
+        mixer.load(0, dc_buffer(0.5, 4096));
+        mixer.set_gain(0, 0.5);
+        let mut out = Vec::new();
+        assert!(mixer.render_channel_to_interleaved(0, 256, 128, &mut out));
+        // 0.5 buffer * 0.5 gain = 0.25, from the first sample (gain is snapped).
+        assert!(
+            (out[0] - 0.25).abs() < 1e-3,
+            "gain not baked in from sample 0: {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn render_channel_ignores_mute_solo_and_other_channels() {
+        let mut mixer = Mixer::new(SR);
+        mixer.load(0, dc_buffer(0.5, 4096));
+        mixer.load(1, dc_buffer(-0.9, 4096));
+        // Hostile mute/solo state: target channel muted, a different one soloed.
+        mixer.set_muted(0, true);
+        mixer.set_soloed(1, true);
+        let mut out = Vec::new();
+        assert!(mixer.render_channel_to_interleaved(0, 256, 128, &mut out));
+        // Still renders channel 0 at full level, with no bleed from channel 1.
+        assert!(
+            (out[0] - 0.5).abs() < 1e-3,
+            "mute/solo leaked into render: {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn render_channel_preroll_warms_effects() {
+        // With a feedback delay, a warmed render differs from a cold one: the
+        // captured region opens with delay repeats already in flight.
+        use crate::ffi::{DELAY_PARAM_FEEDBACK, DELAY_PARAM_MIX};
+        let make = |preroll: usize| {
+            let mut mixer = Mixer::new(SR);
+            mixer.load(0, ramp_buffer(400));
+            mixer.set_loop_end(0, 0.25);
+            let slot = mixer.effect_add(0, EFFECT_DELAY).unwrap();
+            // Audible wet path with feedback so warm-up state is observable.
+            mixer.effect_set_param(0, slot, DELAY_PARAM_FEEDBACK, 0.7);
+            mixer.effect_set_param(0, slot, DELAY_PARAM_MIX, 0.5);
+            let mut out = Vec::new();
+            assert!(mixer.render_channel_to_interleaved(0, 2000, preroll, &mut out));
+            out
+        };
+        let cold = make(0);
+        let warm = make(20_000);
+        let diff: f32 = cold
+            .iter()
+            .zip(&warm)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(diff > 1e-3, "preroll did not warm the effect state");
     }
 }
