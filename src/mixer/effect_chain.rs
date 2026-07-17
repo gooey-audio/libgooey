@@ -333,6 +333,15 @@ impl EffectChain {
         self.effects.clear();
     }
 
+    /// Clear every effect's internal DSP state (delay lines, reverb tails,
+    /// filter memory) without removing the effects from the chain. Used to
+    /// start an offline render from a clean, un-warmed state.
+    pub fn reset(&self) {
+        for effect in &self.effects {
+            effect.reset();
+        }
+    }
+
     /// Set a parameter on the effect at `slot`.
     pub fn set_param(&self, slot: usize, param: u32, value: f32) {
         if let Some(effect) = self.effects.get(slot) {

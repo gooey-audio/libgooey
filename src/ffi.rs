@@ -7978,3 +7978,71 @@ pub unsafe extern "C" fn gooey_engine_bounce_to_wav(
 
     writer.finalize().is_ok()
 }
+
+/// Render a single loop channel offline to a stereo WAV file.
+///
+/// Renders only `channel`, **after** its gain fader and effect chain but
+/// **ignoring mute/solo**, into a 44.1 kHz-agnostic (engine sample rate)
+/// stereo 32-bit float WAV. The channel's cursor and effect DSP are reset,
+/// `preroll_frame_count` frames are rendered and discarded to warm the effects
+/// (delay/reverb feedback), the loop cursor is then restarted while the warmed
+/// effect state is preserved, and exactly `frame_count` stereo frames are
+/// written with no appended tail — so a shorter selected loop region tiles
+/// seamlessly and the file ends on the bar-aligned boundary.
+///
+/// Returns `true` on success. Returns `false` for a null engine/path, an empty
+/// path, `frame_count == 0`, an out-of-range `channel`, a channel with no
+/// loaded buffer, or any file-write error.
+///
+/// This drives the channel directly and is **not** real-time safe: it must not
+/// run concurrently against the same engine's realtime render callback. Callers
+/// (e.g. Whirlpool) invoke it on a disposable offline engine.
+///
+/// # Safety
+/// - `engine` must be a valid pointer returned by `gooey_engine_new`.
+/// - `path` must be a valid null-terminated UTF-8 string.
+#[cfg(feature = "bounce")]
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_loop_render_to_wav(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    frame_count: u32,
+    preroll_frame_count: u32,
+    path: *const std::os::raw::c_char,
+) -> bool {
+    if engine.is_null() || path.is_null() || frame_count == 0 {
+        return false;
+    }
+    let engine = &mut *engine;
+    let path_str = match std::ffi::CStr::from_ptr(path).to_str() {
+        Ok(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+
+    let mut interleaved: Vec<f32> = Vec::new();
+    if !engine.mixer.render_channel_to_interleaved(
+        channel as usize,
+        frame_count as usize,
+        preroll_frame_count as usize,
+        &mut interleaved,
+    ) {
+        return false;
+    }
+
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: engine.sample_rate as u32,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer = match hound::WavWriter::create(path_str, spec) {
+        Ok(w) => w,
+        Err(_) => return false,
+    };
+    for &sample in &interleaved {
+        if writer.write_sample(sample).is_err() {
+            return false;
+        }
+    }
+    writer.finalize().is_ok()
+}

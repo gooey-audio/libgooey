@@ -545,6 +545,21 @@ impl LoopChannel {
         self.active_gain.set_target(if audible { 1.0 } else { 0.0 });
     }
 
+    /// Prepare this channel for an offline single-channel render: force it
+    /// playing and fully audible (ignoring mute/solo), snap the gain and gate
+    /// smoothers to their targets so the capture has stable gain from the first
+    /// sample, clear any warmed effect DSP state, and reset the cursor to the
+    /// loop start. The caller then discards a preroll (to warm the effects) and
+    /// [`Self::restart`]s the cursor before capturing.
+    pub(crate) fn prepare_offline_render(&mut self) {
+        self.playing = true;
+        self.gain.snap();
+        self.active_gain.set_target(1.0);
+        self.active_gain.snap();
+        self.effects.reset();
+        self.restart();
+    }
+
     // --- Getters ----------------------------------------------------------
 
     pub fn has_buffer(&self) -> bool {
