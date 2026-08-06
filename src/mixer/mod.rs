@@ -9,6 +9,7 @@
 //! engine adds to its master bus before the global effects + limiter.
 
 pub mod clip_grid;
+mod control;
 pub mod effect_chain;
 pub mod graph;
 pub mod loop_channel;
@@ -20,10 +21,14 @@ pub use clip_grid::{
     CLIP_QUANTIZE_IMMEDIATE, CLIP_QUANTIZE_QUARTER, CLIP_QUANTIZE_SIXTEENTH, CLIP_ROW_COUNT,
     CLIP_STATE_LOADED, CLIP_STATE_PLAYING, CLIP_STATE_QUEUED,
 };
+pub(crate) use control::MixerCommand;
+pub use control::MixerControl;
 pub use effect_chain::{ChannelEffect, EffectChain};
 pub use graph::MixerGraph;
 pub use loop_channel::{LoopChannel, PitchMode};
 pub use stereo_buffer::StereoSampleBuffer;
+
+use std::collections::VecDeque;
 
 use crate::frame::StereoFrame;
 
@@ -39,6 +44,10 @@ pub struct Mixer {
     clip_grid: ClipGrid,
     sample_rate: f32,
     bpm: f32,
+    control: MixerControl,
+    /// Audio-thread-owned scratch. Commands are moved here before application,
+    /// so producer threads never hold the queue lock while DSP state changes.
+    command_scratch: VecDeque<MixerCommand>,
 }
 
 impl Mixer {
@@ -52,12 +61,147 @@ impl Mixer {
             clip_grid: ClipGrid::new(sample_rate, DEFAULT_BPM),
             sample_rate,
             bpm: DEFAULT_BPM,
+            control: MixerControl::new(),
+            command_scratch: VecDeque::new(),
+        }
+    }
+
+    /// A cloneable, thread-safe endpoint for host/UI control and inspection.
+    pub fn control(&self) -> MixerControl {
+        self.control.clone()
+    }
+
+    /// Drain and apply any queued control-thread commands. Called first thing in
+    /// [`Self::tick`], so all mixer mutation happens on the audio thread. Uses
+    /// `try_lock` (never blocks the audio thread): a missed lock defers the batch
+    /// to the next tick, exactly like `LoopChannel::maybe_swap_pending`.
+    fn apply_pending(&mut self) {
+        let control = self.control.clone();
+        control.drain_into(&mut self.command_scratch);
+        while let Some(command) = self.command_scratch.pop_front() {
+            self.apply(command);
+        }
+    }
+
+    /// Apply one bounded batch at a render-buffer boundary. The FFI render path
+    /// calls this before scheduled transport starts so queued control ordering
+    /// remains deterministic even when a buffer is otherwise silent.
+    pub(crate) fn apply_control_commands(&mut self) {
+        self.apply_pending();
+        self.publish_snapshot();
+    }
+
+    fn apply(&mut self, command: MixerCommand) {
+        match command {
+            MixerCommand::Load { channel, buffer } => {
+                self.load(channel, buffer);
+            }
+            MixerCommand::SetPlaying { channel, playing } => self.set_playing(channel, playing),
+            MixerCommand::SetGain { channel, gain } => self.set_gain(channel, gain),
+            MixerCommand::SetMuted { channel, muted } => self.set_muted(channel, muted),
+            MixerCommand::SetSoloed { channel, soloed } => self.set_soloed(channel, soloed),
+            MixerCommand::SetLoopStart { channel, value } => self.set_loop_start(channel, value),
+            MixerCommand::SetLoopEnd { channel, value } => self.set_loop_end(channel, value),
+            MixerCommand::SetSpeed { channel, speed } => self.set_speed(channel, speed),
+            MixerCommand::SetSourceBpm { channel, bpm } => self.set_source_bpm(channel, bpm),
+            MixerCommand::SetPitchMode { channel, mode } => self.set_pitch_mode(channel, mode),
+            MixerCommand::Restart { channel } => self.restart(channel),
+            MixerCommand::SetPosition { channel, value } => self.set_position(channel, value),
+            MixerCommand::QueueSwap {
+                channel,
+                buffer,
+                divisions,
+            } => {
+                self.queue_swap(channel, buffer, divisions);
+            }
+            MixerCommand::CancelQueuedSwap { channel } => self.cancel_queued_swap(channel),
+            MixerCommand::SetBpm { bpm } => self.set_bpm(bpm),
+            MixerCommand::ClipLoad {
+                column,
+                row,
+                buffer,
+                source_bpm,
+            } => {
+                self.clip_load(column, row, buffer, source_bpm);
+            }
+            MixerCommand::ClipUnload { column, row } => {
+                self.clip_unload(column, row);
+            }
+            MixerCommand::ClipClear => self.clip_clear(),
+            MixerCommand::ClipLaunch {
+                column,
+                row,
+                quantization,
+            } => {
+                self.clip_launch(column, row, quantization);
+            }
+            MixerCommand::ClipLaunchAt { column, row, beat } => {
+                self.clip_launch_at(column, row, beat);
+            }
+            MixerCommand::ClipLaunchScene { row, quantization } => {
+                self.clip_launch_scene(row, quantization);
+            }
+            MixerCommand::ClipLaunchSceneAt { row, beat } => {
+                self.clip_launch_scene_at(row, beat);
+            }
+            MixerCommand::ClipStop {
+                column,
+                quantization,
+            } => {
+                self.clip_stop(column, quantization);
+            }
+            MixerCommand::ClipStopAt { column, beat } => {
+                self.clip_stop_at(column, beat);
+            }
+            MixerCommand::ClipCancel { column } => self.clip_cancel(column),
+            MixerCommand::ClipCancelAll => self.clip_cancel_all(),
+            MixerCommand::ClipSetDefaultQuantization { quantization } => {
+                self.clip_set_default_quantization(quantization)
+            }
+            MixerCommand::ClipSetTrim {
+                column,
+                row,
+                start,
+                end,
+                timing,
+            } => {
+                self.clip_set_trim(column, row, start, end, timing);
+            }
+            MixerCommand::TransportStart => self.transport_start(),
+            MixerCommand::TransportStop => self.transport_stop(),
+            MixerCommand::TransportSeek { beat } => {
+                self.transport_seek(beat);
+            }
+            MixerCommand::TransportReset => self.transport_reset(),
+            MixerCommand::EffectAdd { channel, effect_id } => {
+                self.effect_add(channel, effect_id);
+            }
+            MixerCommand::EffectRemove { channel, slot } => {
+                self.effect_remove(channel, slot);
+            }
+            MixerCommand::EffectMove {
+                channel,
+                slot,
+                new_position,
+            } => {
+                self.effect_move(channel, slot, new_position);
+            }
+            MixerCommand::EffectClear { channel } => self.effect_clear(channel),
+            MixerCommand::EffectSetParam {
+                channel,
+                slot,
+                param,
+                value,
+            } => self.effect_set_param(channel, slot, param, value),
         }
     }
 
     /// Sum all channels into one stereo frame, honoring mute/solo: if any channel
     /// is soloed, only soloed channels sound; otherwise all un-muted channels do.
     pub fn tick(&mut self, engine_sample_rate: f32) -> StereoFrame {
+        // Apply any control-thread commands first, so this sample already
+        // reflects them and all mixer mutation stays on the audio thread.
+        self.apply_pending();
         self.clip_grid.before_tick(&mut self.channels);
         let any_solo = self.channels.iter().any(LoopChannel::is_soloed);
         let mut out = StereoFrame::default();
@@ -71,7 +215,89 @@ impl Mixer {
             out += channel.tick(engine_sample_rate);
         }
         self.clip_grid.after_tick();
+        self.publish_snapshot();
         out
+    }
+
+    fn publish_snapshot(&self) {
+        let snapshot = self.control.snapshot();
+        snapshot.begin_write();
+        for channel in 0..LOOP_CHANNEL_COUNT {
+            let ch = &self.channels[channel];
+            snapshot.loop_position[channel].store(
+                ch.position_normalized().to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            snapshot.loop_source_bpm[channel].store(
+                ch.source_bpm().unwrap_or(0.0).to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let mode = match ch.pitch_mode() {
+                PitchMode::Off => 0,
+                PitchMode::Resample => 1,
+                PitchMode::PreservePitch => 2,
+            };
+            snapshot.loop_pitch_mode[channel].store(mode, std::sync::atomic::Ordering::Relaxed);
+            snapshot.swaps_completed[channel]
+                .store(ch.swaps_completed(), std::sync::atomic::Ordering::Relaxed);
+        }
+        snapshot.default_quantization.store(
+            self.clip_grid.default_quantization().id(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        snapshot.transport_beat.store(
+            self.clip_grid.transport_beat().to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        for column in 0..CLIP_COLUMN_COUNT {
+            snapshot.active_row[column].store(
+                self.clip_grid.active_row(column).map_or(-1, |v| v as i32),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            snapshot.queued_row[column].store(
+                self.clip_grid.queued_row(column).map_or(-1, |v| v as i32),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            snapshot.stop_queued[column].store(
+                self.clip_grid.is_stop_queued(column),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            snapshot.scheduled_beat[column].store(
+                self.clip_grid
+                    .scheduled_beat(column)
+                    .unwrap_or(-1.0)
+                    .to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            snapshot.active_playhead[column].store(
+                self.clip_grid
+                    .active_playhead(column, &self.channels)
+                    .unwrap_or(-1.0)
+                    .to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            for row in 0..CLIP_ROW_COUNT {
+                snapshot.slot_state[column][row].store(
+                    self.clip_grid.slot_state(column, row),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                snapshot.trim_start[column][row].store(
+                    self.clip_grid
+                        .trim_start(column, row)
+                        .unwrap_or(-1.0)
+                        .to_bits(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                snapshot.trim_end[column][row].store(
+                    self.clip_grid
+                        .trim_end(column, row)
+                        .unwrap_or(-1.0)
+                        .to_bits(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
+        snapshot.finish_write();
     }
 
     /// Update the tempo for the mixer: re-tempo every existing note-synced
@@ -448,6 +674,13 @@ impl Mixer {
         preroll: usize,
         out: &mut Vec<f32>,
     ) -> bool {
+        // This path is explicitly offline-only, so it may synchronously drain
+        // controls before directly driving a channel. Never call it alongside
+        // realtime `tick` on the same mixer.
+        while self.control.has_pending() {
+            self.apply_pending();
+        }
+        self.publish_snapshot();
         let sample_rate = self.sample_rate;
         let Some(ch) = self.channels.get_mut(channel) else {
             return false;
@@ -491,6 +724,79 @@ mod tests {
     fn default_channel_count() {
         let mixer = Mixer::new(SR);
         assert_eq!(mixer.channel_count(), LOOP_CHANNEL_COUNT);
+    }
+
+    #[test]
+    fn enqueued_command_applies_on_next_tick() {
+        let mut mixer = Mixer::new(SR);
+        mixer.control().set_pitch_mode(0, PitchMode::PreservePitch);
+        // Not applied until the audio thread drains the queue in `tick`.
+        assert_eq!(mixer.pitch_mode(0), PitchMode::Off);
+        mixer.tick(SR);
+        assert_eq!(mixer.pitch_mode(0), PitchMode::PreservePitch);
+    }
+
+    #[test]
+    fn enqueued_commands_apply_in_fifo_order() {
+        let mut mixer = Mixer::new(SR);
+        let control = mixer.control();
+        control.set_gain(0, 0.2);
+        control.set_gain(0, 0.7);
+        mixer.tick(SR);
+        // Last write wins iff commands ran in enqueue order.
+        let gain = mixer.channel(0).unwrap().gain();
+        assert!((gain - 0.7).abs() < 1e-6, "expected 0.7, got {gain}");
+    }
+
+    #[test]
+    fn enqueued_load_defers_until_tick() {
+        let mut mixer = Mixer::new(SR);
+        let buf = dc_buffer(0.5, 64);
+        mixer.control().load(0, buf);
+        assert!(!mixer.channel(0).unwrap().has_buffer());
+        mixer.tick(SR);
+        assert!(mixer.channel(0).unwrap().has_buffer());
+    }
+
+    #[test]
+    fn control_batch_is_bounded_and_fifo() {
+        let mut mixer = Mixer::new(SR);
+        let control = mixer.control();
+        for i in 0..=control::MAX_COMMANDS_PER_TICK {
+            assert!(control.set_gain(0, i as f32 / 100.0));
+        }
+        mixer.tick(SR);
+        assert!((mixer.channel(0).unwrap().gain() - 0.63).abs() < 1e-6);
+        mixer.tick(SR);
+        assert!((mixer.channel(0).unwrap().gain() - 0.64).abs() < 1e-6);
+    }
+
+    #[test]
+    fn control_snapshot_is_published_after_audio_tick() {
+        let mut mixer = Mixer::new(SR);
+        let control = mixer.control();
+        assert!(control.load(0, dc_buffer(0.5, 128)));
+        assert!(control.set_source_bpm(0, Some(123.0)));
+        assert!(control.set_pitch_mode(0, PitchMode::PreservePitch));
+        assert_eq!(
+            control.source_bpm(0),
+            0.0,
+            "snapshot precedes audio application"
+        );
+        mixer.tick(SR);
+        assert_eq!(control.source_bpm(0), 123.0);
+        assert_eq!(control.pitch_mode(0), PitchMode::PreservePitch);
+        assert!(control.position(0).is_finite());
+    }
+
+    #[test]
+    fn clip_snapshot_does_not_read_live_grid() {
+        let mut mixer = Mixer::new(SR);
+        let control = mixer.control();
+        assert!(control.clip_load(0, 0, dc_buffer(0.5, 128), 120.0));
+        assert_eq!(control.clip_slot_state(0, 0), 0);
+        mixer.tick(SR);
+        assert_eq!(control.clip_slot_state(0, 0), CLIP_STATE_LOADED);
     }
 
     #[test]
