@@ -53,6 +53,10 @@ fn constants_and_load_validation_are_stable() {
         let engine = gooey_engine_new(SR);
         let samples = mono_clip(0.5, 1000);
 
+        // An empty slot is rejected synchronously even though valid launches
+        // are applied asynchronously at the next render boundary.
+        assert!(!gooey_engine_clip_launch(engine, 0, 0, CLIP_QUANTIZE_BAR,));
+
         assert!(!gooey_engine_clip_load(
             engine,
             CLIP_COLUMN_COUNT,
@@ -96,6 +100,7 @@ fn constants_and_load_validation_are_stable() {
         assert_eq!(gooey_engine_clip_get_state(engine, 0, 0), 0);
 
         let _samples = load(engine, 0, 0, 0.5, 1000, 60.0);
+        let _ = render(engine, 1);
         assert_eq!(gooey_engine_clip_get_state(engine, 0, 0), CLIP_STATE_LOADED);
         assert_eq!(
             gooey_engine_clip_get_default_quantization(engine),
@@ -103,6 +108,7 @@ fn constants_and_load_validation_are_stable() {
         );
         assert!(!gooey_engine_clip_set_default_quantization(engine, 99));
         gooey_engine_clip_clear(engine);
+        let _ = render(engine, 1);
         assert_eq!(gooey_engine_clip_get_state(engine, 0, 0), 0);
         gooey_engine_free(engine);
     }
@@ -114,9 +120,6 @@ fn stopped_launch_starts_empty_column_on_first_transport_sample() {
         let engine = gooey_engine_new(SR);
         let _samples = load(engine, 0, 0, 0.5, 4000, 60.0);
         assert!(gooey_engine_clip_launch(engine, 0, 0, CLIP_QUANTIZE_BAR));
-        assert_eq!(gooey_engine_clip_get_active_row(engine, 0), -1);
-        assert_eq!(gooey_engine_clip_get_queued_row(engine, 0), 0);
-        assert_eq!(gooey_engine_clip_get_scheduled_beat(engine, 0), 0.0);
 
         gooey_engine_sequencer_start(engine);
         let _ = render(engine, 1);
@@ -140,6 +143,7 @@ fn running_bar_requests_are_strictly_future_even_on_a_bar_boundary() {
         let _ = render(engine, 4_000); // exactly beat 4
         assert!((gooey_engine_transport_get_beat_position(engine) - 4.0).abs() < 1e-9);
         assert!(gooey_engine_clip_launch(engine, 0, 0, CLIP_QUANTIZE_BAR));
+        let _ = render(engine, 1);
         assert_eq!(gooey_engine_clip_get_scheduled_beat(engine, 0), 8.0);
         gooey_engine_free(engine);
     }
@@ -182,9 +186,12 @@ fn quantized_and_exact_launches_cross_render_boundaries() {
         gooey_engine_sequencer_start(engine);
         let _ = render(engine, 100); // beat 0.1
         assert!(gooey_engine_clip_launch(engine, 0, 0, quantization));
+        let _ = render(engine, 1);
         assert!((gooey_engine_clip_get_scheduled_beat(engine, 0) - expected_beat).abs() < 1e-9);
 
-        let frames_to_boundary = ((expected_beat - 0.1) * SR as f64) as usize;
+        let frames_to_boundary =
+            ((expected_beat - gooey_engine_transport_get_beat_position(engine)) * SR as f64).ceil()
+                as usize;
         let _ = render(engine, frames_to_boundary);
         assert_eq!(gooey_engine_clip_get_active_row(engine, 0), -1);
         let _ = render(engine, 1);
@@ -204,8 +211,9 @@ fn quantized_and_exact_launches_cross_render_boundaries() {
         let _ = render(engine, 100);
         assert!(gooey_engine_clip_launch_at_beat(engine, 0, 0, 0.333));
         assert!(!gooey_engine_clip_launch_at_beat(engine, 0, 0, 0.05));
+        let _ = render(engine, 1);
         assert!((gooey_engine_clip_get_scheduled_beat(engine, 0) - 0.333).abs() < 1e-9);
-        let _ = render(engine, 233);
+        let _ = render(engine, 232);
         assert_eq!(gooey_engine_clip_get_active_row(engine, 0), -1);
         let _ = render(engine, 1);
         assert_eq!(gooey_engine_clip_get_active_row(engine, 0), 0);
@@ -222,7 +230,6 @@ fn column_is_mutually_exclusive_and_latest_request_wins() {
         let _b = load(engine, 0, 1, 0.75, 4000, 60.0);
         assert!(gooey_engine_clip_launch_at_beat(engine, 0, 0, 0.0));
         assert!(gooey_engine_clip_launch_at_beat(engine, 0, 1, 0.0));
-        assert_eq!(gooey_engine_clip_get_queued_row(engine, 0), 1);
         gooey_engine_sequencer_start(engine);
         let _ = render(engine, 1);
         assert_eq!(gooey_engine_clip_get_active_row(engine, 0), 1);
@@ -265,10 +272,11 @@ fn scene_launch_is_atomic_and_empty_cells_stop_columns() {
 
         buffers.push(load(engine, 0, 1, 0.9, 4000, 60.0));
         assert!(gooey_engine_clip_launch_scene_at_beat(engine, 1, 0.25));
+        let _ = render(engine, 1);
         for column in 1..CLIP_COLUMN_COUNT {
             assert!(gooey_engine_clip_is_stop_queued(engine, column));
         }
-        let _ = render(engine, 249);
+        let _ = render(engine, 248);
         for column in 0..CLIP_COLUMN_COUNT {
             assert_eq!(gooey_engine_clip_get_active_row(engine, column), 0);
         }
@@ -324,12 +332,13 @@ fn active_replace_relaunch_and_unload_are_quantized() {
         let _ = render(engine, 100);
 
         let _replacement = load(engine, 0, 0, 0.75, 4000, 60.0);
+        let _ = render(engine, 1);
         assert_eq!(
             gooey_engine_clip_get_state(engine, 0, 0),
             CLIP_STATE_LOADED | CLIP_STATE_PLAYING | CLIP_STATE_QUEUED
         );
         assert!((gooey_engine_clip_get_scheduled_beat(engine, 0) - 0.25).abs() < 1e-9);
-        let _ = render(engine, 150);
+        let _ = render(engine, 149);
         assert_ne!(
             gooey_engine_clip_get_state(engine, 0, 0) & CLIP_STATE_QUEUED,
             0
@@ -346,6 +355,7 @@ fn active_replace_relaunch_and_unload_are_quantized() {
             0,
             CLIP_QUANTIZE_SIXTEENTH
         ));
+        let _ = render(engine, 1);
         assert_ne!(
             gooey_engine_clip_get_state(engine, 0, 0) & CLIP_STATE_QUEUED,
             0
@@ -353,6 +363,7 @@ fn active_replace_relaunch_and_unload_are_quantized() {
         gooey_engine_clip_cancel(engine, 0);
 
         assert!(gooey_engine_clip_unload(engine, 0, 0));
+        let _ = render(engine, 1);
         assert!(gooey_engine_clip_is_stop_queued(engine, 0));
         let target = gooey_engine_clip_get_scheduled_beat(engine, 0);
         let current = gooey_engine_transport_get_beat_position(engine);
@@ -375,6 +386,7 @@ fn legacy_playhead_mutation_detaches_grid_state_but_keeps_slots() {
         assert_eq!(gooey_engine_clip_get_active_row(engine, 0), 0);
 
         gooey_engine_loop_set_position(engine, 0, 0.5);
+        let _ = render(engine, 1);
         assert_eq!(gooey_engine_clip_get_active_row(engine, 0), -1);
         assert_eq!(gooey_engine_clip_get_state(engine, 0, 0), CLIP_STATE_LOADED);
         gooey_engine_free(engine);
@@ -436,6 +448,7 @@ fn trim_validation_and_round_trip() {
     unsafe {
         let engine = gooey_engine_new(SR);
         let _samples = load(engine, 0, 0, 0.5, 1000, 60.0);
+        let _ = render(engine, 1);
 
         // Fresh slot defaults to the full [0, 1) buffer.
         assert_eq!(gooey_engine_clip_get_trim_start(engine, 0, 0), 0.0);
@@ -450,6 +463,7 @@ fn trim_validation_and_round_trip() {
             0.8,
             CLIP_QUANTIZE_IMMEDIATE
         ));
+        let _ = render(engine, 1);
         assert_eq!(gooey_engine_clip_get_trim_start(engine, 0, 0), 0.2);
         assert_eq!(gooey_engine_clip_get_trim_end(engine, 0, 0), 0.8);
 
@@ -474,6 +488,7 @@ fn trim_validation_and_round_trip() {
 
         // Reloading a slot resets its trim to the full buffer.
         let _reload = load(engine, 0, 0, 0.5, 1000, 60.0);
+        let _ = render(engine, 1);
         assert_eq!(gooey_engine_clip_get_trim_start(engine, 0, 0), 0.0);
         assert_eq!(gooey_engine_clip_get_trim_end(engine, 0, 0), 1.0);
 
@@ -546,6 +561,7 @@ fn immediate_retrim_applies_playing_and_stopped() {
             0.95,
             CLIP_QUANTIZE_IMMEDIATE
         ));
+        let _ = render(engine, 1);
         assert!(gooey_engine_loop_get_position(engine, 0) >= 0.8);
         assert_eq!(gooey_engine_clip_get_active_row(engine, 0), 0);
         gooey_engine_free(engine);
@@ -569,6 +585,7 @@ fn immediate_retrim_applies_playing_and_stopped() {
             0.95,
             CLIP_QUANTIZE_IMMEDIATE
         ));
+        let _ = render(engine, 1);
         assert!(gooey_engine_loop_get_position(engine, 0) >= 0.8);
         gooey_engine_free(engine);
     }

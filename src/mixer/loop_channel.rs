@@ -149,6 +149,24 @@ pub struct LoopChannel {
     swaps_completed: AtomicU32,
 }
 
+/// Loop state removed by the audio thread and handed back to the control side
+/// for destruction. Dropping either a large sample buffer or a WSOLA instance
+/// can free heap storage, so realtime replacement paths must not drop them.
+pub(crate) struct RetiredLoopState {
+    buffer: Option<StereoSampleBuffer>,
+    stretcher: Option<WsolaStretcher>,
+}
+
+impl RetiredLoopState {
+    fn new(buffer: Option<StereoSampleBuffer>, stretcher: Option<WsolaStretcher>) -> Self {
+        Self { buffer, stretcher }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buffer.is_none() && self.stretcher.is_none()
+    }
+}
+
 impl LoopChannel {
     pub fn new(sample_rate: f32) -> Self {
         Self {
@@ -389,6 +407,22 @@ impl LoopChannel {
         self.buffer = Some(buffer);
         self.cursor = self.window(len).lo;
         self.stretcher = None;
+    }
+
+    /// Realtime counterpart to [`Self::set_buffer`]. Removed data is retained
+    /// instead of dropped so the mixer can transfer it to a control thread for
+    /// heap reclamation after this render boundary.
+    pub(crate) fn set_buffer_realtime(
+        &mut self,
+        buffer: StereoSampleBuffer,
+        retired: &mut Vec<RetiredLoopState>,
+    ) {
+        let len = buffer.len() as f64;
+        let previous = RetiredLoopState::new(self.buffer.replace(buffer), self.stretcher.take());
+        if !previous.is_empty() {
+            retired.push(previous);
+        }
+        self.cursor = self.window(len).lo;
     }
 
     /// Drop the active sample buffer and reset playback state while preserving

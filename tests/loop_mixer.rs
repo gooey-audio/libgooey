@@ -595,6 +595,9 @@ fn queued_swap_lands_in_preserve_pitch_mode() {
         gooey_engine_set_bpm(engine, 140.0);
         gooey_engine_loop_set_pitch_mode(engine, 0, PITCH_MODE_PRESERVE_PITCH);
         gooey_engine_loop_set_playing(engine, 0, true);
+        // Loop controls apply at the audio boundary; publish a snapshot before
+        // observing the resulting pitch mode through the FFI getter.
+        let _ = render_peak(engine, 1);
         assert_eq!(
             gooey_engine_loop_get_pitch_mode(engine, 0),
             PITCH_MODE_PRESERVE_PITCH
@@ -650,6 +653,9 @@ fn queued_swap_preserves_source_bpm_tag() {
         gooey_engine_set_bpm(engine, 150.0);
         gooey_engine_loop_set_pitch_mode(engine, 0, PITCH_MODE_RESAMPLE);
         gooey_engine_loop_set_playing(engine, 0, true);
+        // Source BPM is a published audio-thread snapshot, not an immediate
+        // control-thread read of the live channel.
+        let _ = render_peak(engine, 1);
         assert_eq!(gooey_engine_loop_get_source_bpm(engine, 0), 100.0);
 
         // Queue a take tagged at a different tempo (128 BPM) and let it land.
