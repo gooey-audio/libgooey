@@ -1389,6 +1389,9 @@ impl GooeyEngine {
             self.current_time += sample_period;
             sample_offset += 1;
         }
+        // Publish once after the completed buffer instead of once per mixer
+        // sample. Silent buffers publish from `apply_control_commands` above.
+        self.mixer.publish_control_snapshot();
     }
 
     fn apply_sequencer_blend_setting(

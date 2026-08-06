@@ -31,6 +31,7 @@ pub use stereo_buffer::StereoSampleBuffer;
 use std::collections::VecDeque;
 
 use crate::frame::StereoFrame;
+use crate::mixer::loop_channel::RetiredLoopState;
 
 /// Number of loop channels in the mixer.
 pub const LOOP_CHANNEL_COUNT: usize = 4;
@@ -48,6 +49,9 @@ pub struct Mixer {
     /// Audio-thread-owned scratch. Commands are moved here before application,
     /// so producer threads never hold the queue lock while DSP state changes.
     command_scratch: VecDeque<MixerCommand>,
+    /// Replaced buffers and WSOLA state retained until they can be handed to a
+    /// producer thread for reclamation. Capacity is fixed before rendering.
+    retired: Vec<RetiredLoopState>,
 }
 
 impl Mixer {
@@ -62,7 +66,8 @@ impl Mixer {
             sample_rate,
             bpm: DEFAULT_BPM,
             control: MixerControl::new(),
-            command_scratch: VecDeque::new(),
+            command_scratch: VecDeque::with_capacity(control::MAX_COMMANDS_PER_TICK),
+            retired: Vec::with_capacity(control::MAX_QUEUED_COMMANDS),
         }
     }
 
@@ -77,10 +82,12 @@ impl Mixer {
     /// to the next tick, exactly like `LoopChannel::maybe_swap_pending`.
     fn apply_pending(&mut self) {
         let control = self.control.clone();
+        control.reclaim_from_audio(&mut self.retired);
         control.drain_into(&mut self.command_scratch);
         while let Some(command) = self.command_scratch.pop_front() {
             self.apply(command);
         }
+        control.reclaim_from_audio(&mut self.retired);
     }
 
     /// Apply one bounded batch at a render-buffer boundary. The FFI render path
@@ -215,8 +222,14 @@ impl Mixer {
             out += channel.tick(engine_sample_rate);
         }
         self.clip_grid.after_tick();
-        self.publish_snapshot();
         out
+    }
+
+    /// Publish the last completed render-buffer state for control/UI getters.
+    /// FFI rendering calls this once per buffer; a silent buffer is covered by
+    /// [`Self::apply_control_commands`] at its start.
+    pub(crate) fn publish_control_snapshot(&self) {
+        self.publish_snapshot();
     }
 
     fn publish_snapshot(&self) {
@@ -330,7 +343,7 @@ impl Mixer {
         self.clip_grid.detach_column(channel);
         match self.channels.get_mut(channel) {
             Some(ch) => {
-                ch.set_buffer(buffer);
+                ch.set_buffer_realtime(buffer, &mut self.retired);
                 true
             }
             None => false,
@@ -772,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn control_snapshot_is_published_after_audio_tick() {
+    fn control_snapshot_is_published_after_render_boundary() {
         let mut mixer = Mixer::new(SR);
         let control = mixer.control();
         assert!(control.load(0, dc_buffer(0.5, 128)));
@@ -784,6 +797,7 @@ mod tests {
             "snapshot precedes audio application"
         );
         mixer.tick(SR);
+        mixer.publish_control_snapshot();
         assert_eq!(control.source_bpm(0), 123.0);
         assert_eq!(control.pitch_mode(0), PitchMode::PreservePitch);
         assert!(control.position(0).is_finite());
@@ -796,6 +810,7 @@ mod tests {
         assert!(control.clip_load(0, 0, dc_buffer(0.5, 128), 120.0));
         assert_eq!(control.clip_slot_state(0, 0), 0);
         mixer.tick(SR);
+        mixer.publish_control_snapshot();
         assert_eq!(control.clip_slot_state(0, 0), CLIP_STATE_LOADED);
     }
 

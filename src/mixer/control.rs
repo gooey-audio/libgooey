@@ -8,15 +8,15 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{
-    ChannelEffect, LaunchQuantization, PitchMode, RetrimTiming, StereoSampleBuffer,
-    CLIP_COLUMN_COUNT, CLIP_ROW_COUNT, LOOP_CHANNEL_COUNT,
+    loop_channel::RetiredLoopState, ChannelEffect, LaunchQuantization, PitchMode, RetrimTiming,
+    StereoSampleBuffer, CLIP_COLUMN_COUNT, CLIP_ROW_COUNT, LOOP_CHANNEL_COUNT,
 };
 
 /// Maximum number of control operations the audio thread applies in one sample.
 /// This bounds command work during a producer burst; remaining operations keep
 /// their FIFO order for the following samples.
 pub(crate) const MAX_COMMANDS_PER_TICK: usize = 64;
-const MAX_QUEUED_COMMANDS: usize = 4096;
+pub(crate) const MAX_QUEUED_COMMANDS: usize = 4096;
 
 /// A control operation which can mutate mixer state. These values are built on
 /// host/control threads and consumed only by the audio thread.
@@ -160,19 +160,41 @@ pub(crate) enum MixerCommand {
     },
 }
 
+impl MixerCommand {
+    fn changes_clip_slot_presence(&self) -> bool {
+        matches!(
+            self,
+            Self::ClipLoad { .. } | Self::ClipUnload { .. } | Self::ClipClear
+        )
+    }
+}
+
 struct QueueState {
     commands: VecDeque<MixerCommand>,
+    /// Control-side projection of loaded slots. This preserves immediate FFI
+    /// admission results for commands that have not reached the audio thread.
+    clip_slots: [[bool; CLIP_ROW_COUNT]; CLIP_COLUMN_COUNT],
+    /// Generation of the snapshot used to build `clip_slots`. A new completed
+    /// render buffer refreshes the projection only after all queued clip work
+    /// has drained, so an audio/control race cannot erase just-queued intent.
+    clip_snapshot_generation: u64,
     /// Desired effect layouts, updated under the same lock that establishes
     /// command order. This lets callers queue `add` then `set_param` before a
     /// render boundary without reading the live effect `Vec`.
     effect_layouts: [Vec<u32>; LOOP_CHANNEL_COUNT],
+    /// State retired by the audio thread. This vector is only dropped after a
+    /// producer releases the queue lock, never by the render callback.
+    retired: Vec<RetiredLoopState>,
 }
 
 impl Default for QueueState {
     fn default() -> Self {
         Self {
-            commands: VecDeque::new(),
+            commands: VecDeque::with_capacity(MAX_QUEUED_COMMANDS),
+            clip_slots: [[false; CLIP_ROW_COUNT]; CLIP_COLUMN_COUNT],
+            clip_snapshot_generation: u64::MAX,
             effect_layouts: std::array::from_fn(|_| Vec::new()),
+            retired: Vec::with_capacity(MAX_QUEUED_COMMANDS),
         }
     }
 }
@@ -342,6 +364,24 @@ impl MixerSnapshot {
     pub(crate) fn transport_beat(&self) -> f64 {
         self.read(|| f64::from_bits(self.transport_beat.load(Ordering::Relaxed)))
     }
+
+    fn clip_slots_with_generation(&self) -> ([[bool; CLIP_ROW_COUNT]; CLIP_COLUMN_COUNT], u64) {
+        loop {
+            let before = self.generation.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                continue;
+            }
+            let slots = std::array::from_fn(|column| {
+                std::array::from_fn(|row| {
+                    self.slot_state[column][row].load(Ordering::Relaxed) & 1 != 0
+                })
+            });
+            let after = self.generation.load(Ordering::Acquire);
+            if before == after {
+                return (slots, before);
+            }
+        }
+    }
 }
 
 pub(crate) struct SharedControl {
@@ -369,15 +409,60 @@ impl MixerControl {
     }
 
     pub(crate) fn enqueue(&self, command: MixerCommand) -> bool {
-        let Ok(mut state) = self.shared.queue.lock() else {
-            return false;
+        let retired = {
+            let Ok(mut state) = self.shared.queue.lock() else {
+                return false;
+            };
+            if state.commands.len() >= MAX_QUEUED_COMMANDS {
+                return false;
+            }
+            state.commands.push_back(command);
+            self.shared.has_commands.store(true, Ordering::Release);
+            Self::take_retired(&mut state)
         };
-        if state.commands.len() >= MAX_QUEUED_COMMANDS {
-            return false;
-        }
-        state.commands.push_back(command);
-        self.shared.has_commands.store(true, Ordering::Release);
+        drop(retired);
         true
+    }
+
+    fn take_retired(state: &mut QueueState) -> Option<Vec<RetiredLoopState>> {
+        (!state.retired.is_empty())
+            .then(|| std::mem::replace(&mut state.retired, Vec::with_capacity(MAX_QUEUED_COMMANDS)))
+    }
+
+    fn enqueue_clip(
+        &self,
+        command: MixerCommand,
+        update: impl FnOnce(&mut [[bool; CLIP_ROW_COUNT]; CLIP_COLUMN_COUNT]) -> bool,
+    ) -> bool {
+        let retired = {
+            let Ok(mut state) = self.shared.queue.lock() else {
+                return false;
+            };
+            self.refresh_clip_projection(&mut state);
+            if state.commands.len() >= MAX_QUEUED_COMMANDS || !update(&mut state.clip_slots) {
+                return false;
+            }
+            state.commands.push_back(command);
+            self.shared.has_commands.store(true, Ordering::Release);
+            Self::take_retired(&mut state)
+        };
+        drop(retired);
+        true
+    }
+
+    fn refresh_clip_projection(&self, state: &mut QueueState) {
+        if state
+            .commands
+            .iter()
+            .any(MixerCommand::changes_clip_slot_presence)
+        {
+            return;
+        }
+        let (slots, generation) = self.snapshot().clip_slots_with_generation();
+        if generation != state.clip_snapshot_generation {
+            state.clip_slots = slots;
+            state.clip_snapshot_generation = generation;
+        }
     }
 
     pub fn load(&self, channel: usize, buffer: StereoSampleBuffer) -> bool {
@@ -436,31 +521,69 @@ impl MixerControl {
         buffer: StereoSampleBuffer,
         source_bpm: f32,
     ) -> bool {
-        self.enqueue(MixerCommand::ClipLoad {
-            column,
-            row,
-            buffer,
-            source_bpm,
-        })
+        if column >= CLIP_COLUMN_COUNT
+            || row >= CLIP_ROW_COUNT
+            || buffer.is_empty()
+            || !source_bpm.is_finite()
+            || source_bpm <= 0.0
+        {
+            return false;
+        }
+        self.enqueue_clip(
+            MixerCommand::ClipLoad {
+                column,
+                row,
+                buffer,
+                source_bpm,
+            },
+            move |slots| {
+                slots[column][row] = true;
+                true
+            },
+        )
     }
     pub fn clip_unload(&self, column: usize, row: usize) -> bool {
-        self.enqueue(MixerCommand::ClipUnload { column, row })
+        if column >= CLIP_COLUMN_COUNT || row >= CLIP_ROW_COUNT {
+            return false;
+        }
+        self.enqueue_clip(MixerCommand::ClipUnload { column, row }, move |slots| {
+            if !slots[column][row] {
+                return false;
+            }
+            slots[column][row] = false;
+            true
+        })
     }
     pub fn clip_clear(&self) -> bool {
-        self.enqueue(MixerCommand::ClipClear)
+        self.enqueue_clip(MixerCommand::ClipClear, |slots| {
+            *slots = [[false; CLIP_ROW_COUNT]; CLIP_COLUMN_COUNT];
+            true
+        })
     }
     pub fn clip_launch(&self, column: usize, row: usize, quantization: LaunchQuantization) -> bool {
-        self.enqueue(MixerCommand::ClipLaunch {
-            column,
-            row,
-            quantization,
-        })
+        if column >= CLIP_COLUMN_COUNT || row >= CLIP_ROW_COUNT {
+            return false;
+        }
+        self.enqueue_clip(
+            MixerCommand::ClipLaunch {
+                column,
+                row,
+                quantization,
+            },
+            move |slots| slots[column][row],
+        )
     }
     pub fn clip_launch_at(&self, column: usize, row: usize, beat: f64) -> bool {
         if !beat.is_finite() || beat + 1.0e-9 < self.snapshot().transport_beat() {
             return false;
         }
-        self.enqueue(MixerCommand::ClipLaunchAt { column, row, beat })
+        if column >= CLIP_COLUMN_COUNT || row >= CLIP_ROW_COUNT {
+            return false;
+        }
+        self.enqueue_clip(
+            MixerCommand::ClipLaunchAt { column, row, beat },
+            move |slots| slots[column][row],
+        )
     }
     pub fn clip_launch_scene(&self, row: usize, quantization: LaunchQuantization) -> bool {
         self.enqueue(MixerCommand::ClipLaunchScene { row, quantization })
@@ -500,13 +623,19 @@ impl MixerControl {
         end: f64,
         timing: RetrimTiming,
     ) -> bool {
-        self.enqueue(MixerCommand::ClipSetTrim {
-            column,
-            row,
-            start,
-            end,
-            timing,
-        })
+        if column >= CLIP_COLUMN_COUNT || row >= CLIP_ROW_COUNT {
+            return false;
+        }
+        self.enqueue_clip(
+            MixerCommand::ClipSetTrim {
+                column,
+                row,
+                start,
+                end,
+                timing,
+            },
+            move |slots| slots[column][row],
+        )
     }
     pub fn transport_start(&self) -> bool {
         self.enqueue(MixerCommand::TransportStart)
@@ -697,6 +826,19 @@ impl MixerControl {
         self.shared
             .has_commands
             .store(!state.commands.is_empty(), Ordering::Release);
+    }
+
+    /// Move audio-retired state into the producer-owned queue without blocking
+    /// the render callback. If the control lock is busy, the mixer retains it
+    /// in preallocated audio-owned storage for a later boundary.
+    pub(crate) fn reclaim_from_audio(&self, retired: &mut Vec<RetiredLoopState>) {
+        if retired.is_empty() {
+            return;
+        }
+        let Ok(mut state) = self.shared.queue.try_lock() else {
+            return;
+        };
+        state.retired.append(retired);
     }
 
     pub(crate) fn has_pending(&self) -> bool {

@@ -53,6 +53,10 @@ fn constants_and_load_validation_are_stable() {
         let engine = gooey_engine_new(SR);
         let samples = mono_clip(0.5, 1000);
 
+        // An empty slot is rejected synchronously even though valid launches
+        // are applied asynchronously at the next render boundary.
+        assert!(!gooey_engine_clip_launch(engine, 0, 0, CLIP_QUANTIZE_BAR,));
+
         assert!(!gooey_engine_clip_load(
             engine,
             CLIP_COLUMN_COUNT,
