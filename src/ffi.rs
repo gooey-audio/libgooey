@@ -7505,7 +7505,8 @@ pub unsafe extern "C" fn gooey_engine_loop_set_position(
 /// boundary. `divisions` splits the loop region into equal segments (pass the
 /// loop's bar count for bar-quantized swaps; 1 for whole-phrase). When the playing
 /// cursor next crosses a segment boundary, the queued buffer becomes active and its
-/// playhead resets to the loop start (restart from the top on the downbeat).
+/// playhead enters at the corresponding phase of its loop window. A whole-phrase
+/// swap therefore still enters at the loop start when the cursor wraps.
 /// Replaces any previously-queued buffer on the channel. Returns false on a null
 /// engine, bad channel, or empty buffer. Samples are interleaved, `channels` deep.
 ///
