@@ -261,14 +261,15 @@ impl LoopChannel {
         // this for the resample/off paths; the WSOLA path bypasses `advance`, so we
         // check here too — otherwise a queued swap could never land while a channel
         // is in PreservePitch mode. `maybe_swap_pending` resets the stretcher on a
-        // swap so the next tick re-seeds on the new buffer at its loop start.
+        // swap so the next tick re-seeds on the new buffer at the matching phrase
+        // phase.
         //
         // Note: `self.cursor` only advances on hop refills (~`wsola::HOP_MS`), so in
         // this mode the boundary check is at hop granularity — a queued swap can land
         // up to one hop after the exact grid sample, whereas the resample/off paths
-        // are sample-accurate. This is accepted: the swap restarts the phrase from the
-        // loop start (already a deliberate discontinuity), and sub-hop precision would
-        // require splitting an overlap-add hop for no meaningful audible gain.
+        // are sample-accurate. This is accepted: preserving the current phrase phase
+        // avoids a forced restart, and sub-hop precision would require splitting an
+        // overlap-add hop for no meaningful audible gain.
         let span = window.span.max(1.0);
         // Feed `maybe_swap_pending` virtual offsets. The non-wrap branch passes
         // `prev - lo` / `cursor - lo`, byte-identical to the previous internal
@@ -331,9 +332,9 @@ impl LoopChannel {
     }
 
     /// If a queued buffer is waiting and this sample crossed a bar-grid boundary
-    /// (or wrapped the loop), swap it in and restart the phrase from the loop
-    /// start — the sample-accurate, click-free downbeat swap. Gated by an atomic
-    /// flag so the nothing-queued path never locks.
+    /// (or wrapped the loop), swap it in at the corresponding phrase phase — the
+    /// sample-accurate, click-free downbeat swap. Gated by an atomic flag so the
+    /// nothing-queued path never locks.
     fn maybe_swap_pending(&mut self, prev_v: f64, cur_v: f64, span: f64, wrapped: bool) {
         if !self.has_pending.load(Ordering::Acquire) {
             return;
@@ -349,9 +350,14 @@ impl LoopChannel {
         // boundary; a missed lock just defers the swap to the next boundary.
         if let Ok(mut pending) = self.pending.try_lock() {
             if let Some(buffer) = pending.take() {
-                let new_lo = self.window(buffer.len() as f64).lo;
+                // `cur_v` is already in virtual loop-window coordinates. This is
+                // `(cursor - lo) / span` for ordinary windows, and continues to
+                // express the same musical phase through a wrapped buffer seam.
+                let phase = (cur_v / span).clamp(0.0, 1.0);
+                let new_window = self.window(buffer.len() as f64);
+                let new_span = new_window.span.max(1.0);
                 self.buffer = Some(buffer);
-                self.cursor = new_lo;
+                self.cursor = new_window.to_physical(phase * new_span);
                 // The buffer/cursor moved externally; drop any WSOLA stretcher so
                 // the PreservePitch path re-seeds on the new buffer (mirrors
                 // `set_buffer`/`restart`/`set_position`). No-op for other modes.
@@ -762,6 +768,25 @@ mod tests {
             (24..=27).contains(&idx),
             "swapped at frame {idx}, expected ~25"
         );
+    }
+
+    #[test]
+    fn queued_swap_preserves_phrase_phase() {
+        let mut ch = LoopChannel::new(SR);
+        ch.set_buffer(ramp_buffer(100));
+        ch.set_playing(true);
+        // The first four-division boundary is frame 25. Queue another ramp so
+        // the incoming sample directly exposes the cursor selected at the swap.
+        ch.queue_swap(ramp_buffer(100), 4);
+
+        // Tick 24 reads the outgoing frame 24, then advances across frame 25
+        // and performs the swap. The following tick must read incoming frame 25,
+        // not restart at incoming frame 0.
+        for _ in 0..25 {
+            ch.tick(SR);
+        }
+        assert_eq!(ch.swaps_completed(), 1);
+        assert_eq!(ch.tick(SR).l, 25.0);
     }
 
     #[test]
