@@ -353,7 +353,10 @@ impl LoopChannel {
                 // `cur_v` is already in virtual loop-window coordinates. This is
                 // `(cursor - lo) / span` for ordinary windows, and continues to
                 // express the same musical phase through a wrapped buffer seam.
-                let phase = (cur_v / span).clamp(0.0, 1.0);
+                // `rem_euclid` also maps the exclusive end (`phase == 1.0`),
+                // which reverse playback can produce on an exact wrap, back to
+                // the loop start.
+                let phase = (cur_v / span).rem_euclid(1.0);
                 let new_window = self.window(buffer.len() as f64);
                 let new_span = new_window.span.max(1.0);
                 self.buffer = Some(buffer);
@@ -787,6 +790,25 @@ mod tests {
         }
         assert_eq!(ch.swaps_completed(), 1);
         assert_eq!(ch.tick(SR).l, 25.0);
+    }
+
+    #[test]
+    fn queued_swap_reverse_wrap_normalizes_to_loop_start() {
+        let mut ch = LoopChannel::new(SR);
+        // Exact markers make the active window [2, 4). Starting at frame 2 and
+        // advancing in reverse by two frames wraps to the exclusive end, frame 4.
+        ch.set_loop_start(0.25);
+        ch.set_loop_end(0.5);
+        ch.set_buffer(ramp_buffer(8));
+        ch.set_speed(-2.0);
+        ch.set_playing(true);
+        ch.queue_swap(ramp_buffer(8), 1);
+
+        ch.tick(SR); // reads outgoing frame 2, then swaps on the reverse wrap
+        assert_eq!(ch.swaps_completed(), 1);
+        // Phase 1 is the exclusive loop end, so the incoming phrase restarts at
+        // its loop start rather than reading frame 4 outside the window.
+        assert_eq!(ch.tick(SR).l, 2.0);
     }
 
     #[test]
