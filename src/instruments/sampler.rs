@@ -182,6 +182,25 @@ impl SamplerRack {
         true
     }
 
+    /// Replace a pad at a render boundary and retain evicted buffers for the
+    /// control side to destroy. Existing voices retain their cloned old buffer
+    /// until they finish, so a swap never hard-cuts an audible pad hit.
+    pub(crate) fn replace_buffer_retained(
+        &mut self,
+        slot: usize,
+        buffer: SamplerBuffer,
+        retired: &mut Vec<SamplerBuffer>,
+    ) -> bool {
+        let Some(target) = self.slots.get_mut(slot) else {
+            retired.push(buffer);
+            return false;
+        };
+        if let Some(previous) = target.replace(buffer) {
+            retired.push(previous);
+        }
+        true
+    }
+
     pub fn clear_slot(&mut self, slot: usize) -> bool {
         let Some(target) = self.slots.get_mut(slot) else {
             return false;
@@ -269,7 +288,9 @@ impl SamplerRack {
 
     /// Called from the render thread before the sequencer is ticked.
     pub fn activate_start_if_due(&mut self, transport_beat: f64) {
-        let Some(target) = self.pending_start_beat else { return };
+        let Some(target) = self.pending_start_beat else {
+            return;
+        };
         if transport_beat + 1.0e-8 < target {
             return;
         }

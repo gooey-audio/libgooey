@@ -101,6 +101,53 @@ fn loaded_slot_can_be_routed_triggered_and_sequenced() {
 }
 
 #[test]
+fn queued_slot_replacement_commits_at_the_next_render_boundary() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let rack = gooey_engine_sampler_register(engine) as u32;
+        assert!(gooey_engine_mixer_route_source(
+            engine,
+            SOURCE_SAMPLER_BASE + rack,
+            3
+        ));
+        let original = vec![0.2_f32; 4096];
+        let replacement = vec![0.7_f32; 4096];
+        assert!(gooey_engine_sampler_set_slot_buffer(
+            engine,
+            rack,
+            0,
+            original.as_ptr(),
+            4096,
+            1,
+            SR
+        ));
+        assert!(gooey_engine_sampler_queue_slot_buffer(
+            engine,
+            rack,
+            0,
+            replacement.as_ptr(),
+            4096,
+            1,
+            SR
+        ));
+        assert_eq!(
+            gooey_engine_sampler_slot_commit_generation(engine, rack, 0),
+            0
+        );
+
+        // The command remains pending until `render` begins its next buffer.
+        let _ = render(engine, 1);
+        assert_eq!(
+            gooey_engine_sampler_slot_commit_generation(engine, rack, 0),
+            1
+        );
+        assert!(gooey_engine_sampler_trigger(engine, rack, 0, 1.0));
+        assert!(peak(&render(engine, 256)) > 0.01);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
 fn manual_sampler_hits_record_but_sequencer_hits_do_not() {
     unsafe {
         let engine = gooey_engine_new(SR);
@@ -234,16 +281,27 @@ fn pattern_start_is_bar_quantized_and_never_seeks_the_clip_transport() {
         assert!(gooey_engine_mixer_route_source(engine, source, 3));
         let pcm = vec![0.5_f32; 4096];
         assert!(gooey_engine_sampler_set_slot_buffer(
-            engine, rack, 0, pcm.as_ptr(), pcm.len() as u32, 1, SR
+            engine,
+            rack,
+            0,
+            pcm.as_ptr(),
+            pcm.len() as u32,
+            1,
+            SR
         ));
         assert!(gooey_engine_sampler_set_step(engine, rack, 0, true, 0, 1.0));
 
         gooey_engine_sequencer_start(engine);
         let _ = render(engine, (SR / 10.0) as usize); // beat 0.1
         assert!(gooey_engine_sampler_start_pattern(
-            engine, rack, CLIP_QUANTIZE_BAR
+            engine,
+            rack,
+            CLIP_QUANTIZE_BAR
         ));
-        assert_eq!(gooey_engine_sampler_get_pending_start_beat(engine, rack), 4.0);
+        assert_eq!(
+            gooey_engine_sampler_get_pending_start_beat(engine, rack),
+            4.0
+        );
         assert!(!gooey_engine_sampler_is_pattern_running(engine, rack));
 
         let _ = render(engine, ((4.0 - 0.1) * SR as f64) as usize);
@@ -260,11 +318,19 @@ fn pattern_start_is_bar_quantized_and_never_seeks_the_clip_transport() {
         assert!(gooey_engine_sampler_stop_pattern(engine, rack));
         assert!(!gooey_engine_sampler_is_pattern_running(engine, rack));
         assert!(gooey_engine_sampler_start_pattern(
-            engine, rack, CLIP_QUANTIZE_BAR
+            engine,
+            rack,
+            CLIP_QUANTIZE_BAR
         ));
-        assert_eq!(gooey_engine_sampler_get_pending_start_beat(engine, rack), 8.0);
+        assert_eq!(
+            gooey_engine_sampler_get_pending_start_beat(engine, rack),
+            8.0
+        );
         assert!(gooey_engine_sampler_cancel_pattern_start(engine, rack));
-        assert_eq!(gooey_engine_sampler_get_pending_start_beat(engine, rack), -1.0);
+        assert_eq!(
+            gooey_engine_sampler_get_pending_start_beat(engine, rack),
+            -1.0
+        );
         gooey_engine_free(engine);
     }
 }
