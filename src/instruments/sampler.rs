@@ -8,10 +8,38 @@
 use std::sync::Arc;
 
 use crate::engine::Sequencer;
+use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
 use crate::frame::StereoFrame;
 
 pub const SAMPLER_SLOT_COUNT: usize = 16;
 pub const SAMPLER_VOICE_COUNT: usize = 32;
+pub const SLOT_GAIN_MAX: f32 = 2.0;
+pub const SLOT_PITCH_RANGE: f32 = 24.0;
+pub const SLOT_ENV_TIME_MAX: f32 = 10.0;
+
+#[derive(Clone, Copy, Debug)]
+pub struct SlotParams {
+    pub gain: f32,
+    pub pitch_semitones: f32,
+    pub envelope: ADSRConfig,
+}
+
+impl Default for SlotParams {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            pitch_semitones: 0.0,
+            envelope: ADSRConfig {
+                attack_time: 0.0,
+                decay_time: 0.0,
+                sustain_level: 1.0,
+                release_time: 0.0,
+                attack_curve: EnvelopeCurve::Linear,
+                decay_curve: EnvelopeCurve::Linear,
+            },
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SamplerBuffer {
@@ -84,7 +112,10 @@ struct SampleVoice {
     slot: usize,
     position: f64,
     increment: f64,
-    velocity: f32,
+    gain: f32,
+    envelope: Envelope,
+    elapsed_secs: f64,
+    dt: f64,
     age: u64,
 }
 
@@ -95,7 +126,10 @@ impl Default for SampleVoice {
             slot: 0,
             position: 0.0,
             increment: 1.0,
-            velocity: 0.0,
+            gain: 0.0,
+            envelope: Envelope::new(),
+            elapsed_secs: 0.0,
+            dt: 0.0,
             age: 0,
         }
     }
@@ -112,12 +146,18 @@ impl SampleVoice {
         buffer: SamplerBuffer,
         engine_rate: f32,
         velocity: f32,
+        params: &SlotParams,
         age: u64,
     ) {
         self.slot = slot;
         self.position = 0.0;
-        self.increment = buffer.sample_rate() as f64 / engine_rate as f64;
-        self.velocity = velocity.clamp(0.0, 1.0);
+        let pitch = (params.pitch_semitones as f64 / 12.0).exp2();
+        self.increment = (buffer.sample_rate() as f64 / engine_rate as f64) * pitch;
+        self.gain = velocity.clamp(0.0, 1.0) * params.gain;
+        self.envelope.set_config(params.envelope);
+        self.envelope.trigger(0.0);
+        self.elapsed_secs = 0.0;
+        self.dt = 1.0 / engine_rate as f64;
         self.age = age;
         self.buffer = Some(buffer);
     }
@@ -127,15 +167,21 @@ impl SampleVoice {
             return StereoFrame::default();
         };
         let frame = buffer.frame(self.position);
-        // Fixed click guard only. This is intentionally not an exposed envelope.
         let fade = 32.0_f64;
         let end = buffer.frames() as f64;
-        let gain = (self.position / fade)
+        let click_guard = (self.position / fade)
             .min(((end - self.position) / fade).max(0.0))
-            .min(1.0) as f32
-            * self.velocity;
+            .min(1.0) as f32;
+        if self.envelope.release_time > 0.0 && self.increment > 0.0 {
+            let remaining_secs = (end - self.position).max(0.0) / self.increment * self.dt;
+            if remaining_secs <= self.envelope.release_time as f64 {
+                self.envelope.release(self.elapsed_secs);
+            }
+        }
+        let gain = click_guard * self.envelope.get_amplitude(self.elapsed_secs) * self.gain;
         self.position += self.increment;
-        if self.position >= end {
+        self.elapsed_secs += self.dt;
+        if self.position >= end || !self.envelope.is_active {
             self.buffer = None;
         }
         frame.scaled(gain)
@@ -145,6 +191,7 @@ impl SampleVoice {
 pub struct SamplerRack {
     sample_rate: f32,
     slots: [Option<SamplerBuffer>; SAMPLER_SLOT_COUNT],
+    slot_params: [SlotParams; SAMPLER_SLOT_COUNT],
     voices: [SampleVoice; SAMPLER_VOICE_COUNT],
     next_age: u64,
     sequencer: Sequencer,
@@ -160,6 +207,7 @@ impl SamplerRack {
         Self {
             sample_rate,
             slots: std::array::from_fn(|_| None),
+            slot_params: std::array::from_fn(|_| SlotParams::default()),
             voices: std::array::from_fn(|_| SampleVoice::default()),
             next_age: 0,
             sequencer: Sequencer::with_pattern(
@@ -212,8 +260,66 @@ impl SamplerRack {
                     .unwrap_or(0)
             });
         self.next_age = self.next_age.wrapping_add(1);
-        self.voices[voice_index].start(slot, buffer, self.sample_rate, velocity, self.next_age);
+        let params = self.slot_params[slot];
+        self.voices[voice_index].start(
+            slot,
+            buffer,
+            self.sample_rate,
+            velocity,
+            &params,
+            self.next_age,
+        );
         true
+    }
+
+    pub fn set_slot_gain(&mut self, slot: usize, gain: f32) -> bool {
+        let Some(params) = self.slot_params.get_mut(slot) else {
+            return false;
+        };
+        if !gain.is_finite() {
+            return false;
+        }
+        params.gain = gain.clamp(0.0, SLOT_GAIN_MAX);
+        true
+    }
+
+    pub fn slot_gain(&self, slot: usize) -> Option<f32> {
+        self.slot_params.get(slot).map(|p| p.gain)
+    }
+
+    pub fn set_slot_pitch(&mut self, slot: usize, semitones: f32) -> bool {
+        let Some(params) = self.slot_params.get_mut(slot) else {
+            return false;
+        };
+        if !semitones.is_finite() {
+            return false;
+        }
+        params.pitch_semitones = semitones.clamp(-SLOT_PITCH_RANGE, SLOT_PITCH_RANGE);
+        true
+    }
+
+    pub fn slot_pitch(&self, slot: usize) -> Option<f32> {
+        self.slot_params.get(slot).map(|p| p.pitch_semitones)
+    }
+
+    pub fn set_slot_envelope(&mut self, slot: usize, a: f32, d: f32, s: f32, r: f32) -> bool {
+        let Some(params) = self.slot_params.get_mut(slot) else {
+            return false;
+        };
+        if ![a, d, s, r].iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        params.envelope = ADSRConfig::new(
+            a.clamp(0.0, SLOT_ENV_TIME_MAX),
+            d.clamp(0.0, SLOT_ENV_TIME_MAX),
+            s,
+            r.clamp(0.0, SLOT_ENV_TIME_MAX),
+        );
+        true
+    }
+
+    pub fn slot_envelope(&self, slot: usize) -> Option<ADSRConfig> {
+        self.slot_params.get(slot).map(|p| p.envelope)
     }
 
     pub fn tick(&mut self) -> StereoFrame {
@@ -269,7 +375,9 @@ impl SamplerRack {
 
     /// Called from the render thread before the sequencer is ticked.
     pub fn activate_start_if_due(&mut self, transport_beat: f64) {
-        let Some(target) = self.pending_start_beat else { return };
+        let Some(target) = self.pending_start_beat else {
+            return;
+        };
         if transport_beat + 1.0e-8 < target {
             return;
         }
@@ -352,5 +460,111 @@ mod tests {
         for _ in 0..32 {
             assert!(rack.tick().l.is_finite());
         }
+    }
+
+    fn voice_active(rack: &SamplerRack) -> bool {
+        rack.voices.iter().any(|v| v.active())
+    }
+
+    #[test]
+    fn pitch_shortens_playback_proportionally() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 1000], 1000, 1, 44_100.0).unwrap(),
+        );
+        assert!(rack.set_slot_pitch(0, 12.0));
+        assert!(rack.trigger(0, 1.0));
+        for _ in 0..500 {
+            let _ = rack.tick();
+        }
+        assert!(!voice_active(&rack));
+
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 1000], 1000, 1, 44_100.0).unwrap(),
+        );
+        assert!(rack.set_slot_pitch(0, -12.0));
+        assert!(rack.trigger(0, 1.0));
+        for _ in 0..1500 {
+            let _ = rack.tick();
+        }
+        assert!(voice_active(&rack));
+    }
+
+    #[test]
+    fn sustain_zero_envelope_ends_voice_early() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 44_100], 44_100, 1, 44_100.0).unwrap(),
+        );
+        assert!(rack.set_slot_envelope(0, 0.0, 0.01, 0.0, 0.01));
+        assert!(rack.trigger(0, 1.0));
+        for _ in 0..3000 {
+            let _ = rack.tick();
+        }
+        assert!(!voice_active(&rack));
+        assert_eq!(rack.tick(), StereoFrame::default());
+    }
+
+    #[test]
+    fn slot_gain_scales_and_latches() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![1.0; 2048], 2048, 1, 44_100.0).unwrap(),
+        );
+        assert!(rack.trigger(0, 1.0));
+        let mid = rack.tick().l;
+        assert!(rack.set_slot_gain(0, 2.0));
+        let after = rack.tick().l;
+        assert!((after - mid).abs() < 0.05);
+        while voice_active(&rack) {
+            let _ = rack.tick();
+        }
+        assert!(rack.trigger(0, 1.0));
+        let louder = (0..64).map(|_| rack.tick().l.abs()).fold(0.0_f32, f32::max);
+        assert!(louder > mid.abs() * 1.4);
+    }
+
+    #[test]
+    fn params_survive_reload_and_clamp() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        assert!(rack.set_slot_gain(0, 5.0));
+        assert_eq!(rack.slot_gain(0), Some(2.0));
+        assert!(rack.set_slot_pitch(0, -30.0));
+        assert_eq!(rack.slot_pitch(0), Some(-24.0));
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 64], 64, 1, 44_100.0).unwrap(),
+        );
+        assert_eq!(rack.slot_gain(0), Some(2.0));
+        assert_eq!(rack.slot_pitch(0), Some(-24.0));
+        assert!(rack.set_slot_envelope(0, 0.0, 0.1, 0.5, 0.2));
+        let env = rack.slot_envelope(0).unwrap();
+        assert!((env.attack_time - 0.001).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn release_fades_before_buffer_end() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![1.0; 4410], 4410, 1, 44_100.0).unwrap(),
+        );
+        assert!(rack.set_slot_envelope(0, 0.0, 0.0, 1.0, 0.05));
+        assert!(rack.trigger(0, 1.0));
+        let mut mid = 0.0;
+        for _ in 0..2205 {
+            mid = rack.tick().l.abs();
+        }
+        let mut tail = 0.0;
+        for _ in 0..2204 {
+            tail = rack.tick().l.abs();
+        }
+        assert!(mid > 0.5);
+        assert!(tail < mid * 0.5);
     }
 }
