@@ -6287,6 +6287,56 @@ pub unsafe extern "C" fn gooey_engine_sampler_get_slot_envelope(
     true
 }
 
+/// Set a slot's normalized 0–1 trim region. `start` must be strictly less than
+/// `end`, both within `[0, 1]`. Returns false on invalid input, rack, or slot.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_set_slot_trim(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    slot: u32,
+    start: f32,
+    end: f32,
+) -> bool {
+    engine
+        .as_mut()
+        .and_then(|engine| engine.samplers.get_mut(rack as usize))
+        .and_then(Option::as_mut)
+        .is_some_and(|sampler| sampler.set_slot_trim(slot as usize, start, end))
+}
+
+/// Read a slot's normalized trim region into the provided out pointers.
+/// Returns false on invalid engine, rack, or slot, or null out pointers.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+/// Out pointers must be valid writable `f32` locations when the call succeeds.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_get_slot_trim(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+    out_start: *mut f32,
+    out_end: *mut f32,
+) -> bool {
+    if out_start.is_null() || out_end.is_null() {
+        return false;
+    }
+    let Some((start, end)) = engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .and_then(|sampler| sampler.slot_trim(slot as usize))
+    else {
+        return false;
+    };
+    *out_start = start;
+    *out_end = end;
+    true
+}
+
 /// Trigger a loaded pad now and stamp it into the shared performance clip when
 /// record-arm is active. Returns false for bad/unloaded rack or slot.
 #[no_mangle]
