@@ -334,3 +334,186 @@ fn pattern_start_is_bar_quantized_and_never_seeks_the_clip_transport() {
         gooey_engine_free(engine);
     }
 }
+
+unsafe fn load_mono(engine: *mut GooeyEngine, rack: u32, slot: u32, frames: usize, value: f32) {
+    let pcm = vec![value; frames];
+    assert!(gooey_engine_sampler_set_slot_buffer(
+        engine,
+        rack,
+        slot,
+        pcm.as_ptr(),
+        frames as u32,
+        1,
+        SR
+    ));
+}
+
+#[test]
+fn default_slot_params_leave_playback_unchanged() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let rack = gooey_engine_sampler_register(engine) as u32;
+        assert!(gooey_engine_mixer_route_source(
+            engine,
+            SOURCE_SAMPLER_BASE + rack,
+            3
+        ));
+        load_mono(engine, rack, 0, 4096, 0.5);
+        assert!((gooey_engine_sampler_slot_gain(engine, rack, 0) - 1.0).abs() < f32::EPSILON);
+        assert!((gooey_engine_sampler_slot_pitch(engine, rack, 0) - 0.5).abs() < f32::EPSILON);
+        assert!(gooey_engine_sampler_trigger(engine, rack, 0, 1.0));
+        let out = render(engine, 4200);
+        assert!(peak(&out) > 0.01);
+        assert!(peak(&out[4150 * 2..]) < 0.01);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn slot_gain_scales_output_and_clamps() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let rack = gooey_engine_sampler_register(engine) as u32;
+        assert!(gooey_engine_mixer_route_source(
+            engine,
+            SOURCE_SAMPLER_BASE + rack,
+            3
+        ));
+        load_mono(engine, rack, 0, 2048, 0.4);
+        assert!(gooey_engine_sampler_set_slot_gain(engine, rack, 0, 2.0));
+        assert!((gooey_engine_sampler_slot_gain(engine, rack, 0) - 2.0).abs() < f32::EPSILON);
+        assert!(gooey_engine_sampler_set_slot_gain(engine, rack, 0, 5.0));
+        assert!((gooey_engine_sampler_slot_gain(engine, rack, 0) - 2.0).abs() < f32::EPSILON);
+        assert!(gooey_engine_sampler_trigger(engine, rack, 0, 1.0));
+        let loud = peak(&render(engine, 256));
+        assert!(loud > 0.01);
+        let _ = render(engine, 4096);
+        assert!(gooey_engine_sampler_set_slot_gain(engine, rack, 0, 0.25));
+        assert!(gooey_engine_sampler_trigger(engine, rack, 0, 1.0));
+        let quiet = peak(&render(engine, 256));
+        assert!(quiet < loud);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn slot_pitch_changes_playback_length() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let rack = gooey_engine_sampler_register(engine) as u32;
+        assert!(gooey_engine_mixer_route_source(
+            engine,
+            SOURCE_SAMPLER_BASE + rack,
+            3
+        ));
+        load_mono(engine, rack, 0, 2000, 0.5);
+        assert!(gooey_engine_sampler_set_slot_pitch(engine, rack, 0, 0.75));
+        assert!(gooey_engine_sampler_trigger(engine, rack, 0, 1.0));
+        let out = render(engine, 1200);
+        assert!(peak(&out[..800 * 2]) > 0.01);
+        assert!(peak(&out[1100 * 2..]) < 0.01);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn slot_envelope_shapes_amplitude() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let rack = gooey_engine_sampler_register(engine) as u32;
+        assert!(gooey_engine_mixer_route_source(
+            engine,
+            SOURCE_SAMPLER_BASE + rack,
+            3
+        ));
+        load_mono(engine, rack, 0, 44_100, 0.5);
+        assert!(gooey_engine_sampler_set_slot_envelope(
+            engine, rack, 0, 0.0, 0.01, 0.0, 0.01
+        ));
+        let mut a = 0.0;
+        let mut d = 0.0;
+        let mut s = 0.0;
+        let mut r = 0.0;
+        assert!(gooey_engine_sampler_get_slot_envelope(
+            engine, rack, 0, &mut a, &mut d, &mut s, &mut r
+        ));
+        assert!((a - 0.001).abs() < 1e-6);
+        assert!((s - 0.0).abs() < f32::EPSILON);
+        assert!(gooey_engine_sampler_trigger(engine, rack, 0, 1.0));
+        let out = render(engine, 8000);
+        assert!(peak(&out[..2000 * 2]) > 0.01);
+        assert!(peak(&out[4000 * 2..]) < 0.01);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn slot_params_latch_at_trigger() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let rack = gooey_engine_sampler_register(engine) as u32;
+        assert!(gooey_engine_mixer_route_source(
+            engine,
+            SOURCE_SAMPLER_BASE + rack,
+            3
+        ));
+        load_mono(engine, rack, 0, 4096, 1.0);
+        assert!(gooey_engine_sampler_trigger(engine, rack, 0, 1.0));
+        let first = peak(&render(engine, 32));
+        assert!(gooey_engine_sampler_set_slot_gain(engine, rack, 0, 0.1));
+        let mid = peak(&render(engine, 32));
+        assert!(
+            (mid - first).abs() < 0.2,
+            "in-flight hit should ignore live gain"
+        );
+        let _ = render(engine, 8192);
+        assert!(gooey_engine_sampler_trigger(engine, rack, 0, 1.0));
+        let next = peak(&render(engine, 64));
+        assert!(next < first * 0.3);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn invalid_rack_or_slot_rejected() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let rack = gooey_engine_sampler_register(engine) as u32;
+        assert!(!gooey_engine_sampler_set_slot_gain(engine, 99, 0, 1.0));
+        assert!(!gooey_engine_sampler_set_slot_gain(engine, rack, 99, 1.0));
+        assert!(!gooey_engine_sampler_set_slot_gain(
+            std::ptr::null_mut(),
+            rack,
+            0,
+            1.0
+        ));
+        assert!(!gooey_engine_sampler_set_slot_gain(
+            engine,
+            rack,
+            0,
+            f32::NAN
+        ));
+        assert!(!gooey_engine_sampler_set_slot_pitch(
+            engine,
+            rack,
+            0,
+            f32::INFINITY
+        ));
+        assert_eq!(gooey_engine_sampler_slot_gain(engine, 99, 0), -1.0);
+        assert_eq!(gooey_engine_sampler_slot_pitch(engine, 99, 0), -1.0);
+        assert!(!gooey_engine_sampler_set_slot_envelope(
+            engine, 99, 0, 0.0, 0.0, 1.0, 0.01
+        ));
+        let mut a = 0.0;
+        assert!(!gooey_engine_sampler_get_slot_envelope(
+            engine,
+            rack,
+            0,
+            std::ptr::null_mut(),
+            &mut a,
+            &mut a,
+            &mut a
+        ));
+        gooey_engine_free(engine);
+    }
+}

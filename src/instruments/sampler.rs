@@ -8,10 +8,48 @@
 use std::sync::Arc;
 
 use crate::engine::Sequencer;
+use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
 use crate::frame::StereoFrame;
 
 pub const SAMPLER_SLOT_COUNT: usize = 16;
 pub const SAMPLER_VOICE_COUNT: usize = 32;
+pub const SLOT_GAIN_MAX: f32 = 2.0;
+pub const SLOT_PITCH_RANGE: f32 = 24.0;
+pub const SLOT_ENV_TIME_MAX: f32 = 10.0;
+
+/// Minimum playable region length in frames. Trims that collapse below this
+/// are rejected so a pad always produces at least a click of audio.
+const SLOT_TRIM_MIN_FRAMES: usize = 2;
+
+#[derive(Clone, Copy, Debug)]
+pub struct SlotParams {
+    pub gain: f32,
+    pub pitch_semitones: f32,
+    pub envelope: ADSRConfig,
+    /// Normalized 0–1 start offset within the source buffer.
+    pub start: f32,
+    /// Normalized 0–1 end offset within the source buffer.
+    pub end: f32,
+}
+
+impl Default for SlotParams {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            pitch_semitones: 0.0,
+            envelope: ADSRConfig {
+                attack_time: 0.0,
+                decay_time: 0.0,
+                sustain_level: 1.0,
+                release_time: 0.0,
+                attack_curve: EnvelopeCurve::Linear,
+                decay_curve: EnvelopeCurve::Linear,
+            },
+            start: 0.0,
+            end: 1.0,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SamplerBuffer {
@@ -78,13 +116,28 @@ impl SamplerBuffer {
     }
 }
 
+/// Check that a normalized `[start, end]` trim resolves to at least
+/// `SLOT_TRIM_MIN_FRAMES` frames within `buffer`.
+fn trim_fits_buffer(buffer: &SamplerBuffer, start: f32, end: f32) -> bool {
+    let start_frame = (start as f64 * buffer.frames() as f64).round() as usize;
+    let end_frame = (end as f64 * buffer.frames() as f64).round() as usize;
+    end_frame.saturating_sub(start_frame) >= SLOT_TRIM_MIN_FRAMES
+}
+
 #[derive(Clone)]
 struct SampleVoice {
     buffer: Option<SamplerBuffer>,
     slot: usize,
     position: f64,
+    /// Absolute frame index at which playback starts (trim start point).
+    start: f64,
+    /// Absolute frame index at which playback ends (trim end point).
+    end: f64,
     increment: f64,
-    velocity: f32,
+    gain: f32,
+    envelope: Envelope,
+    elapsed_secs: f64,
+    dt: f64,
     age: u64,
 }
 
@@ -94,8 +147,13 @@ impl Default for SampleVoice {
             buffer: None,
             slot: 0,
             position: 0.0,
+            start: 0.0,
+            end: 0.0,
             increment: 1.0,
-            velocity: 0.0,
+            gain: 0.0,
+            envelope: Envelope::new(),
+            elapsed_secs: 0.0,
+            dt: 0.0,
             age: 0,
         }
     }
@@ -112,12 +170,25 @@ impl SampleVoice {
         buffer: SamplerBuffer,
         engine_rate: f32,
         velocity: f32,
+        params: &SlotParams,
         age: u64,
     ) {
         self.slot = slot;
-        self.position = 0.0;
-        self.increment = buffer.sample_rate() as f64 / engine_rate as f64;
-        self.velocity = velocity.clamp(0.0, 1.0);
+        let frames = buffer.frames() as f64;
+        let start_frame = (params.start.clamp(0.0, 1.0) as f64 * frames)
+            .min(frames - 1.0)
+            .max(0.0);
+        let end_frame = (params.end.clamp(0.0, 1.0) as f64 * frames).min(frames).max(0.0);
+        self.start = start_frame;
+        self.end = end_frame.max(start_frame);
+        self.position = start_frame;
+        let pitch = (params.pitch_semitones as f64 / 12.0).exp2();
+        self.increment = (buffer.sample_rate() as f64 / engine_rate as f64) * pitch;
+        self.gain = velocity.clamp(0.0, 1.0) * params.gain;
+        self.envelope.set_config(params.envelope);
+        self.envelope.trigger(0.0);
+        self.elapsed_secs = 0.0;
+        self.dt = 1.0 / engine_rate as f64;
         self.age = age;
         self.buffer = Some(buffer);
     }
@@ -127,15 +198,24 @@ impl SampleVoice {
             return StereoFrame::default();
         };
         let frame = buffer.frame(self.position);
-        // Fixed click guard only. This is intentionally not an exposed envelope.
         let fade = 32.0_f64;
-        let end = buffer.frames() as f64;
-        let gain = (self.position / fade)
+        let start = self.start;
+        let end = self.end;
+        // Fade in from the trim start (not frame 0) so a trimmed-in cut point
+        // doesn't jump straight to full gain and click.
+        let click_guard = ((self.position - start) / fade)
             .min(((end - self.position) / fade).max(0.0))
-            .min(1.0) as f32
-            * self.velocity;
+            .min(1.0) as f32;
+        if self.envelope.release_time > 0.0 && self.increment > 0.0 {
+            let remaining_secs = (end - self.position).max(0.0) / self.increment * self.dt;
+            if remaining_secs <= self.envelope.release_time as f64 {
+                self.envelope.release(self.elapsed_secs);
+            }
+        }
+        let gain = click_guard * self.envelope.get_amplitude(self.elapsed_secs) * self.gain;
         self.position += self.increment;
-        if self.position >= end {
+        self.elapsed_secs += self.dt;
+        if self.position >= end || !self.envelope.is_active {
             self.buffer = None;
         }
         frame.scaled(gain)
@@ -145,6 +225,7 @@ impl SampleVoice {
 pub struct SamplerRack {
     sample_rate: f32,
     slots: [Option<SamplerBuffer>; SAMPLER_SLOT_COUNT],
+    slot_params: [SlotParams; SAMPLER_SLOT_COUNT],
     voices: [SampleVoice; SAMPLER_VOICE_COUNT],
     next_age: u64,
     sequencer: Sequencer,
@@ -160,6 +241,7 @@ impl SamplerRack {
         Self {
             sample_rate,
             slots: std::array::from_fn(|_| None),
+            slot_params: std::array::from_fn(|_| SlotParams::default()),
             voices: std::array::from_fn(|_| SampleVoice::default()),
             next_age: 0,
             sequencer: Sequencer::with_pattern(
@@ -177,6 +259,14 @@ impl SamplerRack {
         let Some(target) = self.slots.get_mut(slot) else {
             return false;
         };
+        // Revalidate the persisted trim against the new buffer. A trim accepted
+        // while the slot was empty (or for a longer buffer) may now span fewer
+        // than the minimum playable frames; reset it to the full region so
+        // playback never collapses to a sub-frame click.
+        if !trim_fits_buffer(&buffer, self.slot_params[slot].start, self.slot_params[slot].end) {
+            self.slot_params[slot].start = 0.0;
+            self.slot_params[slot].end = 1.0;
+        }
         *target = Some(buffer);
         self.stop_slot(slot);
         true
@@ -231,8 +321,95 @@ impl SamplerRack {
                     .unwrap_or(0)
             });
         self.next_age = self.next_age.wrapping_add(1);
-        self.voices[voice_index].start(slot, buffer, self.sample_rate, velocity, self.next_age);
+        let params = self.slot_params[slot];
+        self.voices[voice_index].start(
+            slot,
+            buffer,
+            self.sample_rate,
+            velocity,
+            &params,
+            self.next_age,
+        );
         true
+    }
+
+    pub fn set_slot_gain(&mut self, slot: usize, gain: f32) -> bool {
+        let Some(params) = self.slot_params.get_mut(slot) else {
+            return false;
+        };
+        if !gain.is_finite() {
+            return false;
+        }
+        params.gain = gain.clamp(0.0, SLOT_GAIN_MAX);
+        true
+    }
+
+    pub fn slot_gain(&self, slot: usize) -> Option<f32> {
+        self.slot_params.get(slot).map(|p| p.gain)
+    }
+
+    pub fn set_slot_pitch(&mut self, slot: usize, semitones: f32) -> bool {
+        let Some(params) = self.slot_params.get_mut(slot) else {
+            return false;
+        };
+        if !semitones.is_finite() {
+            return false;
+        }
+        params.pitch_semitones = semitones.clamp(-SLOT_PITCH_RANGE, SLOT_PITCH_RANGE);
+        true
+    }
+
+    pub fn slot_pitch(&self, slot: usize) -> Option<f32> {
+        self.slot_params.get(slot).map(|p| p.pitch_semitones)
+    }
+
+    pub fn set_slot_envelope(&mut self, slot: usize, a: f32, d: f32, s: f32, r: f32) -> bool {
+        let Some(params) = self.slot_params.get_mut(slot) else {
+            return false;
+        };
+        if ![a, d, s, r].iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        params.envelope = ADSRConfig::new(
+            a.clamp(0.0, SLOT_ENV_TIME_MAX),
+            d.clamp(0.0, SLOT_ENV_TIME_MAX),
+            s,
+            r.clamp(0.0, SLOT_ENV_TIME_MAX),
+        );
+        true
+    }
+
+    pub fn slot_envelope(&self, slot: usize) -> Option<ADSRConfig> {
+        self.slot_params.get(slot).map(|p| p.envelope)
+    }
+
+    /// Set the normalized 0–1 trim region for a slot. `start` must be strictly
+    /// less than `end`, and both must be finite and within `[0, 1]`. When a
+    /// buffer is loaded the resulting region must span at least
+    /// `SLOT_TRIM_MIN_FRAMES` frames. Returns false on any invalid input or
+    /// out-of-range slot.
+    pub fn set_slot_trim(&mut self, slot: usize, start: f32, end: f32) -> bool {
+        let Some(params) = self.slot_params.get_mut(slot) else {
+            return false;
+        };
+        if !start.is_finite() || !end.is_finite() {
+            return false;
+        }
+        if !(0.0..=1.0).contains(&start) || !(0.0..=1.0).contains(&end) || start >= end {
+            return false;
+        }
+        if let Some(buffer) = self.slots.get(slot).and_then(Option::as_ref) {
+            if !trim_fits_buffer(buffer, start, end) {
+                return false;
+            }
+        }
+        params.start = start;
+        params.end = end;
+        true
+    }
+
+    pub fn slot_trim(&self, slot: usize) -> Option<(f32, f32)> {
+        self.slot_params.get(slot).map(|p| (p.start, p.end))
     }
 
     pub fn tick(&mut self) -> StereoFrame {
@@ -373,5 +550,239 @@ mod tests {
         for _ in 0..32 {
             assert!(rack.tick().l.is_finite());
         }
+    }
+
+    fn voice_active(rack: &SamplerRack) -> bool {
+        rack.voices.iter().any(|v| v.active())
+    }
+
+    #[test]
+    fn pitch_shortens_playback_proportionally() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 1000], 1000, 1, 44_100.0).unwrap(),
+        );
+        assert!(rack.set_slot_pitch(0, 12.0));
+        assert!(rack.trigger(0, 1.0));
+        for _ in 0..500 {
+            let _ = rack.tick();
+        }
+        assert!(!voice_active(&rack));
+
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 1000], 1000, 1, 44_100.0).unwrap(),
+        );
+        assert!(rack.set_slot_pitch(0, -12.0));
+        assert!(rack.trigger(0, 1.0));
+        for _ in 0..1500 {
+            let _ = rack.tick();
+        }
+        assert!(voice_active(&rack));
+    }
+
+    #[test]
+    fn sustain_zero_envelope_ends_voice_early() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 44_100], 44_100, 1, 44_100.0).unwrap(),
+        );
+        assert!(rack.set_slot_envelope(0, 0.0, 0.01, 0.0, 0.01));
+        assert!(rack.trigger(0, 1.0));
+        for _ in 0..3000 {
+            let _ = rack.tick();
+        }
+        assert!(!voice_active(&rack));
+        assert_eq!(rack.tick(), StereoFrame::default());
+    }
+
+    #[test]
+    fn slot_gain_scales_and_latches() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![1.0; 2048], 2048, 1, 44_100.0).unwrap(),
+        );
+        assert!(rack.trigger(0, 1.0));
+        let mid = rack.tick().l;
+        assert!(rack.set_slot_gain(0, 2.0));
+        let after = rack.tick().l;
+        assert!((after - mid).abs() < 0.05);
+        while voice_active(&rack) {
+            let _ = rack.tick();
+        }
+        assert!(rack.trigger(0, 1.0));
+        let louder = (0..64).map(|_| rack.tick().l.abs()).fold(0.0_f32, f32::max);
+        assert!(louder > mid.abs() * 1.4);
+    }
+
+    #[test]
+    fn params_survive_reload_and_clamp() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        assert!(rack.set_slot_gain(0, 5.0));
+        assert_eq!(rack.slot_gain(0), Some(2.0));
+        assert!(rack.set_slot_pitch(0, -30.0));
+        assert_eq!(rack.slot_pitch(0), Some(-24.0));
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 64], 64, 1, 44_100.0).unwrap(),
+        );
+        assert_eq!(rack.slot_gain(0), Some(2.0));
+        assert_eq!(rack.slot_pitch(0), Some(-24.0));
+        assert!(rack.set_slot_envelope(0, 0.0, 0.1, 0.5, 0.2));
+        let env = rack.slot_envelope(0).unwrap();
+        assert!((env.attack_time - 0.001).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn release_fades_before_buffer_end() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![1.0; 4410], 4410, 1, 44_100.0).unwrap(),
+        );
+        assert!(rack.set_slot_envelope(0, 0.0, 0.0, 1.0, 0.05));
+        assert!(rack.trigger(0, 1.0));
+        let mut mid = 0.0;
+        for _ in 0..2205 {
+            mid = rack.tick().l.abs();
+        }
+        let mut tail = 0.0;
+        for _ in 0..2204 {
+            tail = rack.tick().l.abs();
+        }
+        assert!(mid > 0.5);
+        assert!(tail < mid * 0.5);
+    }
+
+    #[test]
+    fn trim_rejects_invalid_ranges() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        assert!(!rack.set_slot_trim(0, 0.5, 0.5));
+        assert!(!rack.set_slot_trim(0, 0.7, 0.3));
+        assert!(!rack.set_slot_trim(0, -0.1, 1.0));
+        assert!(!rack.set_slot_trim(0, 0.0, 1.1));
+        assert!(!rack.set_slot_trim(0, f32::NAN, 1.0));
+        assert!(!rack.set_slot_trim(SAMPLER_SLOT_COUNT, 0.0, 1.0));
+        assert!(rack.set_slot_trim(0, 0.0, 1.0));
+        assert_eq!(rack.slot_trim(0), Some((0.0, 1.0)));
+    }
+
+    #[test]
+    fn trim_enforces_min_frames_when_loaded() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 100], 100, 1, 44_100.0).unwrap(),
+        );
+        // 0.99..1.0 resolves to a single frame; reject it.
+        assert!(!rack.set_slot_trim(0, 0.99, 1.0));
+        // A wide trim is accepted and persists across reloads.
+        assert!(rack.set_slot_trim(0, 0.25, 0.75));
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 100], 100, 1, 44_100.0).unwrap(),
+        );
+        assert_eq!(rack.slot_trim(0), Some((0.25, 0.75)));
+    }
+
+    #[test]
+    fn trim_shortens_playback_and_latches() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![1.0; 44_100], 44_100, 1, 44_100.0).unwrap(),
+        );
+        // Full-buffer reference duration.
+        assert!(rack.trigger(0, 1.0));
+        let full_ticks = (0..)
+            .position(|_| {
+                rack.tick();
+                !voice_active(&rack)
+            })
+            .unwrap();
+        // Trim to the first half: should finish in roughly half the ticks.
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![1.0; 44_100], 44_100, 1, 44_100.0).unwrap(),
+        );
+        assert!(rack.set_slot_trim(0, 0.0, 0.5));
+        assert!(rack.trigger(0, 1.0));
+        let half_ticks = (0..)
+            .position(|_| {
+                rack.tick();
+                !voice_active(&rack)
+            })
+            .unwrap();
+        assert!(half_ticks < (full_ticks as f32 * 0.6) as usize, "{half_ticks} vs {full_ticks}");
+        // Latch: changing trim mid-playback does not alter the running voice.
+        assert!(rack.set_slot_trim(0, 0.0, 1.0));
+        assert!(rack.trigger(0, 1.0));
+        let mut before = 0.0;
+        for _ in 0..100 {
+            before = rack.tick().l.abs();
+        }
+        assert!(rack.set_slot_trim(0, 0.0, 0.1));
+        for _ in 0..100 {
+            let _ = rack.tick();
+        }
+        // Voice keeps playing past the 0.1 trim because it latched at trigger.
+        assert!(voice_active(&rack));
+        assert!(before > 0.0);
+    }
+
+    #[test]
+    fn trim_start_skips_into_buffer() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        // Ramp 0..N so position maps to amplitude; skipping in should jump.
+        let n = 44_100;
+        let ramp: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&ramp, n, 1, 44_100.0).unwrap(),
+        );
+        assert!(rack.set_slot_trim(0, 0.5, 1.0));
+        assert!(rack.trigger(0, 1.0));
+        // The click guard fades in from the trim start, so the first sample is
+        // attenuated rather than jumping straight to the ramp value at 0.5.
+        let first = rack.tick().l.abs();
+        assert!(first < 0.1, "first sample should be faded in, was {first}");
+        // After the fade-in window the voice reaches the trimmed ramp value.
+        let mut reached = 0.0;
+        for _ in 0..64 {
+            reached = rack.tick().l.abs();
+        }
+        assert!(reached > 0.4, "post-fade sample was {reached}");
+    }
+
+    #[test]
+    fn trim_resets_when_buffer_too_short() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        // Accepted while the slot is empty (no buffer to validate against).
+        assert!(rack.set_slot_trim(0, 0.99, 1.0));
+        assert_eq!(rack.slot_trim(0), Some((0.99, 1.0)));
+        // Loading a short buffer makes the persisted region sub-min-frame;
+        // set_buffer resets it to the full region instead of collapsing.
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 100], 100, 1, 44_100.0).unwrap(),
+        );
+        assert_eq!(rack.slot_trim(0), Some((0.0, 1.0)));
+        // A reload that still fits the persisted trim leaves it untouched.
+        assert!(rack.set_slot_trim(0, 0.25, 0.75));
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 100], 100, 1, 44_100.0).unwrap(),
+        );
+        assert_eq!(rack.slot_trim(0), Some((0.25, 0.75)));
+        // Reloading with a shorter buffer that can't hold the trim resets it.
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 3], 3, 1, 44_100.0).unwrap(),
+        );
+        assert_eq!(rack.slot_trim(0), Some((0.0, 1.0)));
     }
 }
