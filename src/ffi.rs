@@ -6069,7 +6069,9 @@ pub unsafe extern "C" fn gooey_engine_sampler_set_slot_buffer(
     if samples.is_null() {
         return false;
     }
-    let Some(engine) = engine.as_mut() else { return false; };
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
     let channels = channels as usize;
     let frames = frames as usize;
     let Some(count) = frames.checked_mul(channels) else {
@@ -6158,6 +6160,127 @@ pub unsafe extern "C" fn gooey_engine_sampler_slot_sample_rate(
         .map_or(0.0, |buffer| buffer.sample_rate())
 }
 
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_set_slot_gain(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    slot: u32,
+    gain: f32,
+) -> bool {
+    engine
+        .as_mut()
+        .and_then(|engine| engine.samplers.get_mut(rack as usize))
+        .and_then(Option::as_mut)
+        .is_some_and(|sampler| sampler.set_slot_gain(slot as usize, gain))
+}
+
+/// Returns `-1.0` if the engine, rack, or slot is invalid.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_slot_gain(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .and_then(|sampler| sampler.slot_gain(slot as usize))
+        .unwrap_or(-1.0)
+}
+
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_set_slot_pitch(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    slot: u32,
+    semitones: f32,
+) -> bool {
+    engine
+        .as_mut()
+        .and_then(|engine| engine.samplers.get_mut(rack as usize))
+        .and_then(Option::as_mut)
+        .is_some_and(|sampler| sampler.set_slot_pitch(slot as usize, semitones))
+}
+
+/// Returns `0.0` if the engine, rack, or slot is invalid.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_slot_pitch(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .and_then(|sampler| sampler.slot_pitch(slot as usize))
+        .unwrap_or(0.0)
+}
+
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_set_slot_envelope(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    slot: u32,
+    attack: f32,
+    decay: f32,
+    sustain: f32,
+    release: f32,
+) -> bool {
+    engine
+        .as_mut()
+        .and_then(|engine| engine.samplers.get_mut(rack as usize))
+        .and_then(Option::as_mut)
+        .is_some_and(|sampler| {
+            sampler.set_slot_envelope(slot as usize, attack, decay, sustain, release)
+        })
+}
+
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+/// Out pointers must be valid writable `f32` locations when the call succeeds.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_get_slot_envelope(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+    out_attack: *mut f32,
+    out_decay: *mut f32,
+    out_sustain: *mut f32,
+    out_release: *mut f32,
+) -> bool {
+    if out_attack.is_null() || out_decay.is_null() || out_sustain.is_null() || out_release.is_null()
+    {
+        return false;
+    }
+    let Some(env) = engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .and_then(|sampler| sampler.slot_envelope(slot as usize))
+    else {
+        return false;
+    };
+    *out_attack = env.attack_time;
+    *out_decay = env.decay_time;
+    *out_sustain = env.sustain_level;
+    *out_release = env.release_time;
+    true
+}
+
 /// Trigger a loaded pad now and stamp it into the shared performance clip when
 /// record-arm is active. Returns false for bad/unloaded rack or slot.
 #[no_mangle]
@@ -6232,7 +6355,10 @@ pub unsafe extern "C" fn gooey_engine_sampler_stop_pattern(
         .as_mut()
         .and_then(|engine| engine.samplers.get_mut(rack as usize))
         .and_then(Option::as_mut)
-        .map(|rack| { rack.stop_pattern(); true })
+        .map(|rack| {
+            rack.stop_pattern();
+            true
+        })
         .unwrap_or(false)
 }
 
@@ -6246,7 +6372,10 @@ pub unsafe extern "C" fn gooey_engine_sampler_cancel_pattern_start(
         .as_mut()
         .and_then(|engine| engine.samplers.get_mut(rack as usize))
         .and_then(Option::as_mut)
-        .map(|rack| { rack.cancel_pending_start(); true })
+        .map(|rack| {
+            rack.cancel_pending_start();
+            true
+        })
         .unwrap_or(false)
 }
 

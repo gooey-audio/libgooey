@@ -176,7 +176,25 @@ fn draw(engine: *mut GooeyEngine, running: bool) -> io::Result<()> {
                 "OFF (transport still runs)"
             }
         );
-        println!("\n1–4 trigger pads  |  r record arm  |  c clear recording");
+        println!(
+            "Slot 0 pitch: {:+.1} st  envelope: {}",
+            gooey_engine_sampler_slot_pitch(engine, 0, 0),
+            {
+                let mut a = 0.0;
+                let mut d = 0.0;
+                let mut s = 0.0;
+                let mut r = 0.0;
+                let _ = gooey_engine_sampler_get_slot_envelope(
+                    engine, 0, 0, &mut a, &mut d, &mut s, &mut r,
+                );
+                if s > 0.5 {
+                    "neutral"
+                } else {
+                    "tight"
+                }
+            }
+        );
+        println!("\n1–4 trigger pads  |  -/= pitch  |  e envelope  |  r record arm  |  c clear recording");
         println!("s toggle sequence hits  |  space play/stop  |  q quit");
         io::stdout().flush()
     }
@@ -236,6 +254,32 @@ fn main() -> anyhow::Result<()> {
                             (ch as u8 - b'1') as u32,
                             1.0,
                         );
+                    }
+                    KeyCode::Char('-') => {
+                        let pitch = gooey_engine_sampler_slot_pitch(guard.0, rack, 0);
+                        let _ = gooey_engine_sampler_set_slot_pitch(guard.0, rack, 0, pitch - 1.0);
+                    }
+                    KeyCode::Char('=') => {
+                        let pitch = gooey_engine_sampler_slot_pitch(guard.0, rack, 0);
+                        let _ = gooey_engine_sampler_set_slot_pitch(guard.0, rack, 0, pitch + 1.0);
+                    }
+                    KeyCode::Char('e') => {
+                        let mut a = 0.0;
+                        let mut d = 0.0;
+                        let mut s = 0.0;
+                        let mut r = 0.0;
+                        let _ = gooey_engine_sampler_get_slot_envelope(
+                            guard.0, rack, 0, &mut a, &mut d, &mut s, &mut r,
+                        );
+                        if s > 0.5 {
+                            let _ = gooey_engine_sampler_set_slot_envelope(
+                                guard.0, rack, 0, 0.0, 0.08, 0.0, 0.05,
+                            );
+                        } else {
+                            let _ = gooey_engine_sampler_set_slot_envelope(
+                                guard.0, rack, 0, 0.0, 0.0, 1.0, 0.01,
+                            );
+                        }
                     }
                     _ => {}
                 }
