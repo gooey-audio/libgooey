@@ -10,6 +10,7 @@ use crate::effects::{
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
 use crate::frame::StereoFrame;
+use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
     BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth,
     PolySynthConfig, SampleBuffer, SamplerBuffer, SamplerRack, SnareConfig, SnareDrum, Tom2,
@@ -773,6 +774,11 @@ pub struct GooeyEngine {
     performance: PerformanceRecorder,
     // Config-time registered sample-pad instruments. Empty entries are not graph sources.
     samplers: [Option<SamplerRack>; SAMPLER_RACK_MAX as usize],
+    /// Control-side sampler replacement endpoint. Producers never mutate
+    /// `samplers`; the render thread commits this queue at buffer boundaries.
+    sampler_control: SamplerControl,
+    sampler_command_scratch: std::collections::VecDeque<SamplerCommand>,
+    sampler_retired: Vec<SamplerBuffer>,
 }
 
 /// Host-clock reference for the next render buffer. The audio callback sets
@@ -886,6 +892,7 @@ impl GooeyEngine {
         let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] = std::array::from_fn(|_| Vec::new());
         let mixer = Mixer::new(sample_rate);
         let mixer_control = mixer.control();
+        let sampler_control = SamplerControl::new();
 
         Self {
             kit,
@@ -958,7 +965,34 @@ impl GooeyEngine {
             // Chord performance clip (disarmed by default)
             performance: PerformanceRecorder::new(),
             samplers: std::array::from_fn(|_| None),
+            sampler_control,
+            sampler_command_scratch: std::collections::VecDeque::with_capacity(16),
+            sampler_retired: Vec::with_capacity(1024),
         }
+    }
+
+    fn apply_sampler_control_commands(&mut self) {
+        let control = self.sampler_control.clone();
+        control.reclaim_from_audio(&mut self.sampler_retired);
+        control.drain_into(&mut self.sampler_command_scratch);
+        while let Some(command) = self.sampler_command_scratch.pop_front() {
+            match command {
+                SamplerCommand::Replace { rack, slot, buffer } => {
+                    let committed = if let Some(sampler) =
+                        self.samplers.get_mut(rack).and_then(Option::as_mut)
+                    {
+                        sampler.replace_buffer_retained(slot, buffer, &mut self.sampler_retired)
+                    } else {
+                        self.sampler_retired.push(buffer);
+                        false
+                    };
+                    if committed {
+                        control.mark_committed(rack, slot);
+                    }
+                }
+            }
+        }
+        control.reclaim_from_audio(&mut self.sampler_retired);
     }
 
     /// Resolve any `pending_arm_host_time` against the current
@@ -1054,6 +1088,7 @@ impl GooeyEngine {
         // Commands are applied at buffer boundaries, including buffers that
         // are temporarily silent while a host-time arm is pending.
         self.mixer.apply_control_commands();
+        self.apply_sampler_control_commands();
 
         // Number of stereo frames this buffer holds (two slots per frame).
         let frame_count = buffer.len() / 2;
@@ -6087,6 +6122,65 @@ pub unsafe extern "C" fn gooey_engine_sampler_set_slot_buffer(
         .get_mut(rack as usize)
         .and_then(Option::as_mut)
         .is_some_and(|rack| rack.set_buffer(slot as usize, buffer))
+}
+
+/// Copy PCM on the control thread and queue it for replacement at the next
+/// render-buffer boundary. Queued data is never observed by the sampler until
+/// `gooey_engine_render` begins its next buffer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_queue_slot_buffer(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+    samples: *const f32,
+    frames: u32,
+    channels: u32,
+    sample_rate: f32,
+) -> bool {
+    if samples.is_null() {
+        return false;
+    }
+    let Some(engine) = engine.as_ref() else {
+        return false;
+    };
+    // Racks are registered during configuration and never removed, so this
+    // read establishes that the queued command has a valid audio-side target.
+    if engine
+        .samplers
+        .get(rack as usize)
+        .and_then(Option::as_ref)
+        .is_none()
+    {
+        return false;
+    }
+    let channels = channels as usize;
+    let frames = frames as usize;
+    let Some(count) = frames.checked_mul(channels) else {
+        return false;
+    };
+    let data = slice::from_raw_parts(samples, count);
+    let Ok(buffer) = SamplerBuffer::from_interleaved(data, frames, channels, sample_rate) else {
+        return false;
+    };
+    engine
+        .sampler_control
+        .queue_replace(rack as usize, slot as usize, buffer)
+}
+
+/// Monotonic per-slot generation incremented once a queued replacement becomes
+/// playable at a render-buffer boundary. Zero means no queued replacement has
+/// committed since the rack was registered.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_slot_commit_generation(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+) -> u32 {
+    engine.as_ref().map_or(0, |engine| {
+        engine
+            .sampler_control
+            .committed_generation(rack as usize, slot as usize)
+    })
 }
 
 #[no_mangle]

@@ -101,6 +101,53 @@ fn loaded_slot_can_be_routed_triggered_and_sequenced() {
 }
 
 #[test]
+fn queued_slot_replacement_commits_at_the_next_render_boundary() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let rack = gooey_engine_sampler_register(engine) as u32;
+        assert!(gooey_engine_mixer_route_source(
+            engine,
+            SOURCE_SAMPLER_BASE + rack,
+            3
+        ));
+        let original = vec![0.2_f32; 4096];
+        let replacement = vec![0.7_f32; 4096];
+        assert!(gooey_engine_sampler_set_slot_buffer(
+            engine,
+            rack,
+            0,
+            original.as_ptr(),
+            4096,
+            1,
+            SR
+        ));
+        assert!(gooey_engine_sampler_queue_slot_buffer(
+            engine,
+            rack,
+            0,
+            replacement.as_ptr(),
+            4096,
+            1,
+            SR
+        ));
+        assert_eq!(
+            gooey_engine_sampler_slot_commit_generation(engine, rack, 0),
+            0
+        );
+
+        // The command remains pending until `render` begins its next buffer.
+        let _ = render(engine, 1);
+        assert_eq!(
+            gooey_engine_sampler_slot_commit_generation(engine, rack, 0),
+            1
+        );
+        assert!(gooey_engine_sampler_trigger(engine, rack, 0, 1.0));
+        assert!(peak(&render(engine, 256)) > 0.01);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
 fn manual_sampler_hits_record_but_sequencer_hits_do_not() {
     unsafe {
         let engine = gooey_engine_new(SR);

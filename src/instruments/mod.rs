@@ -5,6 +5,7 @@ pub mod hihat2;
 pub mod kick;
 pub mod poly_synth;
 pub mod sampler;
+pub(crate) mod sampler_control;
 pub mod snare;
 pub mod tom;
 pub mod tom2;
