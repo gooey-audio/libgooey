@@ -313,7 +313,7 @@ fn default_slot_params_leave_playback_unchanged() {
         ));
         load_mono(engine, rack, 0, 4096, 0.5);
         assert!((gooey_engine_sampler_slot_gain(engine, rack, 0) - 1.0).abs() < f32::EPSILON);
-        assert_eq!(gooey_engine_sampler_slot_pitch(engine, rack, 0), 0.0);
+        assert!((gooey_engine_sampler_slot_pitch(engine, rack, 0) - 0.5).abs() < f32::EPSILON);
         assert!(gooey_engine_sampler_trigger(engine, rack, 0, 1.0));
         let out = render(engine, 4200);
         assert!(peak(&out) > 0.01);
@@ -360,7 +360,7 @@ fn slot_pitch_changes_playback_length() {
             3
         ));
         load_mono(engine, rack, 0, 2000, 0.5);
-        assert!(gooey_engine_sampler_set_slot_pitch(engine, rack, 0, 12.0));
+        assert!(gooey_engine_sampler_set_slot_pitch(engine, rack, 0, 0.75));
         assert!(gooey_engine_sampler_trigger(engine, rack, 0, 1.0));
         let out = render(engine, 1200);
         assert!(peak(&out[..800 * 2]) > 0.01);
@@ -453,6 +453,7 @@ fn invalid_rack_or_slot_rejected() {
             f32::INFINITY
         ));
         assert_eq!(gooey_engine_sampler_slot_gain(engine, 99, 0), -1.0);
+        assert_eq!(gooey_engine_sampler_slot_pitch(engine, 99, 0), -1.0);
         assert!(!gooey_engine_sampler_set_slot_envelope(
             engine, 99, 0, 0.0, 0.0, 1.0, 0.01
         ));

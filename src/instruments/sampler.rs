@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use crate::engine::Sequencer;
-use crate::envelope::{ADSRConfig, Envelope};
+use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
 use crate::frame::StereoFrame;
 
 pub const SAMPLER_SLOT_COUNT: usize = 16;
@@ -29,7 +29,14 @@ impl Default for SlotParams {
         Self {
             gain: 1.0,
             pitch_semitones: 0.0,
-            envelope: ADSRConfig::new(0.0, 0.0, 1.0, 0.01),
+            envelope: ADSRConfig {
+                attack_time: 0.0,
+                decay_time: 0.0,
+                sustain_level: 1.0,
+                release_time: 0.0,
+                attack_curve: EnvelopeCurve::Linear,
+                decay_curve: EnvelopeCurve::Linear,
+            },
         }
     }
 }
@@ -165,6 +172,12 @@ impl SampleVoice {
         let click_guard = (self.position / fade)
             .min(((end - self.position) / fade).max(0.0))
             .min(1.0) as f32;
+        if self.envelope.release_time > 0.0 && self.increment > 0.0 {
+            let remaining_secs = (end - self.position).max(0.0) / self.increment * self.dt;
+            if remaining_secs <= self.envelope.release_time as f64 {
+                self.envelope.release(self.elapsed_secs);
+            }
+        }
         let gain = click_guard * self.envelope.get_amplitude(self.elapsed_secs) * self.gain;
         self.position += self.increment;
         self.elapsed_secs += self.dt;
@@ -532,5 +545,26 @@ mod tests {
         assert!(rack.set_slot_envelope(0, 0.0, 0.1, 0.5, 0.2));
         let env = rack.slot_envelope(0).unwrap();
         assert!((env.attack_time - 0.001).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn release_fades_before_buffer_end() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![1.0; 4410], 4410, 1, 44_100.0).unwrap(),
+        );
+        assert!(rack.set_slot_envelope(0, 0.0, 0.0, 1.0, 0.05));
+        assert!(rack.trigger(0, 1.0));
+        let mut mid = 0.0;
+        for _ in 0..2205 {
+            mid = rack.tick().l.abs();
+        }
+        let mut tail = 0.0;
+        for _ in 0..2204 {
+            tail = rack.tick().l.abs();
+        }
+        assert!(mid > 0.5);
+        assert!(tail < mid * 0.5);
     }
 }

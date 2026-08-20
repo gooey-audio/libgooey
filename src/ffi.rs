@@ -586,6 +586,7 @@ const KIT_VOICE_COUNT: usize = 4;
 pub const SAMPLER_RACK_MAX: u32 = 4;
 /// PCM pads in each sampler rack and steps in its sequencer.
 pub const SAMPLER_SLOT_COUNT: u32 = crate::instruments::sampler::SAMPLER_SLOT_COUNT as u32;
+const SLOT_PITCH_RANGE: f32 = crate::instruments::sampler::SLOT_PITCH_RANGE;
 
 /// One voice's complete per-channel state: the instrument plus its sequencer,
 /// preset blender, mixer strip (fader / mute-solo / pan / peak), manual-trigger
@@ -6201,8 +6202,12 @@ pub unsafe extern "C" fn gooey_engine_sampler_set_slot_pitch(
     engine: *mut GooeyEngine,
     rack: u32,
     slot: u32,
-    semitones: f32,
+    normalized: f32,
 ) -> bool {
+    if !normalized.is_finite() {
+        return false;
+    }
+    let semitones = normalized.clamp(0.0, 1.0) * (2.0 * SLOT_PITCH_RANGE) - SLOT_PITCH_RANGE;
     engine
         .as_mut()
         .and_then(|engine| engine.samplers.get_mut(rack as usize))
@@ -6210,7 +6215,7 @@ pub unsafe extern "C" fn gooey_engine_sampler_set_slot_pitch(
         .is_some_and(|sampler| sampler.set_slot_pitch(slot as usize, semitones))
 }
 
-/// Returns `0.0` if the engine, rack, or slot is invalid.
+/// Normalized 0–1 pitch (`0.5` = unison). Returns `-1.0` if invalid.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
@@ -6225,7 +6230,8 @@ pub unsafe extern "C" fn gooey_engine_sampler_slot_pitch(
         .and_then(|engine| engine.samplers.get(rack as usize))
         .and_then(Option::as_ref)
         .and_then(|sampler| sampler.slot_pitch(slot as usize))
-        .unwrap_or(0.0)
+        .map(|st| (st + SLOT_PITCH_RANGE) / (2.0 * SLOT_PITCH_RANGE))
+        .unwrap_or(-1.0)
 }
 
 /// # Safety

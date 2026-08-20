@@ -178,7 +178,7 @@ fn draw(engine: *mut GooeyEngine, running: bool) -> io::Result<()> {
         );
         println!(
             "Slot 0 pitch: {:+.1} st  envelope: {}",
-            gooey_engine_sampler_slot_pitch(engine, 0, 0),
+            (gooey_engine_sampler_slot_pitch(engine, 0, 0) - 0.5) * 48.0,
             {
                 let mut a = 0.0;
                 let mut d = 0.0;
@@ -257,11 +257,21 @@ fn main() -> anyhow::Result<()> {
                     }
                     KeyCode::Char('-') => {
                         let pitch = gooey_engine_sampler_slot_pitch(guard.0, rack, 0);
-                        let _ = gooey_engine_sampler_set_slot_pitch(guard.0, rack, 0, pitch - 1.0);
+                        let _ = gooey_engine_sampler_set_slot_pitch(
+                            guard.0,
+                            rack,
+                            0,
+                            pitch - 1.0 / 48.0,
+                        );
                     }
                     KeyCode::Char('=') => {
                         let pitch = gooey_engine_sampler_slot_pitch(guard.0, rack, 0);
-                        let _ = gooey_engine_sampler_set_slot_pitch(guard.0, rack, 0, pitch + 1.0);
+                        let _ = gooey_engine_sampler_set_slot_pitch(
+                            guard.0,
+                            rack,
+                            0,
+                            pitch + 1.0 / 48.0,
+                        );
                     }
                     KeyCode::Char('e') => {
                         let mut a = 0.0;
