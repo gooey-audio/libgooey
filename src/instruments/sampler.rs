@@ -116,11 +116,21 @@ impl SamplerBuffer {
     }
 }
 
+/// Check that a normalized `[start, end]` trim resolves to at least
+/// `SLOT_TRIM_MIN_FRAMES` frames within `buffer`.
+fn trim_fits_buffer(buffer: &SamplerBuffer, start: f32, end: f32) -> bool {
+    let start_frame = (start as f64 * buffer.frames() as f64).round() as usize;
+    let end_frame = (end as f64 * buffer.frames() as f64).round() as usize;
+    end_frame.saturating_sub(start_frame) >= SLOT_TRIM_MIN_FRAMES
+}
+
 #[derive(Clone)]
 struct SampleVoice {
     buffer: Option<SamplerBuffer>,
     slot: usize,
     position: f64,
+    /// Absolute frame index at which playback starts (trim start point).
+    start: f64,
     /// Absolute frame index at which playback ends (trim end point).
     end: f64,
     increment: f64,
@@ -137,6 +147,7 @@ impl Default for SampleVoice {
             buffer: None,
             slot: 0,
             position: 0.0,
+            start: 0.0,
             end: 0.0,
             increment: 1.0,
             gain: 0.0,
@@ -168,8 +179,9 @@ impl SampleVoice {
             .min(frames - 1.0)
             .max(0.0);
         let end_frame = (params.end.clamp(0.0, 1.0) as f64 * frames).min(frames).max(0.0);
-        self.position = start_frame;
+        self.start = start_frame;
         self.end = end_frame.max(start_frame);
+        self.position = start_frame;
         let pitch = (params.pitch_semitones as f64 / 12.0).exp2();
         self.increment = (buffer.sample_rate() as f64 / engine_rate as f64) * pitch;
         self.gain = velocity.clamp(0.0, 1.0) * params.gain;
@@ -187,8 +199,11 @@ impl SampleVoice {
         };
         let frame = buffer.frame(self.position);
         let fade = 32.0_f64;
+        let start = self.start;
         let end = self.end;
-        let click_guard = (self.position / fade)
+        // Fade in from the trim start (not frame 0) so a trimmed-in cut point
+        // doesn't jump straight to full gain and click.
+        let click_guard = ((self.position - start) / fade)
             .min(((end - self.position) / fade).max(0.0))
             .min(1.0) as f32;
         if self.envelope.release_time > 0.0 && self.increment > 0.0 {
@@ -244,6 +259,14 @@ impl SamplerRack {
         let Some(target) = self.slots.get_mut(slot) else {
             return false;
         };
+        // Revalidate the persisted trim against the new buffer. A trim accepted
+        // while the slot was empty (or for a longer buffer) may now span fewer
+        // than the minimum playable frames; reset it to the full region so
+        // playback never collapses to a sub-frame click.
+        if !trim_fits_buffer(&buffer, self.slot_params[slot].start, self.slot_params[slot].end) {
+            self.slot_params[slot].start = 0.0;
+            self.slot_params[slot].end = 1.0;
+        }
         *target = Some(buffer);
         self.stop_slot(slot);
         true
@@ -357,9 +380,7 @@ impl SamplerRack {
             return false;
         }
         if let Some(buffer) = self.slots.get(slot).and_then(Option::as_ref) {
-            let start_frame = (start as f64 * buffer.frames() as f64).round() as usize;
-            let end_frame = (end as f64 * buffer.frames() as f64).round() as usize;
-            if end_frame.saturating_sub(start_frame) < SLOT_TRIM_MIN_FRAMES {
+            if !trim_fits_buffer(buffer, start, end) {
                 return false;
             }
         }
@@ -706,8 +727,43 @@ mod tests {
         );
         assert!(rack.set_slot_trim(0, 0.5, 1.0));
         assert!(rack.trigger(0, 1.0));
-        let first = rack.tick().l;
-        // Untrimmed playback would start near 0; trimmed starts near 0.5.
-        assert!(first > 0.4, "first sample was {first}");
+        // The click guard fades in from the trim start, so the first sample is
+        // attenuated rather than jumping straight to the ramp value at 0.5.
+        let first = rack.tick().l.abs();
+        assert!(first < 0.1, "first sample should be faded in, was {first}");
+        // After the fade-in window the voice reaches the trimmed ramp value.
+        let mut reached = 0.0;
+        for _ in 0..64 {
+            reached = rack.tick().l.abs();
+        }
+        assert!(reached > 0.4, "post-fade sample was {reached}");
+    }
+
+    #[test]
+    fn trim_resets_when_buffer_too_short() {
+        let mut rack = SamplerRack::new(44_100.0, 120.0, "test");
+        // Accepted while the slot is empty (no buffer to validate against).
+        assert!(rack.set_slot_trim(0, 0.99, 1.0));
+        assert_eq!(rack.slot_trim(0), Some((0.99, 1.0)));
+        // Loading a short buffer makes the persisted region sub-min-frame;
+        // set_buffer resets it to the full region instead of collapsing.
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 100], 100, 1, 44_100.0).unwrap(),
+        );
+        assert_eq!(rack.slot_trim(0), Some((0.0, 1.0)));
+        // A reload that still fits the persisted trim leaves it untouched.
+        assert!(rack.set_slot_trim(0, 0.25, 0.75));
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 100], 100, 1, 44_100.0).unwrap(),
+        );
+        assert_eq!(rack.slot_trim(0), Some((0.25, 0.75)));
+        // Reloading with a shorter buffer that can't hold the trim resets it.
+        rack.set_buffer(
+            0,
+            SamplerBuffer::from_interleaved(&vec![0.5; 3], 3, 1, 44_100.0).unwrap(),
+        );
+        assert_eq!(rack.slot_trim(0), Some((0.0, 1.0)));
     }
 }
