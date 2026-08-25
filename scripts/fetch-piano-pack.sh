@@ -42,7 +42,7 @@ EXISTING="$(find_sfz)"
 if [[ -n "$EXISTING" && $FORCE -eq 0 ]]; then
   echo "Pack already present."
   echo
-  echo "  cargo run --example piano --features native,crossterm,bounce -- '$EXISTING'"
+  echo "  cargo run --release --example piano --features native,crossterm,bounce -- '$EXISTING'"
   exit 0
 fi
 
@@ -67,4 +67,4 @@ echo
 echo "Done. Sample data is gitignored under assets/."
 echo "License: CC-BY 3.0 — credit Alexander Holm if you redistribute it."
 echo
-echo "  cargo run --example piano --features native,crossterm,bounce -- '$SFZ'"
+echo "  cargo run --release --example piano --features native,crossterm,bounce -- '$SFZ'"

@@ -4,11 +4,13 @@
 //!   cargo run --example piano --features native,crossterm,bounce
 //!
 //! With no argument it plays a synthesized stand-in so the UI and voice engine
-//! are still demonstrable. To hear a real piano, point it at a pack:
+//! are still demonstrable. To hear a real piano, point it at a pack — and use
+//! `--release`, because decoding a few hundred WAV files takes ~2 s optimized
+//! but over 30 s in a debug build:
 //!
 //!   ./scripts/fetch-piano-pack.sh
-//!   cargo run --example piano --features native,crossterm,bounce -- \
-//!       assets/piano/SalamanderGrandPianoV3/SalamanderGrandPiano.sfz
+//!   cargo run --release --example piano --features native,crossterm,bounce -- \
+//!       assets/piano/SalamanderGrandPianoV3_44.1khz16bit/SalamanderGrandPianoV3.sfz
 //!
 //! The pack path may also come from the GOOEY_PIANO_PACK environment variable.
 //! Sample data is never vendored into this repository — see
@@ -121,12 +123,25 @@ fn load_map() -> LoadedMap {
         ]);
     };
 
+    // Decoding a full piano pack means reading a few hundred WAV files — a
+    // couple of seconds in release, and well over half a minute in a debug
+    // build. Say so before starting, or the terminal just sits blank and looks
+    // hung. This runs before raw mode is enabled, so plain println is fine.
+    println!("Loading pack: {path}");
+    if cfg!(debug_assertions) {
+        println!("  (debug build — decoding is ~15x slower here; add --release if this drags)");
+    }
+    io::stdout().flush().ok();
+
     let options = PackLoadOptions::default();
+    let started = Instant::now();
     match load_sfz(&path, &options) {
         Ok(pack) => {
             let map = pack.map.build();
+            let elapsed = started.elapsed().as_secs_f32();
+            println!("  {} zones in {elapsed:.1}s", pack.zones_loaded);
             let mut notes = vec![format!(
-                "{} zones from {} regions, {} velocity layers",
+                "{} zones from {} regions, {} velocity layers, loaded in {elapsed:.1}s",
                 pack.zones_loaded,
                 pack.regions_declared,
                 map.velocity_layers()
