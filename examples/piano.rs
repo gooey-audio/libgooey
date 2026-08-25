@@ -42,7 +42,8 @@ use gooey::instruments::multisample_pack::{load_sfz, PackLoadOptions};
 use gooey::mixer::StereoSampleBuffer;
 #[cfg(all(feature = "native", feature = "bounce"))]
 use gooey::music::{
-    apply_voicing, available_voicings, midi_to_string, Key, NoteName, ScaleType, VoicingType,
+    apply_voicing, available_voicings, midi_to_string, ChordDynamics, Key, NoteName, ScaleType,
+    VelocityProfile, VoicingType,
 };
 #[cfg(all(feature = "native", feature = "bounce"))]
 use std::io::{self, Write};
@@ -297,6 +298,11 @@ struct AppState {
     velocity: f32,
     preset_index: usize,
     pedal: bool,
+    /// Per-voice velocity weighting plus humanizing, so chords are not struck
+    /// mechanically. Held across chords so its random sequence keeps advancing.
+    dynamics: ChordDynamics,
+    /// The velocities the last chord actually used, for the readout.
+    last_velocities: Vec<f32>,
     /// Degrees whose key is currently held down, so a chord is released only
     /// when its own key comes up.
     held: [bool; 7],
@@ -318,6 +324,8 @@ impl AppState {
             velocity: 0.75,
             preset_index: 0,
             pedal: false,
+            dynamics: ChordDynamics::new(VelocityProfile::MelodyLead, 0.35),
+            last_velocities: Vec::new(),
             held: [false; 7],
             sounding: Default::default(),
         }
@@ -406,6 +414,7 @@ fn draw_ui(state: &AppState, loaded: &LoadedMap, piano: &Arc<Mutex<MultiSampleIn
     println!("  a s d f g h j = {verb} chord I..VII    SPACE = sustain pedal\r");
     println!("  <-/-> key   TAB maj/min   [ ] voicing   , . chord level\r");
     println!("  o/k octave   z/x velocity   1-3 preset   q quit\r");
+    println!("  v = velocity profile   n/m = humanize down/up\r");
     println!("  chord keys: {}\r", state.key_mode.label());
     println!("\r");
 
@@ -421,6 +430,12 @@ fn draw_ui(state: &AppState, loaded: &LoadedMap, piano: &Arc<Mutex<MultiSampleIn
         "  Velocity: {} {:.2}\r",
         make_bar(state.velocity, 20),
         state.velocity
+    );
+    println!(
+        "  Profile:  {:<8} Humanize: {} {:.2}\r",
+        state.dynamics.profile().to_string(),
+        make_bar(state.dynamics.humanize(), 10),
+        state.dynamics.humanize()
     );
     println!("\r");
 
@@ -473,6 +488,19 @@ fn draw_ui(state: &AppState, loaded: &LoadedMap, piano: &Arc<Mutex<MultiSampleIn
     );
     println!("\r");
 
+    // Show the velocities the last chord was actually struck with, lowest voice
+    // first. Watching these move is how you tell a profile apart from plain
+    // jitter, and how you confirm two presses of the same chord really differ.
+    if !state.last_velocities.is_empty() {
+        let struck: Vec<String> = state
+            .last_velocities
+            .iter()
+            .map(|v| format!("{v:.2}"))
+            .collect();
+        println!("  Last struck (low->high): {}\r", struck.join("  "));
+        println!("\r");
+    }
+
     // The zone readout is what makes a mapping bug visible rather than merely
     // audible: it shows which recording each sounding note actually picked.
     println!("  Voices: {voice_count}/32\r");
@@ -509,11 +537,16 @@ fn press_degree(piano: &Arc<Mutex<MultiSampleInstrument>>, state: &mut AppState,
         return;
     }
     let notes = state.notes_for(degree);
+    // One velocity per voice rather than one for the whole chord: this is what
+    // keeps a sampled chord from sounding like every key was struck by the same
+    // machine at the same instant.
+    let velocities = state.dynamics.velocities(state.velocity, notes.len());
     let mut guard = piano.lock().unwrap();
-    for &note in &notes {
-        guard.note_on(note, state.velocity);
+    for (&note, &velocity) in notes.iter().zip(velocities.iter()) {
+        guard.note_on(note, velocity);
     }
     drop(guard);
+    state.last_velocities = velocities;
     state.held[degree] = true;
     state.sounding[degree] = notes;
 }
@@ -669,6 +702,19 @@ fn main() -> anyhow::Result<()> {
 
             KeyCode::Char('o') | KeyCode::Char('O') => state.octave = (state.octave - 1).max(1),
             KeyCode::Char('k') | KeyCode::Char('K') => state.octave = (state.octave + 1).min(6),
+
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                let next = state.dynamics.profile().next();
+                state.dynamics.set_profile(next);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                let h = state.dynamics.humanize();
+                state.dynamics.set_humanize(h - 0.1);
+            }
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                let h = state.dynamics.humanize();
+                state.dynamics.set_humanize(h + 0.1);
+            }
 
             KeyCode::Char('z') | KeyCode::Char('Z') => {
                 state.velocity = (state.velocity - 0.1).clamp(0.05, 1.0)
