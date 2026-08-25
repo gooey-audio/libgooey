@@ -16,7 +16,7 @@ use crossterm::{
     cursor,
     event::{
         self, Event, KeyCode, KeyEvent, KeyEventKind, KeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
@@ -258,10 +258,7 @@ fn draw_ui(snap: &UiSnapshot, state: &AppState) -> io::Result<()> {
         print!("  (empty)\r\n");
     } else {
         for (i, (start, dur, degree, velocity)) in snap.events.iter().enumerate() {
-            let deg = DEGREE_LABELS
-                .get(*degree as usize)
-                .copied()
-                .unwrap_or("?");
+            let deg = DEGREE_LABELS.get(*degree as usize).copied().unwrap_or("?");
             let start_step = *start as f32 / 24.0;
             let dur_steps = *dur as f32 / 24.0;
             print!(

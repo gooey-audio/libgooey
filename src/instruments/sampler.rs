@@ -178,7 +178,9 @@ impl SampleVoice {
         let start_frame = (params.start.clamp(0.0, 1.0) as f64 * frames)
             .min(frames - 1.0)
             .max(0.0);
-        let end_frame = (params.end.clamp(0.0, 1.0) as f64 * frames).min(frames).max(0.0);
+        let end_frame = (params.end.clamp(0.0, 1.0) as f64 * frames)
+            .min(frames)
+            .max(0.0);
         self.start = start_frame;
         self.end = end_frame.max(start_frame);
         self.position = start_frame;
@@ -263,7 +265,11 @@ impl SamplerRack {
         // while the slot was empty (or for a longer buffer) may now span fewer
         // than the minimum playable frames; reset it to the full region so
         // playback never collapses to a sub-frame click.
-        if !trim_fits_buffer(&buffer, self.slot_params[slot].start, self.slot_params[slot].end) {
+        if !trim_fits_buffer(
+            &buffer,
+            self.slot_params[slot].start,
+            self.slot_params[slot].end,
+        ) {
             self.slot_params[slot].start = 0.0;
             self.slot_params[slot].end = 1.0;
         }
@@ -717,7 +723,10 @@ mod tests {
                 !voice_active(&rack)
             })
             .unwrap();
-        assert!(half_ticks < (full_ticks as f32 * 0.6) as usize, "{half_ticks} vs {full_ticks}");
+        assert!(
+            half_ticks < (full_ticks as f32 * 0.6) as usize,
+            "{half_ticks} vs {full_ticks}"
+        );
         // Latch: changing trim mid-playback does not alter the running voice.
         assert!(rack.set_slot_trim(0, 0.0, 1.0));
         assert!(rack.trigger(0, 1.0));

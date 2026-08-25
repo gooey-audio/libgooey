@@ -392,11 +392,7 @@ impl ClipGrid {
     /// reads the loop channel instead of deriving a phase from transport beat:
     /// a launch at beat 4 and a cropped/wrapped window still begin at their
     /// physical first audible frame.
-    pub fn active_playhead(
-        &self,
-        column: usize,
-        channels: &[LoopChannel],
-    ) -> Option<f64> {
+    pub fn active_playhead(&self, column: usize, channels: &[LoopChannel]) -> Option<f64> {
         self.active_row(column)?;
         channels
             .get(column)
