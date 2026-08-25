@@ -129,3 +129,6 @@ test-results/
 
 # Generated aliasing validation plots/WAVs (examples/aliasing_plots.rs)
 /aliasing-plots/
+
+# Sample packs fetched by scripts/fetch-piano-pack.sh (never vendored)
+/assets/

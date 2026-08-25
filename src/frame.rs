@@ -36,6 +36,24 @@ impl StereoFrame {
         }
     }
 
+    /// Apply a stereo balance to an **already-stereo** frame. `pan` is clamped
+    /// to `[0, 1]`: 0.0 = hard left, 0.5 = center, 1.0 = hard right.
+    ///
+    /// Unlike [`Self::panned`], center is a true identity (no -3 dB), because
+    /// the signal is already spread across two channels and does not need to be
+    /// placed. Use this for sample-based sources that carry their own image;
+    /// use `panned` for the mono seam.
+    pub fn balanced(self, pan: f32) -> Self {
+        if pan == 0.5 {
+            return self;
+        }
+        let pan = pan.clamp(0.0, 1.0);
+        Self {
+            l: self.l * (2.0 * (1.0 - pan)).min(1.0),
+            r: self.r * (2.0 * pan).min(1.0),
+        }
+    }
+
     /// Collapse the frame to a single mono sample (average of both channels).
     /// Used when the output device has a single channel and when feeding the
     /// visualization buffer, which expects one value per sample.
@@ -138,6 +156,26 @@ mod tests {
             let f = StereoFrame::panned(x, pan);
             assert!((f.l * f.l + f.r * f.r - x * x).abs() < 1e-5, "pan {pan}");
         }
+    }
+
+    #[test]
+    fn balanced_center_is_an_exact_identity() {
+        let f = StereoFrame { l: 0.3, r: -0.7 };
+        assert_eq!(f.balanced(0.5), f);
+    }
+
+    #[test]
+    fn balanced_hard_sides_silence_the_opposite_channel() {
+        let f = StereoFrame { l: 0.3, r: -0.7 };
+        assert_eq!(f.balanced(0.0), StereoFrame { l: 0.3, r: -0.0 });
+        assert_eq!(f.balanced(1.0), StereoFrame { l: 0.0, r: -0.7 });
+    }
+
+    #[test]
+    fn balanced_clamps_out_of_range() {
+        let f = StereoFrame { l: 0.3, r: -0.7 };
+        assert_eq!(f.balanced(-1.0), f.balanced(0.0));
+        assert_eq!(f.balanced(2.0), f.balanced(1.0));
     }
 
     #[test]

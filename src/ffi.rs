@@ -9,7 +9,14 @@ use crate::effects::{
 };
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
+use crate::envelope::ADSRConfig;
 use crate::frame::StereoFrame;
+use crate::instruments::multisample::{
+    LoopMode, MultiSampleConfig, MultiSampleInstrument, SampleMap, SampleZone,
+};
+use crate::instruments::multisample_control::{
+    MultiSampleCommand, MultiSampleControl, MULTISAMPLE_INSTRUMENT_COUNT,
+};
 use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
     BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth,
@@ -779,6 +786,17 @@ pub struct GooeyEngine {
     sampler_control: SamplerControl,
     sampler_command_scratch: std::collections::VecDeque<SamplerCommand>,
     sampler_retired: Vec<SamplerBuffer>,
+    /// Config-time registered multi-sample instruments (pianos). Empty entries
+    /// are not graph sources.
+    pianos: [Option<MultiSampleInstrument>; MULTISAMPLE_INSTRUMENT_COUNT],
+    /// Zones staged by the control thread, one builder per instrument, until
+    /// `gooey_engine_piano_zone_commit` turns them into a map.
+    piano_builders: [Option<SampleMap>; MULTISAMPLE_INSTRUMENT_COUNT],
+    /// Control-side map replacement endpoint. Producers never mutate `pianos`;
+    /// the render thread commits this queue at buffer boundaries.
+    piano_control: MultiSampleControl,
+    piano_command_scratch: std::collections::VecDeque<MultiSampleCommand>,
+    piano_retired: Vec<std::sync::Arc<SampleMap>>,
 }
 
 /// Host-clock reference for the next render buffer. The audio callback sets
@@ -893,6 +911,7 @@ impl GooeyEngine {
         let mixer = Mixer::new(sample_rate);
         let mixer_control = mixer.control();
         let sampler_control = SamplerControl::new();
+        let piano_control = MultiSampleControl::new();
 
         Self {
             kit,
@@ -968,7 +987,40 @@ impl GooeyEngine {
             sampler_control,
             sampler_command_scratch: std::collections::VecDeque::with_capacity(16),
             sampler_retired: Vec::with_capacity(1024),
+            pianos: std::array::from_fn(|_| None),
+            piano_builders: std::array::from_fn(|_| None),
+            piano_control,
+            piano_command_scratch: std::collections::VecDeque::with_capacity(
+                MULTISAMPLE_INSTRUMENT_COUNT,
+            ),
+            piano_retired: Vec::with_capacity(MULTISAMPLE_INSTRUMENT_COUNT * 4),
         }
+    }
+
+    /// Install any control-thread-staged maps. Called once per render buffer,
+    /// before any audio is generated, so a map never changes mid-buffer.
+    fn apply_piano_control_commands(&mut self) {
+        let control = self.piano_control.clone();
+        control.reclaim_from_audio(&mut self.piano_retired);
+        control.drain_into(&mut self.piano_command_scratch);
+        while let Some(command) = self.piano_command_scratch.pop_front() {
+            match command {
+                MultiSampleCommand::SetMap { instrument, map } => {
+                    match self.pianos.get_mut(instrument).and_then(Option::as_mut) {
+                        Some(piano) => {
+                            // Retire the outgoing map instead of dropping it
+                            // here: freeing a large map on the audio thread
+                            // would block the callback.
+                            self.piano_retired.push(std::sync::Arc::clone(piano.map()));
+                            piano.set_map(map);
+                            control.mark_committed(instrument);
+                        }
+                        None => self.piano_retired.push(map),
+                    }
+                }
+            }
+        }
+        control.reclaim_from_audio(&mut self.piano_retired);
     }
 
     fn apply_sampler_control_commands(&mut self) {
@@ -1089,6 +1141,7 @@ impl GooeyEngine {
         // are temporarily silent while a host-time arm is pending.
         self.mixer.apply_control_commands();
         self.apply_sampler_control_commands();
+        self.apply_piano_control_commands();
 
         // Number of stereo frames this buffer holds (two slots per frame).
         let frame_count = buffer.len() / 2;
@@ -1351,6 +1404,14 @@ impl GooeyEngine {
             self.graph.scatter(SOURCE_LOOPMIXER, loop_frame);
             for (rack, frame) in sampler_frames.into_iter().enumerate() {
                 self.graph.scatter(SOURCE_SAMPLER_BASE + rack as u32, frame);
+            }
+            // Multi-sample instruments are stereo-native; scatter their frames
+            // unchanged so the recorded image reaches the track balance intact.
+            for index in 0..MULTISAMPLE_INSTRUMENT_COUNT {
+                let frame = self.pianos[index]
+                    .as_mut()
+                    .map_or(StereoFrame::default(), MultiSampleInstrument::tick_frame);
+                self.graph.scatter(SOURCE_PIANO_BASE + index as u32, frame);
             }
             let mut stereo = self.graph.mix_down();
 
@@ -1920,8 +1981,30 @@ pub const SOURCE_LOOPMIXER: u32 = crate::mixer::graph::SOURCE_LOOPMIXER;
 /// First source ID reserved for registered sampler racks. Rack `n` uses
 /// `SOURCE_SAMPLER_BASE + n`; only registered racks are routable.
 pub const SOURCE_SAMPLER_BASE: u32 = crate::mixer::graph::SOURCE_SAMPLER_BASE;
+/// First source ID reserved for registered multi-sample instruments. Instrument
+/// `n` uses `SOURCE_PIANO_BASE + n`; only registered instruments are routable.
+pub const SOURCE_PIANO_BASE: u32 = crate::mixer::graph::SOURCE_PIANO_BASE;
 /// Number of routable mixer graph sources.
 pub const SOURCE_COUNT: u32 = crate::mixer::graph::SOURCE_COUNT as u32;
+
+/// Maximum multi-sample instruments a host may register.
+pub const PIANO_INSTRUMENT_MAX: u32 = MULTISAMPLE_INSTRUMENT_COUNT as u32;
+
+/// Piano preset: the default voicing.
+pub const PIANO_PRESET_DEFAULT: u32 = 0;
+/// Piano preset: slower damper, stronger velocity response.
+pub const PIANO_PRESET_SOFT: u32 = 1;
+/// Piano preset: tighter damper, wider image.
+pub const PIANO_PRESET_BRIGHT: u32 = 2;
+
+/// Zone loop mode: play once to the end of the region.
+pub const PIANO_LOOP_NONE: u32 = 0;
+/// Zone loop mode: play once, ignoring note-off.
+pub const PIANO_LOOP_ONE_SHOT: u32 = 1;
+/// Zone loop mode: loop for the life of the voice.
+pub const PIANO_LOOP_CONTINUOUS: u32 = 2;
+/// Zone loop mode: loop while held, then play out past the loop end.
+pub const PIANO_LOOP_SUSTAIN: u32 = 3;
 
 // =============================================================================
 // Preset blend constants
@@ -6582,6 +6665,458 @@ pub unsafe extern "C" fn gooey_engine_sampler_get_step(
     true
 }
 
+// =============================================================================
+// Multi-sample instruments (piano)
+// =============================================================================
+//
+// A multi-sample instrument maps many recordings across the keyboard: each zone
+// covers a key range and a velocity range and is resampled from its own root
+// key. Building a map is a two-phase, control-thread operation:
+//
+//   1. `gooey_engine_piano_zone_begin` opens a builder.
+//   2. `gooey_engine_piano_zone_add` copies one recording's PCM plus its
+//      mapping metadata into the builder. Call once per zone.
+//   3. `gooey_engine_piano_zone_commit` queues the finished map; the render
+//      thread installs it at the next buffer boundary.
+//
+// Hosts poll `gooey_engine_piano_map_generation` to learn when a queued map
+// became audible. PCM is decoded by the host, matching the sampler rack's
+// contract — except with the `bounce` feature, where
+// `gooey_engine_piano_load_sfz` does the decoding for you.
+
+/// Register one multi-sample instrument. Returns its stable ID (0 or 1), or -1
+/// when all instruments are already in use or the engine is null. Registration
+/// is one-way for the engine's lifetime. The instrument is addressed in the
+/// mixer graph as `SOURCE_PIANO_BASE + id`, and renders silence until a map is
+/// committed.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_register(engine: *mut GooeyEngine) -> i32 {
+    let Some(engine) = engine.as_mut() else {
+        return -1;
+    };
+    let Some(index) = engine.pianos.iter().position(Option::is_none) else {
+        return -1;
+    };
+    engine.pianos[index] = Some(MultiSampleInstrument::new(engine.sample_rate));
+    if engine
+        .graph
+        .register_source(SOURCE_PIANO_BASE + index as u32)
+    {
+        index as i32
+    } else {
+        // Roll back, so a graph that cannot take the source does not leave a
+        // registered-but-unroutable instrument behind.
+        engine.pianos[index] = None;
+        -1
+    }
+}
+
+/// The mixer graph source ID for a registered instrument, or `u32::MAX`.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_get_source_id(
+    engine: *const GooeyEngine,
+    piano: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.pianos.get(piano as usize))
+        .and_then(Option::as_ref)
+        .map_or(u32::MAX, |_| SOURCE_PIANO_BASE + piano)
+}
+
+/// Open (or reset) a map builder for `piano`. Any zones staged but not yet
+/// committed are discarded. Returns false unless `piano` has been registered,
+/// so building a map for an instrument that will never be heard fails loudly at
+/// the call rather than silently at commit time.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_zone_begin(
+    engine: *mut GooeyEngine,
+    piano: u32,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    if !engine
+        .pianos
+        .get(piano as usize)
+        .is_some_and(Option::is_some)
+    {
+        return false;
+    }
+    let Some(slot) = engine.piano_builders.get_mut(piano as usize) else {
+        return false;
+    };
+    *slot = Some(SampleMap::new());
+    true
+}
+
+/// Stage one zone into the open builder. `pcm` is `frames * channels`
+/// interleaved samples with `channels` of 1 or 2; it is copied, so the caller
+/// may free it immediately.
+///
+/// `tune_cents` is fine tuning, `volume_db` a per-zone trim, `pan` a balance in
+/// `[0, 1]` (0.5 = center), `loop_mode` one of the `PIANO_LOOP_*` constants,
+/// and `release_secs` the damper time. Returns false for a bad instrument ID,
+/// no open builder, or PCM that fails validation.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, and `pcm`
+/// must point to at least `frames * channels` readable `f32` values.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn gooey_engine_piano_zone_add(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    pcm: *const f32,
+    frames: u32,
+    channels: u32,
+    sample_rate: f32,
+    lokey: u32,
+    hikey: u32,
+    root_key: u32,
+    lovel: u32,
+    hivel: u32,
+    tune_cents: f32,
+    volume_db: f32,
+    pan: f32,
+    release_secs: f32,
+    loop_mode: u32,
+    loop_start: u32,
+    loop_end: u32,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    if pcm.is_null() || frames == 0 || !(channels == 1 || channels == 2) {
+        return false;
+    }
+    if ![tune_cents, volume_db, pan, release_secs, sample_rate]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        return false;
+    }
+    let Some(total) = (frames as usize).checked_mul(channels as usize) else {
+        return false;
+    };
+    let Some(builder) = engine
+        .piano_builders
+        .get_mut(piano as usize)
+        .and_then(Option::as_mut)
+    else {
+        return false;
+    };
+
+    let samples = slice::from_raw_parts(pcm, total);
+    let Ok(buffer) = StereoSampleBuffer::from_interleaved(samples, channels as usize, sample_rate)
+    else {
+        return false;
+    };
+
+    let mut zone = SampleZone::new(buffer, root_key.min(127) as u8)
+        .with_key_range(lokey.min(127) as u8, hikey.min(127) as u8)
+        .with_velocity_range(lovel.clamp(1, 127) as u8, hivel.clamp(1, 127) as u8);
+    zone.tune_cents = tune_cents;
+    zone.volume_db = volume_db;
+    zone.pan = pan.clamp(0.0, 1.0);
+    zone.envelope = ADSRConfig::new(0.001, 0.001, 1.0, release_secs.max(0.0));
+    zone.loop_mode = match loop_mode {
+        PIANO_LOOP_ONE_SHOT => LoopMode::OneShot,
+        PIANO_LOOP_CONTINUOUS => LoopMode::LoopContinuous,
+        PIANO_LOOP_SUSTAIN => LoopMode::LoopSustain,
+        _ => LoopMode::NoLoop,
+    };
+    zone.loop_start = loop_start as usize;
+    zone.loop_end = loop_end as usize;
+
+    builder.push_zone(zone).is_ok()
+}
+
+/// Finish the open builder and queue its map for `piano`. The swap happens at
+/// the next render-buffer boundary; sounding voices ring out on their old
+/// samples. Returns false when there is no open builder or it holds no zones.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_zone_commit(
+    engine: *mut GooeyEngine,
+    piano: u32,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let Some(slot) = engine.piano_builders.get_mut(piano as usize) else {
+        return false;
+    };
+    let Some(builder) = slot.take() else {
+        return false;
+    };
+    if builder.is_empty() {
+        return false;
+    }
+    engine
+        .piano_control
+        .queue_set_map(piano as usize, builder.build())
+}
+
+/// Monotonic counter incremented each time a queued map becomes audible. Zero
+/// means nothing has been committed yet. Safe to poll from a control thread.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_map_generation(
+    engine: *const GooeyEngine,
+    piano: u32,
+) -> u32 {
+    engine.as_ref().map_or(0, |engine| {
+        engine.piano_control.committed_generation(piano as usize)
+    })
+}
+
+/// Zones in the instrument's currently audible map.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_zone_count(
+    engine: *const GooeyEngine,
+    piano: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.pianos.get(piano as usize))
+        .and_then(Option::as_ref)
+        .map_or(0, |piano| piano.map().zone_count() as u32)
+}
+
+/// Strike a key. `velocity` is normalized 0–1. Returns false when the map has
+/// no zone for that note and velocity.
+///
+/// Note that `velocity == 0.0` **sounds the softest layer** — it is not a
+/// note-off. MIDI hosts that forward a raw note-on with velocity 0 (which the
+/// MIDI spec treats as a note-off) must translate it to
+/// `gooey_engine_piano_note_off` themselves.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_note_on(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    note: u32,
+    velocity: f32,
+) -> bool {
+    if note > 127 || !velocity.is_finite() {
+        return false;
+    }
+    let Some(instrument) = engine
+        .as_mut()
+        .and_then(|engine| engine.pianos.get_mut(piano as usize))
+        .and_then(Option::as_mut)
+    else {
+        return false;
+    };
+    instrument.note_on(note as u8, velocity.clamp(0.0, 1.0))
+}
+
+/// Release a key. With the sustain pedal down the note keeps ringing until the
+/// pedal is lifted.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_note_off(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    note: u32,
+) -> bool {
+    if note > 127 {
+        return false;
+    }
+    let Some(instrument) = engine
+        .as_mut()
+        .and_then(|engine| engine.pianos.get_mut(piano as usize))
+        .and_then(Option::as_mut)
+    else {
+        return false;
+    };
+    instrument.note_off(note as u8);
+    true
+}
+
+/// Press or lift the sustain pedal (MIDI CC64).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_set_sustain(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    down: bool,
+) -> bool {
+    let Some(instrument) = engine
+        .as_mut()
+        .and_then(|engine| engine.pianos.get_mut(piano as usize))
+        .and_then(Option::as_mut)
+    else {
+        return false;
+    };
+    instrument.set_sustain_pedal(down);
+    true
+}
+
+/// Release every sounding note, ignoring the pedal.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_release_all(
+    engine: *mut GooeyEngine,
+    piano: u32,
+) -> bool {
+    let Some(instrument) = engine
+        .as_mut()
+        .and_then(|engine| engine.pianos.get_mut(piano as usize))
+        .and_then(Option::as_mut)
+    else {
+        return false;
+    };
+    instrument.release_all();
+    true
+}
+
+/// Notes currently sounding, for UI metering.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_active_voices(
+    engine: *const GooeyEngine,
+    piano: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.pianos.get(piano as usize))
+        .and_then(Option::as_ref)
+        .map_or(0, |piano| piano.active_voice_count() as u32)
+}
+
+/// Apply a `PIANO_PRESET_*` preset. Applied as smoothed targets, never snapped,
+/// so switching mid-performance does not click.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_set_preset(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    preset: u32,
+) -> bool {
+    let Some(instrument) = engine
+        .as_mut()
+        .and_then(|engine| engine.pianos.get_mut(piano as usize))
+        .and_then(Option::as_mut)
+    else {
+        return false;
+    };
+    instrument.set_config(match preset {
+        PIANO_PRESET_SOFT => MultiSampleConfig::soft(),
+        PIANO_PRESET_BRIGHT => MultiSampleConfig::bright(),
+        _ => MultiSampleConfig::default(),
+    });
+    true
+}
+
+/// Set one parameter by index, normalized 0–1:
+/// 0 volume, 1 velocity_track, 2 release, 3 stereo_width.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_set_param(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    param: u32,
+    value: f32,
+) -> bool {
+    if !value.is_finite() {
+        return false;
+    }
+    let Some(instrument) = engine
+        .as_mut()
+        .and_then(|engine| engine.pianos.get_mut(piano as usize))
+        .and_then(Option::as_mut)
+    else {
+        return false;
+    };
+    let value = value.clamp(0.0, 1.0);
+    match param {
+        0 => instrument.params.volume.set_target(value),
+        1 => instrument.params.velocity_track.set_target(value),
+        2 => instrument.params.release.set_target(value),
+        3 => instrument.params.stereo_width.set_target(value),
+        _ => return false,
+    }
+    true
+}
+
+/// Load an SFZ pack from disk and queue it for `piano`, thinning it to
+/// `velocity_layers` (pass 0 to keep every layer). `path` is a NUL-terminated
+/// UTF-8 path to the `.sfz` file; samples resolve relative to its directory.
+///
+/// This decodes hundreds of WAV files, so call it from a control thread — never
+/// from the audio callback. The finished map is installed at the next render
+/// boundary, observable via `gooey_engine_piano_map_generation`.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, and `path`
+/// must be a valid NUL-terminated C string.
+#[cfg(feature = "bounce")]
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_load_sfz(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    path: *const c_char,
+    velocity_layers: u32,
+) -> bool {
+    use crate::instruments::multisample_pack::{load_sfz, PackLoadOptions};
+
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    if path.is_null()
+        || !engine
+            .pianos
+            .get(piano as usize)
+            .is_some_and(Option::is_some)
+    {
+        return false;
+    }
+    let Ok(path) = CStr::from_ptr(path).to_str() else {
+        return false;
+    };
+
+    let options = PackLoadOptions::default()
+        .with_velocity_layers((velocity_layers > 0).then_some(velocity_layers as usize));
+    let Ok(pack) = load_sfz(path, &options) else {
+        return false;
+    };
+    engine
+        .piano_control
+        .queue_set_map(piano as usize, pack.map.build())
+}
+
 /// Restore the default graph layout: Drums, Bass, Synth, Loops.
 ///
 /// # Safety
@@ -6595,6 +7130,15 @@ pub unsafe extern "C" fn gooey_engine_mixer_reset_default_layout(engine: *mut Go
                 let _ = engine
                     .graph
                     .register_source(SOURCE_SAMPLER_BASE + rack as u32);
+            }
+        }
+        // Registration persists for the engine lifetime, so rebuilding the
+        // default layout must not leave a registered instrument unroutable.
+        for index in 0..MULTISAMPLE_INSTRUMENT_COUNT {
+            if engine.pianos[index].is_some() {
+                let _ = engine
+                    .graph
+                    .register_source(SOURCE_PIANO_BASE + index as u32);
             }
         }
     }
