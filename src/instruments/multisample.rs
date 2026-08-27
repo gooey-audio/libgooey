@@ -28,6 +28,16 @@ use crate::utils::SmoothedParam;
 /// far more notes than a synth patch, so this is deliberately generous.
 pub const MULTISAMPLE_VOICE_COUNT: usize = 32;
 
+/// Extra voice slots that exist only so a *stolen* note can ramp to silence
+/// instead of being cut mid-sample.
+///
+/// Stealing needs the victim's slot immediately, so fading it in place is not
+/// possible — it is moved here (a cheap struct move; the PCM is behind an
+/// `Arc`) and finishes its ~6 ms fade while the new note starts. These are not
+/// playable polyphony and do not appear in
+/// [`MultiSampleInstrument::active_voice_count`].
+const FADE_SLOT_COUNT: usize = 4;
+
 /// Upper bound on zones in one map, so a malformed pack cannot exhaust memory.
 pub const MULTISAMPLE_MAX_ZONES: usize = 1024;
 
@@ -528,7 +538,17 @@ impl MsVoice {
         self.fade_step = (1.0 / samples) as f32;
     }
 
+    /// A one-shot plays to the end of its region no matter what the key or the
+    /// pedal does — that is the whole meaning of the mode. Only [`Self::stop`]
+    /// (transport stop, teardown) cuts it short.
+    fn ignores_note_off(&self) -> bool {
+        self.loop_mode == LoopMode::OneShot
+    }
+
     fn release(&mut self) {
+        if self.ignores_note_off() {
+            return;
+        }
         self.envelope.release(self.elapsed_secs);
     }
 
@@ -578,7 +598,13 @@ impl MsVoice {
         if looping && self.position >= self.loop_end {
             let span = self.loop_end - self.loop_start;
             if span > 0.0 {
-                self.position -= span;
+                // Fold by the full overshoot, not one span. A short loop read at
+                // a transposed increment larger than the span would otherwise
+                // still sit past `loop_end` after a single subtraction, and go
+                // on to either read outside the authored region or trip the
+                // `position >= end` check below and stop the voice.
+                self.position =
+                    self.loop_start + (self.position - self.loop_start).rem_euclid(span);
             }
         }
 
@@ -606,6 +632,8 @@ pub struct MultiSampleInstrument {
     map: Arc<SampleMap>,
     pub params: MultiSampleParams,
     voices: [MsVoice; MULTISAMPLE_VOICE_COUNT],
+    /// Stolen voices ramping to silence. See [`FADE_SLOT_COUNT`].
+    fading: [MsVoice; FADE_SLOT_COUNT],
     trigger_counter: u64,
     sustain_pedal: bool,
     /// Note staged by the sequencer via `Instrument::set_midi_note`.
@@ -623,6 +651,7 @@ impl MultiSampleInstrument {
             map: Arc::new(SampleMap::new()),
             params: MultiSampleParams::from_config(&config, sample_rate),
             voices: std::array::from_fn(|_| MsVoice::default()),
+            fading: std::array::from_fn(|_| MsVoice::default()),
             trigger_counter: 0,
             sustain_pedal: false,
             pending_note: None,
@@ -682,24 +711,30 @@ impl MultiSampleInstrument {
     }
 
     /// Release a key. With the sustain pedal down the voice keeps ringing and
-    /// is only released when the pedal lifts.
+    /// is only released when the pedal lifts. Voices from
+    /// [`LoopMode::OneShot`] zones ignore this entirely and play to the end.
     pub fn note_off(&mut self, note: u8) {
-        let mut released_velocity = None;
+        let mut damped_a_string = false;
         for voice in &mut self.voices {
             if !voice.active() || voice.note != note || !voice.held {
                 continue;
             }
+            // The key is up either way; only what happens to the *sound*
+            // depends on the pedal and the zone's loop mode.
             voice.held = false;
+            if voice.ignores_note_off() {
+                continue;
+            }
             if self.sustain_pedal {
                 voice.sustained = true;
             } else {
                 voice.release();
-                released_velocity = Some(voice.gain);
+                damped_a_string = true;
             }
         }
 
-        // Damper noise only makes sense once the string is actually stopped.
-        if released_velocity.is_some() && !self.sustain_pedal {
+        // Damper noise only makes sense once a string is actually stopped.
+        if damped_a_string {
             self.start_zone_voice(note, 64, 0.5, ZoneTrigger::Release);
         }
     }
@@ -725,7 +760,8 @@ impl MultiSampleInstrument {
         self.sustain_pedal
     }
 
-    /// Release every sounding voice, ignoring the pedal.
+    /// Release every sounding voice, ignoring the pedal. One-shot voices still
+    /// play out; use [`Self::stop_all`] to cut everything.
     pub fn release_all(&mut self) {
         for voice in &mut self.voices {
             if voice.active() {
@@ -739,11 +775,14 @@ impl MultiSampleInstrument {
     /// Cut every voice immediately. Only for transport stops and teardown —
     /// this can click, unlike [`Self::release_all`].
     pub fn stop_all(&mut self) {
-        for voice in &mut self.voices {
+        for voice in self.voices.iter_mut().chain(self.fading.iter_mut()) {
             voice.stop();
         }
     }
 
+    /// Notes currently sounding in the playable pool. Stolen voices finishing
+    /// their fade are excluded: they are no longer notes, and counting them
+    /// would make a UI read above the instrument's polyphony.
     pub fn active_voice_count(&self) -> usize {
         self.voices.iter().filter(|v| v.active()).count()
     }
@@ -805,7 +844,8 @@ impl MultiSampleInstrument {
     }
 
     /// Prefer a free voice; then the oldest voice that is already releasing;
-    /// then the oldest voice overall. A stolen voice is faded rather than cut.
+    /// then the oldest voice overall. A stolen voice is moved to a fade slot so
+    /// it ramps to silence rather than being cut off mid-sample.
     fn allocate_voice(&mut self) -> usize {
         if let Some(index) = self.voices.iter().position(|v| !v.active()) {
             return index;
@@ -827,7 +867,34 @@ impl MultiSampleInstrument {
                 .map(|(i, _)| i)
                 .unwrap_or(0)
         });
+
+        // Vacate the slot before the caller overwrites it. `MsVoice` holds its
+        // PCM behind an `Arc`, so this move is a handful of words, not a copy
+        // of the sample.
+        let victim = std::mem::take(&mut self.voices[index]);
+        self.retire_to_fade_slot(victim);
         index
+    }
+
+    /// Park a stolen voice in a fade slot and start its ramp to silence.
+    fn retire_to_fade_slot(&mut self, mut victim: MsVoice) {
+        victim.begin_fast_fade();
+        let slot = self
+            .fading
+            .iter()
+            .position(|v| !v.active())
+            .unwrap_or_else(|| {
+                // Every fade slot is busy. Recycle the one furthest through its
+                // ramp: it is the quietest, so cutting it is the least audible
+                // choice available.
+                self.fading
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| a.fade.total_cmp(&b.fade))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            });
+        self.fading[slot] = victim;
     }
 
     /// Generate one stereo sample. This is the instrument's native output;
@@ -839,6 +906,11 @@ impl MultiSampleInstrument {
 
         let mut out = StereoFrame::default();
         for voice in &mut self.voices {
+            out += voice.tick();
+        }
+        // Stolen voices finishing their ramp still make sound — that is the
+        // point of them.
+        for voice in &mut self.fading {
             out += voice.tick();
         }
 
@@ -892,8 +964,13 @@ impl Instrument for MultiSampleInstrument {
         Some(self.tick_frame())
     }
 
+    /// True while anything is still producing sound, fade tails included — an
+    /// engine must not treat the instrument as finished mid-ramp.
     fn is_active(&self) -> bool {
-        self.voices.iter().any(|v| v.active())
+        self.voices
+            .iter()
+            .chain(self.fading.iter())
+            .any(|v| v.active())
     }
 
     fn set_midi_note(&mut self, note: u8) {
@@ -1133,6 +1210,151 @@ mod tests {
         assert!(map
             .push_zone(SampleZone::new(flat_buffer(128, 1.0), 60))
             .is_ok());
+    }
+
+    #[test]
+    fn a_stolen_voice_fades_instead_of_cutting() {
+        // Fill every slot, then steal. The victim must keep sounding for the
+        // length of its fade rather than vanishing on the next sample.
+        let mut piano = MultiSampleInstrument::with_map(SR, two_layer_map());
+        piano.snap_params();
+        for i in 0..MULTISAMPLE_VOICE_COUNT {
+            piano.note_on(55 + (i % 13) as u8, 1.0);
+            piano.tick_frame();
+        }
+        assert_eq!(piano.active_voice_count(), MULTISAMPLE_VOICE_COUNT);
+
+        assert_eq!(
+            piano.fading.iter().filter(|v| v.active()).count(),
+            0,
+            "nothing should be fading yet"
+        );
+
+        // Force a steal. The victim must still be rendering — in a fade slot,
+        // ramping down — rather than having been overwritten in place.
+        piano.note_on(67, 1.0);
+        let fading: Vec<&MsVoice> = piano.fading.iter().filter(|v| v.active()).collect();
+        assert_eq!(fading.len(), 1, "the stolen voice should be kept as a tail");
+        assert!(fading[0].fade_step > 0.0, "the tail should be ramping down");
+
+        // Its gain really does decrease sample over sample.
+        let first = piano.fading.iter().find(|v| v.active()).unwrap().fade;
+        for _ in 0..16 {
+            piano.tick_frame();
+        }
+        let later = piano.fading.iter().find(|v| v.active()).unwrap().fade;
+        assert!(later < first, "fade should progress: {first} -> {later}");
+
+        // The playable pool never exceeds its advertised polyphony...
+        assert_eq!(piano.active_voice_count(), MULTISAMPLE_VOICE_COUNT);
+        // ...and the tail finishes on its own well inside the fade time.
+        for _ in 0..(SR * FAST_FADE_SECS) as usize + 64 {
+            piano.tick_frame();
+        }
+        assert_eq!(
+            piano.fading.iter().filter(|v| v.active()).count(),
+            0,
+            "the tail should have finished"
+        );
+    }
+
+    #[test]
+    fn stealing_repeatedly_stays_bounded_and_finite() {
+        // Far more steals than there are fade slots, so the recycle path runs.
+        let mut piano = MultiSampleInstrument::with_map(SR, two_layer_map());
+        piano.snap_params();
+        for round in 0..8 {
+            for i in 0..MULTISAMPLE_VOICE_COUNT {
+                piano.note_on(55 + ((i + round) % 13) as u8, 1.0);
+            }
+            for _ in 0..64 {
+                let f = piano.tick_frame();
+                assert!(f.l.is_finite() && f.r.is_finite());
+            }
+        }
+        assert!(piano.active_voice_count() <= MULTISAMPLE_VOICE_COUNT);
+    }
+
+    #[test]
+    fn one_shot_zones_ignore_note_off_and_the_pedal() {
+        let mut map = SampleMap::new();
+        let mut zone = SampleZone::new(flat_buffer(SR as usize, 1.0), 60);
+        zone.loop_mode = LoopMode::OneShot;
+        // A release short enough that, if it were applied, the voice would be
+        // long gone by the time we check.
+        zone.envelope = ADSRConfig::new(0.001, 0.001, 1.0, 0.01);
+        map.push_zone(zone).unwrap();
+        let map = map.build();
+
+        // Note-off must not truncate it.
+        let mut piano = MultiSampleInstrument::with_map(SR, Arc::clone(&map));
+        piano.snap_params();
+        piano.note_on(60, 1.0);
+        piano.note_off(60);
+        for _ in 0..(SR as usize / 2) {
+            piano.tick_frame();
+        }
+        assert!(piano.is_active(), "a one-shot should play past note-off");
+
+        // Neither should release_all.
+        piano.release_all();
+        for _ in 0..1024 {
+            piano.tick_frame();
+        }
+        assert!(piano.is_active(), "a one-shot should play past release_all");
+
+        // It still ends when the sample does.
+        for _ in 0..SR as usize {
+            piano.tick_frame();
+        }
+        assert!(!piano.is_active(), "a one-shot ends with its recording");
+
+        // ...and stop_all is the hard cut that does work.
+        let mut piano = MultiSampleInstrument::with_map(SR, map);
+        piano.snap_params();
+        piano.note_on(60, 1.0);
+        piano.stop_all();
+        assert!(!piano.is_active());
+    }
+
+    #[test]
+    fn a_loop_shorter_than_its_increment_stays_inside_its_region() {
+        // A 2-frame loop read 25 semitones up advances ~4.24 frames per sample.
+        // The step is deliberately not a multiple of the span, so a single
+        // `position -= span` leaves the cursor past `loop_end` and the voice
+        // reads outside the region the pack authored.
+        let mut map = SampleMap::new();
+        let mut zone = SampleZone::new(flat_buffer(4096, 1.0), 35).with_key_range(35, 84);
+        zone.loop_mode = LoopMode::LoopContinuous;
+        zone.loop_start = 100;
+        zone.loop_end = 102;
+        zone.envelope = ADSRConfig::new(0.001, 0.001, 1.0, 0.05);
+        map.push_zone(zone).unwrap();
+
+        let mut piano = MultiSampleInstrument::with_map(SR, map.build());
+        piano.snap_params();
+        assert!(piano.note_on(60, 1.0));
+
+        let mut worst = 0.0_f64;
+        for _ in 0..8192 {
+            let f = piano.tick_frame();
+            assert!(f.l.is_finite());
+            // Once the cursor has entered the loop it must never sit past the
+            // loop end again.
+            if let Some(voice) = piano.voices.iter().find(|v| v.active()) {
+                if voice.position >= voice.loop_start {
+                    worst = worst.max(voice.position);
+                }
+            }
+        }
+        assert!(
+            worst < 102.0,
+            "cursor escaped the loop region, reaching {worst} (loop ends at 102)"
+        );
+        assert!(
+            piano.is_active(),
+            "a short loop must keep looping, not stop early"
+        );
     }
 
     #[test]
