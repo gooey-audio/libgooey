@@ -110,6 +110,13 @@ pub struct SampleZone {
     pub offset: usize,
     /// Last frame played, or `None` for "to the end of the buffer".
     pub end: Option<usize>,
+    /// Frames over which to fade out at the end of the region.
+    ///
+    /// Zero uses the short default de-click ramp, which is all an untrimmed
+    /// sample needs — it already ends near silence. A sample cut short of its
+    /// natural decay ends on real signal, so it needs a much longer ramp
+    /// (tens of milliseconds) or the cut is audible as a click or thump.
+    pub fade_out_frames: usize,
     /// Amplitude envelope. For a piano the recording carries the decay, so this
     /// is usually a near-instant attack, full sustain, and a short release.
     pub envelope: ADSRConfig,
@@ -138,6 +145,7 @@ impl SampleZone {
             loop_end: 0,
             offset: 0,
             end: None,
+            fade_out_frames: 0,
             envelope: ADSRConfig::new(0.001, 0.001, 1.0, 0.4),
             amp_veltrack: 0.6,
             trigger: ZoneTrigger::Attack,
@@ -279,6 +287,17 @@ impl SampleMap {
         let lo = self.zones.iter().map(|z| z.lokey).min()?;
         let hi = self.zones.iter().map(|z| z.hikey).max()?;
         Some((lo, hi))
+    }
+
+    /// Bytes of sample data this map holds resident.
+    ///
+    /// The number a host budgets against on a memory-constrained target: a full
+    /// piano pack can run to hundreds of megabytes, and `PackLoadOptions`
+    /// (velocity layers, key range, `max_seconds`) is how you bring it down.
+    /// Shared buffers are counted once per zone, so a pack whose zones reuse a
+    /// file reads high — packs of that shape are rare.
+    pub fn memory_bytes(&self) -> usize {
+        self.zones.iter().map(|z| z.buffer.memory_bytes()).sum()
     }
 
     /// Number of distinct velocity layers, measured by distinct `hivel` values
@@ -424,6 +443,9 @@ struct MsVoice {
     increment: f64,
     start: f64,
     end: f64,
+    /// Frames of ramp at the end of the region, from the zone. Longer than the
+    /// default de-click when the pack was trimmed mid-decay.
+    fade_out: f64,
     loop_start: f64,
     loop_end: f64,
     loop_mode: LoopMode,
@@ -454,6 +476,7 @@ impl Default for MsVoice {
             increment: 1.0,
             start: 0.0,
             end: 0.0,
+            fade_out: CLICK_GUARD_FRAMES,
             loop_start: 0.0,
             loop_end: 0.0,
             loop_mode: LoopMode::NoLoop,
@@ -497,6 +520,7 @@ impl MsVoice {
         self.zone = zone_index;
         self.start = (zone.offset as f64).min(frames - 1.0).max(0.0);
         self.end = zone.end_frame().max(self.start + 1.0);
+        self.fade_out = (zone.fade_out_frames as f64).max(CLICK_GUARD_FRAMES);
         self.position = self.start;
 
         let semitones = (note as f64 - zone.root_key as f64) + zone.tune_cents as f64 / 100.0;
@@ -581,7 +605,7 @@ impl MsVoice {
         let click_guard = if looping {
             from_start.clamp(0.0, 1.0) as f32
         } else {
-            let to_end = (self.end - self.position) / CLICK_GUARD_FRAMES;
+            let to_end = (self.end - self.position) / self.fade_out;
             from_start.min(to_end).clamp(0.0, 1.0) as f32
         };
 
@@ -1354,6 +1378,55 @@ mod tests {
         assert!(
             piano.is_active(),
             "a short loop must keep looping, not stop early"
+        );
+    }
+
+    #[test]
+    fn a_trimmed_zone_fades_out_instead_of_stepping() {
+        // A buffer that ends at full amplitude — exactly what trimming a decay
+        // mid-flight produces. Without a fade the last sample is a step to
+        // silence; with one the tail ramps down.
+        fn last_samples(fade_frames: usize) -> Vec<f32> {
+            let frames = 4410;
+            let mut map = SampleMap::new();
+            let mut zone = SampleZone::new(flat_buffer(frames, 1.0), 60);
+            zone.fade_out_frames = fade_frames;
+            zone.amp_veltrack = 0.0;
+            map.push_zone(zone).unwrap();
+
+            let mut piano = MultiSampleInstrument::with_map(SR, map.build());
+            piano.snap_params();
+            piano.note_on(60, 1.0);
+            let mut out = Vec::new();
+            while piano.is_active() {
+                out.push(piano.tick_frame().l.abs());
+            }
+            out
+        }
+
+        // Default de-click ramp: 32 frames, so the level is still high a
+        // millisecond before the end.
+        let abrupt = last_samples(0);
+        // 40 ms fade, the loader's default for a trimmed sample.
+        let faded = last_samples((0.04 * SR) as usize);
+
+        let sample_at = |v: &[f32], back: usize| v[v.len().saturating_sub(back)];
+        // 20 ms before the end the faded version is already well down, while
+        // the abrupt one is still at full level.
+        let ms20 = (0.02 * SR) as usize;
+        assert!(
+            sample_at(&faded, ms20) < sample_at(&abrupt, ms20) * 0.7,
+            "faded {} should be well below abrupt {} 20ms from the end",
+            sample_at(&faded, ms20),
+            sample_at(&abrupt, ms20)
+        );
+
+        // And the faded tail descends monotonically over its last stretch,
+        // rather than holding level and dropping off a cliff.
+        let tail = &faded[faded.len() - ms20..];
+        assert!(
+            tail.first() > tail.last(),
+            "the trim fade should be ramping down"
         );
     }
 

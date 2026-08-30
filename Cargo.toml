@@ -130,6 +130,10 @@ name = "piano"
 required-features = ["native", "crossterm", "bounce"]
 
 [[example]]
+name = "prepare_piano_pack"
+required-features = ["bounce"]
+
+[[example]]
 name = "antialias_validation"
 required-features = ["bounce"]
 

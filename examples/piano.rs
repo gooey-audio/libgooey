@@ -15,6 +15,11 @@
 //! The pack path may also come from the GOOEY_PIANO_PACK environment variable.
 //! Sample data is never vendored into this repository — see
 //! docs/multisample-instruments.md for licensing and bring-your-own-pack notes.
+//!
+//! By default a big pack is thinned to six velocity layers on load. Pass
+//! `--layers N` to keep a different number, or `--layers 0` to load the pack
+//! exactly as it is — which is what you want for a pack already shrunk by
+//! `cargo run --example prepare_piano_pack`.
 
 #[cfg(all(feature = "native", feature = "bounce"))]
 use crossterm::{
@@ -110,8 +115,28 @@ struct LoadedMap {
 fn resolve_pack_path() -> Option<String> {
     std::env::args()
         .nth(1)
+        .filter(|a| !a.starts_with("--"))
         .or_else(|| std::env::var("GOOEY_PIANO_PACK").ok())
         .filter(|path| !path.is_empty())
+}
+
+/// Velocity layers to keep, from `--layers N`. Zero means "load the pack as it
+/// is", which is what you want for a pack already thinned by
+/// `prepare_piano_pack` — otherwise this would throw away layers that were
+/// deliberately kept.
+#[cfg(all(feature = "native", feature = "bounce"))]
+fn resolve_layer_limit() -> Option<usize> {
+    let args: Vec<String> = std::env::args().collect();
+    let requested = args
+        .iter()
+        .position(|a| a == "--layers")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<usize>().ok());
+    match requested {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(gooey::instruments::multisample::DEFAULT_VELOCITY_LAYERS),
+    }
 }
 
 #[cfg(all(feature = "native", feature = "bounce"))]
@@ -134,7 +159,7 @@ fn load_map() -> LoadedMap {
     }
     io::stdout().flush().ok();
 
-    let options = PackLoadOptions::default();
+    let options = PackLoadOptions::default().with_velocity_layers(resolve_layer_limit());
     let started = Instant::now();
     match load_sfz(&path, &options) {
         Ok(pack) => {

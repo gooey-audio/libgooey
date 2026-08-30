@@ -73,6 +73,10 @@ pub const SUPPORTED_OPCODES: &[&str] = &[
     "hicc64",
 ];
 
+/// Fade applied where `max_seconds` cuts into a sample's decay. Long enough to
+/// hide the step, short enough not to audibly shorten the note further.
+pub const DEFAULT_TRIM_FADE_MS: f32 = 40.0;
+
 /// How much of a pack to import. Filtering happens *before* any WAV is opened,
 /// so thinning a 16-layer library to six layers also skips reading the files
 /// belonging to the discarded layers.
@@ -87,6 +91,19 @@ pub struct PackLoadOptions {
     /// double a piano pack's footprint for a subtle effect, so they are off by
     /// default.
     pub include_release_zones: bool,
+    /// Cap every sample at this many seconds, discarding the rest of its decay.
+    ///
+    /// This is usually the largest single lever on memory: a piano's low
+    /// strings ring for twenty seconds or more, and that tail is only ever
+    /// heard on a held or pedalled note. Truncation happens during decoding, so
+    /// the discarded audio is never resident. `None` keeps every sample whole.
+    pub max_seconds: Option<f32>,
+    /// Fade applied at a truncation point, in milliseconds.
+    ///
+    /// A trimmed sample ends on real signal rather than silence, so cutting it
+    /// dead would click. Only applied to samples that `max_seconds` actually
+    /// shortened.
+    pub trim_fade_ms: f32,
     /// Hard ceiling on imported zones.
     pub max_zones: usize,
 }
@@ -97,6 +114,8 @@ impl Default for PackLoadOptions {
             velocity_layers: Some(DEFAULT_VELOCITY_LAYERS),
             key_range: None,
             include_release_zones: false,
+            max_seconds: None,
+            trim_fade_ms: DEFAULT_TRIM_FADE_MS,
             max_zones: MULTISAMPLE_MAX_ZONES,
         }
     }
@@ -109,6 +128,8 @@ impl PackLoadOptions {
             velocity_layers: None,
             key_range: None,
             include_release_zones: true,
+            max_seconds: None,
+            trim_fade_ms: DEFAULT_TRIM_FADE_MS,
             max_zones: MULTISAMPLE_MAX_ZONES,
         }
     }
@@ -125,6 +146,12 @@ impl PackLoadOptions {
 
     pub fn with_release_zones(mut self, include: bool) -> Self {
         self.include_release_zones = include;
+        self
+    }
+
+    /// Cap every sample's length. See [`Self::max_seconds`].
+    pub fn with_max_seconds(mut self, seconds: Option<f32>) -> Self {
+        self.max_seconds = seconds.filter(|s| s.is_finite() && *s > 0.0);
         self
     }
 }
@@ -176,6 +203,7 @@ pub fn load_sfz_str(
     let mut map = SampleMap::new();
     let mut cache: HashMap<PathBuf, StereoSampleBuffer> = HashMap::new();
     let mut zones_loaded = 0;
+    let mut trimmed_count = 0;
 
     for region in regions {
         if zones_loaded >= options.max_zones {
@@ -194,7 +222,7 @@ pub fn load_sfz_str(
 
         let buffer = match cache.get(&full) {
             Some(buffer) => buffer.clone(),
-            None => match StereoSampleBuffer::from_wav(&full) {
+            None => match StereoSampleBuffer::from_wav_trimmed(&full, options.max_seconds) {
                 Ok(buffer) => {
                     cache.insert(full.clone(), buffer.clone());
                     buffer
@@ -206,7 +234,22 @@ pub fn load_sfz_str(
             },
         };
 
-        match region.into_zone(buffer) {
+        // A sample that reached the cap was almost certainly cut mid-decay, so
+        // it needs a real fade rather than the short de-click ramp. Samples
+        // shorter than the cap ended naturally and are left alone.
+        let trimmed = options
+            .max_seconds
+            .is_some_and(|cap| buffer.len() as f32 >= cap * buffer.sample_rate() - 1.0);
+        let fade_frames = if trimmed {
+            (options.trim_fade_ms.max(0.0) / 1000.0 * buffer.sample_rate()) as usize
+        } else {
+            0
+        };
+        if trimmed {
+            trimmed_count += 1;
+        }
+
+        match region.into_zone(buffer, fade_frames) {
             Ok(zone) => match map.push_zone(zone) {
                 Ok(()) => zones_loaded += 1,
                 Err(error) => warnings.push(format!("skipped {}: {error}", full.display())),
@@ -220,6 +263,14 @@ pub fn load_sfz_str(
             "SFZ declared {regions_declared} regions but none could be loaded; first problem: {}",
             warnings.first().map_or("unknown", String::as_str)
         ));
+    }
+
+    if let Some(cap) = options.max_seconds {
+        if trimmed_count > 0 {
+            warnings.push(format!(
+                "trimmed {trimmed_count} of {zones_loaded} samples to {cap:.1}s"
+            ));
+        }
     }
 
     Ok(LoadedPack {
@@ -281,7 +332,11 @@ impl Region {
         }
     }
 
-    fn into_zone(self, buffer: StereoSampleBuffer) -> Result<SampleZone, String> {
+    fn into_zone(
+        self,
+        buffer: StereoSampleBuffer,
+        fade_out_frames: usize,
+    ) -> Result<SampleZone, String> {
         let root = self
             .pitch_keycenter
             .or(self.lokey)
@@ -305,6 +360,7 @@ impl Region {
         zone.loop_end = self.loop_end;
         zone.offset = self.offset;
         zone.end = self.end;
+        zone.fade_out_frames = fade_out_frames;
         zone.envelope = ADSRConfig::new(
             self.ampeg_attack.max(0.0),
             self.ampeg_decay.max(0.0),
@@ -950,6 +1006,115 @@ mod tests {
         }
         // `default_path` resolved, so the WAVs really were read.
         assert!(!map.zone(0).unwrap().buffer.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn max_seconds_shortens_buffers_and_cuts_memory() {
+        let dir = temp_dir();
+        let samples = dir.join("samples");
+        std::fs::create_dir_all(&samples).unwrap();
+        // Four seconds of audio per sample.
+        write_wav(&samples.join("a.wav"), 44_100 * 4, 0.5);
+        std::fs::write(
+            dir.join("p.sfz"),
+            "<control> default_path=samples/\n<region> key=60 sample=a.wav\n",
+        )
+        .unwrap();
+        let sfz = dir.join("p.sfz");
+
+        let whole = load_sfz(&sfz, &PackLoadOptions::default()).unwrap();
+        let whole_map = whole.map.build();
+        assert_eq!(whole_map.zone(0).unwrap().buffer.len(), 44_100 * 4);
+
+        // Cap at one second: a quarter of the frames, a quarter of the memory.
+        let opts = PackLoadOptions::default().with_max_seconds(Some(1.0));
+        let cut = load_sfz(&sfz, &opts).unwrap();
+        assert!(cut.warnings.iter().any(|w| w.contains("trimmed 1")));
+        let cut_map = cut.map.build();
+        let zone = cut_map.zone(0).unwrap();
+        assert_eq!(zone.buffer.len(), 44_100);
+        assert!(
+            cut_map.memory_bytes() * 4 <= whole_map.memory_bytes() + 64,
+            "memory should scale with the trim: {} vs {}",
+            cut_map.memory_bytes(),
+            whole_map.memory_bytes()
+        );
+        // A trimmed sample gets a real fade; an untrimmed one does not.
+        assert!(zone.fade_out_frames > 1000, "{}", zone.fade_out_frames);
+        assert_eq!(whole_map.zone(0).unwrap().fade_out_frames, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_sample_shorter_than_the_cap_is_left_untrimmed() {
+        let dir = temp_dir();
+        let samples = dir.join("samples");
+        std::fs::create_dir_all(&samples).unwrap();
+        write_wav(&samples.join("short.wav"), 4410, 0.5); // 0.1s
+        std::fs::write(
+            dir.join("p.sfz"),
+            "<control> default_path=samples/\n<region> key=60 sample=short.wav\n",
+        )
+        .unwrap();
+
+        let opts = PackLoadOptions::default().with_max_seconds(Some(5.0));
+        let pack = load_sfz(dir.join("p.sfz"), &opts).unwrap();
+        assert!(!pack.warnings.iter().any(|w| w.contains("trimmed")));
+        let map = pack.map.build();
+        assert_eq!(map.zone(0).unwrap().buffer.len(), 4410);
+        assert_eq!(
+            map.zone(0).unwrap().fade_out_frames,
+            0,
+            "a sample that ended naturally needs no trim fade"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sixteen_bit_packs_load_at_half_the_memory_of_float_ones() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join("samples")).unwrap();
+        write_wav(&dir.join("samples/a.wav"), 1000, 0.5);
+
+        // Same audio, written as 32-bit float.
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 44_100,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(dir.join("samples/b.wav"), spec).unwrap();
+        for _ in 0..1000 {
+            w.write_sample(0.5f32).unwrap();
+            w.write_sample(0.5f32).unwrap();
+        }
+        w.finalize().unwrap();
+
+        std::fs::write(
+            dir.join("p.sfz"),
+            "<control> default_path=samples/\n\
+             <region> key=60 sample=a.wav\n\
+             <region> key=64 sample=b.wav\n",
+        )
+        .unwrap();
+
+        let pack = load_sfz(dir.join("p.sfz"), &PackLoadOptions::everything()).unwrap();
+        let map = pack.map.build();
+        let compact = map.zone(0).unwrap();
+        let wide = map.zone(1).unwrap();
+        assert!(
+            compact.buffer.is_compact(),
+            "16-bit source should stay 16-bit"
+        );
+        assert!(!wide.buffer.is_compact(), "float source should stay float");
+        assert_eq!(
+            compact.buffer.memory_bytes() * 2,
+            wide.buffer.memory_bytes()
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

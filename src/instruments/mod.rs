@@ -7,6 +7,8 @@ pub mod multisample;
 pub(crate) mod multisample_control;
 #[cfg(feature = "bounce")]
 pub mod multisample_pack;
+#[cfg(feature = "bounce")]
+pub mod multisample_prep;
 pub mod poly_synth;
 pub mod sampler;
 pub(crate) mod sampler_control;
@@ -22,6 +24,8 @@ pub use self::kick::*;
 pub use self::multisample::*;
 #[cfg(feature = "bounce")]
 pub use self::multisample_pack::*;
+#[cfg(feature = "bounce")]
+pub use self::multisample_prep::*;
 pub use self::poly_synth::*;
 pub use self::sampler::*;
 pub use self::snare::*;
