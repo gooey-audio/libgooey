@@ -42,6 +42,14 @@ struct SharedControl {
     queue: Mutex<QueueState>,
     has_commands: AtomicBool,
     committed_generation: [AtomicU32; MULTISAMPLE_INSTRUMENT_COUNT],
+    /// State the render thread publishes for hosts to read.
+    ///
+    /// A UI polls these every frame from another thread, so they cannot be read
+    /// off the live instrument — that would alias the `&mut` the render thread
+    /// holds. Publishing to atomics is the same approach
+    /// [`crate::mixer`] takes with its snapshot.
+    zone_count: [AtomicU32; MULTISAMPLE_INSTRUMENT_COUNT],
+    active_voices: [AtomicU32; MULTISAMPLE_INSTRUMENT_COUNT],
 }
 
 #[derive(Clone)]
@@ -56,6 +64,8 @@ impl MultiSampleControl {
                 queue: Mutex::new(QueueState::default()),
                 has_commands: AtomicBool::new(false),
                 committed_generation: std::array::from_fn(|_| AtomicU32::new(0)),
+                zone_count: std::array::from_fn(|_| AtomicU32::new(0)),
+                active_voices: std::array::from_fn(|_| AtomicU32::new(0)),
             }),
         }
     }
@@ -134,6 +144,36 @@ impl MultiSampleControl {
             .committed_generation
             .get(instrument)
             .map_or(0, |value| value.load(Ordering::Acquire))
+    }
+
+    /// Publish the zone count of a newly installed map. Called from the render
+    /// thread as it commits.
+    pub(crate) fn publish_zone_count(&self, instrument: usize, zones: usize) {
+        if let Some(value) = self.shared.zone_count.get(instrument) {
+            value.store(zones as u32, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn zone_count(&self, instrument: usize) -> u32 {
+        self.shared
+            .zone_count
+            .get(instrument)
+            .map_or(0, |value| value.load(Ordering::Acquire))
+    }
+
+    /// Publish the sounding-voice count. Called once per render buffer, which
+    /// is far finer than any UI needs.
+    pub(crate) fn publish_active_voices(&self, instrument: usize, voices: usize) {
+        if let Some(value) = self.shared.active_voices.get(instrument) {
+            value.store(voices as u32, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn active_voices(&self, instrument: usize) -> u32 {
+        self.shared
+            .active_voices
+            .get(instrument)
+            .map_or(0, |value| value.load(Ordering::Relaxed))
     }
 }
 

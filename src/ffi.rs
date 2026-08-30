@@ -1012,7 +1012,9 @@ impl GooeyEngine {
                             // here: freeing a large map on the audio thread
                             // would block the callback.
                             self.piano_retired.push(std::sync::Arc::clone(piano.map()));
+                            let zones = map.zone_count();
                             piano.set_map(map);
+                            control.publish_zone_count(instrument, zones);
                             control.mark_committed(instrument);
                         }
                         None => self.piano_retired.push(map),
@@ -1489,6 +1491,19 @@ impl GooeyEngine {
         // Publish once after the completed buffer instead of once per mixer
         // sample. Silent buffers publish from `apply_control_commands` above.
         self.mixer.publish_control_snapshot();
+        self.publish_piano_meters();
+    }
+
+    /// Hand piano metering to the control side once per buffer.
+    ///
+    /// A UI polls voice counts from its own thread, so it must read published
+    /// atomics rather than the live instrument, which the render thread holds
+    /// exclusively.
+    fn publish_piano_meters(&self) {
+        for (index, piano) in self.pianos.iter().enumerate() {
+            let voices = piano.as_ref().map_or(0, |p| p.active_voice_count());
+            self.piano_control.publish_active_voices(index, voices);
+        }
     }
 
     fn apply_sequencer_blend_setting(
@@ -6886,6 +6901,9 @@ pub unsafe extern "C" fn gooey_engine_piano_map_generation(
 
 /// Zones in the instrument's currently audible map.
 ///
+/// Reads state the render thread publishes when it installs a map, so this is
+/// safe to poll from a UI thread while audio is running.
+///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
 #[no_mangle]
@@ -6895,9 +6913,7 @@ pub unsafe extern "C" fn gooey_engine_piano_zone_count(
 ) -> u32 {
     engine
         .as_ref()
-        .and_then(|engine| engine.pianos.get(piano as usize))
-        .and_then(Option::as_ref)
-        .map_or(0, |piano| piano.map().zone_count() as u32)
+        .map_or(0, |engine| engine.piano_control.zone_count(piano as usize))
 }
 
 /// Strike a key. `velocity` is normalized 0–1. Returns false when the map has
@@ -6998,6 +7014,10 @@ pub unsafe extern "C" fn gooey_engine_piano_release_all(
 
 /// Notes currently sounding, for UI metering.
 ///
+/// Published once per render buffer, so this is safe to poll from a UI thread
+/// while audio is running. Fade tails from stolen voices are excluded, so it
+/// never reads above the instrument's polyphony.
+///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
 #[no_mangle]
@@ -7005,11 +7025,9 @@ pub unsafe extern "C" fn gooey_engine_piano_active_voices(
     engine: *const GooeyEngine,
     piano: u32,
 ) -> u32 {
-    engine
-        .as_ref()
-        .and_then(|engine| engine.pianos.get(piano as usize))
-        .and_then(Option::as_ref)
-        .map_or(0, |piano| piano.active_voice_count() as u32)
+    engine.as_ref().map_or(0, |engine| {
+        engine.piano_control.active_voices(piano as usize)
+    })
 }
 
 /// Apply a `PIANO_PRESET_*` preset. Applied as smoothed targets, never snapped,
@@ -7075,9 +7093,18 @@ pub unsafe extern "C" fn gooey_engine_piano_set_param(
 /// `velocity_layers` (pass 0 to keep every layer). `path` is a NUL-terminated
 /// UTF-8 path to the `.sfz` file; samples resolve relative to its directory.
 ///
-/// This decodes hundreds of WAV files, so call it from a control thread — never
-/// from the audio callback. The finished map is installed at the next render
-/// boundary, observable via `gooey_engine_piano_map_generation`.
+/// This decodes hundreds of WAV files — seconds of work — so it is designed to
+/// be called from a **background thread while audio is running**. It takes a
+/// `const` engine and touches only the control queue, never the live
+/// instruments, so it cannot race the render thread. The finished map is
+/// installed at the next render boundary; poll
+/// `gooey_engine_piano_map_generation` to learn when it became audible.
+///
+/// Never call it from the audio callback.
+///
+/// Queueing for an instrument that was never registered is accepted here and
+/// discarded by the render thread, because registration state belongs to that
+/// thread and cannot be read safely from this one.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`, and `path`
@@ -7085,22 +7112,17 @@ pub unsafe extern "C" fn gooey_engine_piano_set_param(
 #[cfg(feature = "bounce")]
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_piano_load_sfz(
-    engine: *mut GooeyEngine,
+    engine: *const GooeyEngine,
     piano: u32,
     path: *const c_char,
     velocity_layers: u32,
 ) -> bool {
     use crate::instruments::multisample_pack::{load_sfz, PackLoadOptions};
 
-    let Some(engine) = engine.as_mut() else {
+    let Some(engine) = engine.as_ref() else {
         return false;
     };
-    if path.is_null()
-        || !engine
-            .pianos
-            .get(piano as usize)
-            .is_some_and(Option::is_some)
-    {
+    if path.is_null() || piano as usize >= MULTISAMPLE_INSTRUMENT_COUNT {
         return false;
     }
     let Ok(path) = CStr::from_ptr(path).to_str() else {

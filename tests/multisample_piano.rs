@@ -145,14 +145,70 @@ fn a_committed_map_can_be_routed_and_played() {
         assert_eq!(gooey_engine_piano_map_generation(engine, piano), 1);
 
         assert!(gooey_engine_piano_note_on(engine, piano, 60, 1.0));
-        assert_eq!(gooey_engine_piano_active_voices(engine, piano), 1);
         assert!(
             peak(&render(engine, 512)) > 0.01,
             "a struck note must sound"
         );
+        // Metering is published once per render buffer so it can be polled
+        // from a UI thread, so it reports after the buffer that played it.
+        assert_eq!(gooey_engine_piano_active_voices(engine, piano), 1);
 
         // A note outside the mapped range allocates nothing.
         assert!(!gooey_engine_piano_note_on(engine, piano, 20, 1.0));
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn metering_is_published_and_safe_to_poll_while_rendering() {
+    // The pattern an iOS host uses: audio runs on one thread, a UI polls
+    // counters from another. Those reads must come from published state, not
+    // from the live instrument the render thread owns.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct Ptr(*const GooeyEngine);
+    unsafe impl Send for Ptr {}
+    unsafe impl Sync for Ptr {}
+
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let piano = gooey_engine_piano_register(engine) as u32;
+        assert!(gooey_engine_mixer_route_source(
+            engine,
+            SOURCE_PIANO_BASE + piano,
+            2
+        ));
+        commit_two_layer_map(engine, piano, 3 * SR as usize);
+        render(engine, 64);
+        gooey_engine_piano_note_on(engine, piano, 60, 1.0);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Ptr(engine as *const GooeyEngine));
+
+        // A "UI thread" hammering the getters while we render.
+        let poller = {
+            let stop = Arc::clone(&stop);
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let mut seen_voices = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    seen_voices = seen_voices.max(gooey_engine_piano_active_voices(shared.0, 0));
+                    let _ = gooey_engine_piano_zone_count(shared.0, 0);
+                    let _ = gooey_engine_piano_map_generation(shared.0, 0);
+                }
+                seen_voices
+            })
+        };
+
+        for _ in 0..200 {
+            render(engine, 128);
+        }
+        stop.store(true, Ordering::Relaxed);
+        let seen = poller.join().unwrap();
+
+        assert_eq!(seen, 1, "the poller should have observed the sounding note");
+        assert_eq!(gooey_engine_piano_zone_count(engine, piano), 2);
         gooey_engine_free(engine);
     }
 }
@@ -397,13 +453,13 @@ fn two_pianos_render_independently() {
         render(engine, 64);
 
         assert!(gooey_engine_piano_note_on(engine, a, 60, 1.0));
+        assert!(peak(&render(engine, 256)) > 0.01);
         assert_eq!(gooey_engine_piano_active_voices(engine, a), 1);
         assert_eq!(
             gooey_engine_piano_active_voices(engine, b),
             0,
             "playing one instrument must not trigger the other"
         );
-        assert!(peak(&render(engine, 256)) > 0.01);
         gooey_engine_free(engine);
     }
 }

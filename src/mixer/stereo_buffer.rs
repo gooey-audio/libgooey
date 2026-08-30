@@ -23,24 +23,27 @@ use std::sync::Arc;
 use crate::frame::StereoFrame;
 use crate::utils::cubic_interpolate;
 
-/// One stored sample, widened to `f32` on read.
+/// One stored sample, converted to `f32` on read.
 ///
 /// Implemented for the two storage precisions so the interpolator can be
 /// generic over them instead of branching per tap.
+///
+/// Deliberately not named `widen`: std has an unstable inherent `i16::widen`,
+/// and an inherent method would silently win over this trait's if it lands.
 pub trait StoredSample: Copy {
-    fn widen(self) -> f32;
+    fn to_f32(self) -> f32;
 }
 
 impl StoredSample for f32 {
     #[inline]
-    fn widen(self) -> f32 {
+    fn to_f32(self) -> f32 {
         self
     }
 }
 
 impl StoredSample for i16 {
     #[inline]
-    fn widen(self) -> f32 {
+    fn to_f32(self) -> f32 {
         // Divide by 32767 so full-scale positive reaches exactly 1.0, matching
         // how the WAV readers elsewhere in the crate scale integer PCM.
         self as f32 / i16::MAX as f32
@@ -355,13 +358,13 @@ impl StereoSampleBuffer {
     #[inline]
     fn tap_clamped<S: StoredSample>(channel: &[S], index: isize) -> f32 {
         let last = channel.len() as isize - 1;
-        channel[index.clamp(0, last) as usize].widen()
+        channel[index.clamp(0, last) as usize].to_f32()
     }
 
     #[inline]
     fn tap_wrapped<S: StoredSample>(channel: &[S], index: isize) -> f32 {
         let len = channel.len() as isize;
-        channel[index.rem_euclid(len) as usize].widen()
+        channel[index.rem_euclid(len) as usize].to_f32()
     }
 
     /// Cubic read over one channel pair at whichever precision they are stored.
@@ -406,8 +409,8 @@ impl StereoSampleBuffer {
                 r: right[0],
             },
             Storage::I16 { left, right } => StereoFrame {
-                l: left[0].widen(),
-                r: right[0].widen(),
+                l: left[0].to_f32(),
+                r: right[0].to_f32(),
             },
         }
     }
