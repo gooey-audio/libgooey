@@ -126,6 +126,10 @@ name = "sampler_rack"
 required-features = ["native", "crossterm"]
 
 [[example]]
+name = "metronome"
+required-features = ["native", "crossterm"]
+
+[[example]]
 name = "antialias_validation"
 required-features = ["bounce"]
 
