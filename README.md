@@ -7,6 +7,7 @@
 - Kick, Snare, Hihat and Tom drum synthesizer with comprehensive parameter control
 - Parameter smoothing
 - 16-step sequencer with sample-accurate timing
+- Optional metronome / monitor click, locked to the transport and excluded from offline exports
 - C FFI for integration with Swift/iOS and other languages
 - Cross-platform support (native, iOS)
 

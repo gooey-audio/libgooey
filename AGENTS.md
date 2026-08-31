@@ -47,6 +47,7 @@ src/
 │   └── blendable.rs     # PresetBlender: cross-fade between parameter sets
 │
 ├── envelope.rs          # ADSR envelope with curve shaping
+├── metronome.rs         # Optional transport-locked monitor click (post-limiter)
 ├── dsl.rs               # Line-based DSL for declarative instrument setup
 ├── ffi.rs               # C FFI bindings for iOS/Swift integration
 └── visualization.rs     # Waveform display (feature-gated)
@@ -61,11 +62,15 @@ src/
 ## Signal Flow (per sample)
 
 ```
-Sequencer ──trigger──▶ Instruments ──tick──▶ Sum ──▶ Master Gain ──▶ Effects Chain ──▶ Output
-     ▲                      ▲
-     │                      │
-  BPM clock            LFO modulation
+Sequencer ──trigger──▶ Instruments ──tick──▶ Sum ──▶ Master Gain ──▶ Effects Chain ──▶ Limiter ──▶ (+) ──▶ Output
+     ▲                      ▲                                                                      ▲
+     │                      │                                                                      │
+  BPM clock            LFO modulation                                          Metronome (monitor click, off by default)
 ```
+
+The metronome taps in *after* the limiter deliberately: it is a monitoring aid,
+so enabling it must not alter the material being auditioned, and it is bypassed
+entirely during offline bounce.
 
 ## Key Patterns
 

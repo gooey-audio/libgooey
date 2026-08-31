@@ -148,6 +148,11 @@ depending on the function.
 - Project files that do not store graph layout can rely on the default layout.
   Project files that do store graph layout should recreate it with
   `clear_layout` + `add_track` + `route_source`.
+- The metronome (`gooey_engine_set_metronome_enabled`) is intentionally **not** a
+  graph source, so there is no `SOURCE_*` id to route. It is summed after the
+  limiter and is unaffected by track routing, track gain, mute/solo, and track
+  effects — enabling it can never change how the mix itself sounds. Use
+  `gooey_engine_set_metronome_level` for its level.
 
 ## Manual Verification
 
