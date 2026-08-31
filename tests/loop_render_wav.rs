@@ -209,10 +209,22 @@ fn rejects_invalid_arguments() {
         let engine = gooey_engine_new(SAMPLE_RATE);
         load(engine, 0, &dc_stereo(0.5, 1024));
         // Null path.
-        assert!(!gooey_engine_loop_render_to_wav(engine, 0, 100, 0, std::ptr::null()));
+        assert!(!gooey_engine_loop_render_to_wav(
+            engine,
+            0,
+            100,
+            0,
+            std::ptr::null()
+        ));
         // Empty path.
         let empty = CString::new("").unwrap();
-        assert!(!gooey_engine_loop_render_to_wav(engine, 0, 100, 0, empty.as_ptr()));
+        assert!(!gooey_engine_loop_render_to_wav(
+            engine,
+            0,
+            100,
+            0,
+            empty.as_ptr()
+        ));
         // Zero frame count.
         assert!(!render(engine, 0, 0, 0, &path));
         // Out-of-range channel.

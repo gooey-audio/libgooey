@@ -7,7 +7,7 @@
 
 use crate::effects::Waveshaper;
 use crate::engine::{Instrument, Modulatable};
-use crate::utils::{cubic_interpolate, raised_sine_window, SmoothedParam};
+use crate::utils::{cubic_interpolate, raised_sine_window, SmoothedParam, XorShift32};
 use std::sync::Arc;
 
 const MAX_GRAINS: usize = 64;
@@ -826,40 +826,6 @@ fn cloud_duration_ms(value: f32) -> f32 {
 #[inline]
 fn window_shape(value: f32) -> f32 {
     0.5 + value.clamp(0.0, 1.0) * 3.5
-}
-
-#[derive(Clone, Copy, Debug)]
-struct XorShift32 {
-    state: u32,
-}
-
-impl XorShift32 {
-    fn new(seed: u32) -> Self {
-        Self {
-            state: if seed == 0 { 0x6d2b_79f5 } else { seed },
-        }
-    }
-
-    #[inline]
-    fn next_u32(&mut self) -> u32 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        self.state = x;
-        x
-    }
-
-    #[inline]
-    fn next_f32(&mut self) -> f32 {
-        self.next_u32() as f32 / u32::MAX as f32
-    }
-}
-
-impl Default for XorShift32 {
-    fn default() -> Self {
-        Self::new(0x1234_abcd)
-    }
 }
 
 #[cfg(test)]
