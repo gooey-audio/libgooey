@@ -163,6 +163,36 @@ fn division_controls_the_click_rate() {
     }
 }
 
+/// Changing division mid-run is picked up by the render thread without the
+/// setter reaching into render-owned state, and without a double-click at the
+/// switch: the grid index is measured in units of the division, so the stale
+/// one must be discarded rather than compared against the new units.
+#[test]
+fn division_change_mid_run_takes_effect_cleanly() {
+    unsafe {
+        let engine = silent_running_engine();
+        gooey_engine_set_metronome_enabled(engine, true);
+
+        // Land exactly on a beat boundary, having just clicked it.
+        let first = onsets(&render(engine, FRAMES_PER_BEAT));
+        assert_eq!(first.len(), 1);
+
+        gooey_engine_set_metronome_division(engine, METRONOME_DIVISION_EIGHTH);
+        // One beat at eighths is 2 clicks, at the beat and the half-beat, with
+        // no extra click squeezed in at the switch itself.
+        let after = onsets(&render(engine, FRAMES_PER_BEAT));
+        assert_eq!(after.len(), 2, "expected 2 eighth clicks, got {after:?}");
+        assert!(after[0].0 <= 2);
+        assert!(
+            after[1].0.abs_diff(FRAMES_PER_BEAT / 2) <= 2,
+            "second eighth landed at {}, expected {}",
+            after[1].0,
+            FRAMES_PER_BEAT / 2
+        );
+        gooey_engine_free(engine);
+    }
+}
+
 #[test]
 fn stopped_transport_is_silent() {
     unsafe {
@@ -205,6 +235,56 @@ fn stop_and_restart_resyncs_the_click() {
         let found = onsets(&render(engine, FRAMES_PER_BEAT * 2));
         assert_eq!(found.len(), 2);
         assert!(found[0].0 <= 2, "restart should click immediately");
+        gooey_engine_free(engine);
+    }
+}
+
+/// Regression: transport commands issued between two audio callbacks all land
+/// in a single `Mixer::apply_pending` batch, so the render thread never observes
+/// `running == false` and cannot infer the discontinuity from that. The click
+/// must still resync — this is the ordering `stop_and_restart_resyncs_the_click`
+/// hides by rendering between the stop and the start.
+#[test]
+fn queued_stop_reset_start_burst_still_clicks_the_downbeat() {
+    unsafe {
+        let engine = silent_running_engine();
+        gooey_engine_set_metronome_enabled(engine, true);
+        // Stay inside beat 0 so the stale grid index is the downbeat's own, and
+        // resetting to 0 lands right back on it.
+        render(engine, FRAMES_PER_BEAT / 4);
+
+        gooey_engine_sequencer_stop(engine);
+        gooey_engine_sequencer_reset(engine);
+        gooey_engine_sequencer_start(engine);
+
+        let found = onsets(&render(engine, FRAMES_PER_BEAT * 2));
+        assert_eq!(found.len(), 2, "expected 2 clicks, got {found:?}");
+        assert!(
+            found[0].0 <= 2,
+            "the downbeat was dropped after a queued stop/reset/start; first \
+             click landed at frame {}",
+            found[0].0
+        );
+        gooey_engine_free(engine);
+    }
+}
+
+/// Seeking twice onto the same boundary must click both times: the second seek
+/// is a real discontinuity even though the beat position is unchanged.
+#[test]
+fn repeated_seek_to_the_same_boundary_clicks_each_time() {
+    unsafe {
+        let engine = silent_running_engine();
+        gooey_engine_set_metronome_enabled(engine, true);
+
+        gooey_engine_sequencer_set_beat_position(engine, 4.0);
+        let first = onsets(&render(engine, FRAMES_PER_BEAT / 2));
+        assert_eq!(first.len(), 1, "first seek should click");
+
+        gooey_engine_sequencer_set_beat_position(engine, 4.0);
+        let second = onsets(&render(engine, FRAMES_PER_BEAT / 2));
+        assert_eq!(second.len(), 1, "second seek to the same beat should click");
+        assert!(second[0].0 <= 2);
         gooey_engine_free(engine);
     }
 }
@@ -319,6 +399,55 @@ fn metronome_is_strictly_additive_over_the_mix() {
             );
         }
         gooey_engine_free(click_engine);
+    }
+}
+
+/// Disabling while a click is sounding must fade it out, not truncate it. A
+/// hard cut steps a nonzero sample straight to zero, which is an audible pop.
+/// Self-calibrating: the step across the disable seam is compared against the
+/// largest step the sine itself takes just before it, so the threshold does not
+/// depend on frequency or level.
+#[test]
+fn disabling_mid_click_does_not_pop() {
+    unsafe {
+        let engine = silent_running_engine();
+        gooey_engine_set_metronome_enabled(engine, true);
+        gooey_engine_set_metronome_level(engine, 1.0);
+
+        // 300 frames ≈ 6.8 ms in: past the 1 ms attack, still well inside the
+        // 30 ms decay, so the envelope is at a substantial nonzero level.
+        let before = render(engine, 300);
+        let left: Vec<f32> = before.chunks_exact(2).map(|f| f[0]).collect();
+        let amplitude = left[left.len() - 60..]
+            .iter()
+            .fold(0.0_f32, |a, b| a.max(b.abs()));
+        assert!(
+            amplitude > 0.05,
+            "expected a click in flight at the seam, amplitude was {amplitude}"
+        );
+        let natural_step = left
+            .windows(2)
+            .rev()
+            .take(60)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0_f32, f32::max);
+
+        gooey_engine_set_metronome_enabled(engine, false);
+        let after = render(engine, FRAMES_PER_BEAT);
+        let seam_step = (after[0] - left[left.len() - 1]).abs();
+        assert!(
+            seam_step <= natural_step * 2.0,
+            "disabling stepped {seam_step} across the seam vs a natural sine \
+             step of {natural_step} — that is a pop, not a fade"
+        );
+
+        // And the fade still reaches exact silence promptly (release is 5 ms).
+        let settled = (0.010 * SAMPLE_RATE) as usize;
+        assert!(
+            max_abs(&after[settled * 2..]) < SILENCE,
+            "the released tail must reach digital silence"
+        );
+        gooey_engine_free(engine);
     }
 }
 

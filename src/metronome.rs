@@ -103,13 +103,24 @@ pub struct Metronome {
     /// A [`MetronomeDivision`] id. Stored as an atomic so the host can change
     /// it without racing the render thread.
     division: AtomicU32,
-    /// 0.0..=1.0, smoothed so a fader move never zips.
+    /// Requested level as `f32` bits, 0.0..=1.0. Every field the host can write
+    /// is an atomic; everything below this line is owned by the render thread
+    /// and must never be touched from a setter. Mirrors the `f32`-in-`AtomicU32`
+    /// pattern used by `VoiceStrip::trigger_velocity`.
+    level_target: AtomicU32,
+
+    /// Render-owned: the smoother the atomic target feeds into.
     level: SmoothedParam,
     voice: Oscillator,
     /// Grid index of the most recent click, in units of the current division,
-    /// or `None` when the tracker must resync (transport parked, metronome
-    /// disabled, division changed, offline bounce).
+    /// or `None` when the tracker must resync.
     last_index: Option<i64>,
+    /// Division the render thread last observed, so it can notice a host change
+    /// itself. The host must not clear `last_index` directly — that field is
+    /// written every sample by `due_index`.
+    last_division: u32,
+    /// Transport generation last observed, for detecting seek/reset/start.
+    last_generation: Option<u64>,
     sample_rate: f32,
     bpm: f32,
 }
@@ -126,9 +137,12 @@ impl Metronome {
             enabled: AtomicBool::new(false),
             accent_enabled: AtomicBool::new(true),
             division: AtomicU32::new(METRONOME_DIVISION_QUARTER),
+            level_target: AtomicU32::new(DEFAULT_METRONOME_LEVEL.to_bits()),
             level: SmoothedParam::new(DEFAULT_METRONOME_LEVEL, 0.0, 1.0, sample_rate, 10.0),
             voice,
             last_index: None,
+            last_division: METRONOME_DIVISION_QUARTER,
+            last_generation: None,
             sample_rate,
             bpm,
         }
@@ -150,12 +164,13 @@ impl Metronome {
         self.accent_enabled.load(Ordering::Acquire)
     }
 
-    /// Change the click interval. Resyncs the grid tracker so the new division
-    /// takes effect from the next boundary rather than inheriting a stale
-    /// index measured in the old units.
-    pub fn set_division(&mut self, division: MetronomeDivision) {
+    /// Change the click interval.
+    ///
+    /// Publishes the id only. The render thread notices the change itself and
+    /// resyncs its grid tracker, so the new division takes effect from the next
+    /// boundary rather than inheriting a stale index measured in the old units.
+    pub fn set_division(&self, division: MetronomeDivision) {
         self.division.store(division.id(), Ordering::Release);
-        self.last_index = None;
     }
 
     pub fn division(&self) -> MetronomeDivision {
@@ -163,15 +178,19 @@ impl Metronome {
             .unwrap_or(MetronomeDivision::Quarter)
     }
 
-    /// Set the click level. [`SmoothedParam`] clamps to `0.0..=1.0`.
-    pub fn set_level(&mut self, level: f32) {
-        self.level.set_target(level);
+    /// Set the click level, clamped to `0.0..=1.0`.
+    ///
+    /// Publishes an atomic target that the render thread feeds into its
+    /// smoother; the smoothing behaviour is unchanged.
+    pub fn set_level(&self, level: f32) {
+        self.level_target
+            .store(level.clamp(0.0, 1.0).to_bits(), Ordering::Release);
     }
 
     /// The most recently set level target, not the in-flight smoothed value,
     /// so host set→get round-trips exactly.
     pub fn level(&self) -> f32 {
-        self.level.target()
+        f32::from_bits(self.level_target.load(Ordering::Acquire))
     }
 
     pub fn set_bpm(&mut self, bpm: f32) {
@@ -179,41 +198,82 @@ impl Metronome {
     }
 
     /// Silence the click and clear the grid tracker.
+    ///
+    /// This is a state reset for offline use (see `bounce_to_buffer`), not a
+    /// user-facing disable, so it cuts the voice dead rather than fading it —
+    /// nobody is listening to the transition.
     pub fn reset(&mut self) {
         self.voice.envelope.is_active = false;
         self.last_index = None;
+        self.last_generation = None;
         self.level.snap();
     }
 
     /// Render one sample of click.
     ///
-    /// `running` and `transport_beat` must be read from the mixer *before* it
-    /// ticks, so the click lands on the same sample as a clip launch scheduled
-    /// at the same grid position. `current_time` is the engine's absolute
-    /// sample clock, which drives the voice's envelope and phase.
-    pub fn tick(&mut self, running: bool, transport_beat: f64, current_time: f64) -> StereoFrame {
+    /// `running`, `transport_beat`, and `generation` must be read from the mixer
+    /// *before* it ticks, so the click lands on the same sample as a clip launch
+    /// scheduled at the same grid position. `current_time` is the engine's
+    /// absolute sample clock, which drives the voice's envelope and phase.
+    pub fn tick(
+        &mut self,
+        running: bool,
+        transport_beat: f64,
+        generation: u64,
+        current_time: f64,
+    ) -> StereoFrame {
         // Always advance the smoother so a level change made while the click is
         // disabled or the transport is parked has settled before the next click.
+        self.apply_control_changes();
         let level = self.level.tick();
 
         if !self.is_enabled() {
-            self.voice.envelope.is_active = false;
+            // Release rather than cut: silencing a click mid-envelope would step
+            // a nonzero sample straight to zero and pop. The envelope reaches
+            // exact silence a few ms later, and `release` is a no-op once the
+            // voice has already auto-released.
+            self.voice.envelope.release(current_time);
             self.last_index = None;
-            return StereoFrame::default();
-        }
-
-        if !running {
+        } else if !running {
             // A parked transport schedules nothing, but a click already
             // sounding finishes its decay so stopping never pops.
             self.last_index = None;
-        } else if let Some(index) = self.due_index(transport_beat) {
-            self.fire(index, current_time);
+        } else {
+            // A seek, reset, or start is a phase discontinuity that the beat
+            // value alone cannot always reveal — a stop/reset/start issued
+            // between two audio callbacks is drained as a single batch, so this
+            // thread never sees `running == false` and the stale grid index
+            // would suppress the click on the beat we just landed on.
+            if self.last_generation != Some(generation) {
+                self.last_generation = Some(generation);
+                self.last_index = None;
+            }
+            if let Some(index) = self.due_index(transport_beat) {
+                self.fire(index, current_time);
+            }
         }
 
         if !self.voice.envelope.is_active {
             return StereoFrame::default();
         }
         StereoFrame::mono(self.voice.tick(current_time) * level)
+    }
+
+    /// Pull host-published atomics into render-owned state. Keeps every setter
+    /// free of writes to fields this thread mutates per sample.
+    fn apply_control_changes(&mut self) {
+        let target = self.level();
+        if target != self.level.target() {
+            self.level.set_target(target);
+        }
+
+        let division = self.division.load(Ordering::Acquire);
+        if division != self.last_division {
+            self.last_division = division;
+            // The grid index is measured in units of the division, so a stale
+            // one is meaningless once the interval changes.
+            self.last_index = None;
+        }
     }
 
     fn beats_per_sample(&self) -> f64 {
@@ -275,6 +335,9 @@ mod tests {
         metronome
     }
 
+    /// Transport generation for a run with no seek/reset/start in it.
+    const GEN: u64 = 7;
+
     fn beats_per_sample() -> f64 {
         BPM as f64 / (60.0 * SR as f64)
     }
@@ -297,7 +360,8 @@ mod tests {
         for index in 0..samples {
             let was_active = metronome.voice.envelope.is_active;
             let beat = start_beat + index as f64 * beats_per_sample();
-            metronome.tick(true, beat, index as f64 / SR as f64);
+            // Constant generation: a free-running transport has no discontinuity.
+            metronome.tick(true, beat, GEN, index as f64 / SR as f64);
             if !was_active && metronome.voice.envelope.is_active {
                 observe(index, metronome);
             }
@@ -328,6 +392,7 @@ mod tests {
             let frame = metronome.tick(
                 true,
                 index as f64 * beats_per_sample(),
+                GEN,
                 index as f64 / SR as f64,
             );
             assert_eq!(frame, StereoFrame::default());
@@ -367,9 +432,9 @@ mod tests {
     fn tolerance_window_never_double_fires() {
         let mut metronome = enabled_metronome();
         // Straddle a boundary with the f64 residue the render clock produces.
-        metronome.tick(true, 3.999_999_999_999_999_6, 0.0);
+        metronome.tick(true, 3.999_999_999_999_999_6, GEN, 0.0);
         let after_first = metronome.voice.envelope.trigger_time;
-        metronome.tick(true, 4.000_000_000_000_000_4, 0.01);
+        metronome.tick(true, 4.000_000_000_000_000_4, GEN, 0.01);
         assert_eq!(metronome.voice.envelope.trigger_time, after_first);
         assert_eq!(metronome.last_index, Some(4));
     }
@@ -378,7 +443,7 @@ mod tests {
     fn stopped_transport_schedules_nothing() {
         let mut metronome = enabled_metronome();
         for index in 0..200 {
-            metronome.tick(false, 0.0, index as f64 / SR as f64);
+            metronome.tick(false, 0.0, GEN, index as f64 / SR as f64);
         }
         assert!(!metronome.voice.envelope.is_active);
         // Starting again from a boundary clicks immediately.
@@ -418,11 +483,84 @@ mod tests {
 
     #[test]
     fn level_round_trips_and_clamps() {
-        let mut metronome = Metronome::new(SR, BPM);
+        let metronome = Metronome::new(SR, BPM);
         assert_eq!(metronome.level(), DEFAULT_METRONOME_LEVEL);
         metronome.set_level(0.5);
         assert_eq!(metronome.level(), 0.5);
         metronome.set_level(5.0);
         assert_eq!(metronome.level(), 1.0);
+    }
+
+    /// The host cannot infer a discontinuity from `running` alone, because a
+    /// stop/reset/start burst is drained as one batch and this thread only ever
+    /// sees `running == true`. A generation change must resync the tracker.
+    #[test]
+    fn generation_change_resyncs_the_grid_tracker() {
+        let mut metronome = enabled_metronome();
+        metronome.tick(true, 0.0, 1, 0.0);
+        assert_eq!(metronome.last_index, Some(0));
+
+        // Same beat, same generation: already clicked, stays quiet.
+        let before = metronome.voice.envelope.trigger_time;
+        metronome.tick(true, 0.0, 1, 1.0);
+        assert_eq!(metronome.voice.envelope.trigger_time, before);
+
+        // Same beat, new generation: the transport was restated, so click.
+        metronome.tick(true, 0.0, 2, 2.0);
+        assert_eq!(metronome.voice.envelope.trigger_time, 2.0);
+    }
+
+    /// Setters only publish atomics; the render thread owns `last_index` and
+    /// notices the division change itself.
+    #[test]
+    fn division_change_is_picked_up_by_the_render_thread() {
+        let mut metronome = enabled_metronome();
+        metronome.tick(true, 0.0, GEN, 0.0);
+        assert_eq!(metronome.last_index, Some(0));
+
+        metronome.set_division(MetronomeDivision::Eighth);
+        // Still stale until the render thread runs.
+        assert_eq!(metronome.last_index, Some(0));
+        metronome.tick(true, 0.0, GEN, 1.0);
+        assert_eq!(metronome.last_division, METRONOME_DIVISION_EIGHTH);
+    }
+
+    /// Disabling mid-click must release the envelope, not cut it dead: a hard
+    /// kill steps a nonzero sample straight to zero and pops. Asserted on the
+    /// envelope rather than the output sample, because a sine crossing zero
+    /// makes sample amplitude an unreliable witness. `tests/metronome.rs`
+    /// covers the audible side at a realistic sample rate.
+    #[test]
+    fn disabling_releases_the_voice_instead_of_cutting_it() {
+        let mut metronome = enabled_metronome();
+        metronome.tick(true, 0.0, GEN, 0.0);
+        assert!(
+            metronome.voice.envelope.is_active,
+            "expected a click firing"
+        );
+        assert!(
+            metronome.voice.envelope.release_time_start.is_none(),
+            "click should still be in its attack/decay"
+        );
+
+        metronome.set_enabled(false);
+        metronome.tick(true, 0.0, GEN, 1.0 / SR as f64);
+        assert!(
+            metronome.voice.envelope.is_active,
+            "disabling must not cut the voice dead"
+        );
+        assert!(
+            metronome.voice.envelope.release_time_start.is_some(),
+            "disabling must start a release so the tail fades"
+        );
+
+        // It still reaches exact silence once the release completes.
+        let mut time = 0.0;
+        for _ in 0..SAMPLES_PER_BEAT {
+            time += 1.0 / SR as f64;
+            metronome.tick(true, 0.0, GEN, time);
+        }
+        assert!(!metronome.voice.envelope.is_active);
+        assert_eq!(metronome.tick(true, 0.0, GEN, time), StereoFrame::default());
     }
 }

@@ -1205,6 +1205,7 @@ impl GooeyEngine {
             // the same sample as a clip launch at this shared bar boundary.
             let transport_running = self.mixer.transport_running();
             let transport_beat = self.mixer.transport_beat();
+            let transport_generation = self.mixer.transport_generation();
             if transport_running {
                 for rack in self.samplers.iter_mut().flatten() {
                     rack.activate_start_if_due(transport_beat);
@@ -1442,9 +1443,12 @@ impl GooeyEngine {
             // feed a reverb tail, a delay line, or the compressor sidechain.
             // Skipped entirely during an offline bounce so exports stay clean.
             if !self.offline_bounce {
-                stereo += self
-                    .metronome
-                    .tick(transport_running, transport_beat, self.current_time);
+                stereo += self.metronome.tick(
+                    transport_running,
+                    transport_beat,
+                    transport_generation,
+                    self.current_time,
+                );
             }
 
             // Write the frame interleaved as [left, right].
