@@ -1,31 +1,32 @@
-# Expose naturalized piano chord velocity through the C FFI
+# Expose a piano chord velocity slider through the C FFI
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. This document is maintained in accordance with `.agent/PLANS.md` from the repository root.
 
 ## Purpose / Big Picture
 
-An iOS or other C-ABI host can already strike individual keys on the multi-sampled piano with a normalized velocity, but it must calculate every MIDI note and every per-note velocity itself. After this change, the host can describe a diatonic seventh chord using the same key, scale, degree, voicing, and octave values accepted by the poly synth, provide one base velocity, and let the engine distribute that velocity naturally across the chord. A host can select even, melody-led, or bass-led dynamics and control the amount of small repeat-to-repeat variation. A newly registered piano starts bass-led with humanize amount 0.35, and the host can obtain mechanical playback by selecting the even profile with amount zero.
+An iOS or other C-ABI host can already strike individual keys on the multi-sampled piano with a normalized velocity, but it must calculate every MIDI note and every per-note velocity itself. After this change, the host can describe a diatonic seventh chord using the same key, scale, degree, voicing, and octave values accepted by the poly synth and provide one base velocity. The instrument distributes that base velocity across the chord according to one normalized slider property: 0.0 emphasizes the lowest note, 0.5 strikes all notes evenly, and 1.0 emphasizes the highest note.
 
-The result is observable through the generated C header and the piano integration tests: one FFI call strikes a complete chord, bass-led dynamics emphasize its lower notes, repeated humanized hits vary deterministically as the stored random-number generator advances, and a second chord does not implicitly release non-shared notes from the first.
+The weighting is continuous, symmetric, and deterministic. At either extreme the emphasized edge remains at the requested base velocity while the opposite edge reaches 66%; intermediate slider positions interpolate toward the even center. A newly registered piano defaults to 0.0 because the original musical requirement favored stronger lower notes.
 
 ## Progress
 
 - [x] (2026-08-31 13:46Z) Inspected the multi-sampled piano, chord dynamics, existing poly chord FFI, generated header flow, and integration tests.
-- [x] (2026-08-31 13:49Z) Added persistent per-piano chord dynamics and the exported C constants and functions.
-- [x] (2026-08-31 13:51Z) Added integration coverage for validation, chord construction, velocity behavior, partial maps, and overlap.
-- [x] (2026-08-31 13:54Z) Ran formatting, focused tests, the full suite, the iOS-feature build, and inspected the generated header.
-- [x] (2026-08-31 13:55Z) Updated this living plan with final evidence and outcomes.
+- [x] (2026-08-31 13:55Z) Implemented and validated the first profile-plus-humanize FFI design.
+- [x] (2026-08-31 17:24Z) Replaced the profile-plus-humanize design with one continuous instrument-owned velocity mode.
+- [x] (2026-08-31 17:27Z) Added instrument and FFI tests for low, center, high, clamping, defaults, chord triggering, partial maps, and overlap.
+- [x] (2026-08-31 17:30Z) Ran final formatting, the full suite, the iOS-feature build, and generated-header inspection after the slider revision.
+- [ ] Record the revision in git and update the open pull request.
 
 ## Surprises & Discoveries
 
-- Observation: The recent piano commit already contains the complete Rust-side dynamics model and uses it in `examples/piano.rs`, but `src/ffi.rs` only exposes per-note velocity.
-  Evidence: `ChordDynamics::velocities` implements profile weighting and seeded jitter, while the only piano strike export is `gooey_engine_piano_note_on`.
+- Observation: The original piano commit already contained a discrete Rust-side `ChordDynamics` model for examples, but the revised app interface needs neither its profile enum nor its humanize control.
+  Evidence: The new deterministic slider weighting can live directly on `MultiSampleInstrument`; `src/music/dynamics.rs` remains unchanged for existing Rust callers.
 
-- Observation: The existing `velocity_track` piano parameter is distinct from chord naturalization.
-  Evidence: `velocity_track` scales amplitude inside a selected sample layer; it does not assign different velocities to chord notes.
+- Observation: The existing `velocity_track` piano parameter is distinct from chord velocity mode.
+  Evidence: `velocity_track` changes amplitude inside a selected sample layer, while velocity mode assigns a different attack velocity to each note in a chord.
 
 - Observation: A strict repository-wide clippy run is not currently a usable acceptance gate because the baseline has unrelated denied warnings.
-  Evidence: `cargo clippy --lib --no-default-features --features ios -- -D warnings` stopped on 58 existing findings in files including `src/gen/polyblep.rs`, `src/dsl.rs`, `src/envelope.rs`, and pre-existing portions of `src/ffi.rs`; none identified the new chord functions.
+  Evidence: `cargo clippy --lib --no-default-features --features ios -- -D warnings` stopped on 58 existing findings in unrelated files and pre-existing portions of `src/ffi.rs`.
 
 ## Decision Log
 
@@ -33,16 +34,24 @@ The result is observable through the generated C header and the piano integratio
   Rationale: The host can reuse its existing root, scale, degree, voicing, and octave values while piano presets remain independently controllable through `gooey_engine_piano_set_preset`.
   Date/Author: 2026-08-31 / Codex and user
 
-- Decision: Expose three profile constants and one setter taking profile plus normalized humanize amount.
-  Rationale: This preserves the existing Rust model and makes naturalization toggleable: bass-led plus 0.35 is naturalized, while even plus zero is mechanical.
+- Decision: Supersede the three-profile and humanize FFI with one normalized velocity mode property stored on `MultiSampleInstrument`.
+  Rationale: The app needs one UI slider, and ownership by the instrument keeps the setting with the piano it affects.
   Date/Author: 2026-08-31 / Codex and user
 
-- Decision: Initialize each piano's chord dynamics as bass-led with humanize 0.35.
-  Rationale: Natural playback should be audible without extra setup, but the host retains explicit control.
-  Date/Author: 2026-08-31 / Codex and user
+- Decision: Map 0.0 to low emphasis, 0.5 to even velocity, and 1.0 to high emphasis using a symmetric linear tilt.
+  Rationale: The endpoints and center have obvious meanings, every intermediate value changes smoothly, and the single control has no hidden discrete transitions.
+  Date/Author: 2026-08-31 / Codex
+
+- Decision: Keep the maximum attenuation at 34%, matching the earlier bass-led profile's 1.0-to-0.66 range, and make the result deterministic.
+  Rationale: This preserves the approved strength of the natural weighting while removing the second humanize control and hidden random state.
+  Date/Author: 2026-08-31 / Codex
+
+- Decision: Default new pianos to low-weighted mode 0.0.
+  Rationale: The original request specifically preferred stronger lower notes, and the center remains one slider movement away.
+  Date/Author: 2026-08-31 / Codex
 
 - Decision: Do not release prior notes in the chord trigger.
-  Rationale: The user selected overlapping chords. Shared keys still use the piano's existing self-masking behavior when restruck, and hosts can call the existing release APIs.
+  Rationale: The user selected overlapping chords. Shared keys use the piano's existing self-masking behavior, and hosts can call the existing release APIs.
   Date/Author: 2026-08-31 / Codex and user
 
 - Decision: Sound every mapped note but return false if any requested note lacks a zone.
@@ -51,88 +60,84 @@ The result is observable through the generated C header and the piano integratio
 
 ## Outcomes & Retrospective
 
-The C FFI now exposes all three chord velocity profiles, a per-piano dynamics setter, and a theory-based piano chord trigger. Each piano starts with persistent bass-led dynamics at humanize 0.35. Chord hits use the existing velocity-layered note path, preserve overlapping non-shared notes, self-mask restruck keys, and report incomplete sample maps without suppressing covered notes.
+The C FFI now exposes one low/center/high velocity mode slider, its getter, and the theory-based piano chord trigger. The mode is owned by each `MultiSampleInstrument`, defaults to low-weighted, is deterministic, and preserves the requested overlap and partial-map behavior. The superseded profile constants, humanize setter, random state, and engine-owned dynamics array are absent.
 
-The focused dynamics tests remained 12/12, and the piano FFI integration suite grew from 11 to 16 passing tests. Formatting, the full test suite, and `cargo build --no-default-features --features ios` passed. The generated header contains the three constants and both function declarations. The existing performance recorder remains poly-synth-specific as intended.
+The focused instrument tests pass 2/2, the piano FFI integration suite passes 16/16, the full suite passes with 376 library tests plus all integration suites, and `cargo build --no-default-features --features ios` succeeds. The generated header contains the setter, getter, and trigger and no longer contains the superseded profile API.
 
 ## Context and Orientation
 
-`src/music/dynamics.rs` defines `VelocityProfile` and `ChordDynamics`. A velocity profile assigns a fixed relative weight to each voice ordered from lowest to highest. The bass-led profile starts at full strength for the lowest note and thins upward. Humanizing adds seeded per-note jitter; storing one `ChordDynamics` per piano lets its random sequence advance on successive hits while remaining reproducible from a fresh engine.
+`src/instruments/multisample.rs` defines `MultiSampleInstrument`, the velocity-layered sample player used for piano packs. It now owns `chord_velocity_mode` as a plain normalized value because the setting affects only future note attacks and does not need audio-rate smoothing. `chord_velocities` receives a base velocity and voice count, treats voice zero as the lowest note, and produces the per-note values used to select sample layers and scale attacks.
 
-`src/ffi.rs` owns the C-compatible `GooeyEngine`. It already contains up to two `MultiSampleInstrument` values in `pianos`, maps C constants to Rust music types, and implements `gooey_engine_poly_trigger_chord` using `Key::diatonic_sevenths` and `apply_voicing`. The new piano chord call will use exactly that harmony path, then call `ChordDynamics::velocities` and the piano's existing `note_on` method for sample-layer selection and playback.
+`src/ffi.rs` owns the C-compatible `GooeyEngine`, up to two registered pianos, and the existing music-theory helpers used by `gooey_engine_poly_trigger_chord`. The piano chord call uses the same `Key::diatonic_sevenths` and `apply_voicing` path, asks the selected piano for per-note velocities, and then calls that piano's existing `note_on` method.
 
-`tests/multisample_piano.rs` drives the public FFI as a Swift or C host would. It can build deterministic in-memory sample maps, render buffers, and inspect public metering. The generated `include/gooey.h` is gitignored and is produced by cbindgen from the public constants and exported functions in `src/ffi.rs` during a Cargo build.
+`tests/multisample_piano.rs` drives the public FFI as a Swift or C host would. It builds deterministic in-memory sample maps, renders buffers, and inspects public metering. The generated `include/gooey.h` is gitignored and is produced by cbindgen during a Cargo build.
 
 ## Plan of Work
 
-In `src/ffi.rs`, import `ChordDynamics` and `VelocityProfile`, add three public `PIANO_VELOCITY_PROFILE_*` constants, and add a `piano_dynamics` array beside the registered piano instruments. Initialize every entry with `ChordDynamics::new(VelocityProfile::BassLead, 0.35)` so registration needs no extra allocation or reset.
+In `src/instruments/multisample.rs`, store a `chord_velocity_mode: f32` on every `MultiSampleInstrument`, default it to zero, and expose setter, getter, and per-chord velocity calculation methods. Clamp finite setter values to 0–1 and ignore non-finite values. For chords of two or more notes, apply a symmetric linear tilt whose maximum attenuation is 0.34; do not attenuate a single note.
 
-Add a private conversion from the public profile ID to `VelocityProfile`. Export `gooey_engine_piano_set_chord_dynamics`, rejecting a null or unregistered piano, an unknown profile, or a non-finite humanize amount. Valid finite amounts are clamped by `ChordDynamics::set_humanize` to the normalized range.
+In `src/ffi.rs`, export `gooey_engine_piano_set_velocity_mode` and `gooey_engine_piano_get_velocity_mode`. The setter returns false for a non-finite value or invalid piano, while the getter returns NaN for an invalid piano. Keep `gooey_engine_piano_trigger_chord`, but obtain its per-note velocities from the instrument property. Remove the superseded profile constants, profile conversion, humanize setter, and engine-owned dynamics array.
 
-Export `gooey_engine_piano_trigger_chord`. Reject a non-finite velocity or invalid piano before advancing dynamics. Convert root, scale, degree, voicing, and octave using the same helpers and fallback rules as the poly chord call. Generate the selected diatonic seventh chord's sorted MIDI notes, generate matching per-note velocities from the persistent dynamics state, and strike each note without releasing existing voices. Attempt all notes and return true only if each call to `note_on` found a sample zone.
-
-Extend `tests/multisample_piano.rs` with public-API integration tests. Use the existing two-layer map for base-velocity and voice-count coverage, and add narrowly mapped or distinguishable zones where necessary to demonstrate partial-map reporting and overlapping chords. Keep exact dynamics math covered by the existing `src/music/dynamics.rs` unit tests rather than duplicating its private random sequence in the FFI test.
+In the unit and integration tests, prove the continuous low-to-high ordering, exact even center, symmetry, clamping, default low mode, deterministic repeated hits, base velocity layer selection, partial-map reporting, and overlapping chord behavior.
 
 ## Concrete Steps
 
-Work from `/Users/pretzel/conductor/workspaces/libgooey/kuala-lumpur`.
-
-Edit the implementation and tests, then run:
+Work from `/Users/pretzel/conductor/workspaces/libgooey/kuala-lumpur` and run:
 
     cargo fmt --all -- --check
-    cargo test --lib music::dynamics
+    cargo test --lib instruments::multisample::tests::chord_velocity_mode
     cargo test --test multisample_piano
     cargo test
     cargo build --no-default-features --features ios
-    rg -n "PIANO_VELOCITY_PROFILE|piano_set_chord_dynamics|piano_trigger_chord" include/gooey.h
+    rg -n "piano_(set|get)_velocity_mode|piano_trigger_chord" include/gooey.h
 
-The focused dynamics suite should retain its 12 passing tests. The piano integration suite should include the new chord cases with no failures. The full suite and iOS-feature build should exit successfully. The final `rg` output should show all three constants and both new exported function declarations.
+The focused instrument suite should pass both slider tests. The piano integration suite should pass all 16 tests. The full suite and iOS-feature build should exit successfully. The generated header should contain the setter, getter, and chord trigger and should no longer contain the superseded velocity-profile constants or chord-dynamics setter.
 
 ## Validation and Acceptance
 
-A registered piano with a committed map covering C3 through C5 must accept a C-major root-position seventh chord at octave 4 and publish four active voices after rendering. Changing the base velocity must select or audibly exercise different velocity layers. All three dynamics profiles must be accepted; an unknown profile, non-finite humanize amount, non-finite chord velocity, or invalid piano must return false. Finite humanize values outside zero through one must be accepted and clamped.
+A new piano reports velocity mode 0.0. Setting 0.5 makes every note in a chord use the base velocity. At 0.0, per-note velocities descend from the lowest voice to the highest; at 1.0 they ascend by the symmetric amount. Values below zero or above one clamp, non-finite setters fail without changing the property, and invalid getters return NaN.
 
-Bass-led dynamics must retain the ordering already pinned by `music::dynamics` tests, repeated naturalized calls must advance the stored random sequence, and even profile with zero humanize must remain equal and repeatable. Triggering two chords without a release must preserve non-shared voices from the first, while shared keys are replaced by the instrument's existing self-masking rather than doubled. A chord with one or more unmapped notes must play its mapped notes and return false.
+A registered piano with a committed map covering C3 through C5 accepts a C-major root-position seventh chord at octave 4 and publishes four active voices after rendering. Changing the base chord velocity reaches different velocity layers. Triggering two chords without a release preserves non-shared voices from the first, while shared keys are replaced by self-masking. A chord with an unmapped note plays its mapped notes and returns false.
 
-No existing per-note piano function, velocity-layer selection rule, `velocity_track` parameter, poly synth chord behavior, or performance-recording behavior may change.
+No existing per-note piano function, `velocity_track` behavior, sample-layer rule, poly synth chord behavior, Rust `ChordDynamics` API, or performance-recording behavior changes.
 
 ## Idempotence and Recovery
 
-All source edits and tests are additive and can be rerun safely. Cargo may rewrite the gitignored generated header and build cache. If a validation step fails, fix the scoped source or test and rerun the same command; no database, network service, or destructive migration is involved.
+All source edits and tests are additive or replace only the unmerged first design on this feature branch. Cargo may rewrite the gitignored generated header and build cache. If validation fails, fix the scoped source or test and rerun the same command; no database, network service, or destructive migration is involved.
 
 ## Artifacts and Notes
 
-Before implementation, focused validation showed:
-
-    music::dynamics: 12 passed; 0 failed
-    tests/multisample_piano.rs: 11 passed; 0 failed
-
-After implementation, validation showed:
+Before the slider revision, validation showed:
 
     cargo fmt --all -- --check: passed
     music::dynamics: 12 passed; 0 failed
     tests/multisample_piano.rs: 16 passed; 0 failed
     cargo test: passed
     cargo build --no-default-features --features ios: passed
-    generated include/gooey.h: three profile constants and both new functions present
 
-The current branch started clean against `origin/main`.
+After the slider code change, focused validation currently shows:
 
-Plan revision note (2026-08-31): Marked implementation and validation complete, recorded the strict-clippy baseline limitation, and added final test and generated-header evidence.
+    instrument chord_velocity_mode tests: 2 passed; 0 failed
+    tests/multisample_piano.rs: 16 passed; 0 failed
+    cargo fmt --all -- --check: passed
+    cargo test: passed (376 library tests plus all integration suites)
+    cargo build --no-default-features --features ios: passed
+    generated include/gooey.h: velocity mode setter/getter and chord trigger present; superseded profile API absent
+
+Plan revision note (2026-08-31): Replaced the discrete profile-plus-humanize design with the requested single instrument-owned low/center/high slider and updated every section to describe the revised interface and validation.
 
 ## Interfaces and Dependencies
 
-The public C ABI will add:
+The public C ABI adds:
 
-    PIANO_VELOCITY_PROFILE_EVEN = 0
-    PIANO_VELOCITY_PROFILE_MELODY_LEAD = 1
-    PIANO_VELOCITY_PROFILE_BASS_LEAD = 2
-
-    bool gooey_engine_piano_set_chord_dynamics(
+    bool gooey_engine_piano_set_velocity_mode(
         GooeyEngine *engine,
         uint32_t piano,
-        uint32_t profile,
-        float humanize);
+        float mode);
+
+    float gooey_engine_piano_get_velocity_mode(
+        const GooeyEngine *engine,
+        uint32_t piano);
 
     bool gooey_engine_piano_trigger_chord(
         GooeyEngine *engine,
@@ -144,4 +149,4 @@ The public C ABI will add:
         int32_t octave,
         float velocity);
 
-No new dependency is required. The implementation reuses `crate::music::{ChordDynamics, VelocityProfile}`, the existing theory conversion helpers in `src/ffi.rs`, and `MultiSampleInstrument::note_on`.
+No new dependency is required. The implementation reuses the existing music-theory helpers in `src/ffi.rs` and `MultiSampleInstrument::note_on`.

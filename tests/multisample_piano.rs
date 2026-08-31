@@ -7,7 +7,6 @@
 //! at a render boundary, and the sustain pedal holds notes.
 
 use gooey::ffi::*;
-use gooey::music::{ChordDynamics, VelocityProfile};
 
 const SR: f32 = 44_100.0;
 
@@ -290,56 +289,34 @@ fn velocity_picks_the_matching_layer() {
 }
 
 #[test]
-fn piano_chord_dynamics_are_validated_and_clamped() {
+fn piano_velocity_mode_is_an_instrument_property_and_clamps() {
     unsafe {
         let engine = gooey_engine_new(SR);
 
-        // A valid ID is not enough: chord state belongs to a registered piano.
-        assert!(!gooey_engine_piano_set_chord_dynamics(
-            engine,
-            0,
-            PIANO_VELOCITY_PROFILE_EVEN,
-            0.0
-        ));
+        assert!(!gooey_engine_piano_set_velocity_mode(engine, 0, 0.5));
+        assert!(gooey_engine_piano_get_velocity_mode(engine, 0).is_nan());
         let piano = gooey_engine_piano_register(engine) as u32;
 
-        for profile in [
-            PIANO_VELOCITY_PROFILE_EVEN,
-            PIANO_VELOCITY_PROFILE_MELODY_LEAD,
-            PIANO_VELOCITY_PROFILE_BASS_LEAD,
-        ] {
-            assert!(gooey_engine_piano_set_chord_dynamics(
-                engine, piano, profile, 0.5
-            ));
-        }
-        // Finite values are normalized by clamping, matching ChordDynamics.
-        assert!(gooey_engine_piano_set_chord_dynamics(
+        // Low-weighted is the instrument default.
+        assert_eq!(gooey_engine_piano_get_velocity_mode(engine, piano), 0.0);
+        assert!(gooey_engine_piano_set_velocity_mode(engine, piano, 0.5));
+        assert_eq!(gooey_engine_piano_get_velocity_mode(engine, piano), 0.5);
+        assert!(gooey_engine_piano_set_velocity_mode(engine, piano, -1.0));
+        assert_eq!(gooey_engine_piano_get_velocity_mode(engine, piano), 0.0);
+        assert!(gooey_engine_piano_set_velocity_mode(engine, piano, 2.0));
+        assert_eq!(gooey_engine_piano_get_velocity_mode(engine, piano), 1.0);
+        assert!(!gooey_engine_piano_set_velocity_mode(
             engine,
             piano,
-            PIANO_VELOCITY_PROFILE_EVEN,
-            -1.0
-        ));
-        assert!(gooey_engine_piano_set_chord_dynamics(
-            engine,
-            piano,
-            PIANO_VELOCITY_PROFILE_EVEN,
-            2.0
-        ));
-        assert!(!gooey_engine_piano_set_chord_dynamics(
-            engine, piano, 99, 0.5
-        ));
-        assert!(!gooey_engine_piano_set_chord_dynamics(
-            engine,
-            piano,
-            PIANO_VELOCITY_PROFILE_EVEN,
             f32::NAN
         ));
-        assert!(!gooey_engine_piano_set_chord_dynamics(
+        assert_eq!(gooey_engine_piano_get_velocity_mode(engine, piano), 1.0);
+        assert!(!gooey_engine_piano_set_velocity_mode(
             engine,
             PIANO_INSTRUMENT_MAX,
-            PIANO_VELOCITY_PROFILE_EVEN,
-            0.0
+            0.5
         ));
+        assert!(gooey_engine_piano_get_velocity_mode(engine, PIANO_INSTRUMENT_MAX).is_nan());
         gooey_engine_free(engine);
     }
 }
@@ -356,12 +333,7 @@ fn chord_trigger_uses_theory_voicing_and_base_velocity() {
         ));
         commit_two_layer_map(engine, piano, 8192);
         render(engine, 64);
-        assert!(gooey_engine_piano_set_chord_dynamics(
-            engine,
-            piano,
-            PIANO_VELOCITY_PROFILE_EVEN,
-            0.0
-        ));
+        assert!(gooey_engine_piano_set_velocity_mode(engine, piano, 0.5));
 
         assert!(gooey_engine_piano_trigger_chord(
             engine,
@@ -420,7 +392,7 @@ fn chord_trigger_uses_theory_voicing_and_base_velocity() {
 }
 
 #[test]
-fn default_chord_dynamics_are_bass_led_and_advance_between_hits() {
+fn default_velocity_mode_is_low_weighted_and_deterministic() {
     unsafe {
         let engine = gooey_engine_new(SR);
         let piano = gooey_engine_piano_register(engine) as u32;
@@ -431,21 +403,8 @@ fn default_chord_dynamics_are_bass_led_and_advance_between_hits() {
         ));
 
         let notes = [60, 64, 67, 71]; // Cmaj7, root position, octave 4.
-        let mut expected = ChordDynamics::new(VelocityProfile::BassLead, 0.35);
-        let first = expected.velocities(1.0, notes.len());
-        let second = expected.velocities(1.0, notes.len());
-        let to_midi = |values: &[f32]| {
-            values
-                .iter()
-                .map(|value| ((value * 127.0).round() as u32).max(1))
-                .collect::<Vec<_>>()
-        };
-        assert_ne!(
-            to_midi(&first),
-            to_midi(&second),
-            "successive naturalized hits should reach different MIDI velocities"
-        );
-        commit_exact_velocity_map(engine, piano, &notes, &first);
+        let expected = [1.0, 1.0 - 0.34 / 3.0, 1.0 - 0.68 / 3.0, 0.66];
+        commit_exact_velocity_map(engine, piano, &notes, &expected);
         render(engine, 64);
 
         assert!(gooey_engine_piano_trigger_chord(
@@ -461,9 +420,9 @@ fn default_chord_dynamics_are_bass_led_and_advance_between_hits() {
         render(engine, 512);
         assert_eq!(gooey_engine_piano_active_voices(engine, piano), 4);
 
-        // The exact first-hit velocity zones no longer cover every note once
-        // the stored random sequence advances for the repeated chord.
-        assert!(!gooey_engine_piano_trigger_chord(
+        // There is no hidden random control: identical chord hits use the same
+        // per-note velocities until the instrument's slider property changes.
+        assert!(gooey_engine_piano_trigger_chord(
             engine,
             piano,
             0, // C
@@ -490,12 +449,7 @@ fn chord_trigger_reports_partial_maps_but_sounds_covered_notes() {
         // Cmaj7 is C4/E4/G4/B4. Stop the map at G4 so only B4 is missing.
         commit_two_layer_map_in_range(engine, piano, 8192, 60, 67);
         render(engine, 64);
-        assert!(gooey_engine_piano_set_chord_dynamics(
-            engine,
-            piano,
-            PIANO_VELOCITY_PROFILE_EVEN,
-            0.0
-        ));
+        assert!(gooey_engine_piano_set_velocity_mode(engine, piano, 0.5));
 
         assert!(!gooey_engine_piano_trigger_chord(
             engine,
@@ -525,12 +479,7 @@ fn chord_trigger_overlaps_non_shared_notes_and_self_masks_restrikes() {
         ));
         commit_two_layer_map(engine, piano, 3 * SR as usize);
         render(engine, 64);
-        assert!(gooey_engine_piano_set_chord_dynamics(
-            engine,
-            piano,
-            PIANO_VELOCITY_PROFILE_EVEN,
-            0.0
-        ));
+        assert!(gooey_engine_piano_set_velocity_mode(engine, piano, 0.5));
 
         assert!(gooey_engine_piano_trigger_chord(
             engine,

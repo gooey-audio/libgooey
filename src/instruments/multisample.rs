@@ -57,6 +57,11 @@ const FAST_FADE_SECS: f32 = 0.006;
 /// Largest release time a preset may ask for, in seconds.
 const MAX_RELEASE_SECS: f32 = 8.0;
 
+/// Maximum attenuation applied to one edge of a chord at a fully biased
+/// velocity mode. The emphasized edge stays at the base velocity while the
+/// opposite edge reaches 66%, matching the existing bass-led profile.
+const MAX_CHORD_VELOCITY_TILT: f32 = 0.34;
+
 /// How a zone's buffer behaves when the cursor reaches the end of the sample.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LoopMode {
@@ -660,6 +665,9 @@ pub struct MultiSampleInstrument {
     fading: [MsVoice; FADE_SLOT_COUNT],
     trigger_counter: u64,
     sustain_pedal: bool,
+    /// Normalized chord velocity balance: 0 emphasizes low notes, 0.5 is even,
+    /// and 1 emphasizes high notes. This affects future chord attacks only.
+    chord_velocity_mode: f32,
     /// Note staged by the sequencer via `Instrument::set_midi_note`.
     pending_note: Option<u8>,
 }
@@ -678,6 +686,7 @@ impl MultiSampleInstrument {
             fading: std::array::from_fn(|_| MsVoice::default()),
             trigger_counter: 0,
             sustain_pedal: false,
+            chord_velocity_mode: 0.0,
             pending_note: None,
         }
     }
@@ -711,6 +720,40 @@ impl MultiSampleInstrument {
 
     pub fn sample_rate(&self) -> f32 {
         self.sample_rate
+    }
+
+    /// Set the normalized chord velocity balance. Zero emphasizes the lowest
+    /// note, 0.5 strikes every note evenly, and one emphasizes the highest.
+    /// Non-finite values are ignored; finite values are clamped to 0–1.
+    pub fn set_chord_velocity_mode(&mut self, mode: f32) {
+        if mode.is_finite() {
+            self.chord_velocity_mode = mode.clamp(0.0, 1.0);
+        }
+    }
+
+    pub fn chord_velocity_mode(&self) -> f32 {
+        self.chord_velocity_mode
+    }
+
+    /// Turn one base chord velocity into a deterministic velocity per voice.
+    /// Voice zero is the lowest note, matching `apply_voicing`'s sorted output.
+    pub fn chord_velocities(&self, base: f32, count: usize) -> Vec<f32> {
+        let base = base.clamp(0.0, 1.0);
+        if count <= 1 {
+            return (0..count).map(|_| base.max(0.05)).collect();
+        }
+        let bias = (self.chord_velocity_mode - 0.5) * 2.0;
+        (0..count)
+            .map(|index| {
+                let position = index as f32 / (count - 1) as f32;
+                let attenuation = if bias < 0.0 {
+                    -bias * position
+                } else {
+                    bias * (1.0 - position)
+                };
+                (base * (1.0 - MAX_CHORD_VELOCITY_TILT * attenuation)).clamp(0.05, 1.0)
+            })
+            .collect()
     }
 
     /// Strike a key. `velocity` is normalized 0–1 and is converted to the MIDI
@@ -1045,6 +1088,36 @@ mod tests {
             let f = instrument.tick_frame();
             acc.max(f.l.abs()).max(f.r.abs())
         })
+    }
+
+    #[test]
+    fn chord_velocity_mode_tilts_continuously_from_low_to_high() {
+        let mut piano = MultiSampleInstrument::new(SR);
+        assert_eq!(piano.chord_velocity_mode(), 0.0);
+        let low = piano.chord_velocities(1.0, 4);
+        assert!(low.windows(2).all(|pair| pair[0] > pair[1]), "{low:?}");
+
+        piano.set_chord_velocity_mode(0.5);
+        let center = piano.chord_velocities(0.8, 4);
+        assert!(center.iter().all(|velocity| *velocity == 0.8));
+
+        piano.set_chord_velocity_mode(1.0);
+        let high = piano.chord_velocities(1.0, 4);
+        assert!(high.windows(2).all(|pair| pair[0] < pair[1]), "{high:?}");
+        assert_eq!(low[0], high[3]);
+        assert_eq!(low[3], high[0]);
+    }
+
+    #[test]
+    fn chord_velocity_mode_clamps_and_single_notes_keep_the_base_velocity() {
+        let mut piano = MultiSampleInstrument::new(SR);
+        piano.set_chord_velocity_mode(2.0);
+        assert_eq!(piano.chord_velocity_mode(), 1.0);
+        piano.set_chord_velocity_mode(-1.0);
+        assert_eq!(piano.chord_velocity_mode(), 0.0);
+        piano.set_chord_velocity_mode(f32::NAN);
+        assert_eq!(piano.chord_velocity_mode(), 0.0);
+        assert_eq!(piano.chord_velocities(0.7, 1), vec![0.7]);
     }
 
     #[test]

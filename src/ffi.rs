@@ -28,10 +28,7 @@ use crate::mixer::{
     ChannelEffect, LaunchQuantization, Mixer, MixerControl, MixerGraph, PitchMode, RetrimTiming,
     StereoSampleBuffer,
 };
-use crate::music::{
-    apply_voicing, available_voicings, ChordDynamics, Key, NoteName, ScaleType, VelocityProfile,
-    VoicingType,
-};
+use crate::music::{apply_voicing, available_voicings, Key, NoteName, ScaleType, VoicingType};
 use crate::performance::{ChordClipEvent, PerformanceRecorder, PlayerAction, RecordMode};
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -793,9 +790,6 @@ pub struct GooeyEngine {
     /// Config-time registered multi-sample instruments (pianos). Empty entries
     /// are not graph sources.
     pianos: [Option<MultiSampleInstrument>; MULTISAMPLE_INSTRUMENT_COUNT],
-    /// Per-piano chord velocity shaping. Kept across chord hits so the seeded
-    /// humanization sequence advances instead of repeating the same variation.
-    piano_dynamics: [ChordDynamics; MULTISAMPLE_INSTRUMENT_COUNT],
     /// Zones staged by the control thread, one builder per instrument, until
     /// `gooey_engine_piano_zone_commit` turns them into a map.
     piano_builders: [Option<SampleMap>; MULTISAMPLE_INSTRUMENT_COUNT],
@@ -1003,9 +997,6 @@ impl GooeyEngine {
             sampler_command_scratch: std::collections::VecDeque::with_capacity(16),
             sampler_retired: Vec::with_capacity(1024),
             pianos: std::array::from_fn(|_| None),
-            piano_dynamics: std::array::from_fn(|_| {
-                ChordDynamics::new(VelocityProfile::BassLead, 0.35)
-            }),
             piano_builders: std::array::from_fn(|_| None),
             piano_control,
             piano_command_scratch: std::collections::VecDeque::with_capacity(
@@ -2055,14 +2046,6 @@ pub const PIANO_PRESET_DEFAULT: u32 = 0;
 pub const PIANO_PRESET_SOFT: u32 = 1;
 /// Piano preset: tighter damper, wider image.
 pub const PIANO_PRESET_BRIGHT: u32 = 2;
-
-/// Piano chord velocity profile: every voice is struck at the base velocity.
-pub const PIANO_VELOCITY_PROFILE_EVEN: u32 = 0;
-/// Piano chord velocity profile: emphasize the top voice, anchor the root, and
-/// pull inner voices back.
-pub const PIANO_VELOCITY_PROFILE_MELODY_LEAD: u32 = 1;
-/// Piano chord velocity profile: emphasize the lowest note and thin upward.
-pub const PIANO_VELOCITY_PROFILE_BASS_LEAD: u32 = 2;
 
 /// Zone loop mode: play once to the end of the region.
 pub const PIANO_LOOP_NONE: u32 = 0;
@@ -7162,54 +7145,47 @@ pub unsafe extern "C" fn gooey_engine_piano_zone_count(
         .map_or(0, |engine| engine.piano_control.zone_count(piano as usize))
 }
 
-fn piano_velocity_profile_from_id(id: u32) -> Option<VelocityProfile> {
-    match id {
-        PIANO_VELOCITY_PROFILE_EVEN => Some(VelocityProfile::Even),
-        PIANO_VELOCITY_PROFILE_MELODY_LEAD => Some(VelocityProfile::MelodyLead),
-        PIANO_VELOCITY_PROFILE_BASS_LEAD => Some(VelocityProfile::BassLead),
-        _ => None,
-    }
-}
-
-/// Configure how a chord's base velocity is distributed across its notes.
-/// `profile` is one of the `PIANO_VELOCITY_PROFILE_*` constants. `humanize` is
-/// normalized 0–1 and controls small, seeded per-note variation; finite values
-/// outside that range are clamped. The profile and random sequence are held per
-/// piano, so successive chord hits vary while a fresh engine remains
-/// reproducible.
-///
-/// For a natural lower-note-weighted feel, use
-/// `PIANO_VELOCITY_PROFILE_BASS_LEAD` with `humanize == 0.35`. For mechanical
-/// playback, use `PIANO_VELOCITY_PROFILE_EVEN` with `humanize == 0.0`.
+/// Set the instrument's normalized chord velocity balance. Zero emphasizes
+/// lower notes, 0.5 strikes every note evenly, and one emphasizes upper notes.
+/// Finite values outside that range are clamped.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
 #[no_mangle]
-pub unsafe extern "C" fn gooey_engine_piano_set_chord_dynamics(
+pub unsafe extern "C" fn gooey_engine_piano_set_velocity_mode(
     engine: *mut GooeyEngine,
     piano: u32,
-    profile: u32,
-    humanize: f32,
+    mode: f32,
 ) -> bool {
-    if !humanize.is_finite() {
+    if !mode.is_finite() {
         return false;
     }
-    let Some(profile) = piano_velocity_profile_from_id(profile) else {
+    let Some(instrument) = engine
+        .as_mut()
+        .and_then(|engine| engine.pianos.get_mut(piano as usize))
+        .and_then(Option::as_mut)
+    else {
         return false;
     };
-    let Some(engine) = engine.as_mut() else {
-        return false;
-    };
-    let index = piano as usize;
-    if !engine.pianos.get(index).is_some_and(Option::is_some) {
-        return false;
-    }
-    let Some(dynamics) = engine.piano_dynamics.get_mut(index) else {
-        return false;
-    };
-    dynamics.set_profile(profile);
-    dynamics.set_humanize(humanize);
+    instrument.set_chord_velocity_mode(mode);
     true
+}
+
+/// Get the instrument's normalized chord velocity balance, or NaN for an
+/// invalid or unregistered piano.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_get_velocity_mode(
+    engine: *const GooeyEngine,
+    piano: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.pianos.get(piano as usize))
+        .and_then(Option::as_ref)
+        .map_or(f32::NAN, MultiSampleInstrument::chord_velocity_mode)
 }
 
 /// Trigger a diatonic seventh chord on a registered piano.
@@ -7217,9 +7193,9 @@ pub unsafe extern "C" fn gooey_engine_piano_set_chord_dynamics(
 /// The harmony arguments match `gooey_engine_poly_trigger_chord`: `root` is
 /// 0=C through 11=B, `scale_type` is `SCALE_MAJOR` or `SCALE_MINOR`, `degree`
 /// is 0–6, and `voicing` is one of the `VOICING_*` constants. `velocity` is a
-/// normalized 0–1 base strike strength. The piano's chord dynamics turn it
-/// into one velocity per note before the existing velocity-layered `note_on`
-/// path is used.
+/// normalized 0–1 base strike strength. The piano's velocity mode turns it into
+/// one velocity per note before the existing velocity-layered `note_on` path is
+/// used.
 ///
 /// Existing notes are not released. Non-shared notes may overlap, while a key
 /// present in both chords uses the piano's normal self-masking behavior when it
@@ -7255,13 +7231,10 @@ pub unsafe extern "C" fn gooey_engine_piano_trigger_chord(
     let chords = key.diatonic_sevenths();
     let chord = &chords[degree as usize % chords.len()];
     let notes = apply_voicing(chord, voicing_from_id(voicing), octave.clamp(0, 8) as i8);
-    let Some(dynamics) = engine.piano_dynamics.get_mut(index) else {
-        return false;
-    };
-    let velocities = dynamics.velocities(velocity.clamp(0.0, 1.0), notes.len());
     let Some(instrument) = engine.pianos.get_mut(index).and_then(Option::as_mut) else {
         return false;
     };
+    let velocities = instrument.chord_velocities(velocity.clamp(0.0, 1.0), notes.len());
 
     let mut all_sounded = true;
     for (note, note_velocity) in notes.into_iter().zip(velocities) {
