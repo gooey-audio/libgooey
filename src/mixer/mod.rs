@@ -615,6 +615,12 @@ impl Mixer {
         self.clip_grid.transport_running()
     }
 
+    /// Monotonic counter of transport discontinuities (seek/reset/start). See
+    /// [`ClipGrid::transport_generation`].
+    pub fn transport_generation(&self) -> u64 {
+        self.clip_grid.transport_generation()
+    }
+
     // --- Per-channel effects ----------------------------------------------
 
     /// Append an effect to a channel. Returns the new effect's slot index, or

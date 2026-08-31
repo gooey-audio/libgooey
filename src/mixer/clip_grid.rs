@@ -143,6 +143,14 @@ pub struct ClipGrid {
     default_quantization: LaunchQuantization,
     transport_beat: f64,
     transport_running: bool,
+    /// Bumped on every transport *discontinuity* (seek, reset, start) but never
+    /// by the per-sample advance in [`ClipGrid::after_tick`]. Consumers that
+    /// derive their own phase from `transport_beat` — the metronome, for
+    /// instance — cannot always infer a discontinuity from the beat value or
+    /// from `transport_running`, because a stop/reset/start issued between two
+    /// audio callbacks is drained as one batch and never observed as a stopped
+    /// tick. Watching this counter for change is exact.
+    transport_generation: u64,
     bpm: f32,
     sample_rate: f32,
 }
@@ -155,6 +163,7 @@ impl ClipGrid {
             default_quantization: LaunchQuantization::Bar,
             transport_beat: 0.0,
             transport_running: false,
+            transport_generation: 0,
             bpm,
             sample_rate,
         }
@@ -521,6 +530,10 @@ impl ClipGrid {
 
     pub fn transport_start(&mut self, channels: &mut [LoopChannel]) {
         self.transport_running = true;
+        // Starting is a discontinuity for phase-deriving consumers even though
+        // the beat does not move: a stop/start round trip should restate the
+        // grid position rather than be swallowed as "no change".
+        self.transport_generation = self.transport_generation.wrapping_add(1);
         for (column, state) in self.columns.iter().enumerate() {
             if state.active_row.is_some() {
                 if let Some(channel) = channels.get_mut(column) {
@@ -547,6 +560,9 @@ impl ClipGrid {
             return false;
         }
         self.transport_beat = beat;
+        // After the validity guard, so a rejected seek is not a discontinuity.
+        // `transport_reset` routes through here, so it bumps exactly once.
+        self.transport_generation = self.transport_generation.wrapping_add(1);
         for (column, state) in self.columns.iter().enumerate() {
             let Some(clip) = state.active_clip.as_ref() else {
                 continue;
@@ -573,6 +589,13 @@ impl ClipGrid {
 
     pub fn transport_running(&self) -> bool {
         self.transport_running
+    }
+
+    /// Monotonic counter of transport discontinuities. Only the *change* is
+    /// meaningful; the magnitude is not (an armed host-time start seeks and
+    /// then starts, so one logical discontinuity can bump it twice).
+    pub fn transport_generation(&self) -> u64 {
+        self.transport_generation
     }
 
     fn activate(&mut self, column: usize, row: usize, channels: &mut [LoopChannel]) {

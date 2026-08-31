@@ -23,6 +23,7 @@ use crate::instruments::{
     PolySynthConfig, SampleBuffer, SamplerBuffer, SamplerRack, SnareConfig, SnareDrum, Tom2,
     Tom2Config,
 };
+use crate::metronome::{Metronome, MetronomeDivision, DEFAULT_METRONOME_LEVEL};
 use crate::mixer::{
     ChannelEffect, LaunchQuantization, Mixer, MixerControl, MixerGraph, PitchMode, RetrimTiming,
     StereoSampleBuffer,
@@ -797,6 +798,14 @@ pub struct GooeyEngine {
     piano_control: MultiSampleControl,
     piano_command_scratch: std::collections::VecDeque<MultiSampleCommand>,
     piano_retired: Vec<std::sync::Arc<SampleMap>>,
+
+    // Optional monitor click, disabled by default. Summed after the limiter so
+    // it never feeds an effect, is never scaled by the master fader, and is
+    // never captured by track metering. See `src/metronome.rs`.
+    metronome: Metronome,
+    // True only while `bounce_to_buffer` drives `render` offline. The metronome
+    // consults it so a monitoring aid can never land in an exported file.
+    offline_bounce: bool,
 }
 
 /// Host-clock reference for the next render buffer. The audio callback sets
@@ -994,6 +1003,9 @@ impl GooeyEngine {
                 MULTISAMPLE_INSTRUMENT_COUNT,
             ),
             piano_retired: Vec::with_capacity(MULTISAMPLE_INSTRUMENT_COUNT * 4),
+            // Monitor click, off until the host asks for it.
+            metronome: Metronome::new(sample_rate, bpm),
+            offline_bounce: false,
         }
     }
 
@@ -1237,13 +1249,21 @@ impl GooeyEngine {
                 arm_fires_at = None;
             }
 
+            // One transport read per frame, taken before `self.mixer.tick(..)`
+            // below advances the beat. The sampler racks and the monitor click
+            // must both see this same pre-tick value: reading the beat again
+            // after the tick would place the click one sample later than a clip
+            // launch scheduled at the same grid position.
+            //
             // A rack start is owned by the render clock, not by the host UI
             // timer. Applying it before sequencer ticks makes step zero fire on
             // the same sample as a clip launch at this shared bar boundary.
-            if self.mixer.transport_running() {
-                let beat = self.mixer.transport_beat();
+            let transport_running = self.mixer.transport_running();
+            let transport_beat = self.mixer.transport_beat();
+            let transport_generation = self.mixer.transport_generation();
+            if transport_running {
                 for rack in self.samplers.iter_mut().flatten() {
-                    rack.activate_start_if_due(beat);
+                    rack.activate_start_if_due(transport_beat);
                 }
             }
 
@@ -1473,11 +1493,26 @@ impl GooeyEngine {
             }
 
             // Optional limiter (always last when enabled)
-            let stereo = if self.limiter_enabled {
+            let mut stereo = if self.limiter_enabled {
                 self.limiter.process_stereo(stereo)
             } else {
                 stereo
             };
+
+            // Monitor click, summed after everything else. The metronome is a
+            // listening aid, not part of the mix: keeping it outside the master
+            // fader, the effect chain, and the limiter means enabling it cannot
+            // change the sound of the material being auditioned, and it cannot
+            // feed a reverb tail, a delay line, or the compressor sidechain.
+            // Skipped entirely during an offline bounce so exports stay clean.
+            if !self.offline_bounce {
+                stereo += self.metronome.tick(
+                    transport_running,
+                    transport_beat,
+                    transport_generation,
+                    self.current_time,
+                );
+            }
 
             // Write the frame interleaved as [left, right].
             frame[0] = stereo.l;
@@ -3508,6 +3543,9 @@ pub unsafe extern "C" fn gooey_engine_set_bpm(engine: *mut GooeyEngine, bpm: f32
     // this function's engine mutation is a separate, pre-existing concern).
     engine.mixer_control.set_bpm(bpm);
 
+    // The click derives its beat-boundary tolerance from beats-per-sample.
+    engine.metronome.set_bpm(bpm);
+
     // Propagate BPM to note-synced effects in per-track racks.
     engine.graph.set_bpm(bpm);
 }
@@ -3640,6 +3678,197 @@ pub unsafe extern "C" fn gooey_engine_get_swing(engine: *mut GooeyEngine) -> f32
 
     let engine = &*engine;
     engine.swing
+}
+
+// =============================================================================
+// Metronome (monitor click)
+// =============================================================================
+//
+// An optional click track, disabled by default. It is locked to the engine's
+// musical transport — the same monotonic quarter-note clock reported by
+// `gooey_engine_transport_get_beat_position` and used to quantize clip launches
+// — so a click always lands exactly where a clip could have launched. It sounds
+// only while the transport is running, and it is summed AFTER the master fader,
+// the global effects chain, and the limiter. Enabling it therefore cannot alter
+// the sound of the material being auditioned, and it never appears in
+// `gooey_engine_bounce_to_buffer`, `gooey_engine_bounce_to_wav`, or
+// `gooey_engine_loop_render_to_wav` output.
+
+/// Click on every 4/4 bar line only.
+pub const METRONOME_DIVISION_BAR: u32 = crate::metronome::METRONOME_DIVISION_BAR;
+/// Click on every quarter note (the default).
+pub const METRONOME_DIVISION_QUARTER: u32 = crate::metronome::METRONOME_DIVISION_QUARTER;
+/// Click on every eighth note.
+pub const METRONOME_DIVISION_EIGHTH: u32 = crate::metronome::METRONOME_DIVISION_EIGHTH;
+/// Click on every sixteenth note.
+pub const METRONOME_DIVISION_SIXTEENTH: u32 = crate::metronome::METRONOME_DIVISION_SIXTEENTH;
+
+/// Enable or disable the monitor click.
+///
+/// Disabled by default. While enabled, one click sounds on every boundary of
+/// the configured division (quarter notes by default), and the first click of
+/// each 4-beat bar is accented unless the accent has been turned off. Nothing
+/// sounds while the transport is stopped — see `gooey_engine_sequencer_start`
+/// and `gooey_engine_sequencer_stop`.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `enabled` - `true` to hear the click, `false` for exact silence
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_metronome_enabled(
+    engine: *mut GooeyEngine,
+    enabled: bool,
+) {
+    if engine.is_null() {
+        return;
+    }
+    (*engine).metronome.set_enabled(enabled);
+}
+
+/// Query whether the monitor click is enabled.
+///
+/// # Returns
+/// `true` if the click is enabled, or `false` if `engine` is null — the safe
+/// default, matching the disabled-by-default behavior.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_metronome_enabled(engine: *const GooeyEngine) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+    (*engine).metronome.is_enabled()
+}
+
+/// Set the monitor click level.
+///
+/// The click is summed after the limiter, so this level is independent of
+/// `gooey_engine_set_master_gain` and of every track fader. Non-finite values
+/// are ignored; finite values are clamped to `0.0..=1.0` and smoothed over
+/// 10 ms so a fader move never zips.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `level` - Linear peak level for an accented click, clamped to 0.0-1.0.
+///   Un-accented clicks sound at 70% of this. The default is 0.35.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_metronome_level(engine: *mut GooeyEngine, level: f32) {
+    if engine.is_null() || !level.is_finite() {
+        return;
+    }
+    (*engine).metronome.set_level(level);
+}
+
+/// Get the current monitor click level.
+///
+/// Returns the most-recently-set target (not the in-flight smoothed value), so
+/// set→get round-trips exactly.
+///
+/// # Returns
+/// The current linear level target, or 0.35 — the default — if `engine` is null.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_metronome_level(engine: *const GooeyEngine) -> f32 {
+    if engine.is_null() {
+        return DEFAULT_METRONOME_LEVEL;
+    }
+    (*engine).metronome.level()
+}
+
+/// Set how often the click sounds.
+///
+/// Changing the division resyncs the click to the transport grid, so the new
+/// rate takes effect from the next boundary rather than inheriting a position
+/// measured in the old units.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `division` - One of `METRONOME_DIVISION_BAR` (0),
+///   `METRONOME_DIVISION_QUARTER` (1, the default),
+///   `METRONOME_DIVISION_EIGHTH` (2), or `METRONOME_DIVISION_SIXTEENTH` (3).
+///   An unrecognized value is ignored and the current division is kept.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_metronome_division(
+    engine: *mut GooeyEngine,
+    division: u32,
+) {
+    if engine.is_null() {
+        return;
+    }
+    let Some(division) = MetronomeDivision::from_id(division) else {
+        return;
+    };
+    (*engine).metronome.set_division(division);
+}
+
+/// Get the current click division.
+///
+/// # Returns
+/// One of the `METRONOME_DIVISION_*` values, or
+/// `METRONOME_DIVISION_QUARTER` (1) — the default — if `engine` is null.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_metronome_division(engine: *const GooeyEngine) -> u32 {
+    if engine.is_null() {
+        return METRONOME_DIVISION_QUARTER;
+    }
+    (*engine).metronome.division().id()
+}
+
+/// Enable or disable the downbeat accent.
+///
+/// When enabled — the default — the first click of every 4-beat bar sounds
+/// higher and louder than the rest, so the bar line is audible and not just the
+/// pulse. The engine has no time-signature concept: a bar is always 4 quarter
+/// notes, the same assumption clip launch quantization makes. Hosts working in
+/// other meters should turn the accent off and hear a uniform click.
+///
+/// At `METRONOME_DIVISION_BAR` every click is a bar start, so the accent
+/// applies to all of them and this toggle only changes the pitch and level.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_metronome_accent_enabled(
+    engine: *mut GooeyEngine,
+    enabled: bool,
+) {
+    if engine.is_null() {
+        return;
+    }
+    (*engine).metronome.set_accent_enabled(enabled);
+}
+
+/// Query whether the downbeat accent is enabled.
+///
+/// # Returns
+/// `true` if the accent is enabled, or `true` if `engine` is null — the safe
+/// default, matching the accent-on-by-default behavior.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_metronome_accent_enabled(
+    engine: *const GooeyEngine,
+) -> bool {
+    if engine.is_null() {
+        return true;
+    }
+    (*engine).metronome.accent_enabled()
 }
 
 // =============================================================================
@@ -8778,6 +9007,15 @@ impl GooeyEngine {
 
         // Reset engine to a clean state
         self.current_time = 0.0;
+
+        // The monitor click is a listening aid and is never part of an export.
+        // `render` reads this flag and skips the metronome entirely, so the
+        // click's post-limiter position alone is not what keeps it out of the
+        // bounce — this flag is. If this function panics mid-loop the flag
+        // stays set and the click goes silent until the next bounce; `render`
+        // is `catch_unwind`-wrapped at the FFI boundary but this path is not.
+        self.offline_bounce = true;
+        self.metronome.reset();
         for seq in self.sequencers_iter_mut() {
             seq.reset();
             seq.start();
@@ -8819,6 +9057,9 @@ impl GooeyEngine {
         for seq in self.sequencers_iter_mut() {
             seq.stop();
         }
+
+        self.offline_bounce = false;
+        self.metronome.reset();
 
         output
     }
@@ -8937,6 +9178,10 @@ pub unsafe extern "C" fn gooey_engine_bounce_to_wav(
 /// This drives the channel directly and is **not** real-time safe: it must not
 /// run concurrently against the same engine's realtime render callback. Callers
 /// (e.g. Whirlpool) invoke it on a disposable offline engine.
+///
+/// Because it drives the channel directly rather than going through
+/// `GooeyEngine::render`, it needs no metronome bypass — the monitor click can
+/// never reach this output regardless of whether it is enabled.
 ///
 /// # Safety
 /// - `engine` must be a valid pointer returned by `gooey_engine_new`.

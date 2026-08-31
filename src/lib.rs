@@ -4,6 +4,7 @@ pub mod dsl;
 pub mod envelope;
 pub mod filters;
 pub mod max_curve;
+pub mod metronome;
 
 // New organized modules
 pub mod effects;
