@@ -10,8 +10,8 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 // Import the engine and instruments
-use libgooey::engine::{Engine, EngineOutput, Lfo, MusicalDivision};
-use libgooey::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
+use gooey::engine::{Engine, EngineOutput, Lfo, MusicalDivision};
+use gooey::instruments::{HiHat, KickDrum, SnareDrum, TomDrum};
 
 // CLI example for LFO testing
 #[cfg(feature = "native")]
