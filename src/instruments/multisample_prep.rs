@@ -65,6 +65,71 @@ pub struct PrepareOptions {
     pub mono: bool,
     /// File name for the emitted SFZ.
     pub sfz_name: String,
+    /// Where the source material came from, and under what terms.
+    ///
+    /// A prepared pack is a *derivative* of someone's recordings, and the
+    /// permissive licenses these packs ship under (CC-BY in particular) require
+    /// attribution wherever the audio is redistributed. Setting this writes the
+    /// credit into the emitted SFZ and a `NOTICE.txt`, so the obligation travels
+    /// with the files instead of living in a README nobody copies.
+    pub attribution: Option<Attribution>,
+}
+
+/// Credit for the source recordings.
+#[derive(Clone, Debug)]
+pub struct Attribution {
+    /// Pack name, e.g. "Salamander Grand Piano V3".
+    pub source: String,
+    /// Who recorded it.
+    pub author: String,
+    /// License identifier, e.g. "CC-BY 3.0".
+    pub license: String,
+    /// Where it came from.
+    pub url: String,
+}
+
+impl Attribution {
+    pub fn new(
+        source: impl Into<String>,
+        author: impl Into<String>,
+        license: impl Into<String>,
+        url: impl Into<String>,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            author: author.into(),
+            license: license.into(),
+            url: url.into(),
+        }
+    }
+
+    /// Salamander Grand Piano V3, the pack `scripts/fetch-piano-pack.sh` fetches.
+    pub fn salamander() -> Self {
+        Self::new(
+            "Salamander Grand Piano V3",
+            "Alexander Holm",
+            "CC-BY 3.0",
+            "https://archive.org/details/SalamanderGrandPianoV3",
+        )
+    }
+
+    /// The `NOTICE.txt` shipped beside a prepared pack. Names the author, the
+    /// license, and — as CC-BY requires — that the material was modified.
+    fn notice(&self) -> String {
+        format!(
+            "This instrument is derived from {}\n\
+             by {}, licensed {}.\n\
+             Source: {}\n\
+             \n\
+             MODIFIED: velocity layers and/or key range thinned, samples\n\
+             truncated and faded, and re-encoded as 16-bit PCM by libgooey's\n\
+             multisample_prep.\n\
+             \n\
+             If you redistribute this instrument — including inside an\n\
+             application — this credit must accompany it.\n",
+            self.source, self.author, self.license, self.url
+        )
+    }
 }
 
 impl Default for PrepareOptions {
@@ -73,6 +138,7 @@ impl Default for PrepareOptions {
             load: PackLoadOptions::default(),
             mono: false,
             sfz_name: "instrument.sfz".to_string(),
+            attribution: None,
         }
     }
 }
@@ -90,6 +156,7 @@ impl PrepareOptions {
                 .with_max_seconds(Some(6.0)),
             mono: false,
             sfz_name: "instrument.sfz".to_string(),
+            attribution: None,
         }
     }
 
@@ -102,7 +169,14 @@ impl PrepareOptions {
                 .with_max_seconds(Some(4.0)),
             mono: true,
             sfz_name: "instrument.sfz".to_string(),
+            attribution: None,
         }
+    }
+
+    /// Attach source credit. Required by CC-BY packs; see [`Attribution`].
+    pub fn with_attribution(mut self, attribution: Attribution) -> Self {
+        self.attribution = Some(attribution);
+        self
     }
 }
 
@@ -162,7 +236,21 @@ pub fn prepare_pack(
 
     let mut sfz = String::new();
     sfz.push_str("// Prepared by libgooey multisample_prep.\n");
-    sfz.push_str("// Derived from a source pack; original license and attribution still apply.\n");
+    match &options.attribution {
+        Some(credit) => {
+            sfz.push_str(&format!(
+                "// Derived from {} by {}, licensed {}.\n// Source: {}\n\
+                 // MODIFIED: thinned, truncated, re-encoded 16-bit. See NOTICE.txt.\n",
+                credit.source, credit.author, credit.license, credit.url
+            ));
+            let notice = out_dir.join("NOTICE.txt");
+            std::fs::write(&notice, credit.notice())
+                .map_err(|e| format!("Failed to write {}: {e}", notice.display()))?;
+        }
+        None => sfz.push_str(
+            "// Derived from a source pack; its original license and attribution still apply.\n",
+        ),
+    }
     sfz.push_str(&format!("<control> default_path={SAMPLES_DIR}/\n\n"));
 
     let mut output_bytes = 0u64;
@@ -562,6 +650,44 @@ mod tests {
             "veltrack {}",
             z.amp_veltrack
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn attribution_travels_with_the_prepared_pack() {
+        // A prepared pack is a modified derivative, and CC-BY requires the
+        // credit to accompany it wherever it goes — including inside a shipped
+        // app. So it must be written into the files, not just documented.
+        let dir = temp_dir();
+        let source = source_pack(&dir, 2, 1.0);
+        let out = dir.join("out");
+
+        let options = PrepareOptions::default().with_attribution(Attribution::salamander());
+        let report = prepare_pack(&source, &out, &options).unwrap();
+
+        let notice = std::fs::read_to_string(out.join("NOTICE.txt")).unwrap();
+        assert!(notice.contains("Alexander Holm"), "{notice}");
+        assert!(notice.contains("CC-BY 3.0"), "{notice}");
+        assert!(
+            notice.contains("MODIFIED"),
+            "CC-BY requires stating that changes were made: {notice}"
+        );
+
+        // ...and the SFZ carries it too, so a stray .sfz still names its source.
+        let sfz = std::fs::read_to_string(&report.sfz_path).unwrap();
+        assert!(sfz.contains("Alexander Holm"), "{sfz}");
+        assert!(sfz.contains("CC-BY 3.0"));
+        // The credit is commented out, so it must not disturb parsing.
+        let reloaded = load_sfz(&report.sfz_path, &PackLoadOptions::everything()).unwrap();
+        assert_eq!(reloaded.map.build().zone_count(), report.zones_written);
+
+        // Without attribution there is no NOTICE, but the SFZ still warns.
+        let bare_out = dir.join("bare");
+        let bare = prepare_pack(&source, &bare_out, &PrepareOptions::default()).unwrap();
+        assert!(!bare_out.join("NOTICE.txt").exists());
+        let bare_sfz = std::fs::read_to_string(&bare.sfz_path).unwrap();
+        assert!(bare_sfz.contains("original license and attribution still apply"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

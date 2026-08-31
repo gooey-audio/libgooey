@@ -17,6 +17,8 @@
 //!   --keys LO-HI      restrict to a MIDI key range, e.g. 33-96
 //!   --mono            collapse to mono, halving memory again
 //!   --releases        include release (damper noise) samples
+//!   --attribution S   credit the source; 'salamander' is built in. Required by
+//!                     CC-BY packs — writes NOTICE.txt beside the pack.
 //!   --preset mobile   8 layers / 6s / stereo   (~230 MB for Salamander)
 //!   --preset compact  4 layers / 4s / mono     (for tight memory ceilings)
 //!
@@ -28,7 +30,7 @@
 #[cfg(feature = "bounce")]
 use gooey::instruments::multisample_pack::PackLoadOptions;
 #[cfg(feature = "bounce")]
-use gooey::instruments::multisample_prep::{prepare_pack, PrepareOptions};
+use gooey::instruments::multisample_prep::{prepare_pack, Attribution, PrepareOptions};
 
 #[cfg(feature = "bounce")]
 fn parse_args() -> Result<(String, String, PrepareOptions), String> {
@@ -44,6 +46,7 @@ fn parse_args() -> Result<(String, String, PrepareOptions), String> {
     let mut keys = None;
     let mut mono = false;
     let mut releases = false;
+    let mut attribution = None;
 
     let mut i = 2;
     while i < args.len() {
@@ -91,6 +94,17 @@ fn parse_args() -> Result<(String, String, PrepareOptions), String> {
                 ));
                 i += 2;
             }
+            "--attribution" => {
+                attribution = match value()?.as_str() {
+                    "salamander" => Some(Attribution::salamander()),
+                    other => {
+                        return Err(format!(
+                        "unknown attribution '{other}'; use 'salamander' or edit PrepareOptions"
+                    ))
+                    }
+                };
+                i += 2;
+            }
             "--mono" => {
                 mono = true;
                 i += 1;
@@ -115,6 +129,7 @@ fn parse_args() -> Result<(String, String, PrepareOptions), String> {
         PrepareOptions {
             load,
             mono,
+            attribution,
             ..PrepareOptions::default()
         },
     ))
