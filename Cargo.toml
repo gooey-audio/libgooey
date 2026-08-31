@@ -102,6 +102,10 @@ name = "chords"
 required-features = ["native", "crossterm"]
 
 [[example]]
+name = "polysynth_gui"
+required-features = ["native", "visualization"]
+
+[[example]]
 name = "bounce"
 required-features = ["bounce"]
 

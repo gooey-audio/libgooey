@@ -19,9 +19,9 @@ use crate::instruments::multisample_control::{
 };
 use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
-    BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth,
-    PolySynthConfig, SampleBuffer, SamplerBuffer, SamplerRack, SnareConfig, SnareDrum, Tom2,
-    Tom2Config,
+    BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolyModRoute,
+    PolyModSource, PolySynth, PolySynthConfig, SampleBuffer, SamplerBuffer, SamplerRack,
+    SnareConfig, SnareDrum, Tom2, Tom2Config,
 };
 use crate::metronome::{Metronome, MetronomeDivision, DEFAULT_METRONOME_LEVEL};
 use crate::mixer::{
@@ -740,9 +740,10 @@ pub struct GooeyEngine {
 
     // Polyphonic synthesizer for chord playback
     poly_synth: PolySynth,
-    /// Per-engine editable copies of the five factory poly-synth presets.
+    // Each engine owns editable copies of the five factory sounds. Chord
+    // retriggers load these copies, so host edits are never replaced by a
+    // freshly constructed factory config.
     poly_presets: [PolySynthConfig; POLY_PRESET_COUNT as usize],
-    /// Canonical `POLY_PRESET_*` id currently loaded into `poly_synth`.
     poly_current_preset: u32,
 
     // Mono granular instrument (sample buffer loaded by the host)
@@ -1409,9 +1410,11 @@ impl GooeyEngine {
                 voice.record_peak(ch_out.abs());
             }
 
-            // Poly synth and granulator have no pan control yet — center them
-            // for consistency with the equal-power law used above.
-            let poly_frame = StereoFrame::panned(self.poly_synth.tick(time), 0.5);
+            // The poly synth now owns a native stereo image (two oscillators
+            // spread by its width control). Feed that image into the graph
+            // unchanged; the track strip can still balance it later.
+            let poly_frame = self.poly_synth.tick_frame(time);
+            // Granulator remains mono and enters through the equal-power seam.
             let gran_frame = StereoFrame::panned(self.granulator.tick(time), 0.5);
             let sampler_frames: [StereoFrame; SAMPLER_RACK_MAX as usize] =
                 std::array::from_fn(|index| {
@@ -4197,14 +4200,16 @@ impl GooeyEngine {
         (step + frac) / 4.0
     }
 
-    /// Load an editable preset copy into the live poly synth.
-    ///
-    /// Unknown ids retain the historical behavior of selecting the default
-    /// preset rather than leaving the previous sound active.
-    fn apply_poly_preset(&mut self, preset: u32) {
-        let index = canonical_poly_preset_index(preset);
-        self.poly_current_preset = index as u32;
+    /// Load one editable preset copy into the live synth. Continuous controls
+    /// move through their smoothers; note-on envelope and modulation settings
+    /// apply to subsequently triggered voices.
+    fn apply_poly_preset(&mut self, preset: u32) -> bool {
+        let Some(index) = valid_poly_preset_index(preset) else {
+            return false;
+        };
+        self.poly_current_preset = preset;
         self.poly_synth.set_config(self.poly_presets[index]);
+        true
     }
 
     /// Apply a clip player action to the poly synth without recording.
@@ -4231,7 +4236,10 @@ impl GooeyEngine {
         let velocity = event.velocity.clamp(0.0, 1.0);
 
         // Smoothed targets only — avoid snap_params on every clip replay hit.
-        self.apply_poly_preset(event.preset);
+        // An invalid persisted id leaves the current sound and voices alone.
+        if !self.apply_poly_preset(event.preset) {
+            return;
+        }
 
         let chords = key.diatonic_sevenths();
         let degree = event.degree as usize % chords.len().max(1);
@@ -5887,50 +5895,90 @@ pub unsafe extern "C" fn gooey_engine_blend_reset_corners(
 // =============================================================================
 
 // Preset IDs
-/// Poly-synth default sound.
 pub const POLY_PRESET_DEFAULT: u32 = 0;
-/// Poly-synth pad sound.
 pub const POLY_PRESET_PAD: u32 = 1;
-/// Poly-synth pluck sound.
 pub const POLY_PRESET_PLUCK: u32 = 2;
-/// Poly-synth keys sound.
 pub const POLY_PRESET_KEYS: u32 = 3;
-/// Poly-synth strings sound.
 pub const POLY_PRESET_STRINGS: u32 = 4;
-/// Number of editable poly-synth presets.
 pub const POLY_PRESET_COUNT: u32 = 5;
 
-// Parameter IDs (must match Swift/C enum if used)
-/// Poly parameter: oscillator shape (0=saw, 1=square).
-pub const POLY_PARAM_OSC_SHAPE: u32 = crate::instruments::POLY_PARAM_OSC_SHAPE;
-/// Poly parameter: two-oscillator detune spread (0-1).
-pub const POLY_PARAM_DETUNE_AMOUNT: u32 = crate::instruments::POLY_PARAM_DETUNE_AMOUNT;
-/// Poly parameter: base filter cutoff (0-1 -> 20-18000 Hz exponential).
-pub const POLY_PARAM_FILTER_CUTOFF: u32 = crate::instruments::POLY_PARAM_FILTER_CUTOFF;
-/// Poly parameter: filter resonance (0-1 -> 0.5-15 Q).
-pub const POLY_PARAM_FILTER_RESONANCE: u32 = crate::instruments::POLY_PARAM_FILTER_RESONANCE;
-/// Poly parameter: filter-envelope depth (0-1).
-pub const POLY_PARAM_FILTER_ENV_AMOUNT: u32 = crate::instruments::POLY_PARAM_FILTER_ENV_AMOUNT;
-/// Poly parameter: amplitude-envelope attack (0-1 -> 1 ms-5 s exponential).
+// Clean poly parameter ABI. All values are normalized 0-1; pitch and filter
+// envelope amounts use 0.5 as their neutral point.
+pub const POLY_PARAM_OSC_A_WAVEFORM: u32 = crate::instruments::POLY_PARAM_OSC_A_WAVEFORM;
+pub const POLY_PARAM_OSC_A_LEVEL: u32 = crate::instruments::POLY_PARAM_OSC_A_LEVEL;
+pub const POLY_PARAM_OSC_B_WAVEFORM: u32 = crate::instruments::POLY_PARAM_OSC_B_WAVEFORM;
+pub const POLY_PARAM_OSC_B_LEVEL: u32 = crate::instruments::POLY_PARAM_OSC_B_LEVEL;
+pub const POLY_PARAM_DETUNE: u32 = crate::instruments::POLY_PARAM_DETUNE;
+pub const POLY_PARAM_STEREO_WIDTH: u32 = crate::instruments::POLY_PARAM_STEREO_WIDTH;
 pub const POLY_PARAM_AMP_ATTACK: u32 = crate::instruments::POLY_PARAM_AMP_ATTACK;
-/// Poly parameter: amplitude-envelope decay (0-1 -> 1 ms-5 s exponential).
 pub const POLY_PARAM_AMP_DECAY: u32 = crate::instruments::POLY_PARAM_AMP_DECAY;
-/// Poly parameter: amplitude-envelope sustain level (0-1).
 pub const POLY_PARAM_AMP_SUSTAIN: u32 = crate::instruments::POLY_PARAM_AMP_SUSTAIN;
-/// Poly parameter: amplitude-envelope release (0-1 -> 1 ms-5 s exponential).
 pub const POLY_PARAM_AMP_RELEASE: u32 = crate::instruments::POLY_PARAM_AMP_RELEASE;
-/// Poly parameter: filter-envelope attack (0-1 -> 1 ms-5 s exponential).
+pub const POLY_PARAM_AMP_ATTACK_CURVE: u32 = crate::instruments::POLY_PARAM_AMP_ATTACK_CURVE;
+pub const POLY_PARAM_AMP_FALL_CURVE: u32 = crate::instruments::POLY_PARAM_AMP_FALL_CURVE;
+pub const POLY_PARAM_PITCH_ENV_AMOUNT: u32 = crate::instruments::POLY_PARAM_PITCH_ENV_AMOUNT;
+pub const POLY_PARAM_PITCH_ATTACK: u32 = crate::instruments::POLY_PARAM_PITCH_ATTACK;
+pub const POLY_PARAM_PITCH_DECAY: u32 = crate::instruments::POLY_PARAM_PITCH_DECAY;
+pub const POLY_PARAM_PITCH_SUSTAIN: u32 = crate::instruments::POLY_PARAM_PITCH_SUSTAIN;
+pub const POLY_PARAM_PITCH_RELEASE: u32 = crate::instruments::POLY_PARAM_PITCH_RELEASE;
+pub const POLY_PARAM_PITCH_ATTACK_CURVE: u32 = crate::instruments::POLY_PARAM_PITCH_ATTACK_CURVE;
+pub const POLY_PARAM_PITCH_FALL_CURVE: u32 = crate::instruments::POLY_PARAM_PITCH_FALL_CURVE;
+pub const POLY_PARAM_FILTER_CUTOFF: u32 = crate::instruments::POLY_PARAM_FILTER_CUTOFF;
+pub const POLY_PARAM_FILTER_RESONANCE: u32 = crate::instruments::POLY_PARAM_FILTER_RESONANCE;
+pub const POLY_PARAM_FILTER_ENV_AMOUNT: u32 = crate::instruments::POLY_PARAM_FILTER_ENV_AMOUNT;
 pub const POLY_PARAM_FILTER_ATTACK: u32 = crate::instruments::POLY_PARAM_FILTER_ATTACK;
-/// Poly parameter: filter-envelope decay (0-1 -> 1 ms-5 s exponential).
 pub const POLY_PARAM_FILTER_DECAY: u32 = crate::instruments::POLY_PARAM_FILTER_DECAY;
-/// Poly parameter: filter-envelope sustain level (0-1).
 pub const POLY_PARAM_FILTER_SUSTAIN: u32 = crate::instruments::POLY_PARAM_FILTER_SUSTAIN;
-/// Poly parameter: filter-envelope release (0-1 -> 1 ms-5 s exponential).
 pub const POLY_PARAM_FILTER_RELEASE: u32 = crate::instruments::POLY_PARAM_FILTER_RELEASE;
-/// Poly parameter: overall volume (0-1).
+pub const POLY_PARAM_FILTER_ATTACK_CURVE: u32 = crate::instruments::POLY_PARAM_FILTER_ATTACK_CURVE;
+pub const POLY_PARAM_FILTER_FALL_CURVE: u32 = crate::instruments::POLY_PARAM_FILTER_FALL_CURVE;
+pub const POLY_PARAM_SATURATION: u32 = crate::instruments::POLY_PARAM_SATURATION;
 pub const POLY_PARAM_VOLUME: u32 = crate::instruments::POLY_PARAM_VOLUME;
-/// Number of addressable poly-synth parameters.
 pub const POLY_PARAM_COUNT: u32 = crate::instruments::POLY_PARAM_COUNT;
+
+pub const POLY_MOD_SOURCE_VELOCITY: u32 = PolyModSource::Velocity as u32;
+pub const POLY_MOD_SOURCE_KEY_POSITION: u32 = PolyModSource::KeyPosition as u32;
+pub const POLY_MOD_ROUTE_COUNT: u32 = crate::instruments::POLY_MOD_ROUTE_COUNT as u32;
+
+/// One velocity/key modulation route. `depth` and `key_scale` are bipolar
+/// -1..1 values; `curve` is normalized 0..1 with 0.5 equal to linear.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GooeyPolyModRoute {
+    pub enabled: bool,
+    pub source: u32,
+    pub destination: u32,
+    pub depth: f32,
+    pub curve: f32,
+    pub key_scale: f32,
+}
+
+impl GooeyPolyModRoute {
+    fn into_route(self) -> Option<PolyModRoute> {
+        PolyModRoute {
+            enabled: self.enabled,
+            source: PolyModSource::from_id(self.source)?,
+            destination: self.destination,
+            depth: self.depth,
+            curve: self.curve,
+            key_scale: self.key_scale,
+        }
+        .validated()
+    }
+}
+
+impl From<PolyModRoute> for GooeyPolyModRoute {
+    fn from(route: PolyModRoute) -> Self {
+        Self {
+            enabled: route.enabled,
+            source: route.source.id(),
+            destination: route.destination,
+            depth: route.depth,
+            curve: route.curve,
+            key_scale: route.key_scale,
+        }
+    }
+}
 
 // Scale type IDs
 pub const SCALE_MAJOR: u32 = 0;
@@ -5974,13 +6022,14 @@ fn root_from_id(id: u32) -> NoteName {
     NoteName::from_index(id as u8 % 12)
 }
 
-fn factory_poly_preset_config(id: u32) -> PolySynthConfig {
+fn factory_poly_preset_config(id: u32) -> Option<PolySynthConfig> {
     match id {
-        POLY_PRESET_PAD => PolySynthConfig::pad(),
-        POLY_PRESET_PLUCK => PolySynthConfig::pluck(),
-        POLY_PRESET_KEYS => PolySynthConfig::keys(),
-        POLY_PRESET_STRINGS => PolySynthConfig::strings(),
-        _ => PolySynthConfig::default(),
+        POLY_PRESET_DEFAULT => Some(PolySynthConfig::default()),
+        POLY_PRESET_PAD => Some(PolySynthConfig::pad()),
+        POLY_PRESET_PLUCK => Some(PolySynthConfig::pluck()),
+        POLY_PRESET_KEYS => Some(PolySynthConfig::keys()),
+        POLY_PRESET_STRINGS => Some(PolySynthConfig::strings()),
+        _ => None,
     }
 }
 
@@ -5996,10 +6045,6 @@ fn factory_poly_presets() -> [PolySynthConfig; POLY_PRESET_COUNT as usize] {
 
 fn valid_poly_preset_index(preset: u32) -> Option<usize> {
     (preset < POLY_PRESET_COUNT).then_some(preset as usize)
-}
-
-fn canonical_poly_preset_index(preset: u32) -> usize {
-    valid_poly_preset_index(preset).unwrap_or(POLY_PRESET_DEFAULT as usize)
 }
 
 /// Trigger a diatonic chord from a key.
@@ -6042,10 +6087,11 @@ pub unsafe extern "C" fn gooey_engine_poly_trigger_chord(
     let octave_clamped = octave.clamp(0, 8) as i8;
     let velocity = velocity.clamp(0.0, 1.0);
 
-    // Apply preset only as smoothed targets — do not snap_params here.
-    // Snapping on every chord change forces discontinuous filter/volume jumps
-    // while voices may still be releasing, which clicks.
-    engine.apply_poly_preset(preset);
+    // Apply the engine's editable preset copy as smoothed targets. Invalid ids
+    // fail without releasing the current chord or changing active state.
+    if !engine.apply_poly_preset(preset) {
+        return;
+    }
 
     // Get diatonic seventh chords and pick the requested degree
     let chords = key.diatonic_sevenths();
@@ -6082,7 +6128,7 @@ pub unsafe extern "C" fn gooey_engine_poly_release(engine: *mut GooeyEngine) {
     let _ = engine.performance.record_chord_off();
 }
 
-/// Set the poly synth preset.
+/// Set the active editable poly synth preset.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -6091,12 +6137,25 @@ pub unsafe extern "C" fn gooey_engine_poly_release(engine: *mut GooeyEngine) {
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
 #[no_mangle]
-pub unsafe extern "C" fn gooey_engine_poly_set_preset(engine: *mut GooeyEngine, preset: u32) {
-    if engine.is_null() {
-        return;
-    }
-    let engine = &mut *engine;
-    engine.apply_poly_preset(preset);
+pub unsafe extern "C" fn gooey_engine_poly_set_preset(
+    engine: *mut GooeyEngine,
+    preset: u32,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    engine.apply_poly_preset(preset)
+}
+
+/// Return the active `POLY_PRESET_*` id, or `POLY_PRESET_DEFAULT` for null.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_get_preset(engine: *const GooeyEngine) -> u32 {
+    engine
+        .as_ref()
+        .map_or(POLY_PRESET_DEFAULT, |engine| engine.poly_current_preset)
 }
 
 // =============================================================================
@@ -6325,38 +6384,31 @@ pub unsafe extern "C" fn gooey_engine_perf_get_length_steps(engine: *const Gooey
     (*engine).performance.length_steps()
 }
 
-/// Set a `POLY_PARAM_*` value on the current poly-synth preset.
-///
-/// The value is normalized 0.0-1.0 and is retained in this engine's editable
-/// copy of the preset. It therefore survives chord retriggers and switching
-/// away from, then back to, this sound. Invalid parameter ids are ignored.
+/// Set one normalized parameter on the active editable preset and live synth.
+/// Returns false for null, unknown, or non-finite input without changing state.
 ///
 /// # Safety
-/// `engine` must be a valid pointer returned by `gooey_engine_new`
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_poly_set_param(
     engine: *mut GooeyEngine,
     param: u32,
     value: f32,
-) {
-    if engine.is_null() {
-        return;
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let preset = engine.poly_current_preset as usize;
+    if !engine.poly_presets[preset].set_param(param, value) {
+        return false;
     }
-    let engine = &mut *engine;
-    let preset_index = engine.poly_current_preset as usize;
-    if engine.poly_presets[preset_index].set_param(param, value) {
-        engine.poly_synth.set_param(param, value);
-    }
+    engine.poly_synth.set_param(param, value)
 }
 
-/// Read the most-recently-set normalized value for the current poly preset.
-///
-/// Returns `NAN` for a null engine or an unknown `POLY_PARAM_*` id. The
-/// smoothing target is returned, so set/get round-trips do not depend on the
-/// audio render thread having advanced.
+/// Get the target value of one active poly parameter, or NaN when invalid.
 ///
 /// # Safety
-/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_poly_get_param(
     engine: *const GooeyEngine,
@@ -6368,26 +6420,8 @@ pub unsafe extern "C" fn gooey_engine_poly_get_param(
         .unwrap_or(f32::NAN)
 }
 
-/// Return the `POLY_PRESET_*` id currently loaded in the poly synth.
-///
-/// A null engine returns `POLY_PRESET_DEFAULT`.
-///
-/// # Safety
-/// `engine` must be a valid pointer returned by `gooey_engine_new`.
-#[no_mangle]
-pub unsafe extern "C" fn gooey_engine_poly_get_preset(engine: *const GooeyEngine) -> u32 {
-    engine
-        .as_ref()
-        .map_or(POLY_PRESET_DEFAULT, |engine| engine.poly_current_preset)
-}
-
-/// Customize one normalized `POLY_PARAM_*` value on a specific preset.
-///
-/// Each engine owns independent editable copies of all `POLY_PRESET_*`
-/// sounds. Editing an inactive preset does not change the sound currently
-/// playing; the value takes effect when that preset is next selected or used
-/// by `gooey_engine_poly_trigger_chord`. Editing the active preset also updates
-/// the live synth. Returns `false` for a null engine or invalid id.
+/// Edit one normalized parameter on any per-engine preset copy. Editing the
+/// active preset also updates the live synth through its parameter smoother.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
@@ -6401,10 +6435,10 @@ pub unsafe extern "C" fn gooey_engine_poly_set_preset_param(
     let Some(engine) = engine.as_mut() else {
         return false;
     };
-    let Some(preset_index) = valid_poly_preset_index(preset) else {
+    let Some(index) = valid_poly_preset_index(preset) else {
         return false;
     };
-    if !engine.poly_presets[preset_index].set_param(param, value) {
+    if !engine.poly_presets[index].set_param(param, value) {
         return false;
     }
     if engine.poly_current_preset == preset {
@@ -6413,12 +6447,10 @@ pub unsafe extern "C" fn gooey_engine_poly_set_preset_param(
     true
 }
 
-/// Read one normalized `POLY_PARAM_*` value from a specific editable preset.
-///
-/// Returns `NAN` for a null engine or invalid preset/parameter id.
+/// Get one parameter from an editable preset copy, or NaN when invalid.
 ///
 /// # Safety
-/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_poly_get_preset_param(
     engine: *const GooeyEngine,
@@ -6433,10 +6465,7 @@ pub unsafe extern "C" fn gooey_engine_poly_get_preset_param(
         .unwrap_or(f32::NAN)
 }
 
-/// Restore one editable poly preset to its factory parameter values.
-///
-/// If the preset is active, the restored values are also applied to the live
-/// synth. Returns `false` for a null engine or invalid preset id.
+/// Restore one editable preset to its factory parameters and routes.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
@@ -6448,13 +6477,94 @@ pub unsafe extern "C" fn gooey_engine_poly_reset_preset(
     let Some(engine) = engine.as_mut() else {
         return false;
     };
-    let Some(preset_index) = valid_poly_preset_index(preset) else {
+    let Some(index) = valid_poly_preset_index(preset) else {
         return false;
     };
-    let config = factory_poly_preset_config(preset);
-    engine.poly_presets[preset_index] = config;
+    let Some(config) = factory_poly_preset_config(preset) else {
+        return false;
+    };
+    engine.poly_presets[index] = config;
     if engine.poly_current_preset == preset {
         engine.poly_synth.set_config(config);
+    }
+    true
+}
+
+/// Set one of eight modulation routes on an editable preset.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_set_mod_route(
+    engine: *mut GooeyEngine,
+    preset: u32,
+    slot: u32,
+    route: GooeyPolyModRoute,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let Some(index) = valid_poly_preset_index(preset) else {
+        return false;
+    };
+    let Some(route) = route.into_route() else {
+        return false;
+    };
+    if !engine.poly_presets[index].set_mod_route(slot as usize, route) {
+        return false;
+    }
+    if engine.poly_current_preset == preset {
+        engine.poly_synth.set_mod_route(slot as usize, route);
+    }
+    true
+}
+
+/// Copy one modulation route into `out_route`. Returns false for invalid ids
+/// or a null output pointer and never writes partial state.
+///
+/// # Safety
+/// `engine` and `out_route` must be valid pointers, or may be null to fail.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_get_mod_route(
+    engine: *const GooeyEngine,
+    preset: u32,
+    slot: u32,
+    out_route: *mut GooeyPolyModRoute,
+) -> bool {
+    let (Some(engine), Some(out_route)) = (engine.as_ref(), out_route.as_mut()) else {
+        return false;
+    };
+    let Some(index) = valid_poly_preset_index(preset) else {
+        return false;
+    };
+    let Some(route) = engine.poly_presets[index].mod_routes.get(slot as usize) else {
+        return false;
+    };
+    *out_route = (*route).into();
+    true
+}
+
+/// Disable and reset one modulation route on an editable preset.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_clear_mod_route(
+    engine: *mut GooeyEngine,
+    preset: u32,
+    slot: u32,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let Some(index) = valid_poly_preset_index(preset) else {
+        return false;
+    };
+    if !engine.poly_presets[index].clear_mod_route(slot as usize) {
+        return false;
+    }
+    if engine.poly_current_preset == preset {
+        engine.poly_synth.clear_mod_route(slot as usize);
     }
     true
 }
