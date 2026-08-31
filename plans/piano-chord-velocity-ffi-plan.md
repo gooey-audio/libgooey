@@ -15,7 +15,7 @@ The weighting is continuous, symmetric, and deterministic. At either extreme the
 - [x] (2026-08-31 17:24Z) Replaced the profile-plus-humanize design with one continuous instrument-owned velocity mode.
 - [x] (2026-08-31 17:27Z) Added instrument and FFI tests for low, center, high, clamping, defaults, chord triggering, partial maps, and overlap.
 - [x] (2026-08-31 17:30Z) Ran final formatting, the full suite, the iOS-feature build, and generated-header inspection after the slider revision.
-- [ ] Record the revision in git and update the open pull request.
+- [x] (2026-08-31 17:32Z) Recorded the revision in git and updated pull request #233.
 
 ## Surprises & Discoveries
 
@@ -125,6 +125,8 @@ After the slider code change, focused validation currently shows:
     generated include/gooey.h: velocity mode setter/getter and chord trigger present; superseded profile API absent
 
 Plan revision note (2026-08-31): Replaced the discrete profile-plus-humanize design with the requested single instrument-owned low/center/high slider and updated every section to describe the revised interface and validation.
+
+Pull request update note (2026-08-31): Pushed commit `3cc5ef1` and retitled pull request #233 to “Add piano chord velocity balance slider to FFI,” with its description revised to match the final interface.
 
 ## Interfaces and Dependencies
 
