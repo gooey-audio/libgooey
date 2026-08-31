@@ -5,6 +5,37 @@ use crate::gen::polyblep::{polyblep_saw, polyblep_square};
 use crate::music::note::midi_to_freq;
 use crate::utils::SmoothedParam;
 
+/// Oscillator shape, normalized from saw (0) to square (1).
+pub const POLY_PARAM_OSC_SHAPE: u32 = 0;
+/// Detune spread between the two oscillators, normalized 0-1.
+pub const POLY_PARAM_DETUNE_AMOUNT: u32 = 1;
+/// Base filter cutoff, normalized 0-1.
+pub const POLY_PARAM_FILTER_CUTOFF: u32 = 2;
+/// Filter resonance, normalized 0-1.
+pub const POLY_PARAM_FILTER_RESONANCE: u32 = 3;
+/// Filter-envelope depth, normalized 0-1.
+pub const POLY_PARAM_FILTER_ENV_AMOUNT: u32 = 4;
+/// Amplitude-envelope attack time, normalized 0-1.
+pub const POLY_PARAM_AMP_ATTACK: u32 = 5;
+/// Amplitude-envelope decay time, normalized 0-1.
+pub const POLY_PARAM_AMP_DECAY: u32 = 6;
+/// Amplitude-envelope sustain level, normalized 0-1.
+pub const POLY_PARAM_AMP_SUSTAIN: u32 = 7;
+/// Amplitude-envelope release time, normalized 0-1.
+pub const POLY_PARAM_AMP_RELEASE: u32 = 8;
+/// Filter-envelope attack time, normalized 0-1.
+pub const POLY_PARAM_FILTER_ATTACK: u32 = 9;
+/// Filter-envelope decay time, normalized 0-1.
+pub const POLY_PARAM_FILTER_DECAY: u32 = 10;
+/// Filter-envelope sustain level, normalized 0-1.
+pub const POLY_PARAM_FILTER_SUSTAIN: u32 = 11;
+/// Filter-envelope release time, normalized 0-1.
+pub const POLY_PARAM_FILTER_RELEASE: u32 = 12;
+/// Overall synth volume, normalized 0-1.
+pub const POLY_PARAM_VOLUME: u32 = 13;
+/// Number of addressable poly-synth parameters.
+pub const POLY_PARAM_COUNT: u32 = 14;
+
 mod ranges {
     pub fn filter_cutoff_hz(normalized: f32) -> f32 {
         // Exponential mapping: 0.0 = 20 Hz, 1.0 = 18000 Hz
@@ -140,6 +171,53 @@ impl PolySynthConfig {
             volume: 0.5,
         }
     }
+
+    /// Set one normalized parameter in this configuration.
+    ///
+    /// Returns `false` when `param` is not a `POLY_PARAM_*` identifier.
+    pub fn set_param(&mut self, param: u32, value: f32) -> bool {
+        let value = value.clamp(0.0, 1.0);
+        let destination = match param {
+            POLY_PARAM_OSC_SHAPE => &mut self.osc_shape,
+            POLY_PARAM_DETUNE_AMOUNT => &mut self.detune_amount,
+            POLY_PARAM_FILTER_CUTOFF => &mut self.filter_cutoff,
+            POLY_PARAM_FILTER_RESONANCE => &mut self.filter_resonance,
+            POLY_PARAM_FILTER_ENV_AMOUNT => &mut self.filter_env_amount,
+            POLY_PARAM_AMP_ATTACK => &mut self.amp_attack,
+            POLY_PARAM_AMP_DECAY => &mut self.amp_decay,
+            POLY_PARAM_AMP_SUSTAIN => &mut self.amp_sustain,
+            POLY_PARAM_AMP_RELEASE => &mut self.amp_release,
+            POLY_PARAM_FILTER_ATTACK => &mut self.filter_attack,
+            POLY_PARAM_FILTER_DECAY => &mut self.filter_decay,
+            POLY_PARAM_FILTER_SUSTAIN => &mut self.filter_sustain,
+            POLY_PARAM_FILTER_RELEASE => &mut self.filter_release,
+            POLY_PARAM_VOLUME => &mut self.volume,
+            _ => return false,
+        };
+        *destination = value;
+        true
+    }
+
+    /// Read one normalized parameter from this configuration.
+    pub fn param(&self, param: u32) -> Option<f32> {
+        match param {
+            POLY_PARAM_OSC_SHAPE => Some(self.osc_shape),
+            POLY_PARAM_DETUNE_AMOUNT => Some(self.detune_amount),
+            POLY_PARAM_FILTER_CUTOFF => Some(self.filter_cutoff),
+            POLY_PARAM_FILTER_RESONANCE => Some(self.filter_resonance),
+            POLY_PARAM_FILTER_ENV_AMOUNT => Some(self.filter_env_amount),
+            POLY_PARAM_AMP_ATTACK => Some(self.amp_attack),
+            POLY_PARAM_AMP_DECAY => Some(self.amp_decay),
+            POLY_PARAM_AMP_SUSTAIN => Some(self.amp_sustain),
+            POLY_PARAM_AMP_RELEASE => Some(self.amp_release),
+            POLY_PARAM_FILTER_ATTACK => Some(self.filter_attack),
+            POLY_PARAM_FILTER_DECAY => Some(self.filter_decay),
+            POLY_PARAM_FILTER_SUSTAIN => Some(self.filter_sustain),
+            POLY_PARAM_FILTER_RELEASE => Some(self.filter_release),
+            POLY_PARAM_VOLUME => Some(self.volume),
+            _ => None,
+        }
+    }
 }
 
 pub struct PolySynthParams {
@@ -199,8 +277,6 @@ impl PolySynthParams {
     pub fn snap_all(&mut self) {
         self.osc_shape.snap();
         self.detune_amount.snap();
-        self.filter_cutoff.snap();
-        self.filter_resonance.snap();
         self.filter_cutoff.snap();
         self.filter_resonance.snap();
         self.filter_env_amount.snap();
@@ -304,6 +380,56 @@ impl PolySynth {
         self.params.snap_all();
     }
 
+    /// Set one normalized runtime parameter.
+    ///
+    /// Returns `false` when `param` is not a `POLY_PARAM_*` identifier.
+    pub fn set_param(&mut self, param: u32, value: f32) -> bool {
+        let value = value.clamp(0.0, 1.0);
+        let destination = match param {
+            POLY_PARAM_OSC_SHAPE => &mut self.params.osc_shape,
+            POLY_PARAM_DETUNE_AMOUNT => &mut self.params.detune_amount,
+            POLY_PARAM_FILTER_CUTOFF => &mut self.params.filter_cutoff,
+            POLY_PARAM_FILTER_RESONANCE => &mut self.params.filter_resonance,
+            POLY_PARAM_FILTER_ENV_AMOUNT => &mut self.params.filter_env_amount,
+            POLY_PARAM_AMP_ATTACK => &mut self.params.amp_attack,
+            POLY_PARAM_AMP_DECAY => &mut self.params.amp_decay,
+            POLY_PARAM_AMP_SUSTAIN => &mut self.params.amp_sustain,
+            POLY_PARAM_AMP_RELEASE => &mut self.params.amp_release,
+            POLY_PARAM_FILTER_ATTACK => &mut self.params.filter_attack,
+            POLY_PARAM_FILTER_DECAY => &mut self.params.filter_decay,
+            POLY_PARAM_FILTER_SUSTAIN => &mut self.params.filter_sustain,
+            POLY_PARAM_FILTER_RELEASE => &mut self.params.filter_release,
+            POLY_PARAM_VOLUME => &mut self.params.volume,
+            _ => return false,
+        };
+        destination.set_target(value);
+        true
+    }
+
+    /// Read the most recently requested normalized parameter value.
+    ///
+    /// This returns the smoothing target so a host can save state immediately
+    /// after a setter call without waiting for the audio thread to converge.
+    pub fn param(&self, param: u32) -> Option<f32> {
+        match param {
+            POLY_PARAM_OSC_SHAPE => Some(self.params.osc_shape.target()),
+            POLY_PARAM_DETUNE_AMOUNT => Some(self.params.detune_amount.target()),
+            POLY_PARAM_FILTER_CUTOFF => Some(self.params.filter_cutoff.target()),
+            POLY_PARAM_FILTER_RESONANCE => Some(self.params.filter_resonance.target()),
+            POLY_PARAM_FILTER_ENV_AMOUNT => Some(self.params.filter_env_amount.target()),
+            POLY_PARAM_AMP_ATTACK => Some(self.params.amp_attack.target()),
+            POLY_PARAM_AMP_DECAY => Some(self.params.amp_decay.target()),
+            POLY_PARAM_AMP_SUSTAIN => Some(self.params.amp_sustain.target()),
+            POLY_PARAM_AMP_RELEASE => Some(self.params.amp_release.target()),
+            POLY_PARAM_FILTER_ATTACK => Some(self.params.filter_attack.target()),
+            POLY_PARAM_FILTER_DECAY => Some(self.params.filter_decay.target()),
+            POLY_PARAM_FILTER_SUSTAIN => Some(self.params.filter_sustain.target()),
+            POLY_PARAM_FILTER_RELEASE => Some(self.params.filter_release.target()),
+            POLY_PARAM_VOLUME => Some(self.params.volume.target()),
+            _ => None,
+        }
+    }
+
     /// Trigger a specific MIDI note with velocity.
     /// Uses the current audio clock time tracked from tick().
     pub fn trigger_note(&mut self, note: u8, velocity: f32) {
@@ -322,10 +448,10 @@ impl PolySynth {
 
         // Configure amp envelope
         let amp_config = ADSRConfig::new(
-            ranges::env_time(self.params.amp_attack.get()),
-            ranges::env_time(self.params.amp_decay.get()),
-            self.params.amp_sustain.get(),
-            ranges::env_time(self.params.amp_release.get()),
+            ranges::env_time(self.params.amp_attack.target()),
+            ranges::env_time(self.params.amp_decay.target()),
+            self.params.amp_sustain.target(),
+            ranges::env_time(self.params.amp_release.target()),
         )
         .with_decay_curve(EnvelopeCurve::Exponential(0.5));
 
@@ -334,10 +460,10 @@ impl PolySynth {
 
         // Configure filter envelope
         let filt_config = ADSRConfig::new(
-            ranges::env_time(self.params.filter_attack.get()),
-            ranges::env_time(self.params.filter_decay.get()),
-            self.params.filter_sustain.get(),
-            ranges::env_time(self.params.filter_release.get()),
+            ranges::env_time(self.params.filter_attack.target()),
+            ranges::env_time(self.params.filter_decay.target()),
+            self.params.filter_sustain.target(),
+            ranges::env_time(self.params.filter_release.target()),
         )
         .with_decay_curve(EnvelopeCurve::Exponential(0.5));
 
@@ -617,5 +743,48 @@ mod tests {
         let _pluck = PolySynth::with_config(sample_rate, PolySynthConfig::pluck());
         let _keys = PolySynth::with_config(sample_rate, PolySynthConfig::keys());
         let _strings = PolySynth::with_config(sample_rate, PolySynthConfig::strings());
+    }
+
+    #[test]
+    fn config_parameters_round_trip_and_clamp() {
+        let mut config = PolySynthConfig::pad();
+        assert!(config.set_param(POLY_PARAM_AMP_ATTACK, 0.23));
+        assert_eq!(config.param(POLY_PARAM_AMP_ATTACK), Some(0.23));
+
+        assert!(config.set_param(POLY_PARAM_FILTER_CUTOFF, 2.0));
+        assert_eq!(config.param(POLY_PARAM_FILTER_CUTOFF), Some(1.0));
+
+        assert!(!config.set_param(POLY_PARAM_COUNT, 0.5));
+        assert_eq!(config.param(POLY_PARAM_COUNT), None);
+    }
+
+    #[test]
+    fn runtime_parameter_getter_returns_smoothing_target() {
+        let mut synth = PolySynth::new(44_100.0);
+        assert!(synth.set_param(POLY_PARAM_AMP_RELEASE, 0.19));
+
+        assert_eq!(synth.param(POLY_PARAM_AMP_RELEASE), Some(0.19));
+        assert_ne!(synth.params.amp_release.get(), 0.19);
+    }
+
+    #[test]
+    fn new_voice_uses_latest_envelope_targets_without_render_delay() {
+        let mut synth = PolySynth::new(44_100.0);
+        synth.set_param(POLY_PARAM_AMP_ATTACK, 0.0);
+        synth.set_param(POLY_PARAM_AMP_DECAY, 0.25);
+        synth.set_param(POLY_PARAM_AMP_SUSTAIN, 0.33);
+        synth.set_param(POLY_PARAM_AMP_RELEASE, 1.0);
+        synth.trigger_note(60, 1.0);
+
+        let envelope = &synth
+            .voices
+            .iter()
+            .find(|voice| voice.active)
+            .expect("trigger should allocate a voice")
+            .amp_envelope;
+        assert_eq!(envelope.attack_time, ranges::env_time(0.0));
+        assert_eq!(envelope.decay_time, ranges::env_time(0.25));
+        assert_eq!(envelope.sustain_level, 0.33);
+        assert_eq!(envelope.release_time, ranges::env_time(1.0));
     }
 }
