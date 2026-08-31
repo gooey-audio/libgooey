@@ -126,6 +126,14 @@ name = "sampler_rack"
 required-features = ["native", "crossterm"]
 
 [[example]]
+name = "piano"
+required-features = ["native", "crossterm", "bounce"]
+
+[[example]]
+name = "prepare_piano_pack"
+required-features = ["bounce"]
+
+[[example]]
 name = "antialias_validation"
 required-features = ["bounce"]
 

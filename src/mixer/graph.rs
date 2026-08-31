@@ -39,23 +39,15 @@ pub const SOURCE_COUNT: usize = 5;
 pub const SOURCE_SAMPLER_BASE: u32 = SOURCE_COUNT as u32;
 /// Maximum sampler racks registered by the FFI engine.
 pub const SAMPLER_SOURCE_COUNT: usize = 4;
-const SOURCE_CAPACITY: usize = SOURCE_COUNT + SAMPLER_SOURCE_COUNT;
+/// First dynamically registered multi-sample (piano) source. Placed after the
+/// sampler block so both legacy and sampler source IDs stay stable.
+pub const SOURCE_PIANO_BASE: u32 = SOURCE_SAMPLER_BASE + SAMPLER_SOURCE_COUNT as u32;
+/// Maximum multi-sample instruments registered by the FFI engine.
+pub const PIANO_SOURCE_COUNT: usize = 2;
+const SOURCE_CAPACITY: usize = SOURCE_COUNT + SAMPLER_SOURCE_COUNT + PIANO_SOURCE_COUNT;
 
 /// Maximum track gain (allows up to +6 dB of makeup on a submix).
 const MAX_TRACK_GAIN: f32 = 2.0;
-
-/// Apply a stereo balance to an already-stereo frame. `pan` is 0.0 (hard left)
-/// .. 0.5 (center) .. 1.0 (hard right). Center is a true identity, so a
-/// default-centered track sums bit-identically to an un-panned mix.
-fn balanced(frame: StereoFrame, pan: f32) -> StereoFrame {
-    let pan = pan.clamp(0.0, 1.0);
-    let left_gain = (2.0 * (1.0 - pan)).min(1.0);
-    let right_gain = (2.0 * pan).min(1.0);
-    StereoFrame {
-        l: frame.l * left_gain,
-        r: frame.r * right_gain,
-    }
-}
 
 /// A named submix bus: a mixer strip (gain / balance / mute-solo / peak) plus a
 /// reorderable effect rack. Sources routed to this track are summed, run through
@@ -390,7 +382,7 @@ impl MixerGraph {
         for (i, track) in tracks.iter_mut().enumerate() {
             let gain = track.gain.tick() * track.mute_gain.tick();
             let mut f = scratch[i].scaled(gain);
-            f = balanced(f, track.pan.tick());
+            f = f.balanced(track.pan.tick());
             f = track.rack.process(f);
             track.record_peak(f.l.abs().max(f.r.abs()));
             master += f;

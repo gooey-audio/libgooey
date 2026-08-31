@@ -117,7 +117,10 @@ fn perf_overdub_keeps_arm_and_appends() {
         assert_eq!(gooey_engine_perf_get_event_count(engine), 1);
 
         // Finish the bar and enter second loop.
-        render_frames(engine, samples_per_step(bpm, sample_rate) as usize * 12 + 256);
+        render_frames(
+            engine,
+            samples_per_step(bpm, sample_rate) as usize * 12 + 256,
+        );
         assert!(gooey_engine_perf_is_record_armed(engine));
 
         // Second pass: different degree

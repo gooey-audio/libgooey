@@ -40,6 +40,19 @@ pub trait Instrument: Send {
     /// Generate one sample of audio at the current time
     fn tick(&mut self, current_time: f64) -> f32;
 
+    /// Generate one *stereo* sample, for instruments that carry their own
+    /// stereo image (multi-sampled instruments, samplers).
+    ///
+    /// The default returns `None`, meaning "I am mono — place my `tick` output
+    /// with the equal-power pan law". An instrument that overrides this keeps
+    /// its recorded image intact: [`Engine::tick_stereo`] applies the
+    /// per-instrument pan as a *balance* rather than re-placing an
+    /// already-stereo signal. The mono [`Engine::tick`] path ignores this
+    /// override and always calls `tick`.
+    fn tick_stereo(&mut self, _current_time: f64) -> Option<StereoFrame> {
+        None
+    }
+
     /// Check if the instrument is currently active
     fn is_active(&self) -> bool;
 
@@ -428,15 +441,21 @@ impl Engine {
         self.advance_control(current_time);
 
         // Sum each instrument into the stereo field via its (smoothed) pan.
+        // A stereo-native instrument is balanced rather than re-panned, so its
+        // recorded image survives; mono instruments take the equal-power seam
+        // exactly as before.
         let mut stereo = StereoFrame::default();
         for (name, instrument) in self.instruments.iter_mut() {
-            let sample = instrument.tick(current_time);
+            let native = instrument.tick_stereo(current_time);
             let pan = self
                 .instrument_pans
                 .get_mut(name)
                 .map(|p| p.tick())
                 .unwrap_or(0.5);
-            stereo += StereoFrame::panned(sample, pan);
+            stereo += match native {
+                Some(frame) => frame.balanced(pan),
+                None => StereoFrame::panned(instrument.tick(current_time), pan),
+            };
         }
 
         // Sum the loop mixer (already stereo, with its own per-channel effects)
