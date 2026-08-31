@@ -65,6 +65,7 @@ impl ADSRConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct Envelope {
     pub attack_time: f32,            // seconds
     pub decay_time: f32,             // seconds

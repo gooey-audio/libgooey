@@ -10,6 +10,7 @@ use crate::effects::{
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
 use crate::frame::StereoFrame;
+use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
     BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolySynth,
     PolySynthConfig, SampleBuffer, SamplerBuffer, SamplerRack, SnareConfig, SnareDrum, Tom2,
@@ -17,7 +18,8 @@ use crate::instruments::{
 };
 use crate::metronome::{Metronome, MetronomeDivision, DEFAULT_METRONOME_LEVEL};
 use crate::mixer::{
-    LaunchQuantization, Mixer, MixerGraph, PitchMode, RetrimTiming, StereoSampleBuffer,
+    ChannelEffect, LaunchQuantization, Mixer, MixerControl, MixerGraph, PitchMode, RetrimTiming,
+    StereoSampleBuffer,
 };
 use crate::music::{apply_voicing, available_voicings, Key, NoteName, ScaleType, VoicingType};
 use crate::performance::{ChordClipEvent, PerformanceRecorder, PlayerAction, RecordMode};
@@ -586,6 +588,7 @@ const KIT_VOICE_COUNT: usize = 4;
 pub const SAMPLER_RACK_MAX: u32 = 4;
 /// PCM pads in each sampler rack and steps in its sequencer.
 pub const SAMPLER_SLOT_COUNT: u32 = crate::instruments::sampler::SAMPLER_SLOT_COUNT as u32;
+const SLOT_PITCH_RANGE: f32 = crate::instruments::sampler::SLOT_PITCH_RANGE;
 
 /// One voice's complete per-channel state: the instrument plus its sequencer,
 /// preset blender, mixer strip (fader / mute-solo / pan / peak), manual-trigger
@@ -738,6 +741,9 @@ pub struct GooeyEngine {
     // into the master bus before the global effects chain. The `gooey_engine_loop_*`
     // FFI functions expose control over this.
     mixer: Mixer,
+    /// Separately shared control endpoint. Loop/clip FFI calls only touch this
+    /// object; realtime rendering owns and mutates `mixer`.
+    mixer_control: MixerControl,
 
     // Host-defined mixer graph: named submix tracks, each with a strip
     // (gain / balance / mute-solo / peak) and its own effect rack. Sources
@@ -769,6 +775,11 @@ pub struct GooeyEngine {
     performance: PerformanceRecorder,
     // Config-time registered sample-pad instruments. Empty entries are not graph sources.
     samplers: [Option<SamplerRack>; SAMPLER_RACK_MAX as usize],
+    /// Control-side sampler replacement endpoint. Producers never mutate
+    /// `samplers`; the render thread commits this queue at buffer boundaries.
+    sampler_control: SamplerControl,
+    sampler_command_scratch: std::collections::VecDeque<SamplerCommand>,
+    sampler_retired: Vec<SamplerBuffer>,
 
     // Optional monitor click, disabled by default. Summed after the limiter so
     // it never feeds an effect, is never scaled by the master fader, and is
@@ -888,6 +899,9 @@ impl GooeyEngine {
         // Create LFO pool (8 LFOs, all disabled by default with quarter note timing)
         let lfos = std::array::from_fn(|_| Lfo::with_sample_rate(sample_rate));
         let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] = std::array::from_fn(|_| Vec::new());
+        let mixer = Mixer::new(sample_rate);
+        let mixer_control = mixer.control();
+        let sampler_control = SamplerControl::new();
 
         Self {
             kit,
@@ -941,7 +955,8 @@ impl GooeyEngine {
                     .unwrap_or_else(|_| unreachable!("constant placeholder buffer is valid")),
             ),
             // Multi-channel stereo loop mixer (empty until the host loads loops).
-            mixer: Mixer::new(sample_rate),
+            mixer,
+            mixer_control,
             // Host-defined mixer graph, seeded with the default 4-track layout
             // (Drums / Bass / Synth / Loops). Bit-identical to the flat mix until
             // the host adjusts a track strip, rack, or routing.
@@ -959,10 +974,37 @@ impl GooeyEngine {
             // Chord performance clip (disarmed by default)
             performance: PerformanceRecorder::new(),
             samplers: std::array::from_fn(|_| None),
+            sampler_control,
+            sampler_command_scratch: std::collections::VecDeque::with_capacity(16),
+            sampler_retired: Vec::with_capacity(1024),
             // Monitor click, off until the host asks for it.
             metronome: Metronome::new(sample_rate, bpm),
             offline_bounce: false,
         }
+    }
+
+    fn apply_sampler_control_commands(&mut self) {
+        let control = self.sampler_control.clone();
+        control.reclaim_from_audio(&mut self.sampler_retired);
+        control.drain_into(&mut self.sampler_command_scratch);
+        while let Some(command) = self.sampler_command_scratch.pop_front() {
+            match command {
+                SamplerCommand::Replace { rack, slot, buffer } => {
+                    let committed = if let Some(sampler) =
+                        self.samplers.get_mut(rack).and_then(Option::as_mut)
+                    {
+                        sampler.replace_buffer_retained(slot, buffer, &mut self.sampler_retired)
+                    } else {
+                        self.sampler_retired.push(buffer);
+                        false
+                    };
+                    if committed {
+                        control.mark_committed(rack, slot);
+                    }
+                }
+            }
+        }
+        control.reclaim_from_audio(&mut self.sampler_retired);
     }
 
     /// Resolve any `pending_arm_host_time` against the current
@@ -1055,6 +1097,10 @@ impl GooeyEngine {
     fn render(&mut self, buffer: &mut [f32]) {
         // Clear pending MIDI events from previous render pass
         self.pending_midi_events.clear();
+        // Commands are applied at buffer boundaries, including buffers that
+        // are temporarily silent while a host-time arm is pending.
+        self.mixer.apply_control_commands();
+        self.apply_sampler_control_commands();
 
         // Number of stereo frames this buffer holds (two slots per frame).
         let frame_count = buffer.len() / 2;
@@ -1410,6 +1456,9 @@ impl GooeyEngine {
             self.current_time += sample_period;
             sample_offset += 1;
         }
+        // Publish once after the completed buffer instead of once per mixer
+        // sample. Silent buffers publish from `apply_control_commands` above.
+        self.mixer.publish_control_snapshot();
     }
 
     fn apply_sequencer_blend_setting(
@@ -3387,8 +3436,10 @@ pub unsafe extern "C" fn gooey_engine_set_bpm(engine: *mut GooeyEngine, bpm: f32
         lfo.set_bpm(bpm);
     }
 
-    // Seed BPM for any future note-synced per-channel loop effects.
-    engine.mixer.set_bpm(bpm);
+    // Seed BPM for any future note-synced per-channel loop effects. Deferred to
+    // the audio thread so it never races the loop mixer's render (the rest of
+    // this function's engine mutation is a separate, pre-existing concern).
+    engine.mixer_control.set_bpm(bpm);
 
     // The click derives its beat-boundary tolerance from beats-per-sample.
     engine.metronome.set_bpm(bpm);
@@ -3739,7 +3790,8 @@ pub unsafe extern "C" fn gooey_engine_sequencer_start(engine: *mut GooeyEngine) 
     for seq in engine.sequencers_iter_mut() {
         seq.start();
     }
-    engine.mixer.transport_start();
+    // Deferred to the audio thread so it never races the loop mixer's render.
+    engine.mixer_control.transport_start();
 }
 
 /// Stop all sequencers.
@@ -3762,7 +3814,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_stop(engine: *mut GooeyEngine) {
     for rack in engine.samplers.iter_mut().flatten() {
         rack.transport_stop();
     }
-    engine.mixer.transport_stop();
+    engine.mixer_control.transport_stop();
 }
 
 /// Reset all sequencers to step 0.
@@ -3785,7 +3837,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_reset(engine: *mut GooeyEngine) 
     for rack in engine.samplers.iter_mut().flatten() {
         rack.transport_reset();
     }
-    engine.mixer.transport_reset();
+    engine.mixer_control.transport_reset();
 }
 
 /// Set all sequencers to a specific beat position in quarter notes.
@@ -3821,7 +3873,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_beat_position(
     for seq in engine.sequencers_iter_mut() {
         seq.set_beat_position(beat_position);
     }
-    engine.mixer.transport_seek(beat_position);
+    engine.mixer_control.transport_seek(beat_position);
 }
 
 /// Tell the engine the host time corresponding to sample 0 of the next
@@ -3900,7 +3952,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_start_at_host_time(
         start_host_time,
         beat_position,
     });
-    engine.mixer.transport_stop();
+    engine.mixer_control.transport_stop();
     for seq in engine.sequencers_iter_mut() {
         seq.cancel_arm();
         seq.stop();
@@ -6297,6 +6349,65 @@ pub unsafe extern "C" fn gooey_engine_sampler_set_slot_buffer(
         .is_some_and(|rack| rack.set_buffer(slot as usize, buffer))
 }
 
+/// Copy PCM on the control thread and queue it for replacement at the next
+/// render-buffer boundary. Queued data is never observed by the sampler until
+/// `gooey_engine_render` begins its next buffer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_queue_slot_buffer(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+    samples: *const f32,
+    frames: u32,
+    channels: u32,
+    sample_rate: f32,
+) -> bool {
+    if samples.is_null() {
+        return false;
+    }
+    let Some(engine) = engine.as_ref() else {
+        return false;
+    };
+    // Racks are registered during configuration and never removed, so this
+    // read establishes that the queued command has a valid audio-side target.
+    if engine
+        .samplers
+        .get(rack as usize)
+        .and_then(Option::as_ref)
+        .is_none()
+    {
+        return false;
+    }
+    let channels = channels as usize;
+    let frames = frames as usize;
+    let Some(count) = frames.checked_mul(channels) else {
+        return false;
+    };
+    let data = slice::from_raw_parts(samples, count);
+    let Ok(buffer) = SamplerBuffer::from_interleaved(data, frames, channels, sample_rate) else {
+        return false;
+    };
+    engine
+        .sampler_control
+        .queue_replace(rack as usize, slot as usize, buffer)
+}
+
+/// Monotonic per-slot generation incremented once a queued replacement becomes
+/// playable at a render-buffer boundary. Zero means no queued replacement has
+/// committed since the rack was registered.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_slot_commit_generation(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+) -> u32 {
+    engine.as_ref().map_or(0, |engine| {
+        engine
+            .sampler_control
+            .committed_generation(rack as usize, slot as usize)
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_sampler_clear_slot(
     engine: *mut GooeyEngine,
@@ -6367,6 +6478,182 @@ pub unsafe extern "C" fn gooey_engine_sampler_slot_sample_rate(
         .and_then(Option::as_ref)
         .and_then(|rack| rack.slot(slot as usize))
         .map_or(0.0, |buffer| buffer.sample_rate())
+}
+
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_set_slot_gain(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    slot: u32,
+    gain: f32,
+) -> bool {
+    engine
+        .as_mut()
+        .and_then(|engine| engine.samplers.get_mut(rack as usize))
+        .and_then(Option::as_mut)
+        .is_some_and(|sampler| sampler.set_slot_gain(slot as usize, gain))
+}
+
+/// Returns `-1.0` if the engine, rack, or slot is invalid.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_slot_gain(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .and_then(|sampler| sampler.slot_gain(slot as usize))
+        .unwrap_or(-1.0)
+}
+
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_set_slot_pitch(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    slot: u32,
+    normalized: f32,
+) -> bool {
+    if !normalized.is_finite() {
+        return false;
+    }
+    let semitones = normalized.clamp(0.0, 1.0) * (2.0 * SLOT_PITCH_RANGE) - SLOT_PITCH_RANGE;
+    engine
+        .as_mut()
+        .and_then(|engine| engine.samplers.get_mut(rack as usize))
+        .and_then(Option::as_mut)
+        .is_some_and(|sampler| sampler.set_slot_pitch(slot as usize, semitones))
+}
+
+/// Normalized 0–1 pitch (`0.5` = unison). Returns `-1.0` if invalid.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_slot_pitch(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .and_then(|sampler| sampler.slot_pitch(slot as usize))
+        .map(|st| (st + SLOT_PITCH_RANGE) / (2.0 * SLOT_PITCH_RANGE))
+        .unwrap_or(-1.0)
+}
+
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_set_slot_envelope(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    slot: u32,
+    attack: f32,
+    decay: f32,
+    sustain: f32,
+    release: f32,
+) -> bool {
+    engine
+        .as_mut()
+        .and_then(|engine| engine.samplers.get_mut(rack as usize))
+        .and_then(Option::as_mut)
+        .is_some_and(|sampler| {
+            sampler.set_slot_envelope(slot as usize, attack, decay, sustain, release)
+        })
+}
+
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+/// Out pointers must be valid writable `f32` locations when the call succeeds.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_get_slot_envelope(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+    out_attack: *mut f32,
+    out_decay: *mut f32,
+    out_sustain: *mut f32,
+    out_release: *mut f32,
+) -> bool {
+    if out_attack.is_null() || out_decay.is_null() || out_sustain.is_null() || out_release.is_null()
+    {
+        return false;
+    }
+    let Some(env) = engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .and_then(|sampler| sampler.slot_envelope(slot as usize))
+    else {
+        return false;
+    };
+    *out_attack = env.attack_time;
+    *out_decay = env.decay_time;
+    *out_sustain = env.sustain_level;
+    *out_release = env.release_time;
+    true
+}
+
+/// Set a slot's normalized 0–1 trim region. `start` must be strictly less than
+/// `end`, both within `[0, 1]`. Returns false on invalid input, rack, or slot.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_set_slot_trim(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    slot: u32,
+    start: f32,
+    end: f32,
+) -> bool {
+    engine
+        .as_mut()
+        .and_then(|engine| engine.samplers.get_mut(rack as usize))
+        .and_then(Option::as_mut)
+        .is_some_and(|sampler| sampler.set_slot_trim(slot as usize, start, end))
+}
+
+/// Read a slot's normalized trim region into the provided out pointers.
+/// Returns false on invalid engine, rack, or slot, or null out pointers.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+/// Out pointers must be valid writable `f32` locations when the call succeeds.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_get_slot_trim(
+    engine: *const GooeyEngine,
+    rack: u32,
+    slot: u32,
+    out_start: *mut f32,
+    out_end: *mut f32,
+) -> bool {
+    if out_start.is_null() || out_end.is_null() {
+        return false;
+    }
+    let Some((start, end)) = engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .and_then(|sampler| sampler.slot_trim(slot as usize))
+    else {
+        return false;
+    };
+    *out_start = start;
+    *out_end = end;
+    true
 }
 
 /// Trigger a loaded pad now and stamp it into the shared performance clip when
@@ -6933,6 +7220,9 @@ pub unsafe extern "C" fn gooey_engine_track_effect_type_at(
 // Transport-synchronized clip grid: 4 columns x 8 rows
 // =============================================================================
 
+// Clip mutations are applied by the audio thread at the next render-buffer
+// boundary. Clip getters expose the last atomically published audio snapshot.
+
 /// Number of clip-grid columns (one per loop mixer channel).
 pub const CLIP_COLUMN_COUNT: u32 = crate::mixer::CLIP_COLUMN_COUNT as u32;
 /// Number of rows in each clip-grid column.
@@ -6993,9 +7283,13 @@ pub unsafe extern "C" fn gooey_engine_clip_load(
     };
     let samples = slice::from_raw_parts(samples, total);
     match StereoSampleBuffer::from_interleaved(samples, channels as usize, sample_rate) {
-        Ok(buffer) => (*engine)
-            .mixer
-            .clip_load(column as usize, row as usize, buffer, source_bpm),
+        Ok(buffer) => {
+            // Defer the slot load to the audio thread (replacing the active slot
+            // touches the live channel); indices/bpm are validated above.
+            (*engine)
+                .mixer_control
+                .clip_load(column as usize, row as usize, buffer, source_bpm)
+        }
         Err(_) => false,
     }
 }
@@ -7011,9 +7305,14 @@ pub unsafe extern "C" fn gooey_engine_clip_unload(
     column: u32,
     row: u32,
 ) -> bool {
-    engine
-        .as_mut()
-        .is_some_and(|engine| engine.mixer.clip_unload(column as usize, row as usize))
+    if column >= CLIP_COLUMN_COUNT || row >= CLIP_ROW_COUNT {
+        return false;
+    }
+    engine.as_ref().is_some_and(|engine| {
+        engine
+            .mixer_control
+            .clip_unload(column as usize, row as usize)
+    })
 }
 
 /// Stop all grid-owned columns and unload every slot.
@@ -7022,8 +7321,8 @@ pub unsafe extern "C" fn gooey_engine_clip_unload(
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_clip_clear(engine: *mut GooeyEngine) {
-    if let Some(engine) = engine.as_mut() {
-        engine.mixer.clip_clear();
+    if let Some(engine) = engine.as_ref() {
+        engine.mixer_control.clip_clear();
     }
 }
 
@@ -7039,14 +7338,17 @@ pub unsafe extern "C" fn gooey_engine_clip_launch(
     row: u32,
     quantization: u32,
 ) -> bool {
-    let Some(engine) = engine.as_mut() else {
+    let Some(engine) = engine.as_ref() else {
         return false;
     };
+    if column >= CLIP_COLUMN_COUNT || row >= CLIP_ROW_COUNT {
+        return false;
+    }
     let Some(quantization) = LaunchQuantization::from_id(quantization) else {
         return false;
     };
     engine
-        .mixer
+        .mixer_control
         .clip_launch(column as usize, row as usize, quantization)
 }
 
@@ -7061,9 +7363,12 @@ pub unsafe extern "C" fn gooey_engine_clip_launch_at_beat(
     row: u32,
     beat: f64,
 ) -> bool {
-    engine.as_mut().is_some_and(|engine| {
+    if column >= CLIP_COLUMN_COUNT || row >= CLIP_ROW_COUNT {
+        return false;
+    }
+    engine.as_ref().is_some_and(|engine| {
         engine
-            .mixer
+            .mixer_control
             .clip_launch_at(column as usize, row as usize, beat)
     })
 }
@@ -7079,13 +7384,18 @@ pub unsafe extern "C" fn gooey_engine_clip_launch_scene(
     row: u32,
     quantization: u32,
 ) -> bool {
-    let Some(engine) = engine.as_mut() else {
+    let Some(engine) = engine.as_ref() else {
         return false;
     };
+    if row >= CLIP_ROW_COUNT {
+        return false;
+    }
     let Some(quantization) = LaunchQuantization::from_id(quantization) else {
         return false;
     };
-    engine.mixer.clip_launch_scene(row as usize, quantization)
+    engine
+        .mixer_control
+        .clip_launch_scene(row as usize, quantization)
 }
 
 /// Queue an entire scene row at an absolute future beat.
@@ -7098,9 +7408,14 @@ pub unsafe extern "C" fn gooey_engine_clip_launch_scene_at_beat(
     row: u32,
     beat: f64,
 ) -> bool {
-    engine
-        .as_mut()
-        .is_some_and(|engine| engine.mixer.clip_launch_scene_at(row as usize, beat))
+    if row >= CLIP_ROW_COUNT {
+        return false;
+    }
+    engine.as_ref().is_some_and(|engine| {
+        engine
+            .mixer_control
+            .clip_launch_scene_at(row as usize, beat)
+    })
 }
 
 /// Queue a column stop at a musical boundary.
@@ -7113,13 +7428,18 @@ pub unsafe extern "C" fn gooey_engine_clip_stop(
     column: u32,
     quantization: u32,
 ) -> bool {
-    let Some(engine) = engine.as_mut() else {
+    let Some(engine) = engine.as_ref() else {
         return false;
     };
+    if column >= CLIP_COLUMN_COUNT {
+        return false;
+    }
     let Some(quantization) = LaunchQuantization::from_id(quantization) else {
         return false;
     };
-    engine.mixer.clip_stop(column as usize, quantization)
+    engine
+        .mixer_control
+        .clip_stop(column as usize, quantization)
 }
 
 /// Queue a column stop at an absolute future beat.
@@ -7132,9 +7452,12 @@ pub unsafe extern "C" fn gooey_engine_clip_stop_at_beat(
     column: u32,
     beat: f64,
 ) -> bool {
+    if column >= CLIP_COLUMN_COUNT {
+        return false;
+    }
     engine
-        .as_mut()
-        .is_some_and(|engine| engine.mixer.clip_stop_at(column as usize, beat))
+        .as_ref()
+        .is_some_and(|engine| engine.mixer_control.clip_stop_at(column as usize, beat))
 }
 
 /// Cancel one column's pending clip action without changing its active clip.
@@ -7143,8 +7466,8 @@ pub unsafe extern "C" fn gooey_engine_clip_stop_at_beat(
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_clip_cancel(engine: *mut GooeyEngine, column: u32) {
-    if let Some(engine) = engine.as_mut() {
-        engine.mixer.clip_cancel(column as usize);
+    if let Some(engine) = engine.as_ref() {
+        engine.mixer_control.clip_cancel(column as usize);
     }
 }
 
@@ -7154,8 +7477,8 @@ pub unsafe extern "C" fn gooey_engine_clip_cancel(engine: *mut GooeyEngine, colu
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_clip_cancel_all(engine: *mut GooeyEngine) {
-    if let Some(engine) = engine.as_mut() {
-        engine.mixer.clip_cancel_all();
+    if let Some(engine) = engine.as_ref() {
+        engine.mixer_control.clip_cancel_all();
     }
 }
 
@@ -7168,14 +7491,15 @@ pub unsafe extern "C" fn gooey_engine_clip_set_default_quantization(
     engine: *mut GooeyEngine,
     quantization: u32,
 ) -> bool {
-    let Some(engine) = engine.as_mut() else {
+    let Some(engine) = engine.as_ref() else {
         return false;
     };
     let Some(quantization) = LaunchQuantization::from_id(quantization) else {
         return false;
     };
-    engine.mixer.clip_set_default_quantization(quantization);
-    true
+    engine
+        .mixer_control
+        .clip_set_default_quantization(quantization)
 }
 
 /// Return the current default `CLIP_QUANTIZE_*` value (bar for a null engine).
@@ -7187,7 +7511,7 @@ pub unsafe extern "C" fn gooey_engine_clip_get_default_quantization(
     engine: *const GooeyEngine,
 ) -> u32 {
     engine.as_ref().map_or(CLIP_QUANTIZE_BAR, |engine| {
-        engine.mixer.clip_default_quantization().id()
+        engine.mixer_control.clip_default_quantization()
     })
 }
 
@@ -7202,7 +7526,9 @@ pub unsafe extern "C" fn gooey_engine_clip_get_state(
     row: u32,
 ) -> u32 {
     engine.as_ref().map_or(0, |engine| {
-        engine.mixer.clip_slot_state(column as usize, row as usize)
+        engine
+            .mixer_control
+            .clip_slot_state(column as usize, row as usize)
     })
 }
 
@@ -7215,10 +7541,9 @@ pub unsafe extern "C" fn gooey_engine_clip_get_active_row(
     engine: *const GooeyEngine,
     column: u32,
 ) -> i32 {
-    engine
-        .as_ref()
-        .and_then(|engine| engine.mixer.clip_active_row(column as usize))
-        .map_or(-1, |row| row as i32)
+    engine.as_ref().map_or(-1, |engine| {
+        engine.mixer_control.clip_active_row(column as usize)
+    })
 }
 
 /// Return the row targeted by a pending launch/unload, or `-1` for none/stop.
@@ -7230,10 +7555,9 @@ pub unsafe extern "C" fn gooey_engine_clip_get_queued_row(
     engine: *const GooeyEngine,
     column: u32,
 ) -> i32 {
-    engine
-        .as_ref()
-        .and_then(|engine| engine.mixer.clip_queued_row(column as usize))
-        .map_or(-1, |row| row as i32)
+    engine.as_ref().map_or(-1, |engine| {
+        engine.mixer_control.clip_queued_row(column as usize)
+    })
 }
 
 /// Return true when the pending action will stop the column (including unload).
@@ -7247,7 +7571,7 @@ pub unsafe extern "C" fn gooey_engine_clip_is_stop_queued(
 ) -> bool {
     engine
         .as_ref()
-        .is_some_and(|engine| engine.mixer.clip_is_stop_queued(column as usize))
+        .is_some_and(|engine| engine.mixer_control.clip_stop_queued(column as usize))
 }
 
 /// Return a column's scheduled absolute beat, or `-1.0` if no action is queued.
@@ -7259,10 +7583,9 @@ pub unsafe extern "C" fn gooey_engine_clip_get_scheduled_beat(
     engine: *const GooeyEngine,
     column: u32,
 ) -> f64 {
-    engine
-        .as_ref()
-        .and_then(|engine| engine.mixer.clip_scheduled_beat(column as usize))
-        .unwrap_or(-1.0)
+    engine.as_ref().map_or(-1.0, |engine| {
+        engine.mixer_control.clip_scheduled_beat(column as usize)
+    })
 }
 
 /// Return the active clip's actual normalized source-buffer cursor, or -1.0
@@ -7273,10 +7596,9 @@ pub unsafe extern "C" fn gooey_engine_clip_get_active_playhead(
     engine: *const GooeyEngine,
     column: u32,
 ) -> f64 {
-    engine
-        .as_ref()
-        .and_then(|engine| engine.mixer.clip_active_playhead(column as usize))
-        .unwrap_or(-1.0)
+    engine.as_ref().map_or(-1.0, |engine| {
+        engine.mixer_control.clip_active_playhead(column as usize)
+    })
 }
 
 /// Set a slot's loop trim as normalized `[0, 1]` start/end markers.
@@ -7312,7 +7634,7 @@ pub unsafe extern "C" fn gooey_engine_clip_set_trim(
     end: f64,
     quantization: u32,
 ) -> bool {
-    let Some(engine) = engine.as_mut() else {
+    let Some(engine) = engine.as_ref() else {
         return false;
     };
     if column >= CLIP_COLUMN_COUNT
@@ -7328,8 +7650,10 @@ pub unsafe extern "C" fn gooey_engine_clip_set_trim(
     let Some(timing) = RetrimTiming::from_id(quantization) else {
         return false;
     };
+    // Defer: an immediate retrim live-resizes the active channel's loop window
+    // (which resets its WSOLA stretcher), so it must run on the audio thread.
     engine
-        .mixer
+        .mixer_control
         .clip_set_trim(column as usize, row as usize, start, end, timing)
 }
 
@@ -7344,10 +7668,11 @@ pub unsafe extern "C" fn gooey_engine_clip_get_trim_start(
     column: u32,
     row: u32,
 ) -> f64 {
-    engine
-        .as_ref()
-        .and_then(|engine| engine.mixer.clip_trim_start(column as usize, row as usize))
-        .unwrap_or(-1.0)
+    engine.as_ref().map_or(-1.0, |engine| {
+        engine
+            .mixer_control
+            .clip_trim_start(column as usize, row as usize)
+    })
 }
 
 /// Return a slot's normalized loop-end marker, or `-1.0` for a null engine or
@@ -7361,10 +7686,11 @@ pub unsafe extern "C" fn gooey_engine_clip_get_trim_end(
     column: u32,
     row: u32,
 ) -> f64 {
-    engine
-        .as_ref()
-        .and_then(|engine| engine.mixer.clip_trim_end(column as usize, row as usize))
-        .unwrap_or(-1.0)
+    engine.as_ref().map_or(-1.0, |engine| {
+        engine
+            .mixer_control
+            .clip_trim_end(column as usize, row as usize)
+    })
 }
 
 /// Return the monotonic absolute transport position in quarter notes.
@@ -7379,7 +7705,7 @@ pub unsafe extern "C" fn gooey_engine_transport_get_beat_position(
 ) -> f64 {
     engine
         .as_ref()
-        .map_or(0.0, |engine| engine.mixer.transport_beat())
+        .map_or(0.0, |engine| engine.mixer_control.transport_beat())
 }
 
 // =============================================================================
@@ -7393,6 +7719,10 @@ pub unsafe extern "C" fn gooey_engine_transport_get_beat_position(
 //
 // `channel` is a 0-based index in `[0, LOOP_CHANNEL_COUNT)`; out-of-range
 // indices are ignored (or return a sensible default).
+//
+// Loop and clip mutations are queued and take effect at the next render-buffer
+// boundary. The getters below read the most recently audio-published snapshot;
+// they never inspect live mixer DSP state from the host/control thread.
 
 /// Pitch mode: no BPM-driven tempo warp; playback rate follows `speed` alone.
 pub const PITCH_MODE_OFF: u32 = 0;
@@ -7425,11 +7755,19 @@ pub unsafe extern "C" fn gooey_engine_loop_load(
     if engine.is_null() || samples.is_null() || frames == 0 || channels == 0 {
         return false;
     }
-    let engine = &mut *engine;
+    let engine = &*engine;
+    if channel as usize >= LOOP_CHANNEL_COUNT as usize {
+        return false;
+    }
     let total = frames as usize * channels as usize;
     let slice = slice::from_raw_parts(samples, total);
     match StereoSampleBuffer::from_interleaved(slice, channels as usize, sample_rate) {
-        Ok(buffer) => engine.mixer.load(channel as usize, buffer),
+        Ok(buffer) => {
+            // Defer the buffer swap to the audio thread: mutating the channel
+            // (and dropping its old buffer / WSOLA stretcher) here would race the
+            // render callback. Validity is checked above so `true` is accurate.
+            engine.mixer_control.load(channel as usize, buffer)
+        }
         Err(_) => false,
     }
 }
@@ -7444,8 +7782,8 @@ pub unsafe extern "C" fn gooey_engine_loop_set_playing(
     channel: u32,
     playing: bool,
 ) {
-    if let Some(engine) = engine.as_mut() {
-        engine.mixer.set_playing(channel as usize, playing);
+    if let Some(engine) = engine.as_ref() {
+        engine.mixer_control.set_playing(channel as usize, playing);
     }
 }
 
@@ -7459,8 +7797,8 @@ pub unsafe extern "C" fn gooey_engine_loop_set_gain(
     channel: u32,
     gain: f32,
 ) {
-    if let Some(engine) = engine.as_mut() {
-        engine.mixer.set_gain(channel as usize, gain);
+    if let Some(engine) = engine.as_ref() {
+        engine.mixer_control.set_gain(channel as usize, gain);
     }
 }
 
@@ -7474,8 +7812,8 @@ pub unsafe extern "C" fn gooey_engine_loop_set_mute(
     channel: u32,
     muted: bool,
 ) {
-    if let Some(engine) = engine.as_mut() {
-        engine.mixer.set_muted(channel as usize, muted);
+    if let Some(engine) = engine.as_ref() {
+        engine.mixer_control.set_muted(channel as usize, muted);
     }
 }
 
@@ -7490,8 +7828,8 @@ pub unsafe extern "C" fn gooey_engine_loop_set_solo(
     channel: u32,
     soloed: bool,
 ) {
-    if let Some(engine) = engine.as_mut() {
-        engine.mixer.set_soloed(channel as usize, soloed);
+    if let Some(engine) = engine.as_ref() {
+        engine.mixer_control.set_soloed(channel as usize, soloed);
     }
 }
 
@@ -7510,8 +7848,10 @@ pub unsafe extern "C" fn gooey_engine_loop_set_start(
     channel: u32,
     normalized: f32,
 ) {
-    if let Some(engine) = engine.as_mut() {
-        engine.mixer.set_loop_start(channel as usize, normalized);
+    if let Some(engine) = engine.as_ref() {
+        engine
+            .mixer_control
+            .set_loop_start(channel as usize, normalized);
     }
 }
 
@@ -7530,8 +7870,10 @@ pub unsafe extern "C" fn gooey_engine_loop_set_end(
     channel: u32,
     normalized: f32,
 ) {
-    if let Some(engine) = engine.as_mut() {
-        engine.mixer.set_loop_end(channel as usize, normalized);
+    if let Some(engine) = engine.as_ref() {
+        engine
+            .mixer_control
+            .set_loop_end(channel as usize, normalized);
     }
 }
 
@@ -7546,8 +7888,8 @@ pub unsafe extern "C" fn gooey_engine_loop_set_speed(
     channel: u32,
     speed: f32,
 ) {
-    if let Some(engine) = engine.as_mut() {
-        engine.mixer.set_speed(channel as usize, speed);
+    if let Some(engine) = engine.as_ref() {
+        engine.mixer_control.set_speed(channel as usize, speed);
     }
 }
 
@@ -7566,13 +7908,13 @@ pub unsafe extern "C" fn gooey_engine_loop_set_source_bpm(
     channel: u32,
     source_bpm: f32,
 ) {
-    if let Some(engine) = engine.as_mut() {
+    if let Some(engine) = engine.as_ref() {
         let bpm = if source_bpm > 0.0 {
             Some(source_bpm)
         } else {
             None
         };
-        engine.mixer.set_source_bpm(channel as usize, bpm);
+        engine.mixer_control.set_source_bpm(channel as usize, bpm);
     }
 }
 
@@ -7588,8 +7930,7 @@ pub unsafe extern "C" fn gooey_engine_loop_get_source_bpm(
 ) -> f32 {
     engine
         .as_ref()
-        .and_then(|e| e.mixer.source_bpm(channel as usize))
-        .unwrap_or(0.0)
+        .map_or(0.0, |e| e.mixer_control.source_bpm(channel as usize))
 }
 
 /// Set a loop channel's tempo-warp/pitch mode. See `PITCH_MODE_*` constants.
@@ -7603,13 +7944,13 @@ pub unsafe extern "C" fn gooey_engine_loop_set_pitch_mode(
     channel: u32,
     mode: u32,
 ) {
-    if let Some(engine) = engine.as_mut() {
+    if let Some(engine) = engine.as_ref() {
         let mode = match mode {
             PITCH_MODE_RESAMPLE => PitchMode::Resample,
             PITCH_MODE_PRESERVE_PITCH => PitchMode::PreservePitch,
             _ => PitchMode::Off,
         };
-        engine.mixer.set_pitch_mode(channel as usize, mode);
+        engine.mixer_control.set_pitch_mode(channel as usize, mode);
     }
 }
 
@@ -7625,7 +7966,7 @@ pub unsafe extern "C" fn gooey_engine_loop_get_pitch_mode(
 ) -> u32 {
     match engine
         .as_ref()
-        .map(|e| e.mixer.pitch_mode(channel as usize))
+        .map(|e| e.mixer_control.pitch_mode(channel as usize))
     {
         Some(PitchMode::Resample) => PITCH_MODE_RESAMPLE,
         Some(PitchMode::PreservePitch) => PITCH_MODE_PRESERVE_PITCH,
@@ -7639,8 +7980,8 @@ pub unsafe extern "C" fn gooey_engine_loop_get_pitch_mode(
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_loop_restart(engine: *mut GooeyEngine, channel: u32) {
-    if let Some(engine) = engine.as_mut() {
-        engine.mixer.restart(channel as usize);
+    if let Some(engine) = engine.as_ref() {
+        engine.mixer_control.restart(channel as usize);
     }
 }
 
@@ -7657,8 +7998,10 @@ pub unsafe extern "C" fn gooey_engine_loop_set_position(
     channel: u32,
     normalized: f32,
 ) {
-    if let Some(engine) = engine.as_mut() {
-        engine.mixer.set_position(channel as usize, normalized);
+    if let Some(engine) = engine.as_ref() {
+        engine
+            .mixer_control
+            .set_position(channel as usize, normalized);
     }
 }
 
@@ -7666,7 +8009,8 @@ pub unsafe extern "C" fn gooey_engine_loop_set_position(
 /// boundary. `divisions` splits the loop region into equal segments (pass the
 /// loop's bar count for bar-quantized swaps; 1 for whole-phrase). When the playing
 /// cursor next crosses a segment boundary, the queued buffer becomes active and its
-/// playhead resets to the loop start (restart from the top on the downbeat).
+/// playhead enters at the corresponding phase of its loop window. A whole-phrase
+/// swap therefore still enters at the loop start when the cursor wraps.
 /// Replaces any previously-queued buffer on the channel. Returns false on a null
 /// engine, bad channel, or empty buffer. Samples are interleaved, `channels` deep.
 ///
@@ -7692,16 +8036,25 @@ pub unsafe extern "C" fn gooey_engine_loop_queue_swap(
     if engine.is_null() || samples.is_null() || frames == 0 || channels == 0 {
         return false;
     }
-    let engine = &mut *engine;
+    let engine = &*engine;
+    if channel as usize >= LOOP_CHANNEL_COUNT as usize {
+        return false;
+    }
     let total = frames as usize * channels as usize;
     let slice = slice::from_raw_parts(samples, total);
     match StereoSampleBuffer::from_interleaved(slice, channels as usize, sample_rate) {
         Ok(mut buffer) => {
+            if buffer.is_empty() {
+                return false;
+            }
             // Tag the pending take so `warp_ratio()` is correct the moment it lands,
             // rather than falling back to 1.0 until the host retags post-swap.
             // `set_source_bpm` filters non-finite/<= 0, so 0.0 means "untagged".
             buffer.set_source_bpm((source_bpm > 0.0).then_some(source_bpm));
-            engine.mixer.queue_swap(channel as usize, buffer, divisions)
+            // Defer to the audio thread — see `gooey_engine_loop_load`.
+            engine
+                .mixer_control
+                .queue_swap(channel as usize, buffer, divisions)
         }
         Err(_) => false,
     }
@@ -7717,8 +8070,8 @@ pub unsafe extern "C" fn gooey_engine_loop_cancel_queued_swap(
     engine: *mut GooeyEngine,
     channel: u32,
 ) {
-    if let Some(engine) = engine.as_mut() {
-        engine.mixer.cancel_queued_swap(channel as usize);
+    if let Some(engine) = engine.as_ref() {
+        engine.mixer_control.cancel_queued_swap(channel as usize);
     }
 }
 
@@ -7735,7 +8088,7 @@ pub unsafe extern "C" fn gooey_engine_loop_swaps_completed(
     channel: u32,
 ) -> u32 {
     match engine.as_ref() {
-        Some(engine) => engine.mixer.swaps_completed(channel as usize),
+        Some(engine) => engine.mixer_control.swaps_completed(channel as usize),
         None => 0,
     }
 }
@@ -7751,10 +8104,7 @@ pub unsafe extern "C" fn gooey_engine_loop_get_position(
     channel: u32,
 ) -> f32 {
     match engine.as_ref() {
-        Some(engine) => engine
-            .mixer
-            .channel(channel as usize)
-            .map_or(0.0, |ch| ch.position_normalized()),
+        Some(engine) => engine.mixer_control.position(channel as usize),
         None => 0.0,
     }
 }
@@ -7771,11 +8121,17 @@ pub unsafe extern "C" fn gooey_engine_loop_effect_add(
     channel: u32,
     effect_id: u32,
 ) -> i32 {
-    match engine.as_mut() {
-        Some(engine) => engine
-            .mixer
-            .effect_add(channel as usize, effect_id)
-            .map_or(-1, |slot| slot as i32),
+    match engine.as_ref() {
+        Some(engine) => {
+            let ch = channel as usize;
+            if ch >= LOOP_CHANNEL_COUNT as usize || !ChannelEffect::is_valid_id(effect_id) {
+                return -1;
+            }
+            engine
+                .mixer_control
+                .effect_add(ch, effect_id)
+                .map_or(-1, |slot| slot as i32)
+        }
         None => -1,
     }
 }
@@ -7791,8 +8147,14 @@ pub unsafe extern "C" fn gooey_engine_loop_effect_remove(
     channel: u32,
     slot: u32,
 ) -> bool {
-    match engine.as_mut() {
-        Some(engine) => engine.mixer.effect_remove(channel as usize, slot as usize),
+    match engine.as_ref() {
+        Some(engine) => {
+            let ch = channel as usize;
+            if ch >= LOOP_CHANNEL_COUNT as usize {
+                return false;
+            }
+            engine.mixer_control.effect_remove(ch, slot as usize)
+        }
         None => false,
     }
 }
@@ -7809,11 +8171,15 @@ pub unsafe extern "C" fn gooey_engine_loop_effect_move(
     slot: u32,
     new_position: u32,
 ) -> bool {
-    match engine.as_mut() {
+    match engine.as_ref() {
         Some(engine) => {
+            let ch = channel as usize;
+            if ch >= LOOP_CHANNEL_COUNT as usize {
+                return false;
+            }
             engine
-                .mixer
-                .effect_move(channel as usize, slot as usize, new_position as usize)
+                .mixer_control
+                .effect_move(ch, slot as usize, new_position as usize)
         }
         None => false,
     }
@@ -7825,8 +8191,8 @@ pub unsafe extern "C" fn gooey_engine_loop_effect_move(
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_loop_effect_clear(engine: *mut GooeyEngine, channel: u32) {
-    if let Some(engine) = engine.as_mut() {
-        engine.mixer.effect_clear(channel as usize);
+    if let Some(engine) = engine.as_ref() {
+        engine.mixer_control.effect_clear(channel as usize);
     }
 }
 
@@ -7845,7 +8211,7 @@ pub unsafe extern "C" fn gooey_engine_loop_effect_set_param(
 ) {
     if let Some(engine) = engine.as_ref() {
         engine
-            .mixer
+            .mixer_control
             .effect_set_param(channel as usize, slot as usize, param, value);
     }
 }
@@ -7861,7 +8227,7 @@ pub unsafe extern "C" fn gooey_engine_loop_effect_count(
     channel: u32,
 ) -> u32 {
     match engine.as_ref() {
-        Some(engine) => engine.mixer.effect_count(channel as usize) as u32,
+        Some(engine) => engine.mixer_control.effect_count(channel as usize) as u32,
         None => 0,
     }
 }
@@ -7879,7 +8245,7 @@ pub unsafe extern "C" fn gooey_engine_loop_effect_type_at(
 ) -> i32 {
     match engine.as_ref() {
         Some(engine) => engine
-            .mixer
+            .mixer_control
             .effect_type_at(channel as usize, slot as usize)
             .map_or(-1, |id| id as i32),
         None => -1,

@@ -108,6 +108,25 @@ impl ChannelEffect {
         }
     }
 
+    /// Whether `effect_id` names a valid per-channel effect (i.e. one that
+    /// [`Self::from_id`] would accept). Lets the FFI validate an add request
+    /// synchronously before deferring the actual chain mutation to the audio
+    /// thread, without constructing the effect.
+    pub fn is_valid_id(effect_id: u32) -> bool {
+        matches!(
+            effect_id,
+            EFFECT_LOWPASS_FILTER
+                | EFFECT_DELAY
+                | EFFECT_SATURATION
+                | EFFECT_COMPRESSOR
+                | EFFECT_TILT_FILTER
+                | EFFECT_REVERB
+                | EFFECT_PLATE_REVERB
+                | EFFECT_WAVESHAPER
+                | EFFECT_FEEDBACK_WAVESHAPER
+        )
+    }
+
     /// The `EFFECT_*` id for this effect.
     pub fn effect_type(&self) -> u32 {
         match self {
