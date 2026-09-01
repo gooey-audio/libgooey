@@ -80,16 +80,16 @@ pub fn available_voicings(quality: &ChordQuality) -> Vec<VoicingType> {
 
 /// Apply a voicing strategy to a chord, returning MIDI note numbers
 pub fn apply_voicing(chord: &Chord, voicing: VoicingType, octave: i8) -> Vec<u8> {
-    let root_midi = note_to_midi(chord.root, octave);
-    let intervals: Vec<u8> = chord
+    let root_midi = i16::from(note_to_midi(chord.root, octave));
+    let intervals: Vec<i16> = chord
         .quality
         .intervals()
         .iter()
-        .map(|i| i.semitones())
+        .map(|i| i16::from(i.semitones()))
         .collect();
 
     // Build close-voiced MIDI notes
-    let mut notes: Vec<u8> = intervals.iter().map(|&i| root_midi + i).collect();
+    let mut notes: Vec<i16> = intervals.iter().map(|&i| root_midi + i).collect();
 
     match voicing {
         VoicingType::RootPosition => {
@@ -125,21 +125,21 @@ pub fn apply_voicing(chord: &Chord, voicing: VoicingType, octave: i8) -> Vec<u8>
         VoicingType::Drop2 => {
             if notes.len() >= 4 {
                 let idx = notes.len() - 2;
-                notes[idx] = notes[idx].saturating_sub(12);
+                notes[idx] -= 12;
                 notes.sort();
             }
         }
         VoicingType::Drop3 => {
             if notes.len() >= 5 {
                 let idx = notes.len() - 3;
-                notes[idx] = notes[idx].saturating_sub(12);
+                notes[idx] -= 12;
                 notes.sort();
             }
         }
         VoicingType::Spread => {
             for (i, note) in notes.iter_mut().enumerate() {
-                let octave_offset = (i / 2) as u8 * 12;
-                *note = note.saturating_add(octave_offset);
+                let octave_offset = (i / 2) as i16 * 12;
+                *note += octave_offset;
             }
             notes.sort();
         }
@@ -166,14 +166,14 @@ pub fn apply_voicing(chord: &Chord, voicing: VoicingType, octave: i8) -> Vec<u8>
             if notes.len() >= 3 {
                 notes.remove(0);
                 // Move the bottom note down an octave to fill the bass range
-                notes[0] = notes[0].saturating_sub(12);
+                notes[0] -= 12;
                 notes.sort();
             }
         }
     }
 
     // Clamp all notes to valid MIDI range
-    notes.iter().map(|&n| n.min(127)).collect()
+    notes.iter().map(|&note| note.clamp(0, 127) as u8).collect()
 }
 
 #[cfg(test)]
@@ -244,5 +244,19 @@ mod tests {
         // Remove root C4, left with E4(64), G4(67)
         // Move bottom (E4) down octave -> E3(52)
         assert_eq!(notes, vec![52, 67]); // E3, G4
+    }
+
+    #[test]
+    fn test_high_voicings_clamp_without_overflow() {
+        let chord = Chord::new(NoteName::B, ChordQuality::Major7);
+
+        assert_eq!(
+            apply_voicing(&chord, VoicingType::RootPosition, 8),
+            vec![119, 123, 126, 127]
+        );
+        assert_eq!(
+            apply_voicing(&chord, VoicingType::OpenVoicing, 8),
+            vec![119, 126, 127, 127]
+        );
     }
 }

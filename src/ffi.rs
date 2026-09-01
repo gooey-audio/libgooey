@@ -7409,6 +7409,107 @@ pub unsafe extern "C" fn gooey_engine_piano_zone_count(
         .map_or(0, |engine| engine.piano_control.zone_count(piano as usize))
 }
 
+/// Set the instrument's normalized chord velocity balance. Zero emphasizes
+/// lower notes, 0.5 strikes every note evenly, and one emphasizes upper notes.
+/// Finite values outside that range are clamped.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_set_velocity_mode(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    mode: f32,
+) -> bool {
+    if !mode.is_finite() {
+        return false;
+    }
+    let Some(instrument) = engine
+        .as_mut()
+        .and_then(|engine| engine.pianos.get_mut(piano as usize))
+        .and_then(Option::as_mut)
+    else {
+        return false;
+    };
+    instrument.set_chord_velocity_mode(mode);
+    true
+}
+
+/// Get the instrument's normalized chord velocity balance, or NaN for an
+/// invalid or unregistered piano.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_get_velocity_mode(
+    engine: *const GooeyEngine,
+    piano: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.pianos.get(piano as usize))
+        .and_then(Option::as_ref)
+        .map_or(f32::NAN, MultiSampleInstrument::chord_velocity_mode)
+}
+
+/// Trigger a diatonic seventh chord on a registered piano.
+///
+/// The harmony arguments match `gooey_engine_poly_trigger_chord`: `root` is
+/// 0=C through 11=B, `scale_type` is `SCALE_MAJOR` or `SCALE_MINOR`, `degree`
+/// is 0–6, and `voicing` is one of the `VOICING_*` constants. `velocity` is a
+/// normalized 0–1 base strike strength. The piano's velocity mode turns it into
+/// one velocity per note before the existing velocity-layered `note_on` path is
+/// used.
+///
+/// Existing notes are not released. Non-shared notes may overlap, while a key
+/// present in both chords uses the piano's normal self-masking behavior when it
+/// is restruck. Returns true only when every chord note found a mapped sample
+/// zone. Mapped notes still sound when another chord note is outside the map.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn gooey_engine_piano_trigger_chord(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    root: u32,
+    scale_type: u32,
+    degree: u32,
+    voicing: u32,
+    octave: i32,
+    velocity: f32,
+) -> bool {
+    if !velocity.is_finite() {
+        return false;
+    }
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let index = piano as usize;
+    if !engine.pianos.get(index).is_some_and(Option::is_some) {
+        return false;
+    }
+
+    let key = Key::new(root_from_id(root), scale_from_id(scale_type));
+    let chords = key.diatonic_sevenths();
+    let chord = &chords[degree as usize % chords.len()];
+    let notes = apply_voicing(chord, voicing_from_id(voicing), octave.clamp(0, 8) as i8);
+    let Some(instrument) = engine.pianos.get_mut(index).and_then(Option::as_mut) else {
+        return false;
+    };
+    let velocities = instrument.chord_velocities(velocity.clamp(0.0, 1.0), notes.len());
+
+    let mut all_sounded = true;
+    for (note, note_velocity) in notes.into_iter().zip(velocities) {
+        // Do not short-circuit: a partially mapped chord should still play all
+        // notes for which the sample pack has a zone.
+        let sounded = instrument.note_on(note, note_velocity);
+        all_sounded &= sounded;
+    }
+    all_sounded
+}
+
 /// Strike a key. `velocity` is normalized 0–1. Returns false when the map has
 /// no zone for that note and velocity.
 ///

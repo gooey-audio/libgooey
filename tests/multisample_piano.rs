@@ -28,6 +28,17 @@ fn flat_pcm(frames: usize, value: f32) -> Vec<f32> {
 /// Stage and commit a two-velocity-layer map covering C3..C5 rooted at C4.
 /// Returns after the commit is queued; it becomes audible on the next render.
 unsafe fn commit_two_layer_map(engine: *mut GooeyEngine, piano: u32, frames: usize) {
+    commit_two_layer_map_in_range(engine, piano, frames, 48, 72);
+}
+
+/// As `commit_two_layer_map`, with an explicit playable key range.
+unsafe fn commit_two_layer_map_in_range(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    frames: usize,
+    lokey: u32,
+    hikey: u32,
+) {
     assert!(gooey_engine_piano_zone_begin(engine, piano));
     for (lovel, hivel, level) in [(1, 63, 0.25_f32), (64, 127, 0.9_f32)] {
         let pcm = flat_pcm(frames, level);
@@ -39,8 +50,8 @@ unsafe fn commit_two_layer_map(engine: *mut GooeyEngine, piano: u32, frames: usi
                 frames as u32,
                 2,
                 SR,
-                48, // lokey  C3
-                72, // hikey  C5
+                lokey,
+                hikey,
                 60, // root   C4
                 lovel,
                 hivel,
@@ -54,6 +65,41 @@ unsafe fn commit_two_layer_map(engine: *mut GooeyEngine, piano: u32, frames: usi
             ),
             "zone {lovel}..{hivel} should be accepted"
         );
+    }
+    assert!(gooey_engine_piano_zone_commit(engine, piano));
+}
+
+unsafe fn commit_exact_velocity_map(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    notes: &[u32],
+    velocities: &[f32],
+) {
+    assert_eq!(notes.len(), velocities.len());
+    assert!(gooey_engine_piano_zone_begin(engine, piano));
+    for (&note, &velocity) in notes.iter().zip(velocities) {
+        let pcm = flat_pcm(8192, 0.5);
+        let midi_velocity = ((velocity.clamp(0.0, 1.0) * 127.0).round() as u32).max(1);
+        assert!(gooey_engine_piano_zone_add(
+            engine,
+            piano,
+            pcm.as_ptr(),
+            8192,
+            2,
+            SR,
+            note,
+            note,
+            note,
+            midi_velocity,
+            midi_velocity,
+            0.0,
+            0.0,
+            0.5,
+            0.3,
+            PIANO_LOOP_NONE,
+            0,
+            0,
+        ));
     }
     assert!(gooey_engine_piano_zone_commit(engine, piano));
 }
@@ -238,6 +284,243 @@ fn velocity_picks_the_matching_layer() {
             hard > soft * 1.5,
             "the loud layer should be clearly louder: hard {hard} vs soft {soft}"
         );
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn piano_velocity_mode_is_an_instrument_property_and_clamps() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+
+        assert!(!gooey_engine_piano_set_velocity_mode(engine, 0, 0.5));
+        assert!(gooey_engine_piano_get_velocity_mode(engine, 0).is_nan());
+        let piano = gooey_engine_piano_register(engine) as u32;
+
+        // Low-weighted is the instrument default.
+        assert_eq!(gooey_engine_piano_get_velocity_mode(engine, piano), 0.0);
+        assert!(gooey_engine_piano_set_velocity_mode(engine, piano, 0.5));
+        assert_eq!(gooey_engine_piano_get_velocity_mode(engine, piano), 0.5);
+        assert!(gooey_engine_piano_set_velocity_mode(engine, piano, -1.0));
+        assert_eq!(gooey_engine_piano_get_velocity_mode(engine, piano), 0.0);
+        assert!(gooey_engine_piano_set_velocity_mode(engine, piano, 2.0));
+        assert_eq!(gooey_engine_piano_get_velocity_mode(engine, piano), 1.0);
+        assert!(!gooey_engine_piano_set_velocity_mode(
+            engine,
+            piano,
+            f32::NAN
+        ));
+        assert_eq!(gooey_engine_piano_get_velocity_mode(engine, piano), 1.0);
+        assert!(!gooey_engine_piano_set_velocity_mode(
+            engine,
+            PIANO_INSTRUMENT_MAX,
+            0.5
+        ));
+        assert!(gooey_engine_piano_get_velocity_mode(engine, PIANO_INSTRUMENT_MAX).is_nan());
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn chord_trigger_uses_theory_voicing_and_base_velocity() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let piano = gooey_engine_piano_register(engine) as u32;
+        assert!(gooey_engine_mixer_route_source(
+            engine,
+            SOURCE_PIANO_BASE + piano,
+            2
+        ));
+        commit_two_layer_map(engine, piano, 8192);
+        render(engine, 64);
+        assert!(gooey_engine_piano_set_velocity_mode(engine, piano, 0.5));
+
+        assert!(gooey_engine_piano_trigger_chord(
+            engine,
+            piano,
+            0, // C
+            SCALE_MAJOR,
+            0,
+            VOICING_ROOT_POSITION,
+            4,
+            0.1,
+        ));
+        let soft = peak(&render(engine, 512));
+        assert_eq!(gooey_engine_piano_active_voices(engine, piano), 4);
+
+        assert!(gooey_engine_piano_release_all(engine, piano));
+        render(engine, SR as usize);
+        assert!(gooey_engine_piano_trigger_chord(
+            engine,
+            piano,
+            0, // C
+            SCALE_MAJOR,
+            0,
+            VOICING_ROOT_POSITION,
+            4,
+            1.0,
+        ));
+        let hard = peak(&render(engine, 512));
+        assert_eq!(gooey_engine_piano_active_voices(engine, piano), 4);
+        assert!(
+            hard > soft * 1.5,
+            "base chord velocity should reach a louder layer: hard {hard} vs soft {soft}"
+        );
+
+        assert!(!gooey_engine_piano_trigger_chord(
+            engine,
+            piano,
+            0, // C
+            SCALE_MAJOR,
+            0,
+            VOICING_ROOT_POSITION,
+            4,
+            f32::NAN,
+        ));
+        assert!(!gooey_engine_piano_trigger_chord(
+            engine,
+            PIANO_INSTRUMENT_MAX,
+            0, // C
+            SCALE_MAJOR,
+            0,
+            VOICING_ROOT_POSITION,
+            4,
+            1.0,
+        ));
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn default_velocity_mode_is_low_weighted_and_deterministic() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let piano = gooey_engine_piano_register(engine) as u32;
+        assert!(gooey_engine_mixer_route_source(
+            engine,
+            SOURCE_PIANO_BASE + piano,
+            2
+        ));
+
+        let notes = [60, 64, 67, 71]; // Cmaj7, root position, octave 4.
+        let expected = [1.0, 1.0 - 0.34 / 3.0, 1.0 - 0.68 / 3.0, 0.66];
+        commit_exact_velocity_map(engine, piano, &notes, &expected);
+        render(engine, 64);
+
+        assert!(gooey_engine_piano_trigger_chord(
+            engine,
+            piano,
+            0, // C
+            SCALE_MAJOR,
+            0,
+            VOICING_ROOT_POSITION,
+            4,
+            1.0,
+        ));
+        render(engine, 512);
+        assert_eq!(gooey_engine_piano_active_voices(engine, piano), 4);
+
+        // There is no hidden random control: identical chord hits use the same
+        // per-note velocities until the instrument's slider property changes.
+        assert!(gooey_engine_piano_trigger_chord(
+            engine,
+            piano,
+            0, // C
+            SCALE_MAJOR,
+            0,
+            VOICING_ROOT_POSITION,
+            4,
+            1.0,
+        ));
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn chord_trigger_reports_partial_maps_but_sounds_covered_notes() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let piano = gooey_engine_piano_register(engine) as u32;
+        assert!(gooey_engine_mixer_route_source(
+            engine,
+            SOURCE_PIANO_BASE + piano,
+            2
+        ));
+        // Cmaj7 is C4/E4/G4/B4. Stop the map at G4 so only B4 is missing.
+        commit_two_layer_map_in_range(engine, piano, 8192, 60, 67);
+        render(engine, 64);
+        assert!(gooey_engine_piano_set_velocity_mode(engine, piano, 0.5));
+
+        assert!(!gooey_engine_piano_trigger_chord(
+            engine,
+            piano,
+            0, // C
+            SCALE_MAJOR,
+            0,
+            VOICING_ROOT_POSITION,
+            4,
+            1.0,
+        ));
+        assert!(peak(&render(engine, 512)) > 0.0);
+        assert_eq!(gooey_engine_piano_active_voices(engine, piano), 3);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn chord_trigger_overlaps_non_shared_notes_and_self_masks_restrikes() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let piano = gooey_engine_piano_register(engine) as u32;
+        assert!(gooey_engine_mixer_route_source(
+            engine,
+            SOURCE_PIANO_BASE + piano,
+            2
+        ));
+        commit_two_layer_map(engine, piano, 3 * SR as usize);
+        render(engine, 64);
+        assert!(gooey_engine_piano_set_velocity_mode(engine, piano, 0.5));
+
+        assert!(gooey_engine_piano_trigger_chord(
+            engine,
+            piano,
+            0, // C
+            SCALE_MAJOR,
+            0,
+            VOICING_ROOT_POSITION,
+            4,
+            0.8,
+        ));
+        render(engine, 512);
+        assert_eq!(gooey_engine_piano_active_voices(engine, piano), 4);
+
+        // Repeating the same chord fades and replaces its four shared keys.
+        assert!(gooey_engine_piano_trigger_chord(
+            engine,
+            piano,
+            0, // C
+            SCALE_MAJOR,
+            0,
+            VOICING_ROOT_POSITION,
+            4,
+            0.8,
+        ));
+        render(engine, 512);
+        assert_eq!(gooey_engine_piano_active_voices(engine, piano), 4);
+
+        // Dm7 shares no notes with Cmaj7, so both four-note chords remain.
+        assert!(gooey_engine_piano_trigger_chord(
+            engine,
+            piano,
+            0, // C
+            SCALE_MAJOR,
+            1,
+            VOICING_ROOT_POSITION,
+            4,
+            0.8,
+        ));
+        render(engine, 512);
+        assert_eq!(gooey_engine_piano_active_voices(engine, piano), 8);
         gooey_engine_free(engine);
     }
 }
