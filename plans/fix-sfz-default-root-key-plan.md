@@ -14,7 +14,8 @@ An SFZ region may omit `pitch_keycenter`; the SFZ default is MIDI note 60 (middl
 - [x] (2026-09-14 20:53Z) Ran formatting, actionlint, focused Rust tests, the no-native FFI integration test, and the full no-default/bounce suite successfully.
 - [x] (2026-09-14 20:52Z) Configured `BLOB_READ_WRITE_TOKEN` as a repository Actions secret without exposing its value.
 - [x] (2026-09-14 20:57Z) Pushed commit `ffc142b`, opened PR #236, and observed both Ubuntu and macOS repository test jobs pass.
-- [ ] Publish and verify the v2 Blob after the workflow is available on `main`.
+- [x] (2026-09-14 21:05Z) Merged PR #236 and ran the pack workflow through source verification, generation, archive validation, and candidate retention; upload failed before creating either Blob because Vercel CLI required account credentials.
+- [ ] Replace the upload client, rerun the workflow from `main`, and publish and verify the v2 Blob.
 
 ## Surprises & Discoveries
 
@@ -28,6 +29,8 @@ An SFZ region may omit `pitch_keycenter`; the SFZ default is MIDI note 60 (middl
   Evidence: `gh secret list --app actions` listed other secrets but not the Blob credential.
 - Observation: The full `cargo test --no-default-features --features bounce` run passes with 411 unit tests passed and one release-contract test intentionally ignored, followed by all integration and doc-test targets passing; five pre-existing `unused_unsafe` warnings remain in `tests/performance_recording.rs`.
   Evidence: Local test output on 2026-09-14.
+- Observation: Vercel CLI 58.9.0 does not authenticate its Blob subcommand from `BLOB_READ_WRITE_TOKEN` on a clean GitHub runner; it asked for `vercel login` or the CLI's separate account `--token` even though the Blob credential was present.
+  Evidence: GitHub Actions run 34896523766 failed only in `Publish immutable private blobs` with `Error: No existing credentials found`; all generation and validation steps passed.
 
 ## Decision Log
 
@@ -40,10 +43,13 @@ An SFZ region may omit `pitch_keycenter`; the SFZ default is MIDI note 60 (middl
 - Decision: Generate on a manually dispatched Ubuntu GitHub Actions runner and refuse publication unless the checked-out ref is `main`.
   Rationale: The user selected CI generation because local disk cannot safely hold the source archive, extraction, prepared pack, and compressed artifact together.
   Date/Author: 2026-09-14 / Codex
+- Decision: Upload with pinned `@vercel/blob` 2.8.0 and pass `BLOB_READ_WRITE_TOKEN` directly to `put`, rather than using Vercel CLI.
+  Rationale: The Blob SDK directly supports token-authenticated private multipart uploads; this avoids introducing or storing a broader Vercel account credential solely for CLI login.
+  Date/Author: 2026-09-14 / Codex
 
 ## Outcomes & Retrospective
 
-The parser, regression coverage, artifact contract test, and CI publisher are implemented and pass local validation. PR #236 is open and its Ubuntu and macOS test jobs pass. The repository Actions secret is configured. Publication remains pending until the workflow file is merged to `main`, because GitHub only exposes a newly added manually dispatched workflow after it exists on the default branch.
+The parser, regression coverage, artifact contract test, and CI publisher were merged in PR #236. The first pack run proved the source download, source checksum, preparation, corrected C4 mapping, audio properties, deterministic archive, and libgooey reload, and retained the candidate as a temporary Actions artifact. The Vercel CLI upload client failed authentication without creating v2. A follow-up changes only the upload client to the Blob SDK; publication and final remote digest verification remain pending.
 
 ## Context and Orientation
 
@@ -57,7 +63,7 @@ In `src/instruments/multisample_pack.rs`, introduce a private named constant for
 
 In `src/instruments/multisample_prep.rs`, add a focused temporary-pack test with one stereo WAV and an SFZ region whose range is 59 through 61 but whose center is omitted. Prepare it without thinning, assert that the emitted mapping and output filename explicitly identify root 60, reload the result through `load_sfz`, and assert the reloaded zone still has range 59 through 61 and root 60. In `src/music/voicing.rs`, add a direct root-position C-major-seventh assertion for `[60, 64, 67, 71]` at octave 4.
 
-Add `.github/workflows/salamander-mobile-pack.yml` with `workflow_dispatch` only and read-only repository permissions. The job must exit unless `GITHUB_REF` is `refs/heads/main`, download and verify the original archive, extract it, run the release-mode mobile preparation command with Salamander attribution, and validate the prepared directory. Validation must establish 244 WAV zones, eight corrected C4 regions, no erroneous center-59 C4 regions, six-second-or-shorter stereo 16-bit audio, attribution, and successful reloading through libgooey. Package the existing `piano-mobile/` root deterministically, generate a conventional `.sha256` sidecar, and upload both immutable private objects with multipart Vercel Blob uploads. Query the uploaded object, download it with authentication, and require its digest to equal the sidecar before reporting success.
+Add `.github/workflows/salamander-mobile-pack.yml` with `workflow_dispatch` only and read-only repository permissions. The job must exit unless `GITHUB_REF` is `refs/heads/main`, download and verify the original archive, extract it, run the release-mode mobile preparation command with Salamander attribution, and validate the prepared directory. Validation must establish 244 WAV zones, eight corrected C4 regions, no erroneous center-59 C4 regions, six-second-or-shorter stereo 16-bit audio, attribution, and successful reloading through libgooey. Package the existing `piano-mobile/` root deterministically, generate a conventional `.sha256` sidecar, and upload both immutable private objects through pinned `@vercel/blob` with private multipart upload, the Blob read/write token, no random suffix, and overwrite disabled. Query the uploaded object, download it with authentication, and require its digest to equal the sidecar before reporting success.
 
 ## Concrete Steps
 
@@ -94,4 +100,4 @@ The published objects are:
 
 ## Interfaces and Dependencies
 
-No Rust or C public API changes are made. The only new operational interface is the manually dispatched GitHub Actions workflow. It uses the existing Rust stable toolchain, `curl`, GNU tar, gzip, standard checksum tools, and Vercel CLI. `BLOB_READ_WRITE_TOKEN` is supplied only as an Actions secret. The Blob store remains private, so verification downloads send the credential in an authorization header without logging it.
+No Rust or C public API changes are made. The only new operational interface is the manually dispatched GitHub Actions workflow. It uses the existing Rust stable toolchain, `curl`, GNU tar, gzip, standard checksum tools, Node.js, and pinned `@vercel/blob` 2.8.0. `BLOB_READ_WRITE_TOKEN` is supplied only as an Actions secret. The Blob store remains private, so verification downloads send the credential in an authorization header without logging it.
