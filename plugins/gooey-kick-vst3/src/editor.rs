@@ -1,10 +1,23 @@
 use crate::params::{AtomicParameters, ParamId};
 use egui::{Color32, RichText, Sense, Stroke, Vec2};
-use egui_baseview::{App, Frame};
+use egui_baseview::{App, Frame, Key, KeyCapture};
 use std::sync::Arc;
 
 pub const EDITOR_WIDTH: f64 = 560.0;
 pub const EDITOR_HEIGHT: f64 = 300.0;
+const KNOB_DRAG_SENSITIVITY: f32 = 0.006;
+
+fn knob_value_from_drag(start: f32, total_drag_y: f32) -> f32 {
+    (start - total_drag_y * KNOB_DRAG_SENSITIVITY).clamp(0.0, 1.0)
+}
+
+fn editor_key_capture(standalone: bool) -> KeyCapture {
+    if standalone {
+        KeyCapture::CaptureKeys(vec![Key::Character(" ".into())])
+    } else {
+        KeyCapture::IgnoreAll
+    }
+}
 
 pub trait EditorHost: Send + 'static {
     fn parameters(&self) -> &AtomicParameters;
@@ -45,8 +58,10 @@ impl KickEditor {
                 self.gesture_start[index] = value;
             }
             if response.dragged() {
-                let dragged =
-                    (self.gesture_start[index] - response.drag_delta().y * 0.006).clamp(0.0, 1.0);
+                let dragged = knob_value_from_drag(
+                    self.gesture_start[index],
+                    response.total_drag_delta().unwrap_or_default().y,
+                );
                 if dragged != value {
                     value = dragged;
                     response.mark_changed();
@@ -102,6 +117,15 @@ impl Drop for KickEditor {
 }
 
 impl App for KickEditor {
+    fn build(
+        &mut self,
+        _egui_ctx: egui::Context,
+        frame: &mut Frame,
+    ) -> Result<(), egui_baseview::baseview::HandlerError> {
+        frame.set_key_capture(editor_key_capture(self.standalone));
+        Ok(())
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut Frame) {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(Color32::from_rgb(20, 22, 28)))
@@ -122,14 +146,24 @@ impl App for KickEditor {
                 });
 
                 if self.standalone {
+                    let mut audition_requested = false;
                     ui.add_space(8.0);
                     ui.horizontal_centered(|ui| {
                         if ui.button("Audition").clicked() {
-                            self.host.audition();
+                            audition_requested = true;
                         }
-                        ui.label("or press Space");
+                        let keyboard_focus = ui.add(
+                            egui::Label::new("or press Space")
+                                .sense(Sense::focusable_noninteractive()),
+                        );
+                        if ui.memory(|memory| memory.focused().is_none()) {
+                            keyboard_focus.request_focus();
+                        }
                     });
                     if ui.input(|input| input.key_pressed(egui::Key::Space)) {
+                        audition_requested = true;
+                    }
+                    if audition_requested {
                         self.host.audition();
                     }
                 }
@@ -159,5 +193,31 @@ impl EditorHost for AtomicEditorHost {
         if let Some(audition) = &self.audition {
             audition();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cumulative_vertical_drag_changes_knob_monotonically_and_clamps() {
+        let upward = [-10.0, -20.0, -30.0].map(|delta| knob_value_from_drag(0.5, delta));
+        assert!(upward.windows(2).all(|values| values[0] < values[1]));
+
+        let downward = [10.0, 20.0, 30.0].map(|delta| knob_value_from_drag(0.5, delta));
+        assert!(downward.windows(2).all(|values| values[0] > values[1]));
+
+        assert_eq!(knob_value_from_drag(0.5, -1_000.0), 1.0);
+        assert_eq!(knob_value_from_drag(0.5, 1_000.0), 0.0);
+    }
+
+    #[test]
+    fn keyboard_capture_is_scoped_to_standalone_spacebar() {
+        assert_eq!(
+            editor_key_capture(true),
+            KeyCapture::CaptureKeys(vec![Key::Character(" ".into())])
+        );
+        assert_eq!(editor_key_capture(false), KeyCapture::IgnoreAll);
     }
 }

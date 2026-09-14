@@ -19,6 +19,10 @@ The proof is observable in three ways. `cargo run -p gooey-kick-xtask -- bundle-
 - [x] (2026-09-14 01:37Z) Implemented bundle assembly, architecture/symbol inspection, signing, safe user installation, checksum-pinned pluginval validation, documentation, and Conductor actions.
 - [x] (2026-09-14 01:45Z) Ran formatting, all default and no-default libgooey tests, new strict Clippy checks, standalone compilation/launch, bundle inspection, signature verification, and pluginval strictness 5 with GUI tests.
 - [x] (2026-09-14 01:46Z) Recorded final evidence, environmental limitations, decisions, and outcomes in this plan.
+- [x] (2026-09-14 19:36Z) Investigated PR review and hands-on standalone feedback about stale first-hit parameters, jittering knobs, and the macOS no-input beep.
+- [x] (2026-09-14 19:45Z) Snapped bulk DSP parameter loads, changed knobs to cumulative drag distance, and scoped keyboard capture to standalone Space input with regression tests.
+- [x] (2026-09-14 19:59Z) Re-ran formatting, focused and repository-wide tests, no-default-feature tests, strict plug-in Clippy, standalone build/window launch, and pluginval strictness 5.
+- [ ] Complete a post-fix human interaction pass: drag every knob, listen to subsequent hits, and confirm Space no longer produces the macOS no-input beep.
 
 ## Surprises & Discoveries
 
@@ -36,6 +40,18 @@ The proof is observable in three ways. `cargo run -p gooey-kick-xtask -- bundle-
 
 - Observation: checking every pre-existing root feature needs an external CMake installation for `glfw-sys`; CMake is absent on this machine.
   Evidence: `cargo check --workspace --all-targets --all-features` stopped in the `glfw-sys` build script with `is cmake not installed?`. This does not affect the VST3 or standalone targets, which compile and validate.
+
+- Observation: `KickAdapter::apply_all_parameters` originally reused real-time setters that changed only `SmoothedParam` targets, but `KickDrum::trigger_with_velocity` snapshots current pitch-envelope values before any sample can advance the smoothers.
+  Evidence: a regression that inspects the current config immediately after construction, state replacement, and sample-rate reconstruction fails without a final `KickDrum::snap_params()` call and passes with it.
+
+- Observation: egui 0.36 defines `Response::drag_delta()` as movement since the last frame and `Response::total_drag_delta()` as movement since the drag started.
+  Evidence: combining a fixed gesture-start value with per-frame delta repeatedly pulled knobs back toward their starting point; cumulative-drag tests now stay monotonic in both directions.
+
+- Observation: egui-baseview returns ignored for keyboard events unless egui has a focused widget, and baseview's macOS view forwards ignored key events to AppKit's superclass implementation.
+  Evidence: Space still triggered the egui action but then reached AppKit and produced the system no-input beep. The standalone now keeps a focus target and captures only the keyboard-types Space key.
+
+- Observation: the first repository-wide validation attempt exhausted the nearly full host volume while Cargo was linking test binaries.
+  Evidence: the linker returned `errno=28`; cleaning only this workspace's generated `target/` and rerunning with `CARGO_INCREMENTAL=0` completed the same test matrix successfully.
 
 ## Decision Log
 
@@ -67,11 +83,25 @@ The proof is observable in three ways. `cargo run -p gooey-kick-xtask -- bundle-
   Rationale: Installation stays explicit and a failed replacement restores the previous bundle; ordinary build and validation only mutate ignored paths under `target/`.
   Date/Author: 2026-09-14 / Codex.
 
+- Decision: Snap the kick's smoothers only after the adapter's bulk parameter loop, not after individual parameter updates.
+  Rationale: Construction, state restoration, and sample-rate reconstruction must be immediately coherent before the first trigger, while automation and live knob changes still need click-free smoothing.
+  Date/Author: 2026-09-14 / Codex.
+
+- Decision: Keep the fixed value captured at drag start and combine it with egui's cumulative vertical drag distance.
+  Rationale: This preserves the existing sensitivity and host gesture lifecycle while preventing per-frame pointer deltas from resetting the displayed value toward its start.
+  Date/Author: 2026-09-14 / Codex.
+
+- Decision: Capture only Space in the standalone editor and ignore all keys in the embedded editor, with a standalone-only focusable keyboard hint.
+  Rationale: Space must remain inside the standalone to suppress AppKit's beep, while a hosted editor has no keyboard commands and should leave DAW shortcuts available.
+  Date/Author: 2026-09-14 / Codex.
+
 ## Outcomes & Retrospective
 
 The proof of concept meets its automated acceptance target. The root is a workspace, the hosted VST3 links libgooey without its CPAL-backed default feature, and the standalone enables CPAL separately. Seven stable parameters, versioned atomic state, MIDI velocity/retrigger behavior, exact-offset host automation, safe sample-rate rebuilds, finite stereo output, separate VST3 processor/controller objects, host-mediated editor gestures, and fixed 560 by 300 egui knobs are implemented. libgooey's public Rust and C interfaces were not changed.
 
 `target/bundled/Gooey Kick POC.vst3` is an arm64 Mach-O bundle with the intended property-list metadata, all three entry symbols, a valid ad-hoc signature, and module metadata. pluginval 1.0.4 passed strictness 5 including GUI, processing, state, automation, and bus tests. The standalone launched and remained running with its window and CPAL stream until deliberately interrupted.
+
+The PR follow-up makes every bulk-loaded parameter current before the next hit without weakening live smoothing. The shared editor now uses cumulative drag distance, standalone Space input is captured instead of forwarded to AppKit, and embedded editors explicitly pass keyboard input through. Twenty-three plug-in tests, the full workspace and no-default-feature matrices, strict plug-in Clippy, and a fresh pluginval strictness-5 run pass after the changes.
 
 Two limitations remain environmental or manual rather than implementation failures. No human listening confirmation was possible from the coding session, so a user should still press Audition and Space and turn every knob using the Conductor action. The repository's unrelated visualization feature needs CMake, and the existing root crate has strict-Clippy debt; all new targets pass their own strict Clippy checks and the complete normal test matrix passes.
 
@@ -94,6 +124,8 @@ Second, implement the independent core before COM. Seven normalized parameters d
 Third, implement processor and controller COM classes and the factory. The processor declares no input bus, one stereo output, one 16-channel event input, and only 32-bit processing. In each process block, apply every automation point and note-on at its exact sample offset; pitch and note-offs have no effect. Accept a parameter-only flush containing no audio buffers. Reject invalid bus arrangements, sample sizes, and sample rates. Track output silence flags from actual rendered samples. Implement state streams on the processor and component-state loading on the controller. The controller exposes all seven automatable parameters and creates a fixed 560 by 300 NSView-compatible plug view. The view uses baseview and egui-baseview; knob gesture boundaries call the three VST3 edit methods and controller `setParamNormalized` refreshes atomic editor values.
 
 Fourth, implement the standalone binary around the same DSP adapter and editor layout. A lock-free atomic snapshot communicates controls to the CPAL callback. A monotonically increasing atomic audition counter communicates button and Space presses. The callback notices changes, triggers a full-velocity one-shot, and duplicates the mono signal to every configured device channel. Device and stream errors appear as actionable stderr output.
+
+For the review follow-up, finish every bulk adapter parameter application by snapping the kick's current smoother values to those targets. Leave single-parameter updates on the smoothed path. Derive knob values from the value saved at drag start and egui's total vertical drag distance. In standalone mode, configure egui-baseview to capture the keyboard-types Space key and keep a focusable keyboard-hint response active when nothing else has focus; configure embedded mode to ignore keys so the host retains its shortcuts.
 
 Fifth, implement idempotent packaging in xtask. Build the plug-in library in release mode, stage the macOS bundle hierarchy, write the required property list, copy and rename the dynamic library, and ad-hoc sign it with `/usr/bin/codesign`. The install subcommand writes only beneath the current user's VST3 directory and refuses to replace an existing bundle whose identifier is not `audio.gooey.kick-poc` unless `--force` is supplied. Validation assembles a fresh bundle, downloads and verifies pluginval when absent, unpacks it, and invokes `--validate` with `--strictness-level 5` while leaving GUI tests enabled.
 
@@ -137,6 +169,8 @@ Unit tests must demonstrate IDs 0 through 6, defaults derived from the kick conf
 
 DSP tests must observe silence before a trigger and finite nonzero energy afterward at 44,100, 48,000, and 96,000 Hz. They must observe identical stereo channels, lower energy for lower velocity, audible changes from parameters, and a fresh transient after retriggering. COM tests must enumerate exactly the processor and controller classes, create and query their interfaces, inspect buses and parameters, and release every reference without leaks or crashes.
 
+Review regressions must also prove that construction, state replacement, and sample-rate reconstruction expose the requested current parameter values before rendering any sample, while an individual parameter update still takes more than one sample to reach its target. Editor tests must prove cumulative upward and downward drag calculations are monotonic and clamp to 0–1, standalone capture includes only Space, and embedded capture ignores keyboard input.
+
 The produced bundle passes the hierarchy, property-list, arm64, exported-symbol, and ad-hoc signature checks in Concrete Steps. Pluginval exits zero at strictness 5 with GUI tests. Manual acceptance launches the “Kick Standalone” Conductor action, clicks Audition and presses Space, hears a kick for both gestures, and confirms every knob affects subsequent hits. Manual listening is explicitly recorded rather than inferred from compilation.
 
 ## Idempotence and Recovery
@@ -153,7 +187,7 @@ The initial no-default-feature baseline completed successfully before modificati
 Final build and pluginval evidence:
 
     cargo test --workspace --all-targets
-    test result: ok (385 lib tests, every integration suite, 19 plug-in tests, 2 xtask tests)
+    test result: ok (385 lib tests, every integration suite, 23 plug-in tests, 2 xtask tests)
 
     cargo test -p gooey --no-default-features --lib --tests
     test result: ok (385 lib tests and every integration suite)
@@ -177,6 +211,9 @@ Final build and pluginval evidence:
     Reported taillength: 4
     SUCCESS
 
+    cargo build -p gooey-kick-vst3 --features standalone --bin gooey-kick-standalone
+    Finished dev profile; launching the binary created a Gooey Kick POC window
+
 ## Interfaces and Dependencies
 
 The plug-in package uses `vst3 = "0.3.0"` for Steinberg-compatible COM declarations, `baseview = "0.3.4"` for child and standalone native windows, and `egui-baseview = "0.7.1"` for the OpenGL-backed egui integration. CPAL is optional and present only in the `standalone` feature. `gooey = { path = "../..", default-features = false }` is mandatory.
@@ -188,3 +225,5 @@ The processor implements `IPluginBase`, `IComponent`, and `IAudioProcessor`. The
 Revision note (2026-09-14 00:51Z): Created the initial implementation-ready plan after local source and dependency research so subsequent work and validation can be resumed from this file alone.
 
 Revision note (2026-09-14 01:46Z): Marked implementation milestones complete, recorded final architecture decisions, added build and pluginval evidence, and distinguished automated success from the remaining human listening check and unrelated root-tooling limitations.
+
+Revision note (2026-09-14 19:59Z): Addressed PR review and hands-on standalone feedback by documenting immediate bulk parameter snapping, cumulative knob dragging, scoped Space capture, new regression coverage, successful revalidation, and the remaining post-fix human interaction check.

@@ -99,6 +99,7 @@ impl KickAdapter {
         for id in ParamId::ALL {
             self.set_parameter(id, self.parameters.get(id));
         }
+        self.kick.snap_params();
     }
 }
 
@@ -124,6 +125,21 @@ mod tests {
 
     fn energy(adapter: &mut KickAdapter, frames: usize) -> f32 {
         (0..frames).map(|_| adapter.next_sample().abs()).sum()
+    }
+
+    fn assert_current_parameters(adapter: &KickAdapter, expected: Parameters) {
+        let config = adapter.kick.config();
+        assert_eq!(config.frequency, expected.get(ParamId::Frequency));
+        assert_eq!(config.oscillator_decay, expected.get(ParamId::Decay));
+        assert_eq!(config.amp_decay, expected.get(ParamId::Decay));
+        assert_eq!(config.punch_amount, expected.get(ParamId::Punch));
+        assert_eq!(config.click_amount, expected.get(ParamId::Click));
+        assert_eq!(
+            config.pitch_envelope_amount,
+            expected.get(ParamId::PitchSweep)
+        );
+        assert_eq!(config.overdrive_amount, expected.get(ParamId::Drive));
+        assert_eq!(config.volume, expected.get(ParamId::Output));
     }
 
     #[test]
@@ -190,5 +206,40 @@ mod tests {
         assert_eq!(adapter.sample_counter(), 0);
         assert_eq!(adapter.parameters().get(ParamId::Frequency), 0.73);
         assert!(!adapter.set_sample_rate(f64::NAN));
+    }
+
+    #[test]
+    fn bulk_parameter_application_is_immediate() {
+        let initial = Parameters::new([0.91, 0.82, 0.73, 0.64, 0.55, 0.46, 0.37]);
+        let mut adapter = KickAdapter::new(48_000.0, initial);
+        assert_current_parameters(&adapter, initial);
+
+        let restored = Parameters::new([0.12, 0.23, 0.34, 0.45, 0.56, 0.67, 0.78]);
+        adapter.replace_parameters(restored);
+        assert_current_parameters(&adapter, restored);
+
+        adapter.set_parameter(ParamId::PitchSweep, 0.98);
+        let rebuilt = adapter.parameters();
+        assert!(adapter.set_sample_rate(96_000.0));
+        assert_current_parameters(&adapter, rebuilt);
+    }
+
+    #[test]
+    fn real_time_parameter_changes_remain_smoothed() {
+        let mut adapter = KickAdapter::new(48_000.0, Parameters::default());
+        let before = adapter.kick.config().pitch_envelope_amount;
+        let target = if before < 0.5 { 1.0 } else { 0.0 };
+
+        adapter.set_parameter(ParamId::PitchSweep, target);
+        assert_eq!(adapter.parameters().get(ParamId::PitchSweep), target);
+        assert_eq!(adapter.kick.config().pitch_envelope_amount, before);
+
+        assert_eq!(adapter.next_sample(), 0.0);
+        let after_one_sample = adapter.kick.config().pitch_envelope_amount;
+        if target > before {
+            assert!(after_one_sample > before && after_one_sample < target);
+        } else {
+            assert!(after_one_sample < before && after_one_sample > target);
+        }
     }
 }
