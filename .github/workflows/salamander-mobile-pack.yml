@@ -1,0 +1,162 @@
+name: Salamander Mobile Pack
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_ARCHIVE: SalamanderGrandPianoV3_44.1khz16bit.tar.bz2
+  SOURCE_URL: https://archive.org/download/SalamanderGrandPianoV3/SalamanderGrandPianoV3_44.1khz16bit.tar.bz2
+  SOURCE_SHA1: ec5a179a1218a590d2f88728f56b583e79876896
+  SOURCE_SFZ: assets/piano/SalamanderGrandPianoV3_44.1khz16bit/SalamanderGrandPianoV3.sfz
+  ARCHIVE_NAME: salamander-mobile-8x6s-v2.tar.gz
+  BLOB_PREFIX: libgooey/instruments/piano
+
+jobs:
+  build-and-publish:
+    name: Build, validate, and publish v2
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Require Blob credentials
+        run: test -n "$BLOB_READ_WRITE_TOKEN"
+
+      - name: Verify focused regressions
+        run: |
+          cargo test --lib --no-default-features --features bounce instruments::multisample_pack::tests
+          cargo test --lib --no-default-features --features bounce instruments::multisample_prep::tests
+          cargo test --lib --no-default-features --features bounce music::voicing::tests
+          cargo test --test multisample_piano --no-default-features --features bounce
+
+      - name: Download and verify the original WAV source
+        run: |
+          mkdir -p assets/piano
+          curl --fail --location --retry 3 --output "assets/piano/$SOURCE_ARCHIVE" "$SOURCE_URL"
+          echo "$SOURCE_SHA1  assets/piano/$SOURCE_ARCHIVE" | sha1sum --check --strict
+          tar -xjf "assets/piano/$SOURCE_ARCHIVE" -C assets/piano
+          test -f "$SOURCE_SFZ"
+
+      - name: Prepare the mobile pack
+        run: |
+          cargo run --release --example prepare_piano_pack \
+            --no-default-features --features bounce -- \
+            "$SOURCE_SFZ" assets/piano-mobile \
+            --preset mobile --attribution salamander
+
+      - name: Validate generated mapping and audio files
+        run: |
+          test "$(grep -c '^<region>' assets/piano-mobile/instrument.sfz)" -eq 244
+          test "$(grep -c 'lokey=59 hikey=61 pitch_keycenter=60' assets/piano-mobile/instrument.sfz)" -eq 8
+          if grep -q 'lokey=59 hikey=61 pitch_keycenter=59' assets/piano-mobile/instrument.sfz; then
+            echo "C4 regions still use the old MIDI-59 root" >&2
+            exit 1
+          fi
+          grep -q 'Alexander Holm' assets/piano-mobile/NOTICE.txt
+          grep -q 'CC-BY 3.0' assets/piano-mobile/NOTICE.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import wave
+
+          wavs = sorted(Path("assets/piano-mobile/samples").glob("*.wav"))
+          assert len(wavs) == 244, f"expected 244 WAVs, found {len(wavs)}"
+          for path in wavs:
+              with wave.open(str(path), "rb") as wav:
+                  assert wav.getnchannels() == 2, f"{path} is not stereo"
+                  assert wav.getsampwidth() == 2, f"{path} is not 16-bit"
+                  assert wav.getnframes() <= wav.getframerate() * 6, f"{path} exceeds 6 seconds"
+          PY
+
+      - name: Create deterministic archive and checksum
+        run: |
+          mkdir -p dist
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -C assets -cf - piano-mobile \
+            | gzip -n -9 > "dist/$ARCHIVE_NAME"
+          (cd dist && sha256sum "$ARCHIVE_NAME" > "$ARCHIVE_NAME.sha256")
+
+      - name: Validate the packaged bytes through libgooey
+        run: |
+          mkdir -p packaged
+          tar -xzf "dist/$ARCHIVE_NAME" -C packaged
+          GOOEY_MOBILE_PACK_SFZ=packaged/piano-mobile/instrument.sfz \
+            cargo test --release --lib --no-default-features --features bounce \
+            generated_mobile_pack_matches_release_contract -- --ignored
+
+      - name: Retain the candidate for recovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: salamander-mobile-8x6s-v2
+          path: |
+            dist/${{ env.ARCHIVE_NAME }}
+            dist/${{ env.ARCHIVE_NAME }}.sha256
+          retention-days: 7
+          compression-level: 0
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@58.9.0
+
+      - name: Refuse to replace an existing v2 object
+        run: |
+          response="$(curl --fail --silent --show-error \
+            --get 'https://blob.vercel-storage.com' \
+            -H "Authorization: Bearer $BLOB_READ_WRITE_TOKEN" \
+            --data-urlencode "limit=10" \
+            --data-urlencode "prefix=$BLOB_PREFIX/$ARCHIVE_NAME")"
+          count="$(jq --arg archive "$BLOB_PREFIX/$ARCHIVE_NAME" \
+            --arg checksum "$BLOB_PREFIX/$ARCHIVE_NAME.sha256" \
+            '[.blobs[] | select(.pathname == $archive or .pathname == $checksum)] | length' \
+            <<<"$response")"
+          test "$count" -eq 0
+
+      - name: Publish immutable private blobs
+        run: |
+          vercel blob put "dist/$ARCHIVE_NAME" \
+            --access private --multipart true \
+            --pathname "$BLOB_PREFIX/$ARCHIVE_NAME"
+          vercel blob put "dist/$ARCHIVE_NAME.sha256" \
+            --access private --multipart true \
+            --pathname "$BLOB_PREFIX/$ARCHIVE_NAME.sha256"
+
+      - name: Verify the published archive and checksum
+        run: |
+          response="$(curl --fail --silent --show-error \
+            --get 'https://blob.vercel-storage.com' \
+            -H "Authorization: Bearer $BLOB_READ_WRITE_TOKEN" \
+            --data-urlencode "limit=10" \
+            --data-urlencode "prefix=$BLOB_PREFIX/$ARCHIVE_NAME")"
+          archive_url="$(jq -r --arg path "$BLOB_PREFIX/$ARCHIVE_NAME" \
+            '.blobs[] | select(.pathname == $path) | .url' <<<"$response")"
+          checksum_url="$(jq -r --arg path "$BLOB_PREFIX/$ARCHIVE_NAME.sha256" \
+            '.blobs[] | select(.pathname == $path) | .url' <<<"$response")"
+          remote_size="$(jq -r --arg path "$BLOB_PREFIX/$ARCHIVE_NAME" \
+            '.blobs[] | select(.pathname == $path) | .size' <<<"$response")"
+          test -n "$archive_url"
+          test -n "$checksum_url"
+          curl --fail --silent --show-error "$checksum_url" \
+            -H "Authorization: Bearer $BLOB_READ_WRITE_TOKEN" \
+            --output published.sha256
+          cmp "dist/$ARCHIVE_NAME.sha256" published.sha256
+          expected="$(cut -d' ' -f1 "dist/$ARCHIVE_NAME.sha256")"
+          actual="$(curl --fail --silent --show-error "$archive_url" \
+            -H "Authorization: Bearer $BLOB_READ_WRITE_TOKEN" \
+            | sha256sum | cut -d' ' -f1)"
+          test "$actual" = "$expected"
+          {
+            echo "### Salamander mobile v2"
+            echo
+            echo "- Blob: \`$archive_url\`"
+            echo "- Bytes: \`$remote_size\`"
+            echo "- SHA-256: \`$actual\`"
+          } >> "$GITHUB_STEP_SUMMARY"

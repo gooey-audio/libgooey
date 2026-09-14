@@ -189,6 +189,13 @@ mod tests {
     }
 
     #[test]
+    fn test_root_position_c_major_seventh() {
+        let chord = Chord::new(NoteName::C, ChordQuality::Major7);
+        let notes = apply_voicing(&chord, VoicingType::RootPosition, 4);
+        assert_eq!(notes, vec![60, 64, 67, 71]); // C4, E4, G4, B4
+    }
+
+    #[test]
     fn test_first_inversion_c_major() {
         let chord = Chord::new(NoteName::C, ChordQuality::Major);
         let notes = apply_voicing(&chord, VoicingType::FirstInversion, 4);

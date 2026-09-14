@@ -77,6 +77,9 @@ pub const SUPPORTED_OPCODES: &[&str] = &[
 /// hide the step, short enough not to audibly shorten the note further.
 pub const DEFAULT_TRIM_FADE_MS: f32 = 40.0;
 
+/// SFZ v1 defaults an omitted `pitch_keycenter` to middle C.
+const DEFAULT_PITCH_KEYCENTER: u8 = 60;
+
 /// How much of a pack to import. Filtering happens *before* any WAV is opened,
 /// so thinning a 16-layer library to six layers also skips reading the files
 /// belonging to the discarded layers.
@@ -317,6 +320,7 @@ struct Region {
 impl Region {
     fn new() -> Self {
         Self {
+            pitch_keycenter: Some(DEFAULT_PITCH_KEYCENTER),
             lovel: 1,
             hivel: 127,
             pan: 0.0,
@@ -337,10 +341,7 @@ impl Region {
         buffer: StereoSampleBuffer,
         fade_out_frames: usize,
     ) -> Result<SampleZone, String> {
-        let root = self
-            .pitch_keycenter
-            .or(self.lokey)
-            .ok_or("region has neither pitch_keycenter nor lokey")?;
+        let root = self.pitch_keycenter.unwrap_or(DEFAULT_PITCH_KEYCENTER);
         let lokey = self.lokey.unwrap_or(root);
         let hikey = self.hikey.unwrap_or(root);
 
@@ -834,6 +835,19 @@ mod tests {
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].hikey, Some(60));
         assert_eq!(regions[0].sample.as_deref(), Some("C4.wav"));
+    }
+
+    #[test]
+    fn omitted_pitch_keycenter_defaults_to_middle_c_not_lokey() {
+        let (regions, _) = parse("<region> lokey=59 hikey=61 sample=C4v1.wav\n");
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].lokey, Some(59));
+        assert_eq!(regions[0].hikey, Some(61));
+        assert_eq!(regions[0].pitch_keycenter, Some(60));
+
+        let (explicit, _) =
+            parse("<region> lokey=59 hikey=61 pitch_keycenter=62 sample=D4v1.wav\n");
+        assert_eq!(explicit[0].pitch_keycenter, Some(62));
     }
 
     #[test]
