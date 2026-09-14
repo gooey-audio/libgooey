@@ -14,8 +14,9 @@ An SFZ region may omit `pitch_keycenter`; the SFZ default is MIDI note 60 (middl
 - [x] (2026-09-14 20:53Z) Ran formatting, actionlint, focused Rust tests, the no-native FFI integration test, and the full no-default/bounce suite successfully.
 - [x] (2026-09-14 20:52Z) Configured `BLOB_READ_WRITE_TOKEN` as a repository Actions secret without exposing its value.
 - [x] (2026-09-14 20:57Z) Pushed commit `ffc142b`, opened PR #236, and observed both Ubuntu and macOS repository test jobs pass.
-- [x] (2026-09-14 21:05Z) Merged PR #236 and ran the pack workflow through source verification, generation, archive validation, and candidate retention; upload failed before creating either Blob because Vercel CLI required account credentials.
-- [ ] Replace the upload client, rerun the workflow from `main`, and publish and verify the v2 Blob.
+- [x] (2026-09-14 21:05Z) Merged PR #236 and ran the pack workflow through source verification, generation, archive validation, and candidate retention; its Vercel CLI upload step failed because the clean runner had no account credentials.
+- [x] (2026-09-14 21:10Z) Found both v2 objects published after the failed run and independently streamed the private archive to verify its 160,972,915-byte listing, SHA-256, 244 regions, eight corrected C4 centers, and zero old C4 centers.
+- [ ] Merge the SDK/idempotent-rerun correction, rerun the workflow from `main`, and capture a green remote verification result.
 
 ## Surprises & Discoveries
 
@@ -31,6 +32,8 @@ An SFZ region may omit `pitch_keycenter`; the SFZ default is MIDI note 60 (middl
   Evidence: Local test output on 2026-09-14.
 - Observation: Vercel CLI 58.9.0 does not authenticate its Blob subcommand from `BLOB_READ_WRITE_TOKEN` on a clean GitHub runner; it asked for `vercel login` or the CLI's separate account `--token` even though the Blob credential was present.
   Evidence: GitHub Actions run 34896523766 failed only in `Publish immutable private blobs` with `Error: No existing credentials found`; all generation and validation steps passed.
+- Observation: Both v2 objects appeared in the private store shortly after the failed workflow, outside that run's failed CLI step.
+  Evidence: Blob metadata reports archive upload at 21:07:37Z and checksum upload at 21:08:05Z. An authenticated stream hashes to `7065831ae3c6a8e104d36d4680b43c122fcdb0b2c0ff7392ee5724086fcc0812`, matching the published sidecar; the embedded SFZ has 244 regions, eight center-60 C4 regions, and no center-59 C4 regions.
 
 ## Decision Log
 
@@ -46,10 +49,13 @@ An SFZ region may omit `pitch_keycenter`; the SFZ default is MIDI note 60 (middl
 - Decision: Upload with pinned `@vercel/blob` 2.8.0 and pass `BLOB_READ_WRITE_TOKEN` directly to `put`, rather than using Vercel CLI.
   Rationale: The Blob SDK directly supports token-authenticated private multipart uploads; this avoids introducing or storing a broader Vercel account credential solely for CLI login.
   Date/Author: 2026-09-14 / Codex
+- Decision: Treat an already-complete v2 pair as a verification-only rerun, while failing on a partial pair and never overwriting either object.
+  Rationale: Both v2 objects are now present. This preserves immutable pathnames while allowing the corrected workflow to prove the remote archive and checksum exactly match newly regenerated local bytes.
+  Date/Author: 2026-09-14 / Codex
 
 ## Outcomes & Retrospective
 
-The parser, regression coverage, artifact contract test, and CI publisher were merged in PR #236. The first pack run proved the source download, source checksum, preparation, corrected C4 mapping, audio properties, deterministic archive, and libgooey reload, and retained the candidate as a temporary Actions artifact. The Vercel CLI upload client failed authentication without creating v2. A follow-up changes only the upload client to the Blob SDK; publication and final remote digest verification remain pending.
+The parser, regression coverage, artifact contract test, and CI publisher were merged in PR #236. The first pack run proved the source download, source checksum, preparation, corrected C4 mapping, audio properties, deterministic archive, and libgooey reload, and retained the candidate as a temporary Actions artifact. Its Vercel CLI upload client failed authentication, but both expected private v2 objects were subsequently published and independently verified. A follow-up changes the upload client to the Blob SDK and makes an already-complete pair verification-only; one green main-branch rerun remains.
 
 ## Context and Orientation
 

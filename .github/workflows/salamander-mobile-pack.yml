@@ -109,7 +109,8 @@ jobs:
           npm install --prefix "$RUNNER_TEMP/blob-upload" \
             --no-audit --no-fund @vercel/blob@2.8.0
 
-      - name: Refuse to replace an existing v2 object
+      - name: Check for existing v2 objects
+        id: blob-preflight
         run: |
           response="$(curl --fail --silent --show-error \
             --get 'https://blob.vercel-storage.com' \
@@ -120,9 +121,20 @@ jobs:
             --arg checksum "$BLOB_PREFIX/$ARCHIVE_NAME.sha256" \
             '[.blobs[] | select(.pathname == $archive or .pathname == $checksum)] | length' \
             <<<"$response")"
-          test "$count" -eq 0
+          case "$count" in
+            0) echo "upload=true" >> "$GITHUB_OUTPUT" ;;
+            2)
+              echo "Both immutable v2 objects already exist; verifying them without overwriting."
+              echo "upload=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Only one v2 object exists; refusing an incomplete or ambiguous publication." >&2
+              exit 1
+              ;;
+          esac
 
       - name: Publish immutable private blobs
+        if: steps.blob-preflight.outputs.upload == 'true'
         run: |
           cd "$RUNNER_TEMP/blob-upload"
           ARCHIVE_PATH="$GITHUB_WORKSPACE/dist/$ARCHIVE_NAME" \
