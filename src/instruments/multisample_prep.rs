@@ -655,6 +655,66 @@ mod tests {
     }
 
     #[test]
+    fn omitted_pitch_keycenter_round_trips_as_explicit_middle_c() {
+        let dir = temp_dir();
+        let samples = dir.join("src_samples");
+        std::fs::create_dir_all(&samples).unwrap();
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(samples.join("C4v1.wav"), spec).unwrap();
+        for _ in 0..1000 {
+            writer.write_sample(8000i16).unwrap();
+            writer.write_sample(8000i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        std::fs::write(
+            dir.join("source.sfz"),
+            "<control> default_path=src_samples/\n\
+             <region> lokey=59 hikey=61 sample=C4v1.wav\n",
+        )
+        .unwrap();
+
+        let out = dir.join("out");
+        let report = prepare_pack(
+            dir.join("source.sfz"),
+            &out,
+            &PrepareOptions {
+                load: PackLoadOptions::everything(),
+                ..PrepareOptions::default()
+            },
+        )
+        .unwrap();
+
+        let prepared_sfz = std::fs::read_to_string(&report.sfz_path).unwrap();
+        assert!(
+            prepared_sfz.contains("lokey=59 hikey=61 pitch_keycenter=60"),
+            "{prepared_sfz}"
+        );
+        let sample_name = std::fs::read_dir(out.join(SAMPLES_DIR))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        assert!(sample_name.starts_with("C4_060_"), "{sample_name}");
+
+        let map = load_sfz(&report.sfz_path, &PackLoadOptions::everything())
+            .unwrap()
+            .map
+            .build();
+        let zone = map.zone(0).unwrap();
+        assert_eq!((zone.lokey, zone.hikey, zone.root_key), (59, 61, 60));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn attribution_travels_with_the_prepared_pack() {
         // A prepared pack is a modified derivative, and CC-BY requires the
         // credit to accompany it wherever it goes — including inside a shipped
@@ -723,5 +783,37 @@ mod tests {
         assert!(mobile.resident_bytes < mobile.source_resident_bytes);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Run explicitly in the Salamander release workflow after extracting the
+    /// finished archive. Keeping this ignored avoids requiring a 230 MB pack
+    /// for ordinary unit-test runs while still validating the shipped bytes
+    /// through the same loader consumers use.
+    #[test]
+    #[ignore = "requires GOOEY_MOBILE_PACK_SFZ to point at a generated pack"]
+    fn generated_mobile_pack_matches_release_contract() {
+        let sfz = std::env::var("GOOEY_MOBILE_PACK_SFZ")
+            .expect("GOOEY_MOBILE_PACK_SFZ must name the generated instrument.sfz");
+        let pack = load_sfz(&sfz, &PackLoadOptions::everything()).unwrap();
+        let map = pack.map.build();
+
+        assert_eq!(map.zone_count(), 244);
+        assert_eq!(map.velocity_layers(), 8);
+
+        let mut c4_zones = 0;
+        for index in 0..map.zone_count() {
+            let zone = map.zone(index).unwrap();
+            assert_eq!(zone.trigger, ZoneTrigger::Attack, "zone {index}");
+            assert!(zone.buffer.is_compact(), "zone {index} is not 16-bit");
+            assert!(
+                zone.buffer.len() as f32 <= zone.buffer.sample_rate() * 6.0 + 1.0,
+                "zone {index} exceeds the six-second cap"
+            );
+            if zone.lokey == 59 && zone.hikey == 61 {
+                c4_zones += 1;
+                assert_eq!(zone.root_key, 60, "C4 zone {index}");
+            }
+        }
+        assert_eq!(c4_zones, 8);
     }
 }
