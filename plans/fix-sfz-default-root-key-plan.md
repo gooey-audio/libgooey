@@ -13,6 +13,7 @@ An SFZ region may omit `pitch_keycenter`; the SFZ default is MIDI note 60 (middl
 - [x] (2026-09-14 20:52Z) Added a main-only manual workflow that regenerates, validates, archives, and publishes the v2 pack and checksum.
 - [x] (2026-09-14 20:53Z) Ran formatting, actionlint, focused Rust tests, the no-native FFI integration test, and the full no-default/bounce suite successfully.
 - [x] (2026-09-14 20:52Z) Configured `BLOB_READ_WRITE_TOKEN` as a repository Actions secret without exposing its value.
+- [x] (2026-09-14 20:57Z) Pushed commit `ffc142b`, opened PR #236, and observed both Ubuntu and macOS repository test jobs pass.
 - [ ] Publish and verify the v2 Blob after the workflow is available on `main`.
 
 ## Surprises & Discoveries
@@ -42,7 +43,7 @@ An SFZ region may omit `pitch_keycenter`; the SFZ default is MIDI note 60 (middl
 
 ## Outcomes & Retrospective
 
-The parser, regression coverage, artifact contract test, and CI publisher are implemented and pass local validation. The repository Actions secret is configured. Publication remains pending until the workflow file is merged to `main`, because GitHub only exposes a newly added manually dispatched workflow after it exists on the default branch.
+The parser, regression coverage, artifact contract test, and CI publisher are implemented and pass local validation. PR #236 is open and its Ubuntu and macOS test jobs pass. The repository Actions secret is configured. Publication remains pending until the workflow file is merged to `main`, because GitHub only exposes a newly added manually dispatched workflow after it exists on the default branch.
 
 ## Context and Orientation
 
