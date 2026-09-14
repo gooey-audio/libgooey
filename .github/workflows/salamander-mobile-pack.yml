@@ -104,10 +104,13 @@ jobs:
           retention-days: 7
           compression-level: 0
 
-      - name: Install Vercel CLI
-        run: npm install --global vercel@58.9.0
+      - name: Install Vercel Blob SDK
+        run: |
+          npm install --prefix "$RUNNER_TEMP/blob-upload" \
+            --no-audit --no-fund @vercel/blob@2.8.0
 
-      - name: Refuse to replace an existing v2 object
+      - name: Check for existing v2 objects
+        id: blob-preflight
         run: |
           response="$(curl --fail --silent --show-error \
             --get 'https://blob.vercel-storage.com' \
@@ -118,16 +121,43 @@ jobs:
             --arg checksum "$BLOB_PREFIX/$ARCHIVE_NAME.sha256" \
             '[.blobs[] | select(.pathname == $archive or .pathname == $checksum)] | length' \
             <<<"$response")"
-          test "$count" -eq 0
+          case "$count" in
+            0) echo "upload=true" >> "$GITHUB_OUTPUT" ;;
+            2)
+              echo "Both immutable v2 objects already exist; verifying them without overwriting."
+              echo "upload=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Only one v2 object exists; refusing an incomplete or ambiguous publication." >&2
+              exit 1
+              ;;
+          esac
 
       - name: Publish immutable private blobs
+        if: steps.blob-preflight.outputs.upload == 'true'
         run: |
-          vercel blob put "dist/$ARCHIVE_NAME" \
-            --access private --multipart true \
-            --pathname "$BLOB_PREFIX/$ARCHIVE_NAME"
-          vercel blob put "dist/$ARCHIVE_NAME.sha256" \
-            --access private --multipart true \
-            --pathname "$BLOB_PREFIX/$ARCHIVE_NAME.sha256"
+          cd "$RUNNER_TEMP/blob-upload"
+          ARCHIVE_PATH="$GITHUB_WORKSPACE/dist/$ARCHIVE_NAME" \
+          CHECKSUM_PATH="$GITHUB_WORKSPACE/dist/$ARCHIVE_NAME.sha256" \
+            node --input-type=module <<'NODE'
+          import { openAsBlob } from 'node:fs';
+          import { put } from '@vercel/blob';
+
+          const uploads = [
+            [process.env.ARCHIVE_PATH, `${process.env.BLOB_PREFIX}/${process.env.ARCHIVE_NAME}`],
+            [process.env.CHECKSUM_PATH, `${process.env.BLOB_PREFIX}/${process.env.ARCHIVE_NAME}.sha256`],
+          ];
+          for (const [file, pathname] of uploads) {
+            const result = await put(pathname, await openAsBlob(file), {
+              access: 'private',
+              addRandomSuffix: false,
+              allowOverwrite: false,
+              multipart: true,
+              token: process.env.BLOB_READ_WRITE_TOKEN,
+            });
+            console.log(`Uploaded ${result.pathname}: ${result.url}`);
+          }
+          NODE
 
       - name: Verify the published archive and checksum
         run: |
