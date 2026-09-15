@@ -10,6 +10,7 @@ pub mod multisample_pack;
 #[cfg(feature = "bounce")]
 pub mod multisample_prep;
 pub mod poly_synth;
+pub mod reso_kick;
 pub mod sampler;
 pub(crate) mod sampler_control;
 pub mod snare;
@@ -27,6 +28,7 @@ pub use self::multisample_pack::*;
 #[cfg(feature = "bounce")]
 pub use self::multisample_prep::*;
 pub use self::poly_synth::*;
+pub use self::reso_kick::*;
 pub use self::sampler::*;
 pub use self::snare::*;
 pub use self::tom::*;
