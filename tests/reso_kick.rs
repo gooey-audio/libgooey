@@ -128,3 +128,41 @@ fn max_resonate_self_oscillates() {
     let tail = rms(&output[8 * 48_000..]);
     assert!(tail > 0.01, "tail rms={tail}");
 }
+
+#[test]
+fn macro_controls_reach_the_extended_palette_endpoints() {
+    let mut kick = ResoKick::new(SAMPLE_RATE);
+    kick.set_frequency(0.0);
+    kick.set_depth(0.0);
+    kick.set_pitch_decay(0.0);
+    kick.set_resonate(0.0);
+    kick.set_punch(0.0);
+    kick.set_character(0.0);
+    kick.set_ripple(0.0);
+    kick.set_exciter_noise(0.0);
+    assert!((kick.frequency_hz() - 8.0).abs() < 1.0e-4);
+    assert!((kick.pitch_start_multiplier() - 1.0).abs() < 1.0e-4);
+    assert!((kick.pitch_decay_ms() - 2.0).abs() < 1.0e-4);
+    assert!((kick.resonate_t60_seconds() - 0.02).abs() < 1.0e-4);
+    assert!((kick.punch_gain() - 0.35).abs() < 1.0e-4);
+    assert!((kick.character_hz() - 4.0).abs() < 1.0e-4);
+    assert!((kick.ripple_octaves() - 0.0).abs() < 1.0e-4);
+    assert!((kick.exciter_noise_gain() - 0.0).abs() < 1.0e-4);
+
+    kick.set_frequency(1.0);
+    kick.set_depth(1.0);
+    kick.set_pitch_decay(1.0);
+    kick.set_resonate(1.0);
+    kick.set_punch(1.0);
+    kick.set_character(1.0);
+    kick.set_ripple(1.0);
+    kick.set_exciter_noise(1.0);
+    assert!((kick.frequency_hz() - 180.0).abs() < 1.0e-3);
+    assert!((kick.pitch_start_multiplier() - 16.0).abs() < 1.0e-4);
+    assert!((kick.pitch_decay_ms() - 1_500.0).abs() < 1.0e-2);
+    assert!((kick.resonate_t60_seconds() - 12.0).abs() < 1.0e-3);
+    assert!((kick.punch_gain() - 20.0).abs() < 1.0e-4);
+    assert!((kick.character_hz() - 12_000.0).abs() < 1.0e-2);
+    assert!((kick.ripple_octaves() - 5.0).abs() < 1.0e-4);
+    assert!((kick.exciter_noise_gain() - 3.0).abs() < 1.0e-4);
+}

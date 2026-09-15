@@ -135,10 +135,13 @@ fn make_bar(value: f32, width: usize) -> String {
 fn detail(kick: &ResoKick, index: usize) -> String {
     match index {
         0 => format!("{:>6.1} Hz", kick.frequency_hz()),
+        1 => format!("{:>6.2} x", kick.pitch_start_multiplier()),
         2 => format!("{:>6.1} ms", kick.pitch_decay_ms()),
         3 => format!("{:>6.2} s", kick.resonate_t60_seconds()),
         4 => format!("{:>6.2} x", kick.punch_gain()),
         5 => format!("{:>6.1} Hz", kick.character_hz()),
+        6 => format!("{:>6.2} oct", kick.ripple_octaves()),
+        7 => format!("{:>6.2} x", kick.exciter_noise_gain()),
         9 => format!("{:+6.1} st", (kick.tuning() - 0.5) * 24.0),
         _ => String::new(),
     }

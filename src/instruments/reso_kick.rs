@@ -15,19 +15,30 @@ use crate::utils::{
 };
 
 const LINEAR_CURVE: MacroCurve = MacroCurve::new(&[(0.0, 0.0), (1.0, 1.0)]);
+const DEPTH_CURVE: MacroCurve =
+    MacroCurve::new(&[(0.0, 0.0), (0.6, 0.35), (0.85, 0.70), (1.0, 1.0)]);
 const RESONATE_CURVE: MacroCurve =
-    MacroCurve::new(&[(0.0, 0.0), (0.6, 0.55), (0.85, 0.95), (1.0, 1.0)]);
-const PUNCH_CURVE: MacroCurve = MacroCurve::new(&[(0.0, 0.0), (0.3, 0.15), (1.0, 1.0)]);
+    MacroCurve::new(&[(0.0, 0.0), (0.6, 0.40), (0.85, 0.90), (1.0, 1.0)]);
+const PUNCH_CURVE: MacroCurve =
+    MacroCurve::new(&[(0.0, 0.0), (0.3, 0.075), (0.7, 0.35), (1.0, 1.0)]);
+const RIPPLE_CURVE: MacroCurve =
+    MacroCurve::new(&[(0.0, 0.0), (0.5, 0.25), (0.8, 0.60), (1.0, 1.0)]);
+const EXCITER_NOISE_CURVE: MacroCurve =
+    MacroCurve::new(&[(0.0, 0.0), (0.5, 0.20), (0.8, 0.55), (1.0, 1.0)]);
 
-const FREQUENCY: MacroTarget = MacroTarget::new(LINEAR_CURVE, 8.0, 120.0, MacroScale::Log);
+const FREQUENCY: MacroTarget = MacroTarget::new(LINEAR_CURVE, 8.0, 180.0, MacroScale::Log);
 const PITCH_START_MULTIPLIER: MacroTarget =
-    MacroTarget::new(LINEAR_CURVE, 1.0, 8.0, MacroScale::Linear);
+    MacroTarget::new(DEPTH_CURVE, 1.0, 16.0, MacroScale::Linear);
 const PITCH_DECAY_SECONDS: MacroTarget =
-    MacroTarget::new(LINEAR_CURVE, 0.005, 0.4, MacroScale::Log);
+    MacroTarget::new(LINEAR_CURVE, 0.002, 1.5, MacroScale::Log);
 const RESONATE_T60_SECONDS: MacroTarget =
-    MacroTarget::new(LINEAR_CURVE, 0.05, 6.0, MacroScale::Log);
+    MacroTarget::new(LINEAR_CURVE, 0.02, 12.0, MacroScale::Log);
 const CHARACTER_FREQUENCY: MacroTarget =
-    MacroTarget::new(LINEAR_CURVE, 8.0, 4_000.0, MacroScale::Log);
+    MacroTarget::new(LINEAR_CURVE, 4.0, 12_000.0, MacroScale::Log);
+const PUNCH_GAIN: MacroTarget = MacroTarget::new(PUNCH_CURVE, 0.35, 20.0, MacroScale::Linear);
+const RIPPLE_OCTAVES: MacroTarget = MacroTarget::new(RIPPLE_CURVE, 0.0, 5.0, MacroScale::Linear);
+const EXCITER_NOISE_GAIN: MacroTarget =
+    MacroTarget::new(EXCITER_NOISE_CURVE, 0.0, 3.0, MacroScale::Linear);
 
 /// Normalized controls for a dual-resonator kick preset.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,12 +57,12 @@ pub struct ResoKickConfig {
 impl ResoKickConfig {
     pub fn classic808() -> Self {
         Self {
-            frequency: 0.67,
-            depth: 0.55,
-            pitch_decay: 0.35,
-            resonate: 0.68,
+            frequency: 0.61,
+            depth: 0.47,
+            pitch_decay: 0.37,
+            resonate: 0.65,
             punch: 0.30,
-            character: 0.30,
+            character: 0.32,
             ripple: 0.05,
             exciter_noise: 0.04,
             volume: 0.80,
@@ -60,26 +71,26 @@ impl ResoKickConfig {
 
     pub fn punch909() -> Self {
         Self {
-            frequency: 0.72,
-            depth: 0.72,
-            pitch_decay: 0.24,
-            resonate: 0.50,
-            punch: 0.72,
-            character: 0.55,
-            ripple: 0.12,
-            exciter_noise: 0.30,
-            volume: 0.78,
+            frequency: 0.65,
+            depth: 0.76,
+            pitch_decay: 0.28,
+            resonate: 0.46,
+            punch: 0.78,
+            character: 0.62,
+            ripple: 0.20,
+            exciter_noise: 0.42,
+            volume: 0.70,
         }
     }
 
     pub fn soft_bounce() -> Self {
         Self {
-            frequency: 0.62,
-            depth: 0.38,
-            pitch_decay: 0.48,
-            resonate: 0.60,
-            punch: 0.12,
-            character: 0.22,
+            frequency: 0.54,
+            depth: 0.32,
+            pitch_decay: 0.46,
+            resonate: 0.59,
+            punch: 0.18,
+            character: 0.26,
             ripple: 0.0,
             exciter_noise: 0.01,
             volume: 0.88,
@@ -88,13 +99,13 @@ impl ResoKickConfig {
 
     pub fn tom() -> Self {
         Self {
-            frequency: 0.82,
-            depth: 0.50,
-            pitch_decay: 0.70,
-            resonate: 0.74,
-            punch: 0.35,
-            character: 0.55,
-            ripple: 0.38,
+            frequency: 0.76,
+            depth: 0.58,
+            pitch_decay: 0.72,
+            resonate: 0.72,
+            punch: 0.42,
+            character: 0.60,
+            ripple: 0.48,
             exciter_noise: 0.03,
             volume: 0.76,
         }
@@ -102,13 +113,13 @@ impl ResoKickConfig {
 
     pub fn laser() -> Self {
         Self {
-            frequency: 0.75,
+            frequency: 0.70,
             depth: 1.0,
             pitch_decay: 1.0,
-            resonate: 0.72,
-            punch: 0.25,
-            character: 0.62,
-            ripple: 0.48,
+            resonate: 0.76,
+            punch: 0.35,
+            character: 0.72,
+            ripple: 0.68,
             exciter_noise: 0.02,
             volume: 0.72,
         }
@@ -116,13 +127,13 @@ impl ResoKickConfig {
 
     pub fn sub_drone() -> Self {
         Self {
-            frequency: 0.52,
+            frequency: 0.48,
             depth: 0.12,
             pitch_decay: 0.60,
             resonate: 1.0,
             punch: 0.18,
-            character: 0.24,
-            ripple: 0.22,
+            character: 0.27,
+            ripple: 0.30,
             exciter_noise: 0.0,
             volume: 0.58,
         }
@@ -301,20 +312,20 @@ impl ResoKick {
         self.core1
             .set_feedback(RESONATE_CURVE.eval(resonate) * 1.05);
 
-        let noise = self.exciter.tick() * exciter_noise * 0.6;
+        let noise = self.exciter.tick() * EXCITER_NOISE_GAIN.value(exciter_noise);
         let core1 = self.core1.process(noise);
 
-        let punch_gain = 0.7 + PUNCH_CURVE.eval(punch) * 7.3;
+        let punch_gain = PUNCH_GAIN.value(punch);
         let punched = self
             .punch_os
             .process(core1, |sample| (sample * punch_gain).tanh());
 
         let character_hz = CHARACTER_FREQUENCY.value(character);
-        let ripple_octaves = ripple * 2.0;
+        let ripple_octaves = RIPPLE_OCTAVES.value(ripple);
         let character_frequency =
             (character_hz * pitch_multiplier * 2.0_f32.powf(ripple_octaves * core1))
                 .clamp(4.0, self.sample_rate * 0.45);
-        let character_damping = 0.35 + (0.08 - 0.35) * (env * depth).clamp(0.0, 1.0);
+        let character_damping = 0.50 + (0.025 - 0.50) * (env * depth).clamp(0.0, 1.0);
         self.core2.set_frequency(character_frequency);
         self.core2.set_damping(character_damping);
         self.core2.set_feedback(0.0);
@@ -429,11 +440,23 @@ impl ResoKick {
     }
 
     pub fn punch_gain(&self) -> f32 {
-        0.7 + PUNCH_CURVE.eval(self.params.punch.target()) * 7.3
+        PUNCH_GAIN.value(self.params.punch.target())
     }
 
     pub fn character_hz(&self) -> f32 {
         CHARACTER_FREQUENCY.value(self.params.character.target())
+    }
+
+    pub fn pitch_start_multiplier(&self) -> f32 {
+        PITCH_START_MULTIPLIER.value(self.params.depth.target())
+    }
+
+    pub fn ripple_octaves(&self) -> f32 {
+        RIPPLE_OCTAVES.value(self.params.ripple.target())
+    }
+
+    pub fn exciter_noise_gain(&self) -> f32 {
+        EXCITER_NOISE_GAIN.value(self.params.exciter_noise.target())
     }
 }
 
