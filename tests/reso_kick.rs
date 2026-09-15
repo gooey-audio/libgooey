@@ -183,3 +183,15 @@ fn tuning_reaches_lower_without_expanding_the_upper_limit() {
     assert!((kick.tuning_semitones() - 12.0).abs() < 1.0e-4);
     assert!((kick.frequency_hz() - 12.0).abs() < 1.0e-4);
 }
+
+#[test]
+fn mid_punch_peak_is_in_the_dynamics_threshold_region() {
+    let mut mid_punch = ResoKickConfig::classic808();
+    mid_punch.punch = 0.5;
+    let output = render(mid_punch, 0.75, 2.0);
+    let peak = output
+        .iter()
+        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    let peak_db = 20.0 * peak.log10();
+    assert!((-10.0..=-6.0).contains(&peak_db), "peak={peak_db:.2} dBFS");
+}

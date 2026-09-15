@@ -6,7 +6,9 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
+use gooey::effects::{Effect, EntityDynamics, SoftLimiter};
 use gooey::engine::{Engine, EngineOutput, Instrument};
+use gooey::frame::StereoFrame;
 use gooey::instruments::{ResoKick, ResoKickConfig};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
@@ -17,7 +19,7 @@ struct ParamInfo {
     fine_step: f32,
 }
 
-const PARAM_INFO: [ParamInfo; 10] = [
+const PARAM_INFO: [ParamInfo; 13] = [
     ParamInfo {
         name: "frequency",
         coarse_step: 0.05,
@@ -68,6 +70,21 @@ const PARAM_INFO: [ParamInfo; 10] = [
         coarse_step: 0.05,
         fine_step: 0.01,
     },
+    ParamInfo {
+        name: "bass_drive",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+    },
+    ParamInfo {
+        name: "gain_dist",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+    },
+    ParamInfo {
+        name: "dynamics",
+        coarse_step: 0.05,
+        fine_step: 0.01,
+    },
 ];
 
 struct SharedResoKick(Arc<Mutex<ResoKick>>);
@@ -86,7 +103,27 @@ impl Instrument for SharedResoKick {
     }
 }
 
-fn get_param_value(kick: &ResoKick, index: usize) -> f32 {
+struct SharedEntityDynamics(Arc<EntityDynamics>);
+
+impl Effect for SharedEntityDynamics {
+    fn process(&self, input: f32) -> f32 {
+        self.0.process(input)
+    }
+
+    fn process_stereo(&self, input: StereoFrame) -> StereoFrame {
+        self.0.process_stereo(input)
+    }
+}
+
+fn gain_dist_to_normalized(db: f32) -> f32 {
+    (db + 12.0) / 36.0
+}
+
+fn normalized_to_gain_dist(value: f32) -> f32 {
+    -12.0 + value * 36.0
+}
+
+fn get_param_value(kick: &ResoKick, dynamics: &EntityDynamics, index: usize) -> f32 {
     let config = kick.config();
     match index {
         0 => config.frequency,
@@ -99,11 +136,14 @@ fn get_param_value(kick: &ResoKick, index: usize) -> f32 {
         7 => config.exciter_noise,
         8 => config.volume,
         9 => kick.tuning(),
+        10 => dynamics.bass_drive(),
+        11 => gain_dist_to_normalized(dynamics.gain_dist_db()),
+        12 => dynamics.dynamics(),
         _ => 0.0,
     }
 }
 
-fn set_param_value(kick: &mut ResoKick, index: usize, value: f32) {
+fn set_param_value(kick: &mut ResoKick, dynamics: &EntityDynamics, index: usize, value: f32) {
     match index {
         0 => kick.set_frequency(value),
         1 => kick.set_depth(value),
@@ -115,15 +155,19 @@ fn set_param_value(kick: &mut ResoKick, index: usize, value: f32) {
         7 => kick.set_exciter_noise(value),
         8 => kick.set_volume(value),
         9 => kick.set_tuning(value),
+        10 => dynamics.set_bass_drive(value),
+        11 => dynamics.set_gain_dist_db(normalized_to_gain_dist(value)),
+        12 => dynamics.set_dynamics(value),
         _ => {}
     }
 }
 
-fn adjust_param(kick: &mut ResoKick, index: usize, delta: f32) {
+fn adjust_param(kick: &mut ResoKick, dynamics: &EntityDynamics, index: usize, delta: f32) {
     set_param_value(
         kick,
+        dynamics,
         index,
-        (get_param_value(kick, index) + delta).clamp(0.0, 1.0),
+        (get_param_value(kick, dynamics, index) + delta).clamp(0.0, 1.0),
     );
 }
 
@@ -132,7 +176,7 @@ fn make_bar(value: f32, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
-fn detail(kick: &ResoKick, index: usize) -> String {
+fn detail(kick: &ResoKick, dynamics: &EntityDynamics, index: usize) -> String {
     match index {
         0 => format!("{:>6.1} Hz", kick.frequency_hz()),
         1 => format!("{:>6.2} x", kick.pitch_start_multiplier()),
@@ -143,12 +187,16 @@ fn detail(kick: &ResoKick, index: usize) -> String {
         6 => format!("{:>6.2} oct", kick.ripple_octaves()),
         7 => format!("{:>6.2} x", kick.exciter_noise_gain()),
         9 => format!("{:+6.1} st", kick.tuning_semitones()),
+        10 => format!("{:>6.1} Hz", dynamics.bass_drive_hz()),
+        11 => format!("{:+6.1} dB", dynamics.gain_dist_db()),
+        12 => format!("{:>6.0}% wet", dynamics.dynamics() * 100.0),
         _ => String::new(),
     }
 }
 
 fn render_display(
     kick: &ResoKick,
+    dynamics: &EntityDynamics,
     selected: usize,
     trigger_count: u32,
     velocity: f32,
@@ -161,7 +209,7 @@ fn render_display(
     print!("Preset: {preset_name}\r\n\r\n");
 
     for (index, info) in PARAM_INFO.iter().enumerate() {
-        let value = get_param_value(kick, index);
+        let value = get_param_value(kick, dynamics, index);
         let indicator = if index == selected { ">" } else { " " };
         print!(
             "{} {:<15} [{}] {:>4.2}  {}\r\n",
@@ -169,7 +217,7 @@ fn render_display(
             info.name,
             make_bar(value, 12),
             value,
-            detail(kick, index)
+            detail(kick, dynamics, index)
         );
     }
 
@@ -177,7 +225,7 @@ fn render_display(
         "\r\nHits: {trigger_count} | Velocity: {:.0}%\r\n",
         velocity * 100.0
     );
-    print!("Signal: struck body resonator → Punch → character resonator\r\n");
+    print!("Signal: body resonator → Punch → character → Entity Dynamics → safety limiter\r\n");
     io::stdout().flush().unwrap();
 }
 
@@ -197,10 +245,17 @@ fn preset(number: char) -> Option<(&'static str, ResoKickConfig)> {
 fn main() -> anyhow::Result<()> {
     let sample_rate = 44_100.0;
     let kick = Arc::new(Mutex::new(ResoKick::new(sample_rate)));
+    let dynamics = Arc::new(EntityDynamics::new(sample_rate));
+    dynamics.set_bass_drive(0.55);
+    dynamics.set_gain_dist_db(6.0);
+    dynamics.set_dynamics(0.75);
 
     let mut engine = Engine::new(sample_rate);
     engine.set_master_gain(0.85);
     engine.add_instrument("reso_kick", Box::new(SharedResoKick(kick.clone())));
+    engine.clear_global_effects();
+    engine.add_global_effect(Box::new(SharedEntityDynamics(dynamics.clone())));
+    engine.add_global_effect(Box::new(SoftLimiter::new(1.0)));
     let audio_engine = Arc::new(Mutex::new(engine));
 
     let mut engine_output = EngineOutput::new();
@@ -223,6 +278,7 @@ fn main() -> anyhow::Result<()> {
             let voice = kick.lock().unwrap();
             render_display(
                 &voice,
+                &dynamics,
                 selected,
                 trigger_count,
                 velocities[velocity_index],
@@ -251,7 +307,7 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Char(']') => info.fine_step,
                             _ => unreachable!(),
                         };
-                        adjust_param(&mut kick.lock().unwrap(), selected, delta);
+                        adjust_param(&mut kick.lock().unwrap(), &dynamics, selected, delta);
                         preset_name = "Custom";
                         needs_redraw = true;
                     }
