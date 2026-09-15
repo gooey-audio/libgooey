@@ -392,21 +392,23 @@ fn chord_trigger_uses_theory_voicing_and_base_velocity() {
 }
 
 #[test]
-fn third_inversion_and_drop2_each_trigger_four_piano_voices() {
+fn third_inversion_and_drop2_select_expected_notes_through_ffi() {
     unsafe {
-        let engine = gooey_engine_new(SR);
-        let piano = gooey_engine_piano_register(engine) as u32;
-        assert!(gooey_engine_mixer_route_source(
-            engine,
-            SOURCE_PIANO_BASE + piano,
-            2
-        ));
-        // Drop 2 Cmaj7 reaches G3 (55), while third inversion reaches G5 (79).
-        commit_two_layer_map_in_range(engine, piano, 8192, 55, 79);
-        render(engine, 64);
-        assert!(gooey_engine_piano_set_velocity_mode(engine, piano, 0.5));
+        for (voicing, notes) in [
+            (VOICING_THIRD_INVERSION, [71, 72, 76, 79]),
+            (VOICING_DROP2, [55, 60, 64, 71]),
+        ] {
+            let engine = gooey_engine_new(SR);
+            let piano = gooey_engine_piano_register(engine) as u32;
+            assert!(gooey_engine_mixer_route_source(
+                engine,
+                SOURCE_PIANO_BASE + piano,
+                2
+            ));
+            commit_exact_velocity_map(engine, piano, &notes, &[0.8; 4]);
+            render(engine, 64);
+            assert!(gooey_engine_piano_set_velocity_mode(engine, piano, 0.5));
 
-        for voicing in [VOICING_THIRD_INVERSION, VOICING_DROP2] {
             assert!(gooey_engine_piano_trigger_chord(
                 engine,
                 piano,
@@ -423,13 +425,8 @@ fn third_inversion_and_drop2_each_trigger_four_piano_voices() {
                 4,
                 "voicing id {voicing} should trigger every Cmaj7 chord tone"
             );
-
-            assert!(gooey_engine_piano_release_all(engine, piano));
-            render(engine, SR as usize);
-            assert_eq!(gooey_engine_piano_active_voices(engine, piano), 0);
+            gooey_engine_free(engine);
         }
-
-        gooey_engine_free(engine);
     }
 }
 

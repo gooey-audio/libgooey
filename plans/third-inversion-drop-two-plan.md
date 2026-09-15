@@ -12,6 +12,7 @@ The host app currently offers Root, First, Second, Open, and Spread chord choice
 - [x] (2026-09-15 14:22Z) Confirmed the baseline voicing unit suite passes 10 tests and no matching Nexus task exists.
 - [x] (2026-09-15 14:22Z) Added exact Third Inversion coverage plus poly, piano, and recorded-event FFI regressions for IDs 3 and 5.
 - [x] (2026-09-15 14:25Z) Ran the focused tests, full suite, iOS-feature build, formatting check, generated-header inspection, and diff check; all required validation passes.
+- [x] (2026-09-15 19:18Z) Addressed review feedback by adding the required narrative milestone and making the piano FFI test reject incorrect ID-to-note mappings.
 
 ## Surprises & Discoveries
 
@@ -39,9 +40,15 @@ The repository-owned implementation is complete. Third Inversion now has an exac
 
 `src/music/voicing.rs` converts a `Chord` into sorted MIDI note numbers. For C major seventh at octave 4, Third Inversion must yield B4, C5, E5, G5 (`71, 72, 76, 79`), and Drop 2 must yield G3, C4, E4, B4 (`55, 60, 64, 71`). `src/ffi.rs` maps public numeric voicing IDs to these Rust variants and uses the same conversion for poly-synth and multi-sampled piano chord triggers. `src/performance/mod.rs` records the raw numeric voicing ID so a later playback uses the same choice.
 
+## Milestones
+
+### Milestone 1 — Pin the two app-facing voicings end to end
+
+Add exact theory and integration coverage without changing runtime behavior or public interfaces. At the end of this milestone, Third Inversion resolves C major seventh to MIDI notes `71, 72, 76, 79`, Drop 2 resolves it to `55, 60, 64, 71`, public IDs remain 3 and 5, both choices render through the poly FFI, each choice triggers all four notes through the piano FFI, and recorded performance events return the same ID they received. Run the four focused `cargo test` commands in Concrete Steps; each must report one or more passing tests and no failures. Then run the full suite and iOS build, which must both exit successfully, to accept the milestone.
+
 ## Plan of Work
 
-Add the missing exact Third Inversion unit assertion beside the existing Root, First, Second, and Drop 2 expectations. Add a poly FFI integration test that pins IDs 3 and 5 and proves both choices render audio. Add a piano FFI integration test with a sample map spanning G3 through G5, proving each choice maps all four C major seventh notes and activates four voices. Add a performance-recording integration test that records both choices and reads back their unchanged IDs.
+Add the missing exact Third Inversion unit assertion beside the existing Root, First, Second, and Drop 2 expectations. Add a poly FFI integration test that pins IDs 3 and 5 and proves both choices render audio. Add a piano FFI integration test that gives each choice a sample map containing only its four expected MIDI notes, proving that the numeric FFI mapping selects the right notes and activates four voices. Add a performance-recording integration test that records both choices and reads back their unchanged IDs.
 
 Do not change the public Rust or C interfaces, `available_voicings` ordering, existing numeric IDs, fallback behavior, or performance-event representation. The external host should add explicit label-to-ID mappings in this order: Root, First, Second, Third, Open, Drop 2, Spread.
 
@@ -108,3 +115,5 @@ Final focused and full results:
 ## Interfaces and Dependencies
 
 No interface or dependency changes are permitted. The host uses the existing `VOICING_THIRD_INVERSION` and `VOICING_DROP2` C constants with `gooey_engine_poly_trigger_chord` or `gooey_engine_piano_trigger_chord`. Performance clips continue to persist the numeric `voicing: u32` value.
+
+Plan revision note (2026-09-15): Added a narrative implementation milestone and strengthened the piano FFI acceptance method in response to pull-request review. The new per-voicing exact-note maps ensure an incorrect numeric ID mapping fails rather than merely producing four different voices inside a broad playable range.
