@@ -142,7 +142,7 @@ fn detail(kick: &ResoKick, index: usize) -> String {
         5 => format!("{:>6.1} Hz", kick.character_hz()),
         6 => format!("{:>6.2} oct", kick.ripple_octaves()),
         7 => format!("{:>6.2} x", kick.exciter_noise_gain()),
-        9 => format!("{:+6.1} st", (kick.tuning() - 0.5) * 24.0),
+        9 => format!("{:+6.1} st", kick.tuning_semitones()),
         _ => String::new(),
     }
 }
@@ -199,7 +199,7 @@ fn main() -> anyhow::Result<()> {
     let kick = Arc::new(Mutex::new(ResoKick::new(sample_rate)));
 
     let mut engine = Engine::new(sample_rate);
-    engine.set_master_gain(0.7);
+    engine.set_master_gain(0.85);
     engine.add_instrument("reso_kick", Box::new(SharedResoKick(kick.clone())));
     let audio_engine = Arc::new(Mutex::new(engine));
 

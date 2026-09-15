@@ -8,7 +8,7 @@
 
 use std::f64::consts::PI;
 
-const MIN_FREQUENCY_HZ: f64 = 4.0;
+const MIN_FREQUENCY_HZ: f64 = 2.0;
 const MIN_DAMPING: f64 = 1.0e-4;
 const MAX_DAMPING: f64 = 1.0;
 const QUIET_THRESHOLD: f64 = 1.0e-5;

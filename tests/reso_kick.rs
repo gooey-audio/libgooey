@@ -34,7 +34,7 @@ fn stable_at_max_everything_for_ten_seconds() {
     };
     for sample in render(config, 1.0, 10.0) {
         assert!(sample.is_finite());
-        assert!(sample.abs() < 2.0, "sample={sample}");
+        assert!(sample.abs() < 3.0, "sample={sample}");
     }
 }
 
@@ -140,12 +140,12 @@ fn macro_controls_reach_the_extended_palette_endpoints() {
     kick.set_character(0.0);
     kick.set_ripple(0.0);
     kick.set_exciter_noise(0.0);
-    assert!((kick.frequency_hz() - 8.0).abs() < 1.0e-4);
+    assert!((kick.frequency_hz() - 6.0).abs() < 1.0e-4);
     assert!((kick.pitch_start_multiplier() - 1.0).abs() < 1.0e-4);
     assert!((kick.pitch_decay_ms() - 2.0).abs() < 1.0e-4);
     assert!((kick.resonate_t60_seconds() - 0.02).abs() < 1.0e-4);
-    assert!((kick.punch_gain() - 0.35).abs() < 1.0e-4);
-    assert!((kick.character_hz() - 4.0).abs() < 1.0e-4);
+    assert!((kick.punch_gain() - 0.30).abs() < 1.0e-4);
+    assert!((kick.character_hz() - 3.0).abs() < 1.0e-4);
     assert!((kick.ripple_octaves() - 0.0).abs() < 1.0e-4);
     assert!((kick.exciter_noise_gain() - 0.0).abs() < 1.0e-4);
 
@@ -158,11 +158,28 @@ fn macro_controls_reach_the_extended_palette_endpoints() {
     kick.set_ripple(1.0);
     kick.set_exciter_noise(1.0);
     assert!((kick.frequency_hz() - 180.0).abs() < 1.0e-3);
-    assert!((kick.pitch_start_multiplier() - 16.0).abs() < 1.0e-4);
-    assert!((kick.pitch_decay_ms() - 1_500.0).abs() < 1.0e-2);
-    assert!((kick.resonate_t60_seconds() - 12.0).abs() < 1.0e-3);
-    assert!((kick.punch_gain() - 20.0).abs() < 1.0e-4);
-    assert!((kick.character_hz() - 12_000.0).abs() < 1.0e-2);
-    assert!((kick.ripple_octaves() - 5.0).abs() < 1.0e-4);
-    assert!((kick.exciter_noise_gain() - 3.0).abs() < 1.0e-4);
+    assert!((kick.pitch_start_multiplier() - 18.0).abs() < 1.0e-4);
+    assert!((kick.pitch_decay_ms() - 1_800.0).abs() < 1.0e-2);
+    assert!((kick.resonate_t60_seconds() - 15.0).abs() < 1.0e-3);
+    assert!((kick.punch_gain() - 24.0).abs() < 1.0e-4);
+    assert!((kick.character_hz() - 16_000.0).abs() < 1.0e-2);
+    assert!((kick.ripple_octaves() - 7.0).abs() < 1.0e-4);
+    assert!((kick.exciter_noise_gain() - 4.0).abs() < 1.0e-4);
+}
+
+#[test]
+fn tuning_reaches_lower_without_expanding_the_upper_limit() {
+    let mut kick = ResoKick::new(SAMPLE_RATE);
+    kick.set_frequency(0.0);
+    kick.set_tuning(0.0);
+    assert!((kick.tuning_semitones() + 18.0).abs() < 1.0e-4);
+    assert!((kick.frequency_hz() - 2.121_320_2).abs() < 1.0e-4);
+
+    kick.set_tuning(0.5);
+    assert!(kick.tuning_semitones().abs() < 1.0e-4);
+    assert!((kick.frequency_hz() - 6.0).abs() < 1.0e-4);
+
+    kick.set_tuning(1.0);
+    assert!((kick.tuning_semitones() - 12.0).abs() < 1.0e-4);
+    assert!((kick.frequency_hz() - 12.0).abs() < 1.0e-4);
 }

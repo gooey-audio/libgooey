@@ -10,8 +10,7 @@ use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
 use crate::filters::Resonator;
 use crate::gen::{Exciter, ExciterKind};
 use crate::utils::{
-    tuning_to_multiplier, MacroCurve, MacroScale, MacroTarget, Oversampler, OversamplingMode,
-    SmoothedParam, XorShift32,
+    MacroCurve, MacroScale, MacroTarget, Oversampler, OversamplingMode, SmoothedParam, XorShift32,
 };
 
 const LINEAR_CURVE: MacroCurve = MacroCurve::new(&[(0.0, 0.0), (1.0, 1.0)]);
@@ -26,19 +25,34 @@ const RIPPLE_CURVE: MacroCurve =
 const EXCITER_NOISE_CURVE: MacroCurve =
     MacroCurve::new(&[(0.0, 0.0), (0.5, 0.20), (0.8, 0.55), (1.0, 1.0)]);
 
-const FREQUENCY: MacroTarget = MacroTarget::new(LINEAR_CURVE, 8.0, 180.0, MacroScale::Log);
+const FREQUENCY: MacroTarget = MacroTarget::new(LINEAR_CURVE, 6.0, 180.0, MacroScale::Log);
 const PITCH_START_MULTIPLIER: MacroTarget =
-    MacroTarget::new(DEPTH_CURVE, 1.0, 16.0, MacroScale::Linear);
+    MacroTarget::new(DEPTH_CURVE, 1.0, 18.0, MacroScale::Linear);
 const PITCH_DECAY_SECONDS: MacroTarget =
-    MacroTarget::new(LINEAR_CURVE, 0.002, 1.5, MacroScale::Log);
+    MacroTarget::new(LINEAR_CURVE, 0.002, 1.8, MacroScale::Log);
 const RESONATE_T60_SECONDS: MacroTarget =
-    MacroTarget::new(LINEAR_CURVE, 0.02, 12.0, MacroScale::Log);
+    MacroTarget::new(LINEAR_CURVE, 0.02, 15.0, MacroScale::Log);
 const CHARACTER_FREQUENCY: MacroTarget =
-    MacroTarget::new(LINEAR_CURVE, 4.0, 12_000.0, MacroScale::Log);
-const PUNCH_GAIN: MacroTarget = MacroTarget::new(PUNCH_CURVE, 0.35, 20.0, MacroScale::Linear);
-const RIPPLE_OCTAVES: MacroTarget = MacroTarget::new(RIPPLE_CURVE, 0.0, 5.0, MacroScale::Linear);
+    MacroTarget::new(LINEAR_CURVE, 3.0, 16_000.0, MacroScale::Log);
+const PUNCH_GAIN: MacroTarget = MacroTarget::new(PUNCH_CURVE, 0.30, 24.0, MacroScale::Linear);
+const RIPPLE_OCTAVES: MacroTarget = MacroTarget::new(RIPPLE_CURVE, 0.0, 7.0, MacroScale::Linear);
 const EXCITER_NOISE_GAIN: MacroTarget =
-    MacroTarget::new(EXCITER_NOISE_CURVE, 0.0, 3.0, MacroScale::Linear);
+    MacroTarget::new(EXCITER_NOISE_CURVE, 0.0, 4.0, MacroScale::Linear);
+
+/// Keep neutral tuning at the midpoint, extend downward to -18 semitones,
+/// and preserve the previous +12-semitone upper range.
+fn tuning_semitones(normalized: f32) -> f32 {
+    let normalized = normalized.clamp(0.0, 1.0);
+    if normalized <= 0.5 {
+        (normalized - 0.5) * 36.0
+    } else {
+        (normalized - 0.5) * 24.0
+    }
+}
+
+fn tuning_multiplier(normalized: f32) -> f32 {
+    2.0_f32.powf(tuning_semitones(normalized) / 12.0)
+}
 
 /// Normalized controls for a dual-resonator kick preset.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -293,8 +307,8 @@ impl ResoKick {
             .midi_note
             .map(|note| 440.0 * 2.0_f32.powf((note as f32 - 69.0) / 12.0))
             .unwrap_or_else(|| FREQUENCY.value(frequency))
-            .clamp(8.0, 120.0)
-            * tuning_to_multiplier(tuning);
+            .clamp(6.0, 180.0)
+            * tuning_multiplier(tuning);
 
         let pitch_decay_seconds = PITCH_DECAY_SECONDS.value(pitch_decay);
         self.pitch_env.set_decay_time(pitch_decay_seconds);
@@ -302,7 +316,7 @@ impl ResoKick {
         let start_multiplier = PITCH_START_MULTIPLIER.value(depth);
         let pitch_multiplier = 1.0 + (start_multiplier - 1.0) * env;
 
-        let core1_frequency = (base_hz * pitch_multiplier).clamp(4.0, self.sample_rate * 0.45);
+        let core1_frequency = (base_hz * pitch_multiplier).clamp(2.0, self.sample_rate * 0.45);
         let mut t60 = RESONATE_T60_SECONDS.value(resonate);
         if self.velocity > 0.75 && current_time - self.trigger_time < 0.015 {
             t60 *= 0.5;
@@ -322,10 +336,11 @@ impl ResoKick {
 
         let character_hz = CHARACTER_FREQUENCY.value(character);
         let ripple_octaves = RIPPLE_OCTAVES.value(ripple);
+        let ripple_signal = (core1 * 1.5).clamp(-1.0, 1.0);
         let character_frequency =
-            (character_hz * pitch_multiplier * 2.0_f32.powf(ripple_octaves * core1))
-                .clamp(4.0, self.sample_rate * 0.45);
-        let character_damping = 0.50 + (0.025 - 0.50) * (env * depth).clamp(0.0, 1.0);
+            (character_hz * pitch_multiplier * 2.0_f32.powf(ripple_octaves * ripple_signal))
+                .clamp(2.0, self.sample_rate * 0.45);
+        let character_damping = 0.55 + (0.015 - 0.55) * (env * depth).clamp(0.0, 1.0);
         self.core2.set_frequency(character_frequency);
         self.core2.set_damping(character_damping);
         self.core2.set_feedback(0.0);
@@ -335,7 +350,7 @@ impl ResoKick {
             self.active = false;
         }
 
-        output * self.velocity.sqrt() * volume * 1.5
+        output * self.velocity.sqrt() * volume * 2.0
     }
 
     pub fn is_active(&self) -> bool {
@@ -428,7 +443,7 @@ impl ResoKick {
 
     pub fn frequency_hz(&self) -> f32 {
         FREQUENCY.value(self.params.frequency.target())
-            * tuning_to_multiplier(self.params.tuning.target())
+            * tuning_multiplier(self.params.tuning.target())
     }
 
     pub fn pitch_decay_ms(&self) -> f32 {
@@ -457,6 +472,10 @@ impl ResoKick {
 
     pub fn exciter_noise_gain(&self) -> f32 {
         EXCITER_NOISE_GAIN.value(self.params.exciter_noise.target())
+    }
+
+    pub fn tuning_semitones(&self) -> f32 {
+        tuning_semitones(self.params.tuning.target())
     }
 }
 
