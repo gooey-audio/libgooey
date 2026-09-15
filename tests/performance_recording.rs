@@ -97,6 +97,63 @@ fn perf_record_punch_out_one_chord() {
 }
 
 #[test]
+fn perf_events_preserve_third_inversion_and_drop2_ids() {
+    let sample_rate = 44_100.0;
+    let engine = gooey_engine_new(sample_rate);
+    assert!(!engine.is_null());
+
+    unsafe {
+        gooey_engine_set_bpm(engine, 120.0);
+        gooey_engine_perf_set_record_mode(engine, PERF_RECORD_MODE_OVERDUB);
+        gooey_engine_perf_set_record_armed(engine, true);
+        gooey_engine_sequencer_start(engine);
+        render_frames(engine, 64);
+
+        for (index, voicing) in [VOICING_THIRD_INVERSION, VOICING_DROP2]
+            .into_iter()
+            .enumerate()
+        {
+            gooey_engine_poly_trigger_chord(
+                engine,
+                0,
+                SCALE_MAJOR,
+                index as u32,
+                voicing,
+                POLY_PRESET_DEFAULT,
+                4,
+                0.8,
+            );
+            render_frames(engine, 1024);
+            gooey_engine_poly_release(engine);
+        }
+
+        assert_eq!(gooey_engine_perf_get_event_count(engine), 2);
+        for (index, expected) in [VOICING_THIRD_INVERSION, VOICING_DROP2]
+            .into_iter()
+            .enumerate()
+        {
+            let mut actual = u32::MAX;
+            assert!(gooey_engine_perf_get_event(
+                engine,
+                index as u32,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut actual,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ));
+            assert_eq!(actual, expected);
+        }
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
 fn perf_overdub_keeps_arm_and_appends() {
     let sample_rate = 44_100.0;
     let bpm = 120.0;

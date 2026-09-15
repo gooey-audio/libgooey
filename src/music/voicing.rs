@@ -210,6 +210,13 @@ mod tests {
     }
 
     #[test]
+    fn test_third_inversion_c_major_seventh() {
+        let chord = Chord::new(NoteName::C, ChordQuality::Major7);
+        let notes = apply_voicing(&chord, VoicingType::ThirdInversion, 4);
+        assert_eq!(notes, vec![71, 72, 76, 79]); // B4, C5, E5, G5
+    }
+
+    #[test]
     fn test_available_voicings_triad() {
         let voicings = available_voicings(&ChordQuality::Major);
         assert!(voicings.contains(&VoicingType::RootPosition));

@@ -24,6 +24,34 @@ fn samples_per_step(bpm: f32) -> usize {
 }
 
 #[test]
+fn third_inversion_and_drop2_have_stable_ids_and_render_through_ffi() {
+    assert_eq!(VOICING_THIRD_INVERSION, 3);
+    assert_eq!(VOICING_DROP2, 5);
+
+    unsafe {
+        for voicing in [VOICING_THIRD_INVERSION, VOICING_DROP2] {
+            let engine = gooey_engine_new(SR);
+            gooey_engine_poly_trigger_chord(
+                engine,
+                0, // C
+                SCALE_MAJOR,
+                0,
+                voicing,
+                POLY_PRESET_DEFAULT,
+                4,
+                0.8,
+            );
+            let peak = render(engine, 1024)
+                .into_iter()
+                .map(f32::abs)
+                .fold(0.0_f32, f32::max);
+            assert!(peak > 0.001, "voicing id {voicing} should render audio");
+            gooey_engine_free(engine);
+        }
+    }
+}
+
+#[test]
 fn all_thirty_active_parameters_round_trip_and_survive_retrigger() {
     unsafe {
         let engine = gooey_engine_new(SR);

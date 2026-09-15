@@ -392,6 +392,45 @@ fn chord_trigger_uses_theory_voicing_and_base_velocity() {
 }
 
 #[test]
+fn third_inversion_and_drop2_select_expected_notes_through_ffi() {
+    unsafe {
+        for (voicing, notes) in [
+            (VOICING_THIRD_INVERSION, [71, 72, 76, 79]),
+            (VOICING_DROP2, [55, 60, 64, 71]),
+        ] {
+            let engine = gooey_engine_new(SR);
+            let piano = gooey_engine_piano_register(engine) as u32;
+            assert!(gooey_engine_mixer_route_source(
+                engine,
+                SOURCE_PIANO_BASE + piano,
+                2
+            ));
+            commit_exact_velocity_map(engine, piano, &notes, &[0.8; 4]);
+            render(engine, 64);
+            assert!(gooey_engine_piano_set_velocity_mode(engine, piano, 0.5));
+
+            assert!(gooey_engine_piano_trigger_chord(
+                engine,
+                piano,
+                0, // C
+                SCALE_MAJOR,
+                0,
+                voicing,
+                4,
+                0.8,
+            ));
+            assert!(peak(&render(engine, 512)) > 0.0);
+            assert_eq!(
+                gooey_engine_piano_active_voices(engine, piano),
+                4,
+                "voicing id {voicing} should trigger every Cmaj7 chord tone"
+            );
+            gooey_engine_free(engine);
+        }
+    }
+}
+
+#[test]
 fn default_velocity_mode_is_low_weighted_and_deterministic() {
     unsafe {
         let engine = gooey_engine_new(SR);
