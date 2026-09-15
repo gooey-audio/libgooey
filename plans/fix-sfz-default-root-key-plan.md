@@ -49,13 +49,13 @@ An SFZ region may omit `pitch_keycenter`; the SFZ default is MIDI note 60 (middl
 - Decision: Upload with pinned `@vercel/blob` 2.8.0 and pass `BLOB_READ_WRITE_TOKEN` directly to `put`, rather than using Vercel CLI.
   Rationale: The Blob SDK directly supports token-authenticated private multipart uploads; this avoids introducing or storing a broader Vercel account credential solely for CLI login.
   Date/Author: 2026-09-14 / Codex
-- Decision: Treat an already-complete v2 pair as a verification-only rerun, while failing on a partial pair and never overwriting either object.
-  Rationale: Both v2 objects are now present. This preserves immutable pathnames while allowing the corrected workflow to prove the remote archive and checksum exactly match newly regenerated local bytes.
+- Decision: Handle the archive and checksum independently on reruns: verify each existing object against its regenerated local counterpart, upload only a missing object, and never overwrite or accept a mismatch.
+  Rationale: Both v2 objects are now present, but sequential immutable uploads can leave a valid partial publication after a transient failure. Per-object recovery preserves immutable pathnames while allowing a later run to complete safely.
   Date/Author: 2026-09-14 / Codex
 
 ## Outcomes & Retrospective
 
-The parser, regression coverage, artifact contract test, and CI publisher were merged in PR #236. The first pack run proved the source download, source checksum, preparation, corrected C4 mapping, audio properties, deterministic archive, and libgooey reload, and retained the candidate as a temporary Actions artifact. Its Vercel CLI upload client failed authentication, but both expected private v2 objects were subsequently published and independently verified. A follow-up changes the upload client to the Blob SDK and makes an already-complete pair verification-only; one green main-branch rerun remains.
+The parser, regression coverage, artifact contract test, and CI publisher were merged in PR #236. The first pack run proved the source download, source checksum, preparation, corrected C4 mapping, audio properties, deterministic archive, and libgooey reload, and retained the candidate as a temporary Actions artifact. Its Vercel CLI upload client failed authentication, but both expected private v2 objects were subsequently published and independently verified. A follow-up changes the upload client to the Blob SDK and makes every existing object verification-only while uploading any missing counterpart; one green main-branch rerun remains.
 
 ## Context and Orientation
 
@@ -87,11 +87,11 @@ Before dispatching the merged workflow, copy the existing local Blob credential 
 
 The parser regression must fail on the original code because the parsed center is absent, and pass with center 60 after the fix. The preparation regression must fail on the original code because it emits `pitch_keycenter=59` and a `B3_059` filename; after the fix it must emit `pitch_keycenter=60`, a `C4_060` filename, and reload with root 60. The voicing regression must return exactly MIDI 60, 64, 67, and 71.
 
-The CI artifact is accepted only if it contains `piano-mobile/instrument.sfz`, `piano-mobile/NOTICE.txt`, and 244 files under `piano-mobile/samples/`; the C4 range has eight velocity layers centered at MIDI 60; WAVs are stereo 16-bit and no longer than six seconds; and an authenticated download from the v2 Blob hashes to the exact digest published in `salamander-mobile-8x6s-v2.tar.gz.sha256`.
+The CI artifact is accepted only if it contains `piano-mobile/instrument.sfz`, `piano-mobile/NOTICE.txt`, and 244 files under `piano-mobile/samples/`; the C4 range has eight velocity layers centered at MIDI 60; WAVs are stereo 16-bit and no longer than six seconds; and an authenticated download from the v2 Blob hashes to the exact digest published in `salamander-mobile-8x6s-v2.tar.gz.sha256`. On a retry, each existing Blob must match its regenerated local counterpart before the workflow may upload the other object.
 
 ## Idempotence and Recovery
 
-Source changes and tests are repeatable. The preparation output directory is recreated on an ephemeral runner. The v2 Blob pathname is intentionally immutable and uploads do not pass an overwrite flag, so a repeated workflow stops safely instead of replacing consumer bytes. If a run fails before upload, rerun it. If one object uploads and the second fails, inspect the first object's digest before retrying; do not delete or overwrite either version without explicit approval. V1 is never modified.
+Source changes and tests are repeatable. The preparation output directory is recreated on an ephemeral runner. The v2 Blob pathnames are intentionally immutable and uploads disable overwrites. A retry authenticates and verifies any existing archive or checksum against newly generated local bytes, then uploads only the missing counterpart. A mismatch or duplicate exact pathname stops the workflow without modifying Blob state. V1 is never modified.
 
 ## Artifacts and Notes
 
