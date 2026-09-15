@@ -1,9 +1,10 @@
 //! Dual-resonator kick voice inspired by struck analog filter cores.
 //!
-//! The first resonator creates the body and owns the decay. Its output passes
-//! through an unnormalised soft clipper before driving a shorter, more heavily
-//! damped character resonator. There is deliberately no amplitude envelope:
-//! the stored energy in the resonators determines how long the sound lasts.
+//! The first, linear-bounded resonator creates the body and owns the decay. Its
+//! output passes through an unnormalised soft clipper, while a shorter, more
+//! heavily damped character resonator contributes a parallel band-pass ping.
+//! There is deliberately no amplitude envelope: the stored energy in the
+//! resonators determines how long the sound lasts.
 
 use crate::engine::{Instrument, Modulatable};
 use crate::envelope::{ADSRConfig, Envelope, EnvelopeCurve};
@@ -19,7 +20,7 @@ const DEPTH_CURVE: MacroCurve =
 const RESONATE_CURVE: MacroCurve =
     MacroCurve::new(&[(0.0, 0.0), (0.6, 0.40), (0.85, 0.90), (1.0, 1.0)]);
 const PUNCH_CURVE: MacroCurve =
-    MacroCurve::new(&[(0.0, 0.0), (0.3, 0.075), (0.7, 0.35), (1.0, 1.0)]);
+    MacroCurve::new(&[(0.0, 0.0), (0.3, 0.03), (0.7, 0.25), (1.0, 1.0)]);
 const RIPPLE_CURVE: MacroCurve =
     MacroCurve::new(&[(0.0, 0.0), (0.5, 0.25), (0.8, 0.60), (1.0, 1.0)]);
 const EXCITER_NOISE_CURVE: MacroCurve =
@@ -34,10 +35,12 @@ const RESONATE_T60_SECONDS: MacroTarget =
     MacroTarget::new(LINEAR_CURVE, 0.02, 15.0, MacroScale::Log);
 const CHARACTER_FREQUENCY: MacroTarget =
     MacroTarget::new(LINEAR_CURVE, 3.0, 16_000.0, MacroScale::Log);
-const PUNCH_GAIN: MacroTarget = MacroTarget::new(PUNCH_CURVE, 0.30, 24.0, MacroScale::Linear);
+const PUNCH_GAIN: MacroTarget = MacroTarget::new(PUNCH_CURVE, 1.0, 16.0, MacroScale::Linear);
 const RIPPLE_OCTAVES: MacroTarget = MacroTarget::new(RIPPLE_CURVE, 0.0, 7.0, MacroScale::Linear);
 const EXCITER_NOISE_GAIN: MacroTarget =
     MacroTarget::new(EXCITER_NOISE_CURVE, 0.0, 4.0, MacroScale::Linear);
+const CHARACTER_LEVEL: f32 = 0.4;
+const CLICK_LEVEL: f32 = 0.5;
 
 /// Keep neutral tuning at the midpoint, extend downward to -18 semitones,
 /// and preserve the previous +12-semitone upper range.
@@ -71,7 +74,7 @@ pub struct ResoKickConfig {
 impl ResoKickConfig {
     pub fn classic808() -> Self {
         Self {
-            frequency: 0.61,
+            frequency: 0.50,
             depth: 0.47,
             pitch_decay: 0.37,
             resonate: 0.65,
@@ -85,7 +88,7 @@ impl ResoKickConfig {
 
     pub fn punch909() -> Self {
         Self {
-            frequency: 0.65,
+            frequency: 0.59,
             depth: 0.76,
             pitch_decay: 0.28,
             resonate: 0.46,
@@ -99,7 +102,7 @@ impl ResoKickConfig {
 
     pub fn soft_bounce() -> Self {
         Self {
-            frequency: 0.54,
+            frequency: 0.46,
             depth: 0.32,
             pitch_decay: 0.46,
             resonate: 0.59,
@@ -113,7 +116,7 @@ impl ResoKickConfig {
 
     pub fn tom() -> Self {
         Self {
-            frequency: 0.76,
+            frequency: 0.60,
             depth: 0.58,
             pitch_decay: 0.72,
             resonate: 0.72,
@@ -127,7 +130,7 @@ impl ResoKickConfig {
 
     pub fn laser() -> Self {
         Self {
-            frequency: 0.70,
+            frequency: 0.49,
             depth: 1.0,
             pitch_decay: 1.0,
             resonate: 0.76,
@@ -322,9 +325,8 @@ impl ResoKick {
             t60 *= 0.5;
         }
         self.core1.set_frequency(core1_frequency);
+        self.core1.set_feedback(RESONATE_CURVE.eval(resonate) * 0.8);
         self.core1.set_decay_time(t60);
-        self.core1
-            .set_feedback(RESONATE_CURVE.eval(resonate) * 1.05);
 
         let noise = self.exciter.tick() * EXCITER_NOISE_GAIN.value(exciter_noise);
         let core1 = self.core1.process(noise);
@@ -336,7 +338,7 @@ impl ResoKick {
 
         let character_hz = CHARACTER_FREQUENCY.value(character);
         let ripple_octaves = RIPPLE_OCTAVES.value(ripple);
-        let ripple_signal = (core1 * 1.5).clamp(-1.0, 1.0);
+        let ripple_signal = core1.clamp(-1.0, 1.0);
         let character_frequency =
             (character_hz * pitch_multiplier * 2.0_f32.powf(ripple_octaves * ripple_signal))
                 .clamp(2.0, self.sample_rate * 0.45);
@@ -344,13 +346,14 @@ impl ResoKick {
         self.core2.set_frequency(character_frequency);
         self.core2.set_damping(character_damping);
         self.core2.set_feedback(0.0);
-        let output = self.core2.process(punched);
+        let _ = self.core2.process(punched + noise);
+        let output = punched + CHARACTER_LEVEL * self.core2.bandpass() + CLICK_LEVEL * noise;
 
         if self.core1.is_quiet() && self.core2.is_quiet() && !self.exciter.is_active() {
             self.active = false;
         }
 
-        output * self.velocity.sqrt() * volume * 2.0
+        output * self.velocity.sqrt() * volume
     }
 
     pub fn is_active(&self) -> bool {
