@@ -11,6 +11,7 @@ use std::f64::consts::PI;
 const MIN_FREQUENCY_HZ: f64 = 2.0;
 const MIN_DAMPING: f64 = 1.0e-4;
 const MAX_DAMPING: f64 = 1.0;
+const MAX_FEEDBACK: f64 = 0.8;
 const QUIET_THRESHOLD: f64 = 1.0e-5;
 
 /// A topology-preserving-transform state-variable resonator.
@@ -23,6 +24,7 @@ pub struct Resonator {
     k: f64,
     s1: f64,
     s2: f64,
+    prev_band: f64,
     prev_low: f64,
 }
 
@@ -39,6 +41,7 @@ impl Resonator {
             k: 0.2,
             s1: 0.0,
             s2: 0.0,
+            prev_band: 0.0,
             prev_low: 0.0,
         };
         resonator.update_frequency_coefficient();
@@ -66,7 +69,7 @@ impl Resonator {
         } else {
             0.5
         };
-        let zeta = 6.91 / (2.0 * PI * self.freq_hz * t60);
+        let zeta = 6.91 / (2.0 * PI * self.effective_frequency_hz() * t60);
         self.set_damping(zeta as f32);
     }
 
@@ -80,16 +83,17 @@ impl Resonator {
     /// Add positive, saturating feedback around the low-pass state.
     pub fn set_feedback(&mut self, feedback: f32) {
         self.feedback = if feedback.is_finite() {
-            feedback.clamp(0.0, 1.05) as f64
+            feedback.clamp(0.0, MAX_FEEDBACK as f32) as f64
         } else {
             0.0
         };
+        self.update_frequency_coefficient();
     }
 
     /// Inject trigger energy directly into the first integrator.
     pub fn excite(&mut self, energy: f32) {
         if energy.is_finite() {
-            self.s1 = (self.s1 + energy as f64).tanh();
+            self.s1 = Self::bound_state(self.s1 + energy as f64);
         }
     }
 
@@ -102,8 +106,9 @@ impl Resonator {
         let v1 = (self.g * (x - self.s2) + self.s1) * h;
         let v2 = self.s2 + self.g * v1;
 
-        self.s1 = (2.0 * v1 - self.s1).tanh();
-        self.s2 = (2.0 * v2 - self.s2).tanh();
+        self.s1 = Self::bound_state(2.0 * v1 - self.s1);
+        self.s2 = Self::bound_state(2.0 * v2 - self.s2);
+        self.prev_band = v1;
         self.prev_low = v2;
 
         if self.s1.is_finite() && self.s2.is_finite() && v2.is_finite() {
@@ -114,10 +119,16 @@ impl Resonator {
         }
     }
 
+    /// Return the most recently computed band-pass tap.
+    pub fn bandpass(&self) -> f32 {
+        self.prev_band as f32
+    }
+
     /// Clear all stored energy.
     pub fn reset(&mut self) {
         self.s1 = 0.0;
         self.s2 = 0.0;
+        self.prev_band = 0.0;
         self.prev_low = 0.0;
     }
 
@@ -127,7 +138,20 @@ impl Resonator {
     }
 
     fn update_frequency_coefficient(&mut self) {
-        self.g = (PI * self.freq_hz / self.sample_rate).tan();
+        self.g = (PI * self.effective_frequency_hz() / self.sample_rate).tan();
+    }
+
+    fn effective_frequency_hz(&self) -> f64 {
+        (self.freq_hz / (1.0 - self.feedback).sqrt()).min(self.sample_rate * 0.45)
+    }
+
+    #[inline]
+    fn bound_state(state: f64) -> f64 {
+        if state.abs() <= 1.0 {
+            state
+        } else {
+            state.signum() * (1.0 + (state.abs() - 1.0).tanh())
+        }
     }
 }
 
@@ -144,17 +168,41 @@ mod tests {
 
     #[test]
     fn excite_rings_at_set_frequency() {
+        for feedback in [0.0, 0.6] {
+            let mut resonator = Resonator::new(SAMPLE_RATE);
+            resonator.set_frequency(60.0);
+            resonator.set_feedback(feedback);
+            resonator.set_decay_time(1.0);
+            resonator.excite(0.1);
+            let output = render(&mut resonator, 1.0);
+            let crossings = output
+                .windows(2)
+                .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+                .count();
+
+            assert!(
+                (58..=62).contains(&crossings),
+                "feedback={feedback}, crossings={crossings}"
+            );
+        }
+    }
+
+    #[test]
+    fn decay_does_not_collapse_at_normal_amplitude() {
         let mut resonator = Resonator::new(SAMPLE_RATE);
         resonator.set_frequency(60.0);
         resonator.set_decay_time(1.0);
-        resonator.excite(0.1);
-        let output = render(&mut resonator, 1.0);
-        let crossings = output
-            .windows(2)
-            .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
-            .count();
+        resonator.excite(0.6);
+        let output = render(&mut resonator, 0.12);
+        let peak = output
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        let envelope_100ms = output[4_560..5_040]
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
 
-        assert!((58..=62).contains(&crossings), "crossings={crossings}");
+        assert!(peak >= 0.5, "peak={peak}");
+        assert!(envelope_100ms >= 0.3, "envelope={envelope_100ms}");
     }
 
     #[test]
@@ -162,13 +210,21 @@ mod tests {
         for frequency in [8.0, 80.0] {
             let mut resonator = Resonator::new(SAMPLE_RATE);
             resonator.set_frequency(frequency);
+            resonator.set_feedback(1.0);
             resonator.set_decay_time(6.0);
-            resonator.set_feedback(1.05);
             resonator.excite(1.0);
-            for sample in render(&mut resonator, 10.0) {
+            let output = render(&mut resonator, 10.0);
+            for sample in &output {
                 assert!(sample.is_finite());
                 assert!(sample.abs() < 2.0, "frequency={frequency}, sample={sample}");
             }
+            let tail = &output[9 * SAMPLE_RATE as usize..];
+            let tail_mean =
+                tail.iter().map(|&sample| sample as f64).sum::<f64>() / tail.len() as f64;
+            assert!(
+                tail_mean.abs() < 0.005,
+                "frequency={frequency}, tail_mean={tail_mean}"
+            );
         }
     }
 
