@@ -225,7 +225,7 @@ fn render_display(
         "\r\nHits: {trigger_count} | Velocity: {:.0}%\r\n",
         velocity * 100.0
     );
-    print!("Signal: body resonator → Punch → character → Entity Dynamics → safety limiter\r\n");
+    print!("Signal: body → Punch ‖ character ping → Entity Dynamics → safety limiter\r\n");
     io::stdout().flush().unwrap();
 }
 

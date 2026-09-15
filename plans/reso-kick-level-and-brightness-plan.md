@@ -11,9 +11,9 @@ The Entity-style resonator kick currently loses most of its energy inside the re
 - [x] (2026-09-15 14:30Z) Read the supplied design, repository planning rules, current resonator kick implementation, focused tests, and Nexus integration instructions.
 - [x] (2026-09-15 14:30Z) Confirmed that the branch starts clean at `origin/main` and no matching Nexus task exists to claim.
 - [x] (2026-09-15 14:42Z) Implemented the bounded linear resonator states and excitation, band-pass tap, feedback cap, pitch compensation, and unit regressions; all five focused tests pass.
-- [ ] Rewire and retune the kick voice and presets around the corrected resonator level.
-- [ ] Retune Entity Dynamics and replace its ineffective limiter shaping and detector behavior.
-- [ ] Add end-to-end kick regressions and update the interactive signal-flow description.
+- [x] (2026-09-15 15:05Z) Rewired the character resonator in parallel, exposed the click, remapped Punch and Resonate, retuned preset pitches, and selected a measured character mix of 0.4.
+- [x] (2026-09-15 15:12Z) Raised the Entity Dynamics threshold and implemented an identity-below-knee limiter whose feedback gain demonstrably engages under +12 dB drive.
+- [x] (2026-09-15 15:18Z) Added end-to-end kick regressions for level, sustain, pitch, brightness, long-tail DC, and stability, and updated the interactive signal-flow description.
 - [ ] Run formatting, build, test, Clippy, and the interactive example where the environment permits it.
 
 ## Surprises & Discoveries
@@ -24,6 +24,12 @@ The Entity-style resonator kick currently loses most of its energy inside the re
   Evidence: The authenticated task query returned an empty filtered task list, so no task state was changed.
 - Observation: Keeping the old `tanh` only in `excite` limited a requested 0.6 strike to 0.537 and left the 100 ms envelope at 0.277, below the designed 0.3 floor.
   Evidence: The first focused test run failed with `envelope=0.27702448`; applying the same identity-through-one state bound to excitation made all five resonator tests pass.
+- Observation: Sample-delayed positive feedback imposes substantial unintended damping even after the state leak is removed; the Sub Drone became inaudible at 5.94 seconds instead of surviving the eight-to-nine-second test window.
+  Evidence: The initial full-voice run reported `tail rms=0` and `last_audible=5.9410415s`. Solving the current low-pass feedback value with three bounded Newton iterations makes the nine-second tail RMS and DC assertions pass.
+- Observation: A fixed 0.7 character mix put the midpoint-Punch Classic 808 at +1.78 dBFS, outside the required -4 to 0 dBFS raw peak window.
+  Evidence: Reducing only `CHARACTER_LEVEL` to 0.4 brought the peak test into range while the dedicated Character brightness test continues to pass.
+- Observation: Comparing Resonate 0.3 and 0.8 over the same late wall-clock window is not meaningful because the macro also maps those settings to approximately 0.15-second and 4-second decay times.
+  Evidence: The low-Resonate render was silent in the requested 300–600 ms window. The regression now measures each setting in its low-amplitude tail, aligns the parallel character core with the body to avoid low-frequency crossing contamination, and compares crossing periods rather than treating post-decay silence as zero pitch.
 
 ## Decision Log
 
@@ -35,6 +41,15 @@ The Entity-style resonator kick currently loses most of its energy inside the re
   Date/Author: 2026-09-15 / Codex
 - Decision: Apply the linear-until-bounded rule to direct excitation as well as per-sample state integration.
   Rationale: Excitation writes the first integrator state directly; retaining `tanh` there still removed meaningful strike energy and missed the explicit no-collapse envelope target.
+  Date/Author: 2026-09-15 / Codex
+- Decision: Solve the saturating low-pass feedback loop at the current sample with three Newton iterations instead of feeding back the prior low-pass sample.
+  Rationale: The one-sample delay changed both damping and decay duration, defeating the promised T60 even with mathematically correct frequency compensation. Feedback is capped at 0.8, keeping the solve derivative safely away from zero, and maximum-frequency/feedback tests remain bounded.
+  Date/Author: 2026-09-15 / Codex
+- Decision: Use a 0.4 constant character mix instead of the design's 0.7 starting value.
+  Rationale: This is the highest simple tuning change needed to return the corrected voice to the explicit raw peak window without reducing global body level or weakening the brightness path.
+  Date/Author: 2026-09-15 / Codex
+- Decision: Isolate the Character brightness regression with maximum noise excitation and compare Resonate pitch in decay-relative tail windows.
+  Rationale: Character is a resonator and needs broadband energy for a first-difference measurement; Resonate controls decay and feedback together, so equal late windows otherwise compare a silent short-decay voice with an audible long-decay voice rather than comparing pitch.
   Date/Author: 2026-09-15 / Codex
 
 ## Outcomes & Retrospective
@@ -88,9 +103,9 @@ All source edits and validation commands are repeatable. Tests render into memor
 
 ## Artifacts and Notes
 
-The intended voice mix is:
+The tuned voice mix is:
 
-    punched body + 0.7 × character band-pass + 0.5 × exciter noise
+    punched body + 0.4 × character band-pass + 0.5 × exciter noise
 
 The intended limiter transfer is exactly linear below `0.8 * LIMITER_CEILING`, then continuously and smoothly approaches `LIMITER_CEILING` above that knee.
 
@@ -98,4 +113,4 @@ The intended limiter transfer is exactly linear below `0.8 * LIMITER_CEILING`, t
 
 `crate::filters::Resonator` retains `pub fn process(&mut self, input: f32) -> f32` as its low-pass output and gains `pub fn bandpass(&self) -> f32`. No external crates or public C interfaces are added. `ResoKickConfig` retains its existing normalized fields, but the built-in preset values and the physical Punch mapping change. `EntityDynamics` retains its public controls and effect interfaces; only its internal threshold and limiter transfer change.
 
-Revision note (2026-09-15 14:42Z): Recorded completion of the resonator milestone and the measured reason direct excitation uses the new state bound too.
+Revision note (2026-09-15 15:18Z): Recorded completion of implementation milestones, the zero-delay feedback correction, measured character mix, and decay-aware pitch-test design before full repository verification.

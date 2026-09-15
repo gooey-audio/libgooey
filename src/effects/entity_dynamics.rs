@@ -7,10 +7,10 @@ use crate::utils::{Oversampler, OversamplingMode, SmoothedParam};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-// At velocity 0.75 the raw voice peaks around -10 dBFS on Classic 808 and -8
-// dBFS with Punch at midpoint. A -12 dBFS threshold accounts for the 2 ms
-// detector attack and makes that midpoint the onset of obvious compression.
-const COMPRESSOR_THRESHOLD_DB: f32 = -12.0;
+// At velocity 0.75 the corrected raw voice peaks around -3 dBFS with Punch at
+// midpoint. A -6 dBFS threshold leaves its body intact while making that
+// midpoint the onset of obvious compression after the 2 ms detector attack.
+const COMPRESSOR_THRESHOLD_DB: f32 = -6.0;
 const COMPRESSOR_RATIO: f32 = 4.0;
 const COMPRESSOR_ATTACK_MS: f32 = 2.0;
 const COMPRESSOR_RELEASE_MS: f32 = 120.0;
@@ -20,6 +20,7 @@ const BASS_DRIVE_MAX_HZ: f32 = 530.0;
 const GAIN_DIST_MIN_DB: f32 = -12.0;
 const GAIN_DIST_MAX_DB: f32 = 24.0;
 const LIMITER_CEILING: f32 = 0.95;
+const LIMITER_DETECT: f32 = 0.8 * LIMITER_CEILING;
 const LIMITER_ATTACK_MS: f32 = 0.2;
 const LIMITER_RELEASE_MS: f32 = 80.0;
 const DENORMAL_THRESHOLD: f32 = 1.0e-15;
@@ -197,7 +198,7 @@ impl EntityDynamics {
 
     fn limit(&self, state: &mut EntityDynamicsState, input: f32, gain_linear: f32) -> f32 {
         let detector = state.limiter_previous_output.abs();
-        let target = LIMITER_CEILING / detector.max(LIMITER_CEILING);
+        let target = LIMITER_DETECT / detector.max(LIMITER_DETECT);
         let coefficient = if target < state.limiter_gain {
             Self::smoothing_step(LIMITER_ATTACK_MS, self.sample_rate)
         } else {
@@ -207,7 +208,14 @@ impl EntityDynamics {
 
         let driven = input * gain_linear * state.limiter_gain;
         let output = state.limiter_oversampler.process(driven, |sample| {
-            LIMITER_CEILING * (sample / LIMITER_CEILING).tanh()
+            let magnitude = sample.abs();
+            if magnitude <= LIMITER_DETECT {
+                sample
+            } else {
+                let transition = (magnitude - LIMITER_DETECT) / (LIMITER_CEILING - LIMITER_DETECT);
+                sample.signum()
+                    * (LIMITER_DETECT + (LIMITER_CEILING - LIMITER_DETECT) * transition.tanh())
+            }
         });
         if output.is_finite() {
             state.limiter_previous_output = output;
@@ -340,6 +348,21 @@ mod tests {
             // nonlinear function's 0.95 ceiling on a Nyquist-rate square.
             assert!(output.abs() < 1.25, "output={output}");
         }
+    }
+
+    #[test]
+    fn feedback_limiter_reduces_gain_on_twelve_db_drive() {
+        let effect = EntityDynamics::new(SAMPLE_RATE);
+        effect.set_gain_dist_db(12.0);
+        effect.set_dynamics(1.0);
+        settle(&effect);
+        for sample in 0..24_000 {
+            let input = (std::f32::consts::TAU * 100.0 * sample as f32 / SAMPLE_RATE).sin() * 0.5;
+            let _ = effect.process(input);
+        }
+
+        let limiter_gain = unsafe { (&*effect.state.get())[0].limiter_gain };
+        assert!(limiter_gain < 1.0, "limiter_gain={limiter_gain}");
     }
 
     #[test]

@@ -25,7 +25,6 @@ pub struct Resonator {
     s1: f64,
     s2: f64,
     prev_band: f64,
-    prev_low: f64,
 }
 
 impl Resonator {
@@ -42,7 +41,6 @@ impl Resonator {
             s1: 0.0,
             s2: 0.0,
             prev_band: 0.0,
-            prev_low: 0.0,
         };
         resonator.update_frequency_coefficient();
         resonator
@@ -101,15 +99,27 @@ impl Resonator {
     #[inline]
     pub fn process(&mut self, input: f32) -> f32 {
         let input = if input.is_finite() { input as f64 } else { 0.0 };
-        let x = input + self.feedback * self.prev_low.tanh();
         let h = 1.0 / (1.0 + self.k * self.g + self.g * self.g);
-        let v1 = (self.g * (x - self.s2) + self.s1) * h;
+        let mut v1 = (self.g * (input - self.s2) + self.s1) * h;
+
+        // Solve the zero-delay feedback loop. Using the previous low-pass
+        // sample here adds unintended damping, so even a nominal 15-second
+        // decay dies in a few seconds. Three Newton steps converge rapidly
+        // because feedback is capped below unity.
+        for _ in 0..3 {
+            let low = self.s2 + self.g * v1;
+            let saturated_low = low.tanh();
+            let residual =
+                v1 - (self.g * (input + self.feedback * saturated_low - self.s2) + self.s1) * h;
+            let derivative =
+                1.0 - h * self.g * self.g * self.feedback * (1.0 - saturated_low.powi(2));
+            v1 -= residual / derivative;
+        }
         let v2 = self.s2 + self.g * v1;
 
         self.s1 = Self::bound_state(2.0 * v1 - self.s1);
         self.s2 = Self::bound_state(2.0 * v2 - self.s2);
         self.prev_band = v1;
-        self.prev_low = v2;
 
         if self.s1.is_finite() && self.s2.is_finite() && v2.is_finite() {
             v2 as f32
@@ -129,7 +139,6 @@ impl Resonator {
         self.s1 = 0.0;
         self.s2 = 0.0;
         self.prev_band = 0.0;
-        self.prev_low = 0.0;
     }
 
     /// Return true once both integrator states are below the audible floor.
