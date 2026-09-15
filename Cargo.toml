@@ -110,6 +110,10 @@ name = "bounce"
 required-features = ["bounce"]
 
 [[example]]
+name = "fm_percussion"
+required-features = ["bounce"]
+
+[[example]]
 name = "granulator"
 required-features = ["native", "crossterm", "bounce"]
 

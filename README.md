@@ -4,7 +4,9 @@
 
 ## Features
 
-- Kick, Snare, Hihat and Tom drum synthesizer with comprehensive parameter control
+- Kick, Snare, Hihat, Tom, Bass, and monophonic FM percussion synthesizers
+- Noir-inspired FM percussion with two oscillators, phase modulation, pitch-drop envelopes,
+  noise, ring/cross-ring modes, filtering, grit, resonant boost, bit-drive, and pitch/velocity macros
 - Parameter smoothing
 - 16-step sequencer with sample-accurate timing
 - Optional metronome / monitor click, locked to the transport and excluded from offline exports
@@ -23,6 +25,7 @@ cargo build --release
 cargo run --example kick
 cargo run --example snare
 cargo run --example hihat
+cargo run --no-default-features --features bounce --example fm_percussion
 cargo run --example sampler_rack --features native,crossterm
 ```
 
@@ -120,6 +123,17 @@ gooey_engine_free(engine);
 ```
 
 See `include/gooey.h` for complete API documentation.
+
+### FM percussion channels
+
+Any of the five voice strips can host `INSTRUMENT_FM_PERCUSSION`. The 40
+`FM_PERCUSSION_PARAM_*` controls are normalized to 0–1 and round-trip through
+`gooey_engine_set_channel_param` / `gooey_engine_get_channel_param`. Use
+`gooey_engine_trigger_channel_note` for an atomic note-and-velocity hit, or add
+per-step MIDI notes and velocities to the existing 16-step sequencer. The four
+factory sounds (`SUB_KICK`, `METAL_HAT`, `ZAP`, and `INDUSTRIAL`) also form the
+default X/Y blend corners. `INSTRUMENT_COUNT` remains five voice strips;
+`INSTRUMENT_TYPE_COUNT` reports six assignable synth types.
 
 For apps migrating from the old flat instrument mix assumption to mixer graph
 submixing, see [docs/mixer-graph-migration.md](docs/mixer-graph-migration.md).
