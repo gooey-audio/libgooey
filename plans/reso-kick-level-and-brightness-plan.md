@@ -14,7 +14,7 @@ The Entity-style resonator kick currently loses most of its energy inside the re
 - [x] (2026-09-15 15:05Z) Rewired the character resonator in parallel, exposed the click, remapped Punch and Resonate, retuned preset pitches, and selected a measured character mix of 0.4.
 - [x] (2026-09-15 15:12Z) Raised the Entity Dynamics threshold and implemented an identity-below-knee limiter whose feedback gain demonstrably engages under +12 dB drive.
 - [x] (2026-09-15 15:18Z) Added end-to-end kick regressions for level, sustain, pitch, brightness, long-tail DC, and stability, and updated the interactive signal-flow description.
-- [ ] Run formatting, build, test, Clippy, and the interactive example where the environment permits it.
+- [x] (2026-09-15 15:42Z) Ran both builds, formatting, the full verbose test suite, task-scoped Clippy, and an interactive six-preset/four-velocity smoke test; the repository-wide all-target Clippy command is blocked only by the pre-existing stale `examples/hihat.rs` target.
 
 ## Surprises & Discoveries
 
@@ -30,6 +30,8 @@ The Entity-style resonator kick currently loses most of its energy inside the re
   Evidence: Reducing only `CHARACTER_LEVEL` to 0.4 brought the peak test into range while the dedicated Character brightness test continues to pass.
 - Observation: Comparing Resonate 0.3 and 0.8 over the same late wall-clock window is not meaningful because the macro also maps those settings to approximately 0.15-second and 4-second decay times.
   Evidence: The low-Resonate render was silent in the requested 300–600 ms window. The regression now measures each setting in its low-amplitude tail, aligns the parallel character core with the body to avoid low-frequency crossing contamination, and compares crossing periods rather than treating post-decay silence as zero pitch.
+- Observation: Repository-wide all-feature Clippy is already unable to compile the legacy `examples/hihat.rs`, which refers to removed `HiHat2Params` fields and preset constructors.
+  Evidence: `cargo clippy --all-targets --all-features` failed with 14 `E0599`/`E0609` errors in that unchanged example. `cargo clippy --lib --tests --all-features` and `cargo clippy --example reso_kick --features native,crossterm` both completed successfully with only existing warnings.
 
 ## Decision Log
 
@@ -51,10 +53,15 @@ The Entity-style resonator kick currently loses most of its energy inside the re
 - Decision: Isolate the Character brightness regression with maximum noise excitation and compare Resonate pitch in decay-relative tail windows.
   Rationale: Character is a resonator and needs broadband energy for a first-difference measurement; Resonate controls decay and feedback together, so equal late windows otherwise compare a silent short-decay voice with an audible long-decay voice rather than comparing pitch.
   Date/Author: 2026-09-15 / Codex
+- Decision: Skip Newton iterations when feedback is zero and skip coefficient recalculation when the feedback value is unchanged.
+  Rationale: The exact no-feedback result is the initial linear solve, and these fast paths avoid three unnecessary hyperbolic-tangent evaluations in the parallel character core plus redundant tangent calculations after a smoothed control settles.
+  Date/Author: 2026-09-15 / Codex
 
 ## Outcomes & Retrospective
 
-Implementation is in progress. This section will record the final measured behavior, verification results, and any residual listening work.
+The resonator now retains ordinary-amplitude energy, respects its nominal pitch under linearized feedback, keeps its configured long decay through a zero-delay nonlinear feedback solve, and cannot latch at feedback above unity because the public setting caps at 0.8. The kick mixes its punched body, character band-pass ping, and click in parallel; its presets retain their historical approximate fundamentals while the midpoint-Punch Classic 808 meets the new -4 to 0 dBFS window. Entity Dynamics now begins compression at -6 dBFS and its limiter is transparent below the knee while demonstrably reducing feedback gain under +12 dB drive.
+
+Both requested builds, formatting, all 405 library tests plus every integration and documentation target in `cargo test --verbose`, and focused Clippy checks pass. The all-target Clippy command remains non-green solely because the unchanged legacy hi-hat example does not compile against the current `HiHat2` API. The interactive example initialized the MacBook Pro output device at 48 kHz, accepted hits on all six presets and all four velocities, and quit cleanly. A human should still make the subjective click/Punch/ripple listening judgment because an automated agent cannot hear the output.
 
 ## Context and Orientation
 
@@ -113,4 +120,4 @@ The intended limiter transfer is exactly linear below `0.8 * LIMITER_CEILING`, t
 
 `crate::filters::Resonator` retains `pub fn process(&mut self, input: f32) -> f32` as its low-pass output and gains `pub fn bandpass(&self) -> f32`. No external crates or public C interfaces are added. `ResoKickConfig` retains its existing normalized fields, but the built-in preset values and the physical Punch mapping change. `EntityDynamics` retains its public controls and effect interfaces; only its internal threshold and limiter transfer change.
 
-Revision note (2026-09-15 15:18Z): Recorded completion of implementation milestones, the zero-delay feedback correction, measured character mix, and decay-aware pitch-test design before full repository verification.
+Revision note (2026-09-15 15:42Z): Finalized progress, validation evidence, the zero-feedback real-time fast path, the pre-existing all-target Clippy blocker, and the outcome/remaining human listening check.

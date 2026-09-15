@@ -80,12 +80,15 @@ impl Resonator {
 
     /// Add positive, saturating feedback around the low-pass state.
     pub fn set_feedback(&mut self, feedback: f32) {
-        self.feedback = if feedback.is_finite() {
+        let clamped = if feedback.is_finite() {
             feedback.clamp(0.0, MAX_FEEDBACK as f32) as f64
         } else {
             0.0
         };
-        self.update_frequency_coefficient();
+        if (clamped - self.feedback).abs() > 1.0e-9 {
+            self.feedback = clamped;
+            self.update_frequency_coefficient();
+        }
     }
 
     /// Inject trigger energy directly into the first integrator.
@@ -106,14 +109,16 @@ impl Resonator {
         // sample here adds unintended damping, so even a nominal 15-second
         // decay dies in a few seconds. Three Newton steps converge rapidly
         // because feedback is capped below unity.
-        for _ in 0..3 {
-            let low = self.s2 + self.g * v1;
-            let saturated_low = low.tanh();
-            let residual =
-                v1 - (self.g * (input + self.feedback * saturated_low - self.s2) + self.s1) * h;
-            let derivative =
-                1.0 - h * self.g * self.g * self.feedback * (1.0 - saturated_low.powi(2));
-            v1 -= residual / derivative;
+        if self.feedback > 0.0 {
+            for _ in 0..3 {
+                let low = self.s2 + self.g * v1;
+                let saturated_low = low.tanh();
+                let residual =
+                    v1 - (self.g * (input + self.feedback * saturated_low - self.s2) + self.s1) * h;
+                let derivative =
+                    1.0 - h * self.g * self.g * self.feedback * (1.0 - saturated_low.powi(2));
+                v1 -= residual / derivative;
+            }
         }
         let v2 = self.s2 + self.g * v1;
 
