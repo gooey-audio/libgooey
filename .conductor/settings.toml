@@ -1,0 +1,15 @@
+"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
+
+[scripts]
+run_mode = "nonconcurrent"
+
+[scripts.run.kick-standalone]
+available_in = [ "local" ]
+command = "cargo run -p gooey-kick-vst3 --features standalone --bin gooey-kick-standalone"
+default = true
+icon = "play"
+
+[scripts.run.validate-vst3]
+available_in = [ "local" ]
+command = "cargo run -p gooey-kick-xtask -- validate-vst3"
+icon = "test-tube"
