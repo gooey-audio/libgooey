@@ -26,6 +26,7 @@ cargo run --example kick
 cargo run --example snare
 cargo run --example hihat
 cargo run --no-default-features --features bounce --example fm_percussion
+cargo run --example fm_percussion_live --features native,crossterm
 cargo run --example sampler_rack --features native,crossterm
 ```
 
