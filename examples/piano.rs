@@ -47,8 +47,8 @@ use gooey::instruments::multisample_pack::{load_sfz, PackLoadOptions};
 use gooey::mixer::StereoSampleBuffer;
 #[cfg(all(feature = "native", feature = "bounce"))]
 use gooey::music::{
-    apply_voicing, available_voicings, midi_to_string, ChordDynamics, Key, NoteName, ScaleType,
-    VelocityProfile, VoicingType,
+    apply_voicing, available_voicings, midi_to_string, ChordDynamics, ChordSet, Key, NoteName,
+    ScaleType, VelocityProfile, VoicingType,
 };
 #[cfg(all(feature = "native", feature = "bounce"))]
 use std::io::{self, Write};
@@ -251,41 +251,6 @@ fn pluck(midi_note: u8, brightness: f32) -> StereoSampleBuffer {
 // UI state
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "native", feature = "bounce"))]
-#[derive(Clone, Copy, PartialEq)]
-enum ChordLevel {
-    Triads,
-    Sevenths,
-    Ninths,
-}
-
-#[cfg(all(feature = "native", feature = "bounce"))]
-impl ChordLevel {
-    fn label(self) -> &'static str {
-        match self {
-            ChordLevel::Triads => "Triads",
-            ChordLevel::Sevenths => "7ths",
-            ChordLevel::Ninths => "9ths",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            ChordLevel::Triads => ChordLevel::Sevenths,
-            ChordLevel::Sevenths => ChordLevel::Ninths,
-            ChordLevel::Ninths => ChordLevel::Triads,
-        }
-    }
-
-    fn prev(self) -> Self {
-        match self {
-            ChordLevel::Triads => ChordLevel::Ninths,
-            ChordLevel::Sevenths => ChordLevel::Triads,
-            ChordLevel::Ninths => ChordLevel::Sevenths,
-        }
-    }
-}
-
 /// How chord keys behave, decided once at startup from what the terminal can
 /// report.
 ///
@@ -318,7 +283,7 @@ struct AppState {
     root_index: usize,
     scale_type: ScaleType,
     voicing_index: usize,
-    chord_level: ChordLevel,
+    chord_set: ChordSet,
     octave: i8,
     velocity: f32,
     preset_index: usize,
@@ -344,7 +309,7 @@ impl AppState {
             root_index: 0, // C
             scale_type: ScaleType::Major,
             voicing_index: 0,
-            chord_level: ChordLevel::Sevenths,
+            chord_set: ChordSet::Sevenths,
             octave: 4,
             velocity: 0.75,
             preset_index: 0,
@@ -361,12 +326,7 @@ impl AppState {
     }
 
     fn chords(&self) -> Vec<gooey::music::Chord> {
-        let key = self.key();
-        match self.chord_level {
-            ChordLevel::Triads => key.diatonic_triads(),
-            ChordLevel::Sevenths => key.diatonic_sevenths(),
-            ChordLevel::Ninths => key.diatonic_ninths(),
-        }
+        self.chord_set.chords(&self.key())
     }
 
     fn voicings_for(&self, degree: usize) -> Vec<VoicingType> {
@@ -437,17 +397,17 @@ fn draw_ui(state: &AppState, loaded: &LoadedMap, piano: &Arc<Mutex<MultiSampleIn
         KeyMode::Toggle => "toggle",
     };
     println!("  a s d f g h j = {verb} chord I..VII    SPACE = sustain pedal\r");
-    println!("  <-/-> key   TAB maj/min   [ ] voicing   , . chord level\r");
+    println!("  <-/-> key   TAB maj/min   [ ] voicing   , . chord set\r");
     println!("  o/k octave   z/x velocity   1-3 preset   q quit\r");
     println!("  v = velocity profile   n/m = humanize down/up\r");
     println!("  chord keys: {}\r", state.key_mode.label());
     println!("\r");
 
     println!(
-        "  Key: {:<8} Octave: {:<3} Level: {:<8} Preset: {:<8} Pedal: {}\r",
+        "  Key: {:<8} Octave: {:<3} Set: {:<8} Preset: {:<8} Pedal: {}\r",
         state.key(),
         state.octave,
-        state.chord_level.label(),
+        state.chord_set.name_str(),
         PRESET_NAMES[state.preset_index],
         if state.pedal { "DOWN" } else { "up" }
     );
@@ -465,7 +425,7 @@ fn draw_ui(state: &AppState, loaded: &LoadedMap, piano: &Arc<Mutex<MultiSampleIn
     println!("\r");
 
     let chords = state.chords();
-    let key = state.key();
+    let entries = state.chord_set.entries(state.scale_type);
     let velocity = ((state.velocity * 127.0).round() as u8).max(1);
     let mut any_unmapped = false;
     for (degree, chord) in chords.iter().enumerate() {
@@ -491,9 +451,9 @@ fn draw_ui(state: &AppState, loaded: &LoadedMap, piano: &Arc<Mutex<MultiSampleIn
             })
             .collect();
         println!(
-            "  {marker} [{}] {:<5} {:<12} {}\r",
+            "  {marker} [{}] {:<10} {:<12} {}\r",
             DEGREE_KEYS[degree],
-            key.roman_numeral(degree + 1),
+            entries[degree].label_str(),
             chord.display_name(),
             names.join(" ")
         );
@@ -717,11 +677,11 @@ fn main() -> anyhow::Result<()> {
             }
 
             KeyCode::Char(',') | KeyCode::Char('<') => {
-                state.chord_level = state.chord_level.prev();
+                state.chord_set = state.chord_set.prev();
                 state.voicing_index = 0;
             }
             KeyCode::Char('.') | KeyCode::Char('>') => {
-                state.chord_level = state.chord_level.next();
+                state.chord_set = state.chord_set.next();
                 state.voicing_index = 0;
             }
 

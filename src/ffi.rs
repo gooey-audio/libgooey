@@ -28,7 +28,9 @@ use crate::mixer::{
     ChannelEffect, LaunchQuantization, Mixer, MixerControl, MixerGraph, PitchMode, RetrimTiming,
     StereoSampleBuffer,
 };
-use crate::music::{apply_voicing, available_voicings, Key, NoteName, ScaleType, VoicingType};
+use crate::music::{
+    apply_voicing, available_voicings, Chord, ChordSet, Key, NoteName, ScaleType, VoicingType,
+};
 use crate::performance::{ChordClipEvent, PerformanceRecorder, PlayerAction, RecordMode};
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -4228,9 +4230,13 @@ impl GooeyEngine {
 
     /// Build and trigger a chord from a recorded pad-parameter event.
     fn trigger_poly_chord_from_event(&mut self, event: ChordClipEvent) {
-        let root_note = root_from_id(event.root);
-        let scale = scale_from_id(event.scale_type);
-        let key = Key::new(root_note, scale);
+        // Replay the palette the pad was recorded with, not the one the host
+        // UI currently shows. An invalid persisted id plays nothing.
+        let Some(chord) =
+            resolve_chord(event.chord_set, event.root, event.scale_type, event.degree)
+        else {
+            return;
+        };
         let voicing_type = voicing_from_id(event.voicing);
         let octave = event.octave.clamp(0, 8) as i8;
         let velocity = event.velocity.clamp(0.0, 1.0);
@@ -4241,10 +4247,7 @@ impl GooeyEngine {
             return;
         }
 
-        let chords = key.diatonic_sevenths();
-        let degree = event.degree as usize % chords.len().max(1);
-        let chord = &chords[degree];
-        let midi_notes = apply_voicing(chord, voicing_type, octave);
+        let midi_notes = apply_voicing(&chord, voicing_type, octave);
 
         self.poly_synth.release_all();
         for note in &midi_notes {
@@ -5984,6 +5987,23 @@ impl From<PolyModRoute> for GooeyPolyModRoute {
 pub const SCALE_MAJOR: u32 = 0;
 pub const SCALE_MINOR: u32 = 1;
 
+// Chord set (harmonic palette) IDs.
+//
+// A chord set decides what each of the seven chord pads plays for a given key.
+// Sets 0-4 are the plain diatonic levels: pad `n` is scale degree `n` stacked
+// to triads, 7ths, 9ths, 11ths or 13ths. Set 5, Neo Soul, is a stylistic
+// palette whose pads may sit outside the key (pad 6 is a borrowed bVII9).
+pub const CHORD_SET_TRIADS: u32 = 0;
+pub const CHORD_SET_SEVENTHS: u32 = 1;
+pub const CHORD_SET_NINTHS: u32 = 2;
+pub const CHORD_SET_ELEVENTHS: u32 = 3;
+pub const CHORD_SET_THIRTEENTHS: u32 = 4;
+pub const CHORD_SET_NEO_SOUL: u32 = 5;
+/// One past the highest valid chord set id.
+pub const CHORD_SET_COUNT: u32 = 6;
+/// Pads in every chord set. A `degree` argument is always a pad index 0-6.
+pub const CHORD_SET_PAD_COUNT: u32 = 7;
+
 // Voicing type IDs
 pub const VOICING_ROOT_POSITION: u32 = 0;
 pub const VOICING_FIRST_INVERSION: u32 = 1;
@@ -6022,6 +6042,18 @@ fn root_from_id(id: u32) -> NoteName {
     NoteName::from_index(id as u8 % 12)
 }
 
+/// Resolve a pad press to a concrete chord.
+///
+/// Returns `None` only for an unknown `chord_set`. `root`, `scale_type` and
+/// `degree` all wrap or fall back like the rest of the harmony ABI, but an
+/// unknown palette is rejected outright: silently substituting one would play
+/// audibly wrong chords rather than merely shifting a key.
+fn resolve_chord(chord_set: u32, root: u32, scale_type: u32, degree: u32) -> Option<Chord> {
+    let set = ChordSet::from_id(chord_set)?;
+    let key = Key::new(root_from_id(root), scale_from_id(scale_type));
+    Some(set.chord(&key, degree as usize))
+}
+
 fn factory_poly_preset_config(id: u32) -> Option<PolySynthConfig> {
     match id {
         POLY_PRESET_DEFAULT => Some(PolySynthConfig::default()),
@@ -6047,10 +6079,10 @@ fn valid_poly_preset_index(preset: u32) -> Option<usize> {
     (preset < POLY_PRESET_COUNT).then_some(preset as usize)
 }
 
-/// Trigger a diatonic chord from a key.
+/// Trigger a diatonic seventh chord from a key.
 ///
-/// Builds the chord from music theory (root + scale → diatonic chord at degree),
-/// applies the requested voicing, and triggers all notes on the poly synth.
+/// Equivalent to `gooey_engine_poly_trigger_chord_set` with
+/// `CHORD_SET_SEVENTHS`, and kept for hosts written before chord sets existed.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -6075,14 +6107,66 @@ pub unsafe extern "C" fn gooey_engine_poly_trigger_chord(
     octave: i32,
     velocity: f32,
 ) {
+    gooey_engine_poly_trigger_chord_set(
+        engine,
+        CHORD_SET_SEVENTHS,
+        root,
+        scale_type,
+        degree,
+        voicing,
+        preset,
+        octave,
+        velocity,
+    );
+}
+
+/// Trigger a chord pad from a chord set.
+///
+/// Looks up pad `degree` of `chord_set` in the key given by `root` and
+/// `scale_type`, applies the requested voicing, releases anything currently
+/// sounding and triggers the new notes on the poly synth. The press is also
+/// stamped into the performance clip (including `chord_set`) when the recorder
+/// is armed and the transport is running.
+///
+/// Does nothing at all — no release, no recording — when `engine` is null,
+/// `chord_set` is not below `CHORD_SET_COUNT`, or `preset` is not a valid
+/// preset id.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `chord_set` - Chord set ID (CHORD_SET_SEVENTHS, CHORD_SET_NEO_SOUL, ...)
+/// * `root` - Key root note (0=C, 1=C#, 2=D, ... 11=B)
+/// * `scale_type` - Scale (SCALE_MAJOR=0, SCALE_MINOR=1)
+/// * `degree` - Pad index (0-6); higher values wrap
+/// * `voicing` - Voicing type ID (VOICING_ROOT_POSITION, etc.)
+/// * `preset` - Preset ID (POLY_PRESET_DEFAULT, etc.)
+/// * `octave` - Base octave (typically 3-5)
+/// * `velocity` - Note velocity (0.0-1.0)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn gooey_engine_poly_trigger_chord_set(
+    engine: *mut GooeyEngine,
+    chord_set: u32,
+    root: u32,
+    scale_type: u32,
+    degree: u32,
+    voicing: u32,
+    preset: u32,
+    octave: i32,
+    velocity: f32,
+) {
     if engine.is_null() {
         return;
     }
     let engine = &mut *engine;
 
-    let root_note = root_from_id(root);
-    let scale = scale_from_id(scale_type);
-    let key = Key::new(root_note, scale);
+    // An unknown palette is rejected before anything audible happens.
+    let Some(chord) = resolve_chord(chord_set, root, scale_type, degree) else {
+        return;
+    };
     let voicing_type = voicing_from_id(voicing);
     let octave_clamped = octave.clamp(0, 8) as i8;
     let velocity = velocity.clamp(0.0, 1.0);
@@ -6093,13 +6177,8 @@ pub unsafe extern "C" fn gooey_engine_poly_trigger_chord(
         return;
     }
 
-    // Get diatonic seventh chords and pick the requested degree
-    let chords = key.diatonic_sevenths();
-    let degree_idx = degree as usize % chords.len();
-    let chord = &chords[degree_idx];
-
     // Apply voicing to get MIDI notes
-    let midi_notes = apply_voicing(chord, voicing_type, octave_clamped);
+    let midi_notes = apply_voicing(&chord, voicing_type, octave_clamped);
 
     // Release any currently sounding notes, then trigger the new chord
     engine.poly_synth.release_all();
@@ -6109,9 +6188,9 @@ pub unsafe extern "C" fn gooey_engine_poly_trigger_chord(
 
     // Stamp into the performance clip when record-armed and transport is running.
     // Playback-driven triggers set applying_playback and are ignored.
-    let _ = engine
-        .performance
-        .record_chord_on(root, scale_type, degree, voicing, preset, octave, velocity);
+    let _ = engine.performance.record_chord_on(
+        chord_set, root, scale_type, degree, voicing, preset, octave, velocity,
+    );
 }
 
 /// Release all sounding poly synth notes.
@@ -6317,6 +6396,26 @@ pub unsafe extern "C" fn gooey_engine_perf_get_event(
         *velocity = event.velocity;
     }
     true
+}
+
+/// Read the chord set id of one performance clip event.
+///
+/// Kept separate from `gooey_engine_perf_get_event` so that function's
+/// positional argument list stays source-compatible for existing hosts.
+/// Returns `CHORD_SET_SEVENTHS` — what legacy triggers record — when `engine`
+/// is null or `index` is out of range.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_perf_get_event_chord_set(
+    engine: *const GooeyEngine,
+    index: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.performance.event(index as usize))
+        .map_or(CHORD_SET_SEVENTHS, |event| event.chord_set)
 }
 
 /// Number of recorded live sampler hits in the shared performance clip.
@@ -6571,22 +6670,127 @@ pub unsafe extern "C" fn gooey_engine_poly_clear_mod_route(
 
 /// Query how many voicings are available for a given chord quality.
 ///
-/// The chord quality is determined by root + scale + degree.
-///
-/// # Safety
-/// `engine` must be a valid pointer returned by `gooey_engine_new`
+/// The chord quality is determined by root + scale + degree, using the
+/// diatonic seventh chords. Equivalent to
+/// `gooey_chord_set_available_voicing_count` with `CHORD_SET_SEVENTHS`.
 #[no_mangle]
-pub unsafe extern "C" fn gooey_engine_poly_available_voicing_count(
+pub extern "C" fn gooey_engine_poly_available_voicing_count(
     root: u32,
     scale_type: u32,
     degree: u32,
 ) -> u32 {
-    let root_note = root_from_id(root);
-    let scale = scale_from_id(scale_type);
-    let key = Key::new(root_note, scale);
-    let chords = key.diatonic_sevenths();
-    let degree = degree as usize % chords.len();
-    available_voicings(&chords[degree].quality).len() as u32
+    gooey_chord_set_available_voicing_count(CHORD_SET_SEVENTHS, root, scale_type, degree)
+}
+
+// ---------------------------------------------------------------------------
+// Chord sets
+//
+// Metadata for building a chord pad UI. Every string returned here is a static
+// constant baked into the library: the pointers stay valid for the lifetime of
+// the process and must never be freed by the caller.
+// ---------------------------------------------------------------------------
+
+/// Number of chord sets. Valid set ids are `0 .. gooey_chord_set_count()`.
+#[no_mangle]
+pub extern "C" fn gooey_chord_set_count() -> u32 {
+    CHORD_SET_COUNT
+}
+
+/// Number of pads in every chord set. Always `CHORD_SET_PAD_COUNT`.
+#[no_mangle]
+pub extern "C" fn gooey_chord_set_pad_count() -> u32 {
+    CHORD_SET_PAD_COUNT
+}
+
+/// Display name of a chord set ("7ths", "Neo Soul", ...).
+///
+/// Returns a static, never-freed pointer, or null when `chord_set` is unknown.
+#[no_mangle]
+pub extern "C" fn gooey_chord_set_name(chord_set: u32) -> *const c_char {
+    ChordSet::from_id(chord_set).map_or(std::ptr::null(), |set| set.name().as_ptr())
+}
+
+/// Display label of one pad ("IVmaj7#11", "vi", ...).
+///
+/// Labels depend on the scale type because a set has separate major and minor
+/// tables. `degree` wraps past the last pad. Returns a static, never-freed
+/// pointer, or null when `chord_set` is unknown.
+#[no_mangle]
+pub extern "C" fn gooey_chord_set_entry_label(
+    chord_set: u32,
+    scale_type: u32,
+    degree: u32,
+) -> *const c_char {
+    ChordSet::from_id(chord_set).map_or(std::ptr::null(), |set| {
+        set.entry(scale_from_id(scale_type), degree as usize)
+            .label
+            .as_ptr()
+    })
+}
+
+/// Chord-symbol suffix of one pad's quality ("maj9", "7#9", "m7b5", ...).
+///
+/// Empty for a plain major triad. Combine with the pad root to spell the chord
+/// symbol however the host prefers. Returns a static, never-freed pointer, or
+/// null when `chord_set` is unknown.
+#[no_mangle]
+pub extern "C" fn gooey_chord_set_entry_quality_suffix(
+    chord_set: u32,
+    scale_type: u32,
+    degree: u32,
+) -> *const c_char {
+    ChordSet::from_id(chord_set).map_or(std::ptr::null(), |set| {
+        set.entry(scale_from_id(scale_type), degree as usize)
+            .quality
+            .suffix()
+            .as_ptr()
+    })
+}
+
+/// Pitch class (0=C through 11=B) of one pad's chord root in the given key.
+///
+/// The library spells note names with sharps only, so the root is returned as
+/// a number and the host can choose flat spellings itself. Returns 0 when
+/// `chord_set` is unknown; check `gooey_chord_set_count()` first.
+#[no_mangle]
+pub extern "C" fn gooey_chord_set_entry_root(
+    chord_set: u32,
+    root: u32,
+    scale_type: u32,
+    degree: u32,
+) -> u32 {
+    resolve_chord(chord_set, root, scale_type, degree)
+        .map_or(0, |chord| u32::from(chord.root.to_index()))
+}
+
+/// How many notes one pad's chord has. Returns 0 when `chord_set` is unknown.
+#[no_mangle]
+pub extern "C" fn gooey_chord_set_entry_note_count(
+    chord_set: u32,
+    scale_type: u32,
+    degree: u32,
+) -> u32 {
+    ChordSet::from_id(chord_set).map_or(0, |set| {
+        set.entry(scale_from_id(scale_type), degree as usize)
+            .quality
+            .note_count() as u32
+    })
+}
+
+/// How many voicings are available for one pad's chord quality.
+///
+/// Voicing ids passed to the trigger functions are `0 .. this count` in the
+/// order given by the `VOICING_*` constants that apply to that quality.
+/// Returns 0 when `chord_set` is unknown.
+#[no_mangle]
+pub extern "C" fn gooey_chord_set_available_voicing_count(
+    chord_set: u32,
+    root: u32,
+    scale_type: u32,
+    degree: u32,
+) -> u32 {
+    resolve_chord(chord_set, root, scale_type, degree)
+        .map_or(0, |chord| available_voicings(&chord.quality).len() as u32)
 }
 
 // ---------------------------------------------------------------------------
@@ -7480,6 +7684,41 @@ pub unsafe extern "C" fn gooey_engine_piano_trigger_chord(
     octave: i32,
     velocity: f32,
 ) -> bool {
+    gooey_engine_piano_trigger_chord_set(
+        engine,
+        piano,
+        CHORD_SET_SEVENTHS,
+        root,
+        scale_type,
+        degree,
+        voicing,
+        octave,
+        velocity,
+    )
+}
+
+/// Trigger a chord pad from a chord set on a registered piano.
+///
+/// Same behavior as `gooey_engine_piano_trigger_chord`, but `chord_set` picks
+/// the harmonic palette (`CHORD_SET_SEVENTHS`, `CHORD_SET_NEO_SOUL`, ...)
+/// instead of always using the diatonic sevenths. Returns false — sounding
+/// nothing — when `chord_set` is not below `CHORD_SET_COUNT`.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn gooey_engine_piano_trigger_chord_set(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    chord_set: u32,
+    root: u32,
+    scale_type: u32,
+    degree: u32,
+    voicing: u32,
+    octave: i32,
+    velocity: f32,
+) -> bool {
     if !velocity.is_finite() {
         return false;
     }
@@ -7491,10 +7730,10 @@ pub unsafe extern "C" fn gooey_engine_piano_trigger_chord(
         return false;
     }
 
-    let key = Key::new(root_from_id(root), scale_from_id(scale_type));
-    let chords = key.diatonic_sevenths();
-    let chord = &chords[degree as usize % chords.len()];
-    let notes = apply_voicing(chord, voicing_from_id(voicing), octave.clamp(0, 8) as i8);
+    let Some(chord) = resolve_chord(chord_set, root, scale_type, degree) else {
+        return false;
+    };
+    let notes = apply_voicing(&chord, voicing_from_id(voicing), octave.clamp(0, 8) as i8);
     let Some(instrument) = engine.pianos.get_mut(index).and_then(Option::as_mut) else {
         return false;
     };

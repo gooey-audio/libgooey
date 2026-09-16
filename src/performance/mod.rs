@@ -51,6 +51,10 @@ pub struct ChordClipEvent {
     pub start_tick: u32,
     /// Gate length in ticks. At least 1 when finalized.
     pub duration_ticks: u32,
+    /// Chord set (harmonic palette) id the pad was played from. Persisted so a
+    /// clip replays the palette it was recorded with, not whatever the host UI
+    /// happens to show later.
+    pub chord_set: u32,
     pub root: u32,
     pub scale_type: u32,
     pub degree: u32,
@@ -104,6 +108,7 @@ pub enum PlayerAction {
 #[derive(Clone, Copy, Debug)]
 struct OpenEvent {
     start_tick: u32,
+    chord_set: u32,
     root: u32,
     scale_type: u32,
     degree: u32,
@@ -356,8 +361,13 @@ impl PerformanceRecorder {
     }
 
     /// Record a chord pad press at the current clock. Returns true if stamped.
+    ///
+    /// `chord_set` is the harmonic palette id the pad came from; it is stored
+    /// verbatim so replay reproduces the chord that was actually heard.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_chord_on(
         &mut self,
+        chord_set: u32,
         root: u32,
         scale_type: u32,
         degree: u32,
@@ -374,6 +384,7 @@ impl PerformanceRecorder {
         cut_gates_at(&mut self.events, tick, self.length_ticks);
         self.open = Some(OpenEvent {
             start_tick: tick,
+            chord_set,
             root,
             scale_type,
             degree,
@@ -449,6 +460,7 @@ impl PerformanceRecorder {
         let event = ChordClipEvent {
             start_tick: open.start_tick % self.length_ticks,
             duration_ticks: duration,
+            chord_set: open.chord_set,
             root: open.root,
             scale_type: open.scale_type,
             degree: open.degree,
@@ -641,6 +653,7 @@ mod tests {
         let mut events = vec![ChordClipEvent {
             start_tick: 0,
             duration_ticks: 100,
+            chord_set: 1,
             root: 0,
             scale_type: 0,
             degree: 0,
@@ -663,7 +676,7 @@ mod tests {
         let _ = rec.update_clock(0.0, true);
         assert!(rec.is_recording());
 
-        assert!(rec.record_chord_on(0, 0, 0, 0, 1, 4, 0.9));
+        assert!(rec.record_chord_on(1, 0, 0, 0, 0, 1, 4, 0.9));
         // Advance to beat 1 (96 ticks).
         let _ = rec.update_clock(1.0, true);
         assert!(rec.record_chord_off());
@@ -714,7 +727,7 @@ mod tests {
         let _ = rec.update_clock(0.0, true);
 
         // First pass: chord from 0 for a long gate.
-        assert!(rec.record_chord_on(0, 0, 0, 0, 1, 4, 0.9));
+        assert!(rec.record_chord_on(1, 0, 0, 0, 0, 1, 4, 0.9));
         let _ = rec.update_clock(2.0, true); // 192 ticks
         assert!(rec.record_chord_off());
         assert_eq!(rec.event_count(), 1);
@@ -722,7 +735,7 @@ mod tests {
 
         // Second pass at beat 0.5 (48 ticks): new chord cuts previous.
         let _ = rec.update_clock(4.5, true);
-        assert!(rec.record_chord_on(0, 0, 4, 0, 1, 4, 0.8));
+        assert!(rec.record_chord_on(1, 0, 0, 4, 0, 1, 4, 0.8));
         let _ = rec.update_clock(5.0, true);
         assert!(rec.record_chord_off());
 
@@ -755,6 +768,7 @@ mod tests {
         rec.events.push(ChordClipEvent {
             start_tick: 0,
             duration_ticks: 48,
+            chord_set: 1,
             root: 0,
             scale_type: 0,
             degree: 0,
@@ -782,6 +796,7 @@ mod tests {
         rec.events.push(ChordClipEvent {
             start_tick: 0,
             duration_ticks: 10,
+            chord_set: 1,
             root: 0,
             scale_type: 0,
             degree: 0,
@@ -798,7 +813,7 @@ mod tests {
     fn does_not_record_when_disarmed() {
         let mut rec = PerformanceRecorder::new();
         let _ = rec.update_clock(0.0, true);
-        assert!(!rec.record_chord_on(0, 0, 0, 0, 0, 4, 1.0));
+        assert!(!rec.record_chord_on(1, 0, 0, 0, 0, 0, 4, 1.0));
         assert_eq!(rec.event_count(), 0);
     }
 }
