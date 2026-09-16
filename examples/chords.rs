@@ -26,7 +26,8 @@ use gooey::instruments::{
     POLY_PARAM_STEREO_WIDTH, POLY_PARAM_VOLUME,
 };
 use gooey::music::{
-    apply_voicing, available_voicings, midi_to_string, Key, NoteName, ScaleType, VoicingType,
+    apply_voicing, available_voicings, midi_to_string, ChordSet, Key, NoteName, ScaleType,
+    VoicingType,
 };
 use gooey::StereoFrame;
 use std::sync::{Arc, Mutex};
@@ -52,47 +53,6 @@ impl Instrument for SharedPolySynth {
 
     fn set_midi_note(&mut self, note: u8) {
         self.0.lock().unwrap().set_midi_note(note);
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum ChordLevel {
-    Triads,
-    Sevenths,
-    Ninths,
-    Elevenths,
-    Thirteenths,
-}
-
-impl ChordLevel {
-    fn label(self) -> &'static str {
-        match self {
-            ChordLevel::Triads => "Triads",
-            ChordLevel::Sevenths => "7ths",
-            ChordLevel::Ninths => "9ths",
-            ChordLevel::Elevenths => "11ths",
-            ChordLevel::Thirteenths => "13ths",
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            ChordLevel::Triads => ChordLevel::Sevenths,
-            ChordLevel::Sevenths => ChordLevel::Ninths,
-            ChordLevel::Ninths => ChordLevel::Elevenths,
-            ChordLevel::Elevenths => ChordLevel::Thirteenths,
-            ChordLevel::Thirteenths => ChordLevel::Triads,
-        }
-    }
-
-    fn prev(self) -> Self {
-        match self {
-            ChordLevel::Triads => ChordLevel::Thirteenths,
-            ChordLevel::Sevenths => ChordLevel::Triads,
-            ChordLevel::Ninths => ChordLevel::Sevenths,
-            ChordLevel::Elevenths => ChordLevel::Ninths,
-            ChordLevel::Thirteenths => ChordLevel::Elevenths,
-        }
     }
 }
 
@@ -278,7 +238,7 @@ struct AppState {
     scale_type: ScaleType,
     selected_degree: usize,
     voicing_index: usize,
-    chord_level: ChordLevel,
+    chord_set: ChordSet,
     octave: i8,
     sustaining: bool,
     preset_index: usize,
@@ -297,7 +257,7 @@ impl AppState {
             scale_type: ScaleType::Major,
             selected_degree: 0,
             voicing_index: 0,
-            chord_level: ChordLevel::Triads,
+            chord_set: ChordSet::Triads,
             octave: 4,
             sustaining: false,
             preset_index: 0,
@@ -332,14 +292,7 @@ impl AppState {
     }
 
     fn chords(&self) -> Vec<gooey::music::Chord> {
-        let key = self.key();
-        match self.chord_level {
-            ChordLevel::Triads => key.diatonic_triads(),
-            ChordLevel::Sevenths => key.diatonic_sevenths(),
-            ChordLevel::Ninths => key.diatonic_ninths(),
-            ChordLevel::Elevenths => key.diatonic_elevenths(),
-            ChordLevel::Thirteenths => key.diatonic_thirteenths(),
-        }
+        self.chord_set.chords(&self.key())
     }
 
     fn current_voicings(&self) -> Vec<VoicingType> {
@@ -370,16 +323,16 @@ fn draw_ui(state: &AppState, synth: &PolySynth) {
     println!("=== Chord Explorer ===\r");
     println!("\r");
     println!("  SPACE=play  ENTER=sustain  Q=quit  TAB=maj/min\r");
-    println!("  Left/Right=key  Up/Down=chord  [/]=voicing  </>=level\r");
+    println!("  Left/Right=key  Up/Down=chord  [/]=voicing  </>=chord set\r");
     println!("  P=preset  O/K=octave  V/B=velocity  1..6=editor page\r");
     println!("  W/S=select  A/D=edit  F=matrix field\r");
     println!("\r");
     println!(
-        "  Key: {}    Octave: {}    Velocity: {:.2}    Level: {}    Preset: {}\r",
+        "  Key: {}    Octave: {}    Velocity: {:.2}    Set: {}    Preset: {}\r",
         key,
         state.octave,
         state.velocity,
-        state.chord_level.label(),
+        state.chord_set.name_str(),
         PRESET_NAMES[state.preset_index]
     );
     if state.sustaining {
@@ -388,8 +341,9 @@ fn draw_ui(state: &AppState, synth: &PolySynth) {
     println!("\r");
 
     // Draw chord list
+    let entries = state.chord_set.entries(state.scale_type);
     for (i, chord) in chords.iter().enumerate() {
-        let roman = key.roman_numeral(i + 1);
+        let roman = entries[i].label_str();
         let marker = if i == state.selected_degree { ">" } else { " " };
 
         let notes: Vec<String> = chord
@@ -400,7 +354,7 @@ fn draw_ui(state: &AppState, synth: &PolySynth) {
         let notes_str = notes.join(" ");
 
         println!(
-            "  {} {:<5} {:<12} [{}]\r",
+            "  {} {:<10} {:<12} [{}]\r",
             marker,
             roman,
             chord.display_name(),
@@ -650,14 +604,14 @@ fn main() -> anyhow::Result<()> {
                         redraw(&state, &synth);
                     }
 
-                    // Chord level
+                    // Chord set
                     KeyCode::Char('<') | KeyCode::Char(',') => {
-                        state.chord_level = state.chord_level.prev();
+                        state.chord_set = state.chord_set.prev();
                         state.voicing_index = 0;
                         redraw(&state, &synth);
                     }
                     KeyCode::Char('>') | KeyCode::Char('.') => {
-                        state.chord_level = state.chord_level.next();
+                        state.chord_set = state.chord_set.next();
                         state.voicing_index = 0;
                         redraw(&state, &synth);
                     }
