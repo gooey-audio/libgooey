@@ -19,9 +19,9 @@ use crate::instruments::multisample_control::{
 };
 use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
-    BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolyModRoute,
-    PolyModSource, PolySynth, PolySynthConfig, SampleBuffer, SamplerBuffer, SamplerRack,
-    SnareConfig, SnareDrum, Tom2, Tom2Config,
+    BassConfig, BassSynth, FmPercussion, FmPercussionConfig, Granulator, HiHat2, HiHat2Config,
+    KickConfig, KickDrum, PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer,
+    SamplerBuffer, SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config,
 };
 use crate::metronome::{Metronome, MetronomeDivision, DEFAULT_METRONOME_LEVEL};
 use crate::mixer::{
@@ -106,6 +106,7 @@ enum ChannelInstrument {
     HiHat(HiHat2),
     Tom(Tom2),
     Bass(BassSynth),
+    FmPercussion(FmPercussion),
 }
 
 impl ChannelInstrument {
@@ -117,6 +118,7 @@ impl ChannelInstrument {
             Self::HiHat(_) => INSTRUMENT_HIHAT,
             Self::Tom(_) => INSTRUMENT_TOM,
             Self::Bass(_) => INSTRUMENT_BASS,
+            Self::FmPercussion(_) => INSTRUMENT_FM_PERCUSSION,
         }
     }
 
@@ -128,6 +130,7 @@ impl ChannelInstrument {
             Self::HiHat(h) => h.trigger_with_velocity(time, velocity),
             Self::Tom(t) => t.trigger_with_velocity(time, velocity),
             Self::Bass(b) => b.trigger_with_velocity(time, velocity),
+            Self::FmPercussion(fm) => fm.trigger_with_velocity(time, velocity),
         }
     }
 
@@ -140,6 +143,7 @@ impl ChannelInstrument {
             Self::HiHat(h) => h.snap_params(),
             Self::Tom(_) => {} // Tom2 uses plain f32, already immediate
             Self::Bass(b) => b.snap_params(),
+            Self::FmPercussion(fm) => fm.snap_params(),
         }
     }
 
@@ -151,6 +155,7 @@ impl ChannelInstrument {
             Self::HiHat(h) => h.tick(current_time),
             Self::Tom(t) => t.tick(current_time),
             Self::Bass(b) => b.tick(current_time),
+            Self::FmPercussion(fm) => fm.tick(current_time),
         }
     }
 
@@ -160,6 +165,7 @@ impl ChannelInstrument {
             Self::Kick(k) => Some(k.params.frequency.get()),
             Self::Tom(t) => Some(t.tune()),
             Self::Bass(b) => Some(b.params.frequency.get()),
+            Self::FmPercussion(fm) => fm.get_frequency(),
             _ => None,
         }
     }
@@ -172,6 +178,7 @@ impl ChannelInstrument {
             Self::HiHat(h) => h.params.tuning.get(),
             Self::Tom(t) => t.tuning(),
             Self::Bass(b) => b.params.tuning.get(),
+            Self::FmPercussion(fm) => fm.tuning(),
         }
     }
 
@@ -258,6 +265,9 @@ impl ChannelInstrument {
                 BASS_PARAM_TUNING => b.set_tuning(value),
                 _ => {}
             },
+            Self::FmPercussion(fm) => {
+                let _ = fm.set_param(param, value);
+            }
         }
     }
 
@@ -326,7 +336,26 @@ impl ChannelInstrument {
                 TOM_PARAM_TUNING => t.tuning(),
                 _ => f32::NAN,
             },
-            Self::Bass(_) => f32::NAN,
+            Self::Bass(b) => match param {
+                BASS_PARAM_FREQUENCY => b.params.frequency.target(),
+                BASS_PARAM_SUB_LEVEL => b.params.sub_level.target(),
+                BASS_PARAM_OSC_LEVEL => b.params.osc_level.target(),
+                BASS_PARAM_DETUNE_LEVEL => b.params.detune_level.target(),
+                BASS_PARAM_DETUNE_AMOUNT => b.params.detune_amount.target(),
+                BASS_PARAM_OSC_SHAPE => b.params.osc_shape.target(),
+                BASS_PARAM_FILTER_CUTOFF => b.params.filter_cutoff.target(),
+                BASS_PARAM_FILTER_RESONANCE => b.params.filter_resonance.target(),
+                BASS_PARAM_FILTER_ENV_AMOUNT => b.params.filter_env_amount.target(),
+                BASS_PARAM_FILTER_ENV_DECAY => b.params.filter_env_decay.target(),
+                BASS_PARAM_FILTER_ENV_CURVE => b.params.filter_env_curve.target(),
+                BASS_PARAM_AMP_DECAY => b.params.amp_decay.target(),
+                BASS_PARAM_AMP_DECAY_CURVE => b.params.amp_decay_curve.target(),
+                BASS_PARAM_OVERDRIVE => b.params.overdrive.target(),
+                BASS_PARAM_VOLUME => b.params.volume.target(),
+                BASS_PARAM_TUNING => b.params.tuning.target(),
+                _ => f32::NAN,
+            },
+            Self::FmPercussion(fm) => fm.get_param(param).unwrap_or(f32::NAN),
         }
     }
 
@@ -413,6 +442,19 @@ impl ChannelInstrument {
                 BASS_PARAM_TUNING => b.params.tuning.set_bipolar(value),
                 _ => {}
             },
+            Self::FmPercussion(fm) => {
+                let _ = fm.apply_modulation_index(param, value);
+            }
+        }
+    }
+
+    /// Stage a note for the next trigger without changing the base-pitch patch value.
+    fn stage_midi_note(&mut self, note: u8) -> bool {
+        if let Self::FmPercussion(fm) = self {
+            fm.set_midi_note(note);
+            true
+        } else {
+            false
         }
     }
 }
@@ -424,6 +466,7 @@ enum ChannelBlender {
     HiHat(PresetBlender<HiHat2Config>),
     Tom(PresetBlender<Tom2Config>),
     Bass(PresetBlender<BassConfig>),
+    FmPercussion(Box<PresetBlender<FmPercussionConfig>>),
 }
 
 impl ChannelBlender {
@@ -435,6 +478,9 @@ impl ChannelBlender {
             (Self::HiHat(b), ChannelInstrument::HiHat(h)) => h.set_config(b.blend(x, y)),
             (Self::Tom(b), ChannelInstrument::Tom(t)) => t.set_config(b.blend(x, y)),
             (Self::Bass(b), ChannelInstrument::Bass(bs)) => bs.set_config(b.blend(x, y)),
+            (Self::FmPercussion(b), ChannelInstrument::FmPercussion(fm)) => {
+                fm.set_config(b.blend(x, y))
+            }
             _ => {} // type mismatch — should not happen if blender/instrument are kept in sync
         }
     }
@@ -497,6 +543,17 @@ impl ChannelBlender {
                     }
                 }
             }
+            Self::FmPercussion(b) => {
+                if let Some(config) = GooeyEngine::fm_percussion_preset_by_id(preset_id) {
+                    match corner {
+                        BLEND_CORNER_BOTTOM_LEFT => b.set_bottom_left(config),
+                        BLEND_CORNER_BOTTOM_RIGHT => b.set_bottom_right(config),
+                        BLEND_CORNER_TOP_LEFT => b.set_top_left(config),
+                        BLEND_CORNER_TOP_RIGHT => b.set_top_right(config),
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 
@@ -533,6 +590,12 @@ impl ChannelBlender {
                 BassConfig::reese(),
                 BassConfig::stab(),
             )),
+            INSTRUMENT_FM_PERCUSSION => Self::FmPercussion(Box::new(PresetBlender::new(
+                FmPercussionConfig::sub_kick(),
+                FmPercussionConfig::metal_hat(),
+                FmPercussionConfig::zap(),
+                FmPercussionConfig::industrial(),
+            ))),
             _ => Self::Kick(PresetBlender::new(
                 KickConfig::tight(),
                 KickConfig::punch(),
@@ -575,6 +638,12 @@ impl ChannelBlender {
                 BASS_PRESET_REESE,
                 BASS_PRESET_STAB,
             ],
+            INSTRUMENT_FM_PERCUSSION => [
+                FM_PERCUSSION_PRESET_SUB_KICK,
+                FM_PERCUSSION_PRESET_METAL_HAT,
+                FM_PERCUSSION_PRESET_ZAP,
+                FM_PERCUSSION_PRESET_INDUSTRIAL,
+            ],
             _ => [0, 1, 2, 3],
         }
     }
@@ -591,7 +660,7 @@ impl ChannelBlender {
 /// so all parameter changes are automatically smoothed to prevent clicks/pops.
 /// Number of drum voices in the kit (kick, snare, hihat, tom). Bass is a
 /// separate top-level voice, so the addressable voice space
-/// (`NUM_INSTRUMENTS` = 5) is the kit voices plus bass at index 4.
+/// (`NUM_VOICE_STRIPS` = 5) is the kit voices plus bass at index 4.
 const KIT_VOICE_COUNT: usize = 4;
 /// Maximum independently routable sampler racks in one FFI engine.
 pub const SAMPLER_RACK_MAX: u32 = 4;
@@ -602,7 +671,7 @@ const SLOT_PITCH_RANGE: f32 = crate::instruments::sampler::SLOT_PITCH_RANGE;
 /// One voice's complete per-channel state: the instrument plus its sequencer,
 /// preset blender, mixer strip (fader / mute-solo / pan / peak), manual-trigger
 /// latch, and per-step MIDI-note frequency save slot. This bundles what were
-/// previously parallel `[_; NUM_INSTRUMENTS]` arrays into a single owned column
+/// previously parallel `[_; NUM_VOICE_STRIPS]` arrays into a single owned column
 /// so voices can be grouped into a `DrumKit` collection and routed as sources.
 struct VoiceStrip {
     instrument: ChannelInstrument,
@@ -628,6 +697,8 @@ struct VoiceStrip {
     peak: AtomicU32,
     trigger_pending: AtomicBool,
     trigger_velocity: AtomicU32, // f32 bits stored atomically
+    trigger_note_pending: AtomicBool,
+    trigger_note: AtomicU32,
     /// Saved global frequency for restoring after per-step MIDI note overrides.
     saved_global_freq: Option<f32>,
 }
@@ -657,6 +728,8 @@ impl VoiceStrip {
             peak: AtomicU32::new(0.0_f32.to_bits()),
             trigger_pending: AtomicBool::new(false),
             trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
+            trigger_note_pending: AtomicBool::new(false),
+            trigger_note: AtomicU32::new(60),
             saved_global_freq: None,
         }
     }
@@ -1187,6 +1260,7 @@ impl GooeyEngine {
                 // on the next render call", and this render produced silence.
                 for voice in self.voices_iter() {
                     voice.trigger_pending.store(false, Ordering::Release);
+                    voice.trigger_note_pending.store(false, Ordering::Release);
                 }
                 for sample in buffer.iter_mut() {
                     *sample = 0.0;
@@ -1198,7 +1272,7 @@ impl GooeyEngine {
 
         // Check for pending manual triggers with velocity (all channels)
         // Manual triggers fire at sample_offset 0 (start of buffer)
-        for ch in 0..NUM_INSTRUMENTS {
+        for ch in 0..NUM_VOICE_STRIPS {
             let fired = self.voice(ch).and_then(|v| {
                 if v.trigger_pending.swap(false, Ordering::Acquire) {
                     Some(f32::from_bits(v.trigger_velocity.load(Ordering::Acquire)))
@@ -1210,6 +1284,10 @@ impl GooeyEngine {
                 self.push_midi_event(ch as u32, velocity, 0);
                 let time = self.current_time;
                 if let Some(voice) = self.voice_mut(ch) {
+                    if voice.trigger_note_pending.swap(false, Ordering::Acquire) {
+                        let note = voice.trigger_note.load(Ordering::Acquire).min(127) as u8;
+                        voice.instrument.stage_midi_note(note);
+                    }
                     voice.instrument.trigger_with_velocity(time, velocity);
                 }
             }
@@ -1278,8 +1356,8 @@ impl GooeyEngine {
 
             // Tick ALL sequencers first to ensure sample-accurate synchronization
             let mut seq_triggers: [Option<(f32, Option<SequencerBlendSetting>, Option<u8>)>;
-                NUM_INSTRUMENTS] = [None; NUM_INSTRUMENTS];
-            for ch in 0..NUM_INSTRUMENTS {
+                NUM_VOICE_STRIPS] = [None; NUM_VOICE_STRIPS];
+            for ch in 0..NUM_VOICE_STRIPS {
                 if let Some(voice) = self.voice_mut(ch) {
                     seq_triggers[ch] = voice
                         .sequencer
@@ -1291,7 +1369,7 @@ impl GooeyEngine {
             // Apply triggers with velocity after all sequencers have been ticked.
             if self.sequencer_triggers_enabled.load(Ordering::Relaxed) {
                 let time = self.current_time;
-                for ch in 0..NUM_INSTRUMENTS {
+                for ch in 0..NUM_VOICE_STRIPS {
                     if let Some((velocity, blend, note)) = seq_triggers[ch] {
                         self.apply_sequencer_blend_setting(ch as u32, blend);
                         if let Some(voice) = self.voice_mut(ch) {
@@ -1304,18 +1382,24 @@ impl GooeyEngine {
                             // When a step has a note, save the global freq and override.
                             // When a step has no note, restore the saved global freq.
                             if let Some(midi_note) = note {
-                                let instr_type = voice.instrument.instrument_type();
-                                if let Some((freq_min, freq_max)) =
-                                    Self::freq_range_for_instrument(instr_type)
-                                {
-                                    if voice.saved_global_freq.is_none() {
-                                        voice.saved_global_freq = voice.instrument.get_freq_param();
+                                let staged = voice.instrument.stage_midi_note(midi_note);
+                                if staged {
+                                    voice.saved_global_freq = None;
+                                } else {
+                                    let instr_type = voice.instrument.instrument_type();
+                                    if let Some((freq_min, freq_max)) =
+                                        Self::freq_range_for_instrument(instr_type)
+                                    {
+                                        if voice.saved_global_freq.is_none() {
+                                            voice.saved_global_freq =
+                                                voice.instrument.get_freq_param();
+                                        }
+                                        let normalized = Self::midi_note_to_normalized_freq(
+                                            midi_note, freq_min, freq_max,
+                                        );
+                                        voice.instrument.set_param(0, normalized);
+                                        voice.instrument.snap_params();
                                     }
-                                    let normalized = Self::midi_note_to_normalized_freq(
-                                        midi_note, freq_min, freq_max,
-                                    );
-                                    voice.instrument.set_param(0, normalized);
-                                    voice.instrument.snap_params();
                                 }
                             } else if let Some(saved) = voice.saved_global_freq.take() {
                                 voice.instrument.set_param(0, saved);
@@ -1391,7 +1475,7 @@ impl GooeyEngine {
             // form the DrumKit source, bass forms the Bass source. Per-voice gain,
             // mute/solo, pan, and peak metering are unchanged; only the routing
             // target differs. `channel_outs` still feeds the compressor sidechain.
-            let mut channel_outs = [0.0_f32; NUM_INSTRUMENTS];
+            let mut channel_outs = [0.0_f32; NUM_VOICE_STRIPS];
             let mut kit_frame = StereoFrame::default();
             let mut bass_frame = StereoFrame::default();
             let time = self.current_time;
@@ -1470,7 +1554,7 @@ impl GooeyEngine {
                     }
                     EFFECT_COMPRESSOR if self.compressor_enabled => {
                         let sc = self.compressor_sidechain as usize;
-                        stereo = if sc < NUM_INSTRUMENTS {
+                        stereo = if sc < NUM_VOICE_STRIPS {
                             // The sidechain source is a mono per-instrument
                             // sample; feed it to both detectors equally.
                             self.compressor.process_stereo_with_sidechain(
@@ -1668,6 +1752,16 @@ impl GooeyEngine {
             BASS_PRESET_SUB => Some(BassConfig::sub()),
             BASS_PRESET_REESE => Some(BassConfig::reese()),
             BASS_PRESET_STAB => Some(BassConfig::stab()),
+            _ => None,
+        }
+    }
+
+    fn fm_percussion_preset_by_id(id: u32) -> Option<FmPercussionConfig> {
+        match id {
+            FM_PERCUSSION_PRESET_SUB_KICK => Some(FmPercussionConfig::sub_kick()),
+            FM_PERCUSSION_PRESET_METAL_HAT => Some(FmPercussionConfig::metal_hat()),
+            FM_PERCUSSION_PRESET_ZAP => Some(FmPercussionConfig::zap()),
+            FM_PERCUSSION_PRESET_INDUSTRIAL => Some(FmPercussionConfig::industrial()),
             _ => None,
         }
     }
@@ -2020,10 +2114,14 @@ pub const INSTRUMENT_HIHAT: u32 = 2;
 pub const INSTRUMENT_TOM: u32 = 3;
 /// Instrument ID: bass synth
 pub const INSTRUMENT_BASS: u32 = 4;
-/// Total number of instruments
+/// Instrument type ID: monophonic FM percussion synth.
+pub const INSTRUMENT_FM_PERCUSSION: u32 = 5;
+/// Number of addressable voice strips. Preserved for source and ABI compatibility.
 pub const INSTRUMENT_COUNT: u32 = 5;
-/// Internal usize version for array indexing
-const NUM_INSTRUMENTS: usize = INSTRUMENT_COUNT as usize;
+/// Number of instrument types that can be assigned to a voice strip.
+pub const INSTRUMENT_TYPE_COUNT: u32 = 6;
+/// Internal voice-strip count. This must never be derived from the type count.
+const NUM_VOICE_STRIPS: usize = INSTRUMENT_COUNT as usize;
 const DEFAULT_MASTER_GAIN: f32 = 0.25;
 
 /// Number of stereo loop-mixer channels (see `gooey_engine_loop_*`).
@@ -2105,6 +2203,72 @@ pub const TOM_PRESET_RING: u32 = 1;
 pub const TOM_PRESET_BRUSH: u32 = 2;
 /// Tom preset: Void - atmospheric, long
 pub const TOM_PRESET_VOID: u32 = 3;
+
+/// FM percussion preset: deep, pitch-swept sub kick.
+pub const FM_PERCUSSION_PRESET_SUB_KICK: u32 = 0;
+/// FM percussion preset: short cross-ring metallic hat.
+pub const FM_PERCUSSION_PRESET_METAL_HAT: u32 = 1;
+/// FM percussion preset: bright descending zap.
+pub const FM_PERCUSSION_PRESET_ZAP: u32 = 2;
+/// FM percussion preset: gritty industrial hit.
+pub const FM_PERCUSSION_PRESET_INDUSTRIAL: u32 = 3;
+pub const FM_PERCUSSION_PRESET_COUNT: u32 = 4;
+
+/// FFI anchors for FM percussion oscillator waveform controls.
+pub const FM_PERCUSSION_WAVEFORM_SINE: f32 = 0.0;
+pub const FM_PERCUSSION_WAVEFORM_TRIANGLE: f32 = 1.0 / 3.0;
+pub const FM_PERCUSSION_WAVEFORM_SQUARE: f32 = 2.0 / 3.0;
+pub const FM_PERCUSSION_WAVEFORM_METAL: f32 = 1.0;
+/// FFI anchors for the FM percussion ring-mode control.
+pub const FM_PERCUSSION_RING_OFF: f32 = 0.0;
+pub const FM_PERCUSSION_RING: f32 = 0.5;
+pub const FM_PERCUSSION_CROSS_RING: f32 = 1.0;
+/// FFI anchors for the FM percussion filter-mode control.
+pub const FM_PERCUSSION_FILTER_LOWPASS: f32 = 0.0;
+pub const FM_PERCUSSION_FILTER_HIGHPASS: f32 = 1.0;
+
+// Stable normalized FM percussion parameter ABI (0..39).
+pub const FM_PERCUSSION_PARAM_BASE_PITCH: u32 = 0;
+pub const FM_PERCUSSION_PARAM_OSC1_WAVEFORM: u32 = 1;
+pub const FM_PERCUSSION_PARAM_OSC1_FREQUENCY: u32 = 2;
+pub const FM_PERCUSSION_PARAM_OSC1_TRACKING: u32 = 3;
+pub const FM_PERCUSSION_PARAM_OSC1_LEVEL: u32 = 4;
+pub const FM_PERCUSSION_PARAM_OSC1_DROP: u32 = 5;
+pub const FM_PERCUSSION_PARAM_OSC1_SLOPE: u32 = 6;
+pub const FM_PERCUSSION_PARAM_OSC2_WAVEFORM: u32 = 7;
+pub const FM_PERCUSSION_PARAM_OSC2_FREQUENCY: u32 = 8;
+pub const FM_PERCUSSION_PARAM_OSC2_TRACKING: u32 = 9;
+pub const FM_PERCUSSION_PARAM_OSC2_LEVEL: u32 = 10;
+pub const FM_PERCUSSION_PARAM_OSC2_DROP: u32 = 11;
+pub const FM_PERCUSSION_PARAM_OSC2_SLOPE: u32 = 12;
+pub const FM_PERCUSSION_PARAM_NOISE_LEVEL: u32 = 13;
+pub const FM_PERCUSSION_PARAM_NOISE_DECAY: u32 = 14;
+pub const FM_PERCUSSION_PARAM_INDEX: u32 = 15;
+pub const FM_PERCUSSION_PARAM_RING_MODE: u32 = 16;
+pub const FM_PERCUSSION_PARAM_FILTER_MODE: u32 = 17;
+pub const FM_PERCUSSION_PARAM_FILTER_CUTOFF: u32 = 18;
+pub const FM_PERCUSSION_PARAM_FILTER_DECAY: u32 = 19;
+pub const FM_PERCUSSION_PARAM_FILTER_ENV_AMOUNT: u32 = 20;
+pub const FM_PERCUSSION_PARAM_GRIT: u32 = 21;
+pub const FM_PERCUSSION_PARAM_AMP_ATTACK: u32 = 22;
+pub const FM_PERCUSSION_PARAM_AMP_DECAY: u32 = 23;
+pub const FM_PERCUSSION_PARAM_FREQUENCY_BOOST: u32 = 24;
+pub const FM_PERCUSSION_PARAM_BIT_DRIVE: u32 = 25;
+pub const FM_PERCUSSION_PARAM_VOLUME: u32 = 26;
+pub const FM_PERCUSSION_PARAM_TUNING: u32 = 27;
+pub const FM_PERCUSSION_PARAM_PITCH_TO_DROP: u32 = 28;
+pub const FM_PERCUSSION_PARAM_PITCH_TO_FM: u32 = 29;
+pub const FM_PERCUSSION_PARAM_PITCH_TO_NOISE: u32 = 30;
+pub const FM_PERCUSSION_PARAM_PITCH_TO_BALANCE: u32 = 31;
+pub const FM_PERCUSSION_PARAM_PITCH_TO_CUTOFF: u32 = 32;
+pub const FM_PERCUSSION_PARAM_PITCH_TO_LEVEL: u32 = 33;
+pub const FM_PERCUSSION_PARAM_VELOCITY_TO_DROP: u32 = 34;
+pub const FM_PERCUSSION_PARAM_VELOCITY_TO_FM: u32 = 35;
+pub const FM_PERCUSSION_PARAM_VELOCITY_TO_NOISE: u32 = 36;
+pub const FM_PERCUSSION_PARAM_VELOCITY_TO_BALANCE: u32 = 37;
+pub const FM_PERCUSSION_PARAM_VELOCITY_TO_CUTOFF: u32 = 38;
+pub const FM_PERCUSSION_PARAM_VELOCITY_TO_LEVEL: u32 = 39;
+pub const FM_PERCUSSION_PARAM_COUNT: u32 = 40;
 
 // =============================================================================
 // Bass synth parameter constants
@@ -2536,10 +2700,13 @@ pub unsafe extern "C" fn gooey_engine_set_channel_instrument_type(
         INSTRUMENT_HIHAT => ChannelInstrument::HiHat(HiHat2::new(sample_rate)),
         INSTRUMENT_TOM => ChannelInstrument::Tom(Tom2::new(sample_rate)),
         INSTRUMENT_BASS => ChannelInstrument::Bass(BassSynth::new(sample_rate)),
+        INSTRUMENT_FM_PERCUSSION => ChannelInstrument::FmPercussion(FmPercussion::new(sample_rate)),
         _ => return,
     };
 
     voice.instrument = new_instrument;
+    voice.saved_global_freq = None;
+    voice.trigger_note_pending.store(false, Ordering::Release);
     voice.blender = ChannelBlender::default_for_type(instrument_type);
     voice.blend_corner_presets = ChannelBlender::default_corner_preset_ids(instrument_type);
 
@@ -2613,6 +2780,23 @@ pub unsafe extern "C" fn gooey_engine_set_channel_param(
     }
 }
 
+/// Get a normalized parameter target from the instrument assigned to a channel.
+/// Returns NaN for a null engine, invalid channel, or invalid parameter.
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_channel_param(
+    engine: *const GooeyEngine,
+    channel: u32,
+    param: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.voice(channel as usize))
+        .map_or(f32::NAN, |voice| voice.instrument.get_param(param))
+}
+
 /// Set the tuning offset for a channel (0.0 = −12 semitones, 0.5 = neutral, 1.0 = +12 semitones).
 ///
 /// This is a convenience function that dispatches to the correct tuning parameter
@@ -2639,6 +2823,7 @@ pub unsafe extern "C" fn gooey_engine_set_channel_tuning(
         INSTRUMENT_HIHAT => HIHAT_PARAM_TUNING,
         INSTRUMENT_TOM => TOM_PARAM_TUNING,
         INSTRUMENT_BASS => BASS_PARAM_TUNING,
+        INSTRUMENT_FM_PERCUSSION => FM_PERCUSSION_PARAM_TUNING,
         _ => return,
     };
     voice.instrument.set_param(tuning_param, value);
@@ -2699,13 +2884,48 @@ pub unsafe extern "C" fn gooey_engine_trigger_channel_with_velocity(
 ) {
     if let Some(engine) = engine.as_ref() {
         if let Some(voice) = engine.voice(channel as usize) {
+            if !velocity.is_finite() {
+                return;
+            }
             let vel_clamped = velocity.clamp(0.0, 1.0);
+            voice.trigger_note_pending.store(false, Ordering::Release);
             voice
                 .trigger_velocity
                 .store(vel_clamped.to_bits(), Ordering::Release);
             voice.trigger_pending.store(true, Ordering::Release);
         }
     }
+}
+
+/// Atomically stage a MIDI note and velocity for a channel trigger. The note is
+/// consumed at the next render boundary. Non-FM instruments ignore the staged
+/// note while still receiving the trigger.
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_trigger_channel_note(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    note: u8,
+    velocity: f32,
+) -> bool {
+    if !velocity.is_finite() || note > 127 {
+        return false;
+    }
+    let Some(engine) = engine.as_ref() else {
+        return false;
+    };
+    let Some(voice) = engine.voice(channel as usize) else {
+        return false;
+    };
+    voice.trigger_note.store(note as u32, Ordering::Relaxed);
+    voice
+        .trigger_velocity
+        .store(velocity.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    voice.trigger_note_pending.store(true, Ordering::Release);
+    voice.trigger_pending.store(true, Ordering::Release);
+    true
 }
 
 // =============================================================================
@@ -2773,7 +2993,7 @@ pub unsafe extern "C" fn gooey_engine_trigger_instrument(
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
 /// * `out_peaks` - Pointer to a float buffer to receive peak values (0.0–1.0+)
-/// * `count` - Number of channels to read (clamped to NUM_INSTRUMENTS)
+/// * `count` - Number of channels to read (clamped to NUM_VOICE_STRIPS)
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
@@ -2785,7 +3005,7 @@ pub unsafe extern "C" fn gooey_engine_get_channel_peaks(
     count: u32,
 ) {
     if let Some(engine) = engine.as_ref() {
-        let n = (count as usize).min(NUM_INSTRUMENTS);
+        let n = (count as usize).min(NUM_VOICE_STRIPS);
         for (i, voice) in engine.voices_iter().take(n).enumerate() {
             let bits = voice.peak.swap(0.0_f32.to_bits(), Ordering::Relaxed);
             *out_peaks.add(i) = f32::from_bits(bits);
@@ -3151,6 +3371,32 @@ pub unsafe extern "C" fn gooey_engine_load_bass_preset(engine: *mut GooeyEngine,
             bass.set_config(config);
         }
     }
+}
+
+/// Load an FM percussion preset into a specific voice strip.
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_load_fm_percussion_preset(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    preset_id: u32,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let Some(config) = GooeyEngine::fm_percussion_preset_by_id(preset_id) else {
+        return false;
+    };
+    let Some(voice) = engine.voice_mut(channel as usize) else {
+        return false;
+    };
+    let ChannelInstrument::FmPercussion(fm) = &mut voice.instrument else {
+        return false;
+    };
+    fm.set_config(config);
+    true
 }
 
 // =============================================================================
@@ -4848,6 +5094,12 @@ pub extern "C" fn gooey_engine_hihat_param_count() -> u32 {
     6
 }
 
+/// Get the number of parameters in the FM percussion ABI.
+#[no_mangle]
+pub extern "C" fn gooey_engine_fm_percussion_param_count() -> u32 {
+    FM_PERCUSSION_PARAM_COUNT
+}
+
 /// Get the number of sequencer steps
 #[no_mangle]
 pub extern "C" fn gooey_engine_sequencer_step_count() -> u32 {
@@ -4858,6 +5110,12 @@ pub extern "C" fn gooey_engine_sequencer_step_count() -> u32 {
 #[no_mangle]
 pub extern "C" fn gooey_engine_instrument_count() -> u32 {
     INSTRUMENT_COUNT
+}
+
+/// Get the number of synthesizer types assignable to a voice strip.
+#[no_mangle]
+pub extern "C" fn gooey_engine_instrument_type_count() -> u32 {
+    INSTRUMENT_TYPE_COUNT
 }
 
 /// Get the number of available global effects
