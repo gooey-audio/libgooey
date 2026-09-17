@@ -173,6 +173,7 @@ fn load_map() -> LoadedMap {
                 map.velocity_layers()
             )];
             // Surface at most a few warnings; a big pack can produce many.
+            notes.push(format!("layer ladder: {}", layer_ladder(&map)));
             notes.extend(pack.warnings.into_iter().take(3));
             LoadedMap {
                 map,
@@ -286,6 +287,9 @@ struct AppState {
     chord_set: ChordSet,
     octave: i8,
     velocity: f32,
+    /// How much of the pack's recorded loudness spread between velocity layers
+    /// to keep. 1.0 is as recorded; lower brings the damped soft layers up.
+    dynamic_range: f32,
     preset_index: usize,
     pedal: bool,
     /// Per-voice velocity weighting plus humanizing, so chords are not struck
@@ -312,6 +316,7 @@ impl AppState {
             chord_set: ChordSet::Sevenths,
             octave: 4,
             velocity: 0.75,
+            dynamic_range: 1.0,
             preset_index: 0,
             pedal: false,
             dynamics: ChordDynamics::new(VelocityProfile::MelodyLead, 0.35),
@@ -350,6 +355,28 @@ fn preset(index: usize) -> MultiSampleConfig {
         2 => MultiSampleConfig::bright(),
         _ => MultiSampleConfig::default(),
     }
+}
+
+#[cfg(all(feature = "native", feature = "bounce"))]
+fn apply_dynamic_range(piano: &Arc<Mutex<MultiSampleInstrument>>, dynamic_range: f32) {
+    piano
+        .lock()
+        .unwrap()
+        .params
+        .dynamic_range
+        .set_target(dynamic_range);
+}
+
+/// The pack's measured velocity ladder, quietest layer first. A healthy pack
+/// reads as a monotonic climb toward 0 dB; anything else means the layers are
+/// not ordered by loudness and compensation will fight the pack.
+#[cfg(all(feature = "native", feature = "bounce"))]
+fn layer_ladder(map: &SampleMap) -> String {
+    map.layer_levels()
+        .iter()
+        .map(|(hivel, offset_db)| format!("v{hivel}:{offset_db:.1}dB"))
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +427,7 @@ fn draw_ui(state: &AppState, loaded: &LoadedMap, piano: &Arc<Mutex<MultiSampleIn
     println!("  <-/-> key   TAB maj/min   [ ] voicing   , . chord set\r");
     println!("  o/k octave   z/x velocity   1-3 preset   q quit\r");
     println!("  v = velocity profile   n/m = humanize down/up\r");
+    println!("  e/r = layer dynamic range down/up (0 = layers level-matched)\r");
     println!("  chord keys: {}\r", state.key_mode.label());
     println!("\r");
 
@@ -415,6 +443,11 @@ fn draw_ui(state: &AppState, loaded: &LoadedMap, piano: &Arc<Mutex<MultiSampleIn
         "  Velocity: {} {:.2}\r",
         make_bar(state.velocity, 20),
         state.velocity
+    );
+    println!(
+        "  Dyn rng:  {} {:.2}   (1.00 = as recorded)\r",
+        make_bar(state.dynamic_range, 20),
+        state.dynamic_range
     );
     println!(
         "  Profile:  {:<8} Humanize: {} {:.2}\r",
@@ -708,9 +741,20 @@ fn main() -> anyhow::Result<()> {
                 state.velocity = (state.velocity + 0.1).clamp(0.05, 1.0)
             }
 
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                state.dynamic_range = (state.dynamic_range - 0.05).clamp(0.0, 1.0);
+                apply_dynamic_range(&piano, state.dynamic_range);
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                state.dynamic_range = (state.dynamic_range + 0.05).clamp(0.0, 1.0);
+                apply_dynamic_range(&piano, state.dynamic_range);
+            }
+
             KeyCode::Char(ch @ '1'..='3') => {
                 state.preset_index = (ch as u8 - b'1') as usize;
                 piano.lock().unwrap().set_config(preset(state.preset_index));
+                // A preset carries its own dynamic range; keep the readout honest.
+                state.dynamic_range = preset(state.preset_index).dynamic_range;
             }
 
             _ => redraw = false,

@@ -1,12 +1,14 @@
 //! Utility modules for audio processing
 
 pub mod blendable;
+pub mod db;
 pub mod macro_map;
 pub mod oversampler;
 pub mod rng;
 pub mod smoother;
 
 pub use blendable::{Blendable, PresetBlender};
+pub use db::{db_to_gain, gain_to_db, power_to_db, SILENCE_DB};
 pub use macro_map::{MacroCurve, MacroScale, MacroTarget};
 pub use oversampler::{Oversampler, Oversampler2x, Oversampler4x, OversamplingMode};
 pub use rng::XorShift32;
