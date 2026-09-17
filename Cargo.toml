@@ -130,6 +130,10 @@ name = "performance_record"
 required-features = ["native", "crossterm"]
 
 [[example]]
+name = "chord_aware_melody"
+required-features = ["native", "crossterm"]
+
+[[example]]
 name = "sampler_rack"
 required-features = ["native", "crossterm"]
 
