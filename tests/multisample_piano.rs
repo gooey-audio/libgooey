@@ -625,10 +625,15 @@ fn presets_and_params_are_validated() {
             0
         ));
 
-        for param in 0..4 {
+        for param in 0..=PIANO_PARAM_VELOCITY_SPAN {
             assert!(gooey_engine_piano_set_param(engine, piano, param, 0.5));
         }
-        assert!(!gooey_engine_piano_set_param(engine, piano, 4, 0.5));
+        assert!(!gooey_engine_piano_set_param(
+            engine,
+            piano,
+            PIANO_PARAM_VELOCITY_SPAN + 1,
+            0.5
+        ));
         assert!(!gooey_engine_piano_set_param(engine, piano, 0, f32::NAN));
         gooey_engine_free(engine);
     }
@@ -783,6 +788,54 @@ fn two_pianos_render_independently() {
             "playing one instrument must not trigger the other"
         );
         gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn a_fully_level_matched_pack_stays_bounded_under_dense_soft_playing() {
+    // The one thing a boost-only design can make worse is polyphony: a pedalled
+    // wash of soft notes now sums far higher than it used to. It is bounded
+    // above by the same wash played hard, which the headroom already survives,
+    // so assert exactly that.
+    unsafe {
+        let loud = |dynamic_range: f32, velocity: f32| {
+            let engine = gooey_engine_new(SR);
+            let piano = gooey_engine_piano_register(engine) as u32;
+            assert!(gooey_engine_mixer_route_source(
+                engine,
+                SOURCE_PIANO_BASE + piano,
+                2
+            ));
+            commit_two_layer_map(engine, piano, 3 * SR as usize);
+            assert!(gooey_engine_piano_set_param(
+                engine,
+                piano,
+                PIANO_PARAM_DYNAMIC_RANGE,
+                dynamic_range
+            ));
+            render(engine, 64);
+
+            assert!(gooey_engine_piano_set_sustain(engine, piano, true));
+            for round in 0..4 {
+                for note in 48..=72 {
+                    gooey_engine_piano_note_on(engine, piano, note, velocity);
+                }
+                let _ = round;
+            }
+            let output = render(engine, 4096);
+            assert!(output.iter().all(|s| s.is_finite()));
+            let peak = peak(&output);
+            gooey_engine_free(engine);
+            peak
+        };
+
+        let soft_matched = loud(0.0, 0.1);
+        let hard = loud(1.0, 1.0);
+        assert!(soft_matched > 0.0);
+        assert!(
+            soft_matched <= hard * 1.05,
+            "level-matched soft wash peaked at {soft_matched}, above the hard wash at {hard}"
+        );
     }
 }
 

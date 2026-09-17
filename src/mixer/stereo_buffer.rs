@@ -194,6 +194,47 @@ impl StereoSampleBuffer {
         matches!(self.storage, Storage::I16 { .. })
     }
 
+    /// Mean of the squared sample values over `start .. start + len`, both
+    /// channels pooled. Returns `0.0` when the range is empty or starts past
+    /// the end.
+    ///
+    /// This is the measure a loudness *comparison* wants. Peak level is not:
+    /// crest factor varies a lot between recordings of the same instrument at
+    /// different intensities, so two takes with matching peaks can be far apart
+    /// in perceived loudness.
+    pub fn mean_square(&self, start: usize, len: usize) -> f32 {
+        let frames = self.len();
+        if start >= frames || len == 0 {
+            return 0.0;
+        }
+        let end = start.saturating_add(len).min(frames);
+        match &self.storage {
+            Storage::F32 { left, right } => Self::mean_square_range(left, right, start, end),
+            Storage::I16 { left, right } => Self::mean_square_range(left, right, start, end),
+        }
+    }
+
+    /// Generic over the stored precision so each one compiles to its own
+    /// straight-line loop, the same reason [`Self::cubic`] is generic. The
+    /// accumulator is `f64`: a 0.35 s window is tens of thousands of terms,
+    /// which is where an `f32` sum starts dropping the quiet ones.
+    #[inline]
+    fn mean_square_range<S: StoredSample>(
+        left: &[S],
+        right: &[S],
+        start: usize,
+        end: usize,
+    ) -> f32 {
+        let mut sum = 0.0_f64;
+        for channel in [&left[start..end], &right[start..end]] {
+            for sample in channel {
+                let value = sample.to_f32() as f64;
+                sum += value * value;
+            }
+        }
+        (sum / ((end - start) * 2) as f64) as f32
+    }
+
     /// Build from an interleaved frame buffer with `channels` samples per frame.
     /// A mono source (`channels == 1`) is duplicated to both sides; a source
     /// with two or more channels uses channels 0 and 1 as left/right.
@@ -541,6 +582,49 @@ mod tests {
             let b = compact.read_wrapped(pos);
             assert!((a.l - b.l).abs() < 1e-3, "wrapped at {pos}");
         }
+    }
+
+    #[test]
+    fn mean_square_matches_across_i16_and_f32_storage() {
+        let frames = 4096;
+        let wave: Vec<f32> = (0..frames).map(|i| (i as f32 / 32.0).sin() * 0.8).collect();
+        let quantized: Vec<i16> = wave
+            .iter()
+            .map(|&s| (s * i16::MAX as f32).round() as i16)
+            .collect();
+
+        let wide = StereoSampleBuffer::from_channels(wave.clone(), wave, 44100.0).unwrap();
+        let compact =
+            StereoSampleBuffer::from_channels_i16(quantized.clone(), quantized, 44100.0).unwrap();
+
+        let a = wide.mean_square(0, frames);
+        let b = compact.mean_square(0, frames);
+        assert!((a - b).abs() < 1e-5, "f32 {a} vs i16 {b}");
+        // A 0.8 sine has a mean square of 0.8^2 / 2. The window is not a whole
+        // number of cycles, so allow a little slack.
+        assert!((a - 0.32).abs() < 5e-3, "{a}");
+    }
+
+    #[test]
+    fn mean_square_reads_only_the_requested_range() {
+        let loud = vec![1.0_f32; 100];
+        let mut signal = loud.clone();
+        signal.extend(std::iter::repeat_n(0.0_f32, 900));
+        let buf = StereoSampleBuffer::from_channels(signal.clone(), signal, 44100.0).unwrap();
+
+        assert!((buf.mean_square(0, 100) - 1.0).abs() < 1e-6);
+        assert!((buf.mean_square(0, 1000) - 0.1).abs() < 1e-6);
+        assert_eq!(buf.mean_square(100, 900), 0.0);
+        // A range that overruns the buffer is clamped, not panicked on.
+        assert!((buf.mean_square(0, 10_000) - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mean_square_of_an_empty_range_is_zero() {
+        let buf = StereoSampleBuffer::from_channels(vec![1.0; 16], vec![1.0; 16], 44100.0).unwrap();
+        assert_eq!(buf.mean_square(0, 0), 0.0);
+        assert_eq!(buf.mean_square(16, 8), 0.0);
+        assert_eq!(buf.mean_square(99, 8), 0.0);
     }
 
     #[test]

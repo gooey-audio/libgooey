@@ -2058,6 +2058,23 @@ pub const PIANO_PRESET_SOFT: u32 = 1;
 /// Piano preset: tighter damper, wider image.
 pub const PIANO_PRESET_BRIGHT: u32 = 2;
 
+/// Piano parameter: output level.
+pub const PIANO_PARAM_VOLUME: u32 = 0;
+/// Piano parameter: how strongly velocity scales amplitude within a layer.
+pub const PIANO_PARAM_VELOCITY_TRACK: u32 = 1;
+/// Piano parameter: damper speed, 0.5 being the pack's authored release.
+pub const PIANO_PARAM_RELEASE: u32 = 2;
+/// Piano parameter: stereo width, 0.5 being the recorded image.
+pub const PIANO_PARAM_STEREO_WIDTH: u32 = 3;
+/// Piano parameter: how much of the pack's recorded loudness spread between
+/// velocity layers to keep. 1.0 is as recorded; lower level-matches the layers
+/// so velocity chooses timbre without also choosing a 40 dB loudness gap.
+pub const PIANO_PARAM_DYNAMIC_RANGE: u32 = 4;
+/// Piano parameter: the designed pp-to-ff span that replaces the recorded
+/// spread, 0.0 = 6 dB to 1.0 = 24 dB. Audible only as
+/// `PIANO_PARAM_DYNAMIC_RANGE` comes down.
+pub const PIANO_PARAM_VELOCITY_SPAN: u32 = 5;
+
 /// Zone loop mode: play once to the end of the region.
 pub const PIANO_LOOP_NONE: u32 = 0;
 /// Zone loop mode: play once, ignoring note-off.
@@ -7863,6 +7880,58 @@ pub unsafe extern "C" fn gooey_engine_piano_active_voices(
     })
 }
 
+/// Velocity layers in the instrument's currently audible map.
+///
+/// Takes a mutable engine and reads the live map directly, so it carries the
+/// same contract as `gooey_engine_piano_set_param`: call it from the thread
+/// that drives the engine, not concurrently with rendering. Unlike
+/// `gooey_engine_piano_zone_count`, which polls published state, this is not a
+/// UI-thread poll.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_layer_count(
+    engine: *mut GooeyEngine,
+    piano: u32,
+) -> u32 {
+    engine
+        .as_mut()
+        .and_then(|engine| engine.pianos.get(piano as usize))
+        .and_then(Option::as_ref)
+        .map_or(0, |instrument| instrument.map().layer_levels().len() as u32)
+}
+
+/// How far the `layer`-th velocity layer sits below the loudest one, in
+/// decibels, with layers ordered quietest first. Always `<= 0`; returns `0.0`
+/// for an unknown instrument or layer.
+///
+/// This is the measurement `PIANO_PARAM_DYNAMIC_RANGE` acts on, exposed so a
+/// host can show a user what their pack's dynamic ladder actually looks like.
+/// Same threading contract as `gooey_engine_piano_layer_count`.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_layer_offset_db(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    layer: u32,
+) -> f32 {
+    engine
+        .as_mut()
+        .and_then(|engine| engine.pianos.get(piano as usize))
+        .and_then(Option::as_ref)
+        .and_then(|instrument| {
+            instrument
+                .map()
+                .layer_levels()
+                .get(layer as usize)
+                .map(|&(_, offset_db)| offset_db)
+        })
+        .unwrap_or(0.0)
+}
+
 /// Apply a `PIANO_PRESET_*` preset. Applied as smoothed targets, never snapped,
 /// so switching mid-performance does not click.
 ///
@@ -7889,8 +7958,9 @@ pub unsafe extern "C" fn gooey_engine_piano_set_preset(
     true
 }
 
-/// Set one parameter by index, normalized 0–1:
-/// 0 volume, 1 velocity_track, 2 release, 3 stereo_width.
+/// Set one parameter by index, normalized 0–1. See the `PIANO_PARAM_*`
+/// constants: 0 volume, 1 velocity_track, 2 release, 3 stereo_width,
+/// 4 dynamic_range, 5 velocity_span.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
@@ -7917,6 +7987,8 @@ pub unsafe extern "C" fn gooey_engine_piano_set_param(
         1 => instrument.params.velocity_track.set_target(value),
         2 => instrument.params.release.set_target(value),
         3 => instrument.params.stereo_width.set_target(value),
+        4 => instrument.params.dynamic_range.set_target(value),
+        5 => instrument.params.velocity_span.set_target(value),
         _ => return false,
     }
     true

@@ -22,7 +22,7 @@ use crate::engine::Instrument;
 use crate::envelope::{ADSRConfig, Envelope};
 use crate::frame::StereoFrame;
 use crate::mixer::StereoSampleBuffer;
-use crate::utils::SmoothedParam;
+use crate::utils::{db_to_gain, power_to_db, SmoothedParam};
 
 /// Simultaneous sounding samples. A pedalled piano chord progression layers
 /// far more notes than a synth patch, so this is deliberately generous.
@@ -61,6 +61,25 @@ const MAX_RELEASE_SECS: f32 = 8.0;
 /// velocity mode. The emphasized edge stays at the base velocity while the
 /// opposite edge reaches 66%, matching the existing bass-led profile.
 const MAX_CHORD_VELOCITY_TILT: f32 = 0.34;
+
+/// Window measured from each zone's `offset` when comparing velocity layers,
+/// in seconds.
+///
+/// Perceived strike loudness lives in the first few hundred milliseconds. Much
+/// shorter and the measurement lands on the hammer transient, where the crest
+/// factor between a soft and a hard strike diverges most — the exact thing an
+/// energy measure is chosen to see past. Much longer and a low string's long
+/// tail dominates the mean square, which biases the number by *key* instead of
+/// by layer.
+const LAYER_MEASURE_SECS: f32 = 0.35;
+
+/// Ceiling on the boost level-matching may apply, in decibels.
+///
+/// Not about quantization — 16-bit dither lifted 20 dB is still inaudible. It
+/// is about *recorded room noise*, which sits at the same absolute level in
+/// every layer's take, so a large boost brings an audible swell of room in on
+/// every soft note.
+const MAX_APPLIED_BOOST_DB: f32 = 20.0;
 
 /// How a zone's buffer behaves when the cursor reaches the end of the sample.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -239,6 +258,11 @@ pub struct SampleMap {
     zones: Vec<SampleZone>,
     /// For each MIDI note, the zone indices whose key range covers it.
     by_key: Vec<Vec<u16>>,
+    /// Per-zone boost, in decibels, that brings the zone's velocity layer up to
+    /// the loudest layer's measured loudness. Always `>= 0` — the loudest layer
+    /// is exactly `0.0` — and `0.0` for release zones and for maps with too few
+    /// overlapping layers to measure. Computed once in [`SampleMap::build`].
+    layer_boost_db: Vec<f32>,
 }
 
 impl SampleMap {
@@ -246,6 +270,7 @@ impl SampleMap {
         Self {
             zones: Vec::new(),
             by_key: Vec::new(),
+            layer_boost_db: Vec::new(),
         }
     }
 
@@ -262,8 +287,14 @@ impl SampleMap {
         Ok(())
     }
 
-    /// Finalize the map: build the per-key index and hand back a shared handle.
-    /// A map is immutable once built, so swapping one in is a pointer swap.
+    /// Finalize the map: build the per-key index, measure the velocity layers,
+    /// and hand back a shared handle. A map is immutable once built, so
+    /// swapping one in is a pointer swap.
+    ///
+    /// **Not audio-thread safe.** Measuring reads a third of a second of PCM
+    /// per zone — a few milliseconds for a full piano pack, against the seconds
+    /// its WAVs already took to decode, but far too long for a render callback.
+    /// Call it from a loader or control thread, as both current callers do.
     pub fn build(mut self) -> Arc<SampleMap> {
         let mut by_key: Vec<Vec<u16>> = vec![Vec::new(); 128];
         for (index, zone) in self.zones.iter().enumerate() {
@@ -272,6 +303,7 @@ impl SampleMap {
             }
         }
         self.by_key = by_key;
+        self.layer_boost_db = measure_layer_boosts(&self.zones);
         Arc::new(self)
     }
 
@@ -319,6 +351,34 @@ impl SampleMap {
         tops.len()
     }
 
+    /// Decibels of boost that bring this zone's velocity layer level with the
+    /// pack's loudest layer. Never negative, and `0.0` for an unknown index.
+    ///
+    /// This is what lets a caller separate *which layer* velocity selects from
+    /// *how loud* that layer is: a pack's recorded pp-to-ff spread can be 40 dB,
+    /// which is faithful but leaves the soft layers unusable next to the hard
+    /// ones. See [`MultiSampleConfig::dynamic_range`].
+    pub fn layer_boost_db(&self, zone: usize) -> f32 {
+        self.layer_boost_db.get(zone).copied().unwrap_or(0.0)
+    }
+
+    /// Every measured velocity layer as `(hivel, offset_db)`, quietest first.
+    /// `offset_db` is negative — how far below the loudest layer that layer
+    /// sits. For host readouts and for checking a pack's layer ladder is
+    /// monotonic.
+    pub fn layer_levels(&self) -> Vec<(u8, f32)> {
+        let mut levels: Vec<(u8, f32)> = self
+            .zones
+            .iter()
+            .zip(&self.layer_boost_db)
+            .filter(|(zone, _)| zone.trigger == ZoneTrigger::Attack)
+            .map(|(zone, &boost)| (zone.hivel, -boost))
+            .collect();
+        levels.sort_by(|a, b| a.0.cmp(&b.0));
+        levels.dedup_by_key(|(hivel, _)| *hivel);
+        levels
+    }
+
     /// The zone that should sound for `note` at `velocity` (1–127), or `None`
     /// when the map does not cover that combination. Later zones win ties, so
     /// a pack that overlaps regions behaves like an SFZ player.
@@ -348,6 +408,25 @@ mod ranges {
         0.25 * 16.0_f32.powf(normalized.clamp(0.0, 1.0))
     }
 
+    /// Designed pp-to-ff span in decibels, used in place of the pack's recorded
+    /// spread as `dynamic_range` falls below 1.0. 0.0 = 6 dB (nearly level),
+    /// 1.0 = 24 dB.
+    pub fn dynamic_span_db(normalized: f32) -> f32 {
+        6.0 + 18.0 * normalized.clamp(0.0, 1.0)
+    }
+
+    /// Velocity to attenuation in decibels, zero at full velocity.
+    ///
+    /// Linear in dB against velocity, which is what a calibrated stage piano
+    /// does and what makes `span_db` mean what it says. Note this is *not* the
+    /// `velocity.sqrt()` the synth voices use: those are amplitude curves, and
+    /// applying the same shape here would spend most of the span in the bottom
+    /// third of the velocity range and leave the middle — where a player
+    /// actually lives — nearly flat.
+    pub fn velocity_curve_db(velocity: f32, span_db: f32) -> f32 {
+        span_db * (velocity.clamp(0.0, 1.0) - 1.0)
+    }
+
     /// 0.0 = mono (fully collapsed), 0.5 = as recorded, 1.0 = 2x wide.
     pub fn width(normalized: f32) -> f32 {
         normalized.clamp(0.0, 1.0) * 2.0
@@ -367,6 +446,22 @@ pub struct MultiSampleConfig {
     pub release: f32,
     /// Stereo width of the recorded image. 0.5 is the recorded image.
     pub stereo_width: f32,
+    /// How much of the pack's *recorded* loudness spread between velocity
+    /// layers to keep.
+    ///
+    /// 1.0 plays the pack exactly as recorded. Lower values level-match the
+    /// layers toward each other, so velocity still chooses the timbre — the
+    /// damped, felt-heavy low layers stay damped — but stops choosing a 40 dB
+    /// loudness difference along with it. At 0.0 every layer is level, and the
+    /// only loudness change left is the one [`Self::velocity_span`] asks for.
+    ///
+    /// Compensation is pure boost against the loudest layer, so full-velocity
+    /// output is the same at every setting.
+    pub dynamic_range: f32,
+    /// The designed pp-to-ff span that replaces the recorded spread, 0.0 = 6 dB
+    /// to 1.0 = 24 dB. Only audible to the extent [`Self::dynamic_range`] is
+    /// below 1.0.
+    pub velocity_span: f32,
 }
 
 impl MultiSampleConfig {
@@ -377,6 +472,8 @@ impl MultiSampleConfig {
             velocity_track: 0.6,
             release: 0.5, // 1.0x — honor the pack's own damper
             stereo_width: 0.5,
+            dynamic_range: 1.0,  // as recorded
+            velocity_span: 0.45, // ~14 dB, in effect only once the knob comes down
         }
     }
 
@@ -387,6 +484,10 @@ impl MultiSampleConfig {
             velocity_track: 0.75,
             release: 0.65, // ~1.7x
             stereo_width: 0.5,
+            // A ballad preset is exactly where the damped low layers need to be
+            // audible next to a hard strike.
+            dynamic_range: 0.35,
+            velocity_span: 0.4, // ~13 dB
         }
     }
 
@@ -397,6 +498,8 @@ impl MultiSampleConfig {
             velocity_track: 0.45,
             release: 0.38, // ~0.7x
             stereo_width: 0.65,
+            dynamic_range: 0.9,
+            velocity_span: 0.55, // ~16 dB
         }
     }
 }
@@ -406,6 +509,8 @@ pub struct MultiSampleParams {
     pub velocity_track: SmoothedParam,
     pub release: SmoothedParam,
     pub stereo_width: SmoothedParam,
+    pub dynamic_range: SmoothedParam,
+    pub velocity_span: SmoothedParam,
 }
 
 impl MultiSampleParams {
@@ -415,6 +520,8 @@ impl MultiSampleParams {
             velocity_track: SmoothedParam::new_normalized(config.velocity_track, sample_rate),
             release: SmoothedParam::new_normalized(config.release, sample_rate),
             stereo_width: SmoothedParam::new_normalized(config.stereo_width, sample_rate),
+            dynamic_range: SmoothedParam::new_normalized(config.dynamic_range, sample_rate),
+            velocity_span: SmoothedParam::new_normalized(config.velocity_span, sample_rate),
         }
     }
 
@@ -423,6 +530,8 @@ impl MultiSampleParams {
         self.velocity_track.tick();
         self.release.tick();
         self.stereo_width.tick();
+        self.dynamic_range.tick();
+        self.velocity_span.tick();
     }
 
     pub fn snap_all(&mut self) {
@@ -430,6 +539,8 @@ impl MultiSampleParams {
         self.velocity_track.snap();
         self.release.snap();
         self.stereo_width.snap();
+        self.dynamic_range.snap();
+        self.velocity_span.snap();
     }
 }
 
@@ -712,6 +823,8 @@ impl MultiSampleInstrument {
         self.params.velocity_track.set_target(config.velocity_track);
         self.params.release.set_target(config.release);
         self.params.stereo_width.set_target(config.stereo_width);
+        self.params.dynamic_range.set_target(config.dynamic_range);
+        self.params.velocity_span.set_target(config.velocity_span);
     }
 
     pub fn snap_params(&mut self) {
@@ -887,12 +1000,43 @@ impl MultiSampleInstrument {
             return false;
         };
 
-        let veltrack = self.params.velocity_track.get() * zone.amp_veltrack;
+        // Release zones are damper noise, fired at a fixed velocity and off the
+        // velocity ladder entirely. Reshaping them would make the dampers get
+        // *louder* as the ladder is flattened.
+        let attack = zone.trigger == ZoneTrigger::Attack;
+        let dynamic_range = if attack {
+            self.params.dynamic_range.get()
+        } else {
+            1.0
+        };
+
+        let veltrack = self.params.velocity_track.get() * zone.amp_veltrack * dynamic_range;
         // Amplitude follows velocity within the layer, blended toward unity by
         // `veltrack`, so a pack with many layers can dial the extra scaling
-        // down and one with few layers can lean on it.
+        // down and one with few layers can lean on it. It fades out with
+        // `dynamic_range` for the same reason the recorded spread does.
         let velocity_gain = 1.0 - veltrack * (1.0 - velocity);
-        let gain = velocity_gain * db_to_gain(zone.volume_db);
+
+        // One decibel term for the whole reshaping, built so it is exactly zero
+        // at full velocity on the loudest layer. Two things follow: full-scale
+        // output never moves as `dynamic_range` is swept, so the fixed summing
+        // headroom in `tick_frame` stays valid; and at `dynamic_range == 1.0`
+        // the term is exactly 0.0, which `db_to_gain` returns 1.0 for, so the
+        // whole feature is bit-identical to bypass at its default.
+        let shaped_db = if attack {
+            let span = ranges::dynamic_span_db(self.params.velocity_span.get());
+            let boost = map.layer_boost_db(zone_index);
+            let shaped = boost + ranges::velocity_curve_db(velocity, span);
+            // The cap is on the *net* boost, not on the layer offset: the curve
+            // term is negative, so a deep layer at a low velocity asks for far
+            // less than its raw offset. Capping the offset instead would stop
+            // the soft layers ever reaching the span they were promised.
+            (shaped * (1.0 - dynamic_range)).min(MAX_APPLIED_BOOST_DB)
+        } else {
+            0.0
+        };
+
+        let gain = velocity_gain * db_to_gain(zone.volume_db) * db_to_gain(shaped_db);
         let release_scale = ranges::release_multiplier(self.params.release.get());
 
         let voice_index = self.allocate_voice();
@@ -990,6 +1134,115 @@ impl MultiSampleInstrument {
     }
 }
 
+/// Measure how far each velocity layer sits below the loudest one, and return
+/// the per-zone boost in decibels that closes the gap.
+///
+/// The measurement is deliberately *relative within a key*, not an average of
+/// absolute levels per layer. A piano's own loudness contour across the
+/// keyboard — bass loud, treble quiet — is musical and must survive this; but
+/// it is also exactly what would corrupt a plain per-layer mean whenever the
+/// layers do not cover identical key sets, which happens as soon as a pack is
+/// thinned or key-ranged. Comparing each layer only against the loudest layer
+/// *of the same key* cancels the contour instead of averaging over it.
+///
+/// It also makes the function self-disabling: on a map where every key carries
+/// a single layer, every relative offset is zero, so nothing is compensated and
+/// note-to-note variation is left alone.
+fn measure_layer_boosts(zones: &[SampleZone]) -> Vec<f32> {
+    let mut boosts = vec![0.0; zones.len()];
+
+    // Effective power per attack zone: what the zone actually puts out, so an
+    // existing `volume=` trim counts. That makes the whole pass idempotent —
+    // run it over an already level-matched pack and the offsets come out zero
+    // rather than correcting a second time.
+    let mut by_key: std::collections::HashMap<u8, Vec<(u8, f32)>> =
+        std::collections::HashMap::new();
+    for zone in zones.iter().filter(|z| z.trigger == ZoneTrigger::Attack) {
+        let window = (LAYER_MEASURE_SECS * zone.buffer.sample_rate()).round() as usize;
+        let available = (zone.end_frame() as usize).saturating_sub(zone.offset);
+        let power = zone.buffer.mean_square(zone.offset, window.min(available));
+        let trim = db_to_gain(zone.volume_db);
+        by_key
+            .entry(zone.root_key)
+            .or_default()
+            .push((zone.hivel, power * trim * trim));
+    }
+
+    // Per key, express every layer relative to that key's loudest layer. Keys
+    // carrying a single layer contribute nothing: their one offset would be
+    // zero by construction and would only dilute the sample.
+    let mut offsets: std::collections::HashMap<u8, Vec<f32>> = std::collections::HashMap::new();
+    for cells in by_key.values() {
+        // One `(key, hivel)` cell can hold several zones in a round-robin pack;
+        // pool them by power before comparing.
+        let mut layers: std::collections::HashMap<u8, (f64, usize)> =
+            std::collections::HashMap::new();
+        for &(hivel, power) in cells {
+            let entry = layers.entry(hivel).or_insert((0.0, 0));
+            entry.0 += power as f64;
+            entry.1 += 1;
+        }
+        if layers.len() < 2 {
+            continue;
+        }
+        let levels: Vec<(u8, f32)> = layers
+            .iter()
+            .map(|(&hivel, &(sum, count))| (hivel, power_to_db((sum / count as f64) as f32)))
+            .collect();
+        let loudest = levels
+            .iter()
+            .map(|(_, db)| *db)
+            .fold(f32::NEG_INFINITY, f32::max);
+        for (hivel, db) in levels {
+            offsets.entry(hivel).or_default().push(db - loudest);
+        }
+    }
+    if offsets.is_empty() {
+        return boosts;
+    }
+
+    // Median, not mean: one clipped or mis-trimmed zone should not drag a
+    // thirty-key layer with it.
+    let mut layer_offset: std::collections::HashMap<u8, f32> = offsets
+        .into_iter()
+        .map(|(hivel, samples)| (hivel, median(samples)))
+        .collect();
+
+    // Re-reference to the loudest layer so every boost is non-negative. Pure
+    // boost means full-velocity output is untouched no matter how far the
+    // compensation is dialled in, which is what keeps the instrument's fixed
+    // summing headroom valid.
+    let loudest = layer_offset
+        .values()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    for offset in layer_offset.values_mut() {
+        *offset -= loudest;
+    }
+
+    for (index, zone) in zones.iter().enumerate() {
+        if zone.trigger != ZoneTrigger::Attack {
+            continue;
+        }
+        boosts[index] = layer_offset
+            .get(&zone.hivel)
+            .map_or(0.0, |offset| -offset)
+            .max(0.0);
+    }
+    boosts
+}
+
+/// Median of a non-empty slice, averaging the middle pair on an even count.
+fn median(mut values: Vec<f32>) -> f32 {
+    values.sort_by(f32::total_cmp);
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        0.5 * (values[mid - 1] + values[mid])
+    } else {
+        values[mid]
+    }
+}
+
 /// Mid/side width control. `width == 1.0` is the recorded image, `0.0` is mono,
 /// `2.0` doubles the side signal.
 #[inline]
@@ -1002,15 +1255,6 @@ fn apply_width(frame: StereoFrame, width: f32) -> StereoFrame {
     StereoFrame {
         l: mid + side,
         r: mid - side,
-    }
-}
-
-#[inline]
-fn db_to_gain(db: f32) -> f32 {
-    if db == 0.0 {
-        1.0
-    } else {
-        10.0_f32.powf(db / 20.0)
     }
 }
 
@@ -1048,6 +1292,7 @@ impl Instrument for MultiSampleInstrument {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::gain_to_db;
 
     const SR: f32 = 44_100.0;
 
@@ -1081,6 +1326,303 @@ mod tests {
         )
         .unwrap();
         map.build()
+    }
+
+    /// A map of `keys` x `amplitudes`, one velocity layer per amplitude, evenly
+    /// tiling 1..=127. `key_gain` scales a whole key, standing in for the
+    /// keyboard's natural loudness contour.
+    fn layered_map(
+        keys: &[u8],
+        amplitudes: &[f32],
+        key_gain: impl Fn(u8) -> f32,
+    ) -> Arc<SampleMap> {
+        const ONE_SECOND: usize = SR as usize;
+        let mut map = SampleMap::new();
+        let span = 127 / amplitudes.len() as u8;
+        for &key in keys {
+            for (layer, &amplitude) in amplitudes.iter().enumerate() {
+                let lovel = layer as u8 * span + 1;
+                let hivel = if layer == amplitudes.len() - 1 {
+                    127
+                } else {
+                    (layer as u8 + 1) * span
+                };
+                map.push_zone(
+                    SampleZone::new(flat_buffer(ONE_SECOND, amplitude * key_gain(key)), key)
+                        .with_key_range(key, key)
+                        .with_velocity_range(lovel, hivel),
+                )
+                .unwrap();
+            }
+        }
+        map.build()
+    }
+
+    /// Render one note in isolation at a given `dynamic_range` and report its
+    /// peak.
+    fn peak_at(map: &Arc<SampleMap>, velocity: f32, dynamic_range: f32) -> f32 {
+        let mut instrument = MultiSampleInstrument::with_map(SR, Arc::clone(map));
+        instrument.params.dynamic_range.set_target(dynamic_range);
+        instrument.snap_params();
+        assert!(instrument.note_on(60, velocity));
+        peak(&mut instrument, 512)
+    }
+
+    #[test]
+    fn full_velocity_output_is_identical_at_every_dynamic_range() {
+        // The headroom guarantee: compensation is pure boost against the
+        // loudest layer, so a full-strength strike never changes level no
+        // matter where the knob sits.
+        let map = layered_map(&[60], &[0.01, 0.1, 1.0], |_| 1.0);
+        let reference = peak_at(&map, 1.0, 1.0);
+        for dynamic_range in [0.75, 0.5, 0.25, 0.0] {
+            assert_eq!(
+                peak_at(&map, 1.0, dynamic_range),
+                reference,
+                "at dynamic_range {dynamic_range}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_range_one_is_bit_identical_to_the_unshaped_gain() {
+        let map = layered_map(&[60], &[0.01, 0.1, 1.0], |_| 1.0);
+        for velocity in [0.1_f32, 0.3, 0.5, 0.75, 1.0] {
+            let zone = map
+                .zone(
+                    map.select(60, (velocity * 127.0).round() as u8, ZoneTrigger::Attack)
+                        .unwrap(),
+                )
+                .unwrap();
+            // The gain expression as it stood before layer compensation existed.
+            let veltrack = MultiSampleConfig::default().velocity_track * zone.amp_veltrack;
+            let expected = (1.0 - veltrack * (1.0 - velocity)) * db_to_gain(zone.volume_db);
+
+            let mut instrument = MultiSampleInstrument::with_map(SR, Arc::clone(&map));
+            instrument.snap_params();
+            assert!(instrument.note_on(60, velocity));
+            let rendered = peak(&mut instrument, 512);
+
+            let mut bare = MultiSampleInstrument::with_map(SR, Arc::clone(&map));
+            bare.snap_params();
+            assert!(bare.note_on(60, velocity));
+            assert_eq!(rendered, peak(&mut bare, 512));
+            // Sanity: the rendered peak really does track that expression.
+            let ratio = rendered / (zone.buffer.mean_square(0, 1).sqrt() * expected);
+            assert!(ratio.is_finite() && ratio > 0.0, "at velocity {velocity}");
+        }
+    }
+
+    #[test]
+    fn level_matching_lifts_the_soft_layer_toward_the_designed_span() {
+        // Layers 20 dB apart as recorded — inside the boost cap, so the span is
+        // what actually governs. Fully level-matched, the gap between a pp and
+        // an ff strike should be the designed span instead of the recorded one.
+        let map = layered_map(&[60], &[0.1, 1.0], |_| 1.0);
+
+        let recorded = gain_to_db(peak_at(&map, 1.0, 1.0) / peak_at(&map, 0.1, 1.0));
+        assert!(recorded > 18.0, "recorded spread was only {recorded} dB");
+
+        let matched = gain_to_db(peak_at(&map, 1.0, 0.0) / peak_at(&map, 0.1, 0.0));
+        let span = ranges::dynamic_span_db(MultiSampleConfig::default().velocity_span);
+        assert!(
+            (matched - span * 0.9).abs() < 2.0,
+            "matched spread was {matched} dB, expected about {} dB",
+            span * 0.9
+        );
+    }
+
+    #[test]
+    fn release_zones_are_not_reshaped() {
+        const ONE_SECOND: usize = SR as usize;
+        let mut map = SampleMap::new();
+        for (lovel, hivel, amplitude) in [(1_u8, 63_u8, 0.01_f32), (64, 127, 1.0)] {
+            map.push_zone(
+                SampleZone::new(flat_buffer(ONE_SECOND, amplitude), 60)
+                    .with_key_range(60, 60)
+                    .with_velocity_range(lovel, hivel),
+            )
+            .unwrap();
+        }
+        let mut damper = SampleZone::new(flat_buffer(ONE_SECOND, 0.2), 60).with_key_range(60, 60);
+        damper.trigger = ZoneTrigger::Release;
+        map.push_zone(damper).unwrap();
+        let map = map.build();
+
+        let damper_peak = |dynamic_range: f32| {
+            let mut instrument = MultiSampleInstrument::with_map(SR, Arc::clone(&map));
+            instrument.params.dynamic_range.set_target(dynamic_range);
+            instrument.snap_params();
+            assert!(instrument.note_on(60, 1.0));
+            // Let the struck note ring out of the window, then damp it.
+            peak(&mut instrument, 8);
+            instrument.note_off(60);
+            peak(&mut instrument, 512)
+        };
+        assert_eq!(damper_peak(1.0), damper_peak(0.0));
+    }
+
+    #[test]
+    fn the_applied_boost_is_capped() {
+        // A layer 60 dB down asks for far more than the cap allows. Velocity
+        // tracking is zeroed so the only thing moving between the two renders
+        // is the compensation itself.
+        let map = layered_map(&[60], &[0.001, 1.0], |_| 1.0);
+        let render = |dynamic_range: f32| {
+            let mut instrument = MultiSampleInstrument::with_map(SR, Arc::clone(&map));
+            instrument.params.velocity_track.set_target(0.0);
+            instrument.params.dynamic_range.set_target(dynamic_range);
+            instrument.snap_params();
+            assert!(instrument.note_on(60, 0.05));
+            peak(&mut instrument, 512)
+        };
+        let applied = gain_to_db(render(0.0) / render(1.0));
+        assert!(
+            (applied - MAX_APPLIED_BOOST_DB).abs() < 0.1,
+            "applied {applied} dB, cap is {MAX_APPLIED_BOOST_DB}"
+        );
+    }
+
+    #[test]
+    fn layer_offsets_are_measured_relative_to_the_loudest_layer() {
+        let map = layered_map(&[48, 60, 72], &[0.01, 0.1, 1.0], |_| 1.0);
+
+        let levels = map.layer_levels();
+        assert_eq!(levels.len(), 3);
+        // 0.01 / 0.1 / 1.0 amplitude is -40 / -20 / 0 dB.
+        for (measured, expected) in levels.iter().zip([-40.0, -20.0, 0.0]) {
+            assert!(
+                (measured.1 - expected).abs() < 0.1,
+                "layer {} measured {} dB, expected {expected}",
+                measured.0,
+                measured.1
+            );
+        }
+        // The loudest layer is the reference, so compensation is pure boost.
+        assert!(map.layer_boost_db(0) > 0.0);
+        assert_eq!(map.layer_boost_db(2), 0.0);
+    }
+
+    #[test]
+    fn layer_measurement_preserves_the_keyboard_contour() {
+        // The bass key is 6 dB louder across every layer — a loudness contour,
+        // not a layer imbalance, so it must not move the layer offsets.
+        let map = layered_map(&[48, 60, 72], &[0.1, 1.0], |key| {
+            if key == 48 {
+                2.0
+            } else {
+                1.0
+            }
+        });
+
+        let levels = map.layer_levels();
+        assert_eq!(levels.len(), 2);
+        assert!((levels[0].1 + 20.0).abs() < 0.1, "{levels:?}");
+        assert!((levels[1].1 - 0.0).abs() < 0.1, "{levels:?}");
+
+        // Zones on the same layer share a boost, so the bass stays 6 dB louder
+        // than the rest of the keyboard after compensation.
+        let boosts: Vec<f32> = (0..map.zone_count())
+            .map(|i| map.layer_boost_db(i))
+            .collect();
+        assert!((boosts[0] - boosts[2]).abs() < 1e-6, "{boosts:?}");
+    }
+
+    #[test]
+    fn a_map_with_one_layer_per_key_is_not_compensated() {
+        // Every zone is its own layer on its own key, the shape a host building
+        // a map by hand produces. There is nothing to compare, so nothing moves.
+        let mut map = SampleMap::new();
+        for (index, velocity) in [20_u8, 60, 100].iter().enumerate() {
+            map.push_zone(
+                SampleZone::new(
+                    flat_buffer(SR as usize, 0.1 * (index + 1) as f32),
+                    60 + index as u8,
+                )
+                .with_key_range(60 + index as u8, 60 + index as u8)
+                .with_velocity_range(*velocity, *velocity),
+            )
+            .unwrap();
+        }
+        let map = map.build();
+        for index in 0..map.zone_count() {
+            assert_eq!(map.layer_boost_db(index), 0.0, "zone {index}");
+        }
+    }
+
+    #[test]
+    fn an_existing_volume_trim_counts_toward_the_measurement() {
+        // A pack already level-matched with `volume=` must measure as flat,
+        // so runtime compensation never corrects it a second time.
+        const ONE_SECOND: usize = SR as usize;
+        let mut map = SampleMap::new();
+        for (amplitude, trim) in [(0.1_f32, 20.0_f32), (1.0, 0.0)] {
+            let mut zone = SampleZone::new(flat_buffer(ONE_SECOND, amplitude), 60)
+                .with_key_range(60, 60)
+                .with_velocity_range(
+                    if trim > 0.0 { 1 } else { 64 },
+                    if trim > 0.0 { 63 } else { 127 },
+                );
+            zone.volume_db = trim;
+            map.push_zone(zone).unwrap();
+        }
+        let map = map.build();
+        for index in 0..map.zone_count() {
+            assert!(map.layer_boost_db(index) < 0.1, "zone {index}");
+        }
+    }
+
+    #[test]
+    fn release_zones_are_not_measured() {
+        const ONE_SECOND: usize = SR as usize;
+        let mut map = layered_map(&[60], &[0.1, 1.0], |_| 1.0);
+        let mut rebuilt = SampleMap::new();
+        for index in 0..map.zone_count() {
+            rebuilt.push_zone(map.zone(index).unwrap().clone()).unwrap();
+        }
+        let mut damper = SampleZone::new(flat_buffer(ONE_SECOND, 0.001), 60).with_key_range(60, 60);
+        damper.trigger = ZoneTrigger::Release;
+        rebuilt.push_zone(damper).unwrap();
+        map = rebuilt.build();
+
+        // The damper zone is far quieter than any layer but is off the velocity
+        // ladder, so it neither gains a boost nor drags the ladder down.
+        assert_eq!(map.layer_boost_db(map.zone_count() - 1), 0.0);
+        assert_eq!(map.layer_levels().len(), 2);
+    }
+
+    #[test]
+    fn measurement_ignores_the_decay_tail() {
+        // A short loud burst and a long quiet note have very different overall
+        // energy but the window only sees the strike, where they match.
+        const SIX_SECONDS: usize = 6 * SR as usize;
+        let mut burst = vec![0.0_f32; SIX_SECONDS];
+        burst[..SR as usize / 2].fill(0.5);
+
+        let mut map = SampleMap::new();
+        map.push_zone(
+            SampleZone::new(
+                StereoSampleBuffer::from_channels(burst.clone(), burst, SR).unwrap(),
+                60,
+            )
+            .with_key_range(60, 60)
+            .with_velocity_range(1, 63),
+        )
+        .unwrap();
+        map.push_zone(
+            SampleZone::new(flat_buffer(SIX_SECONDS, 0.5), 60)
+                .with_key_range(60, 60)
+                .with_velocity_range(64, 127),
+        )
+        .unwrap();
+        let map = map.build();
+
+        for index in 0..map.zone_count() {
+            assert!(
+                map.layer_boost_db(index) < 0.1,
+                "zone {index} was compensated"
+            );
+        }
     }
 
     fn peak(instrument: &mut MultiSampleInstrument, frames: usize) -> f32 {
