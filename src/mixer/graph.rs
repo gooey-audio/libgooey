@@ -44,7 +44,10 @@ pub const SAMPLER_SOURCE_COUNT: usize = 4;
 pub const SOURCE_PIANO_BASE: u32 = SOURCE_SAMPLER_BASE + SAMPLER_SOURCE_COUNT as u32;
 /// Maximum multi-sample instruments registered by the FFI engine.
 pub const PIANO_SOURCE_COUNT: usize = 2;
-const SOURCE_CAPACITY: usize = SOURCE_COUNT + SAMPLER_SOURCE_COUNT + PIANO_SOURCE_COUNT;
+/// Dedicated chord-aware melody synth. Appended after every existing source so
+/// the published sampler and piano IDs remain stable.
+pub const SOURCE_MELODY: u32 = SOURCE_PIANO_BASE + PIANO_SOURCE_COUNT as u32;
+const SOURCE_CAPACITY: usize = SOURCE_COUNT + SAMPLER_SOURCE_COUNT + PIANO_SOURCE_COUNT + 1;
 
 /// Maximum track gain (allows up to +6 dB of makeup on a submix).
 const MAX_TRACK_GAIN: f32 = 2.0;
@@ -109,7 +112,9 @@ impl MixerGraph {
         Self {
             tracks: Vec::new(),
             routes: [None; SOURCE_CAPACITY],
-            active_sources: std::array::from_fn(|index| index < SOURCE_COUNT),
+            active_sources: std::array::from_fn(|index| {
+                index < SOURCE_COUNT || index == SOURCE_MELODY as usize
+            }),
             scratch: Vec::new(),
             sample_rate,
             bpm,
@@ -129,6 +134,7 @@ impl MixerGraph {
         graph.route(SOURCE_DRUMKIT, drums);
         graph.route(SOURCE_BASS, bass);
         graph.route(SOURCE_POLYSYNTH, synth);
+        graph.route(SOURCE_MELODY, synth);
         graph.route(SOURCE_GRANULATOR, loops);
         graph.route(SOURCE_LOOPMIXER, loops);
         graph
@@ -411,6 +417,8 @@ mod tests {
         assert_eq!(graph.route_of(SOURCE_DRUMKIT), Some(0));
         assert_eq!(graph.route_of(SOURCE_BASS), Some(1));
         assert_eq!(graph.route_of(SOURCE_POLYSYNTH), Some(2));
+        assert_eq!(SOURCE_MELODY, 11);
+        assert_eq!(graph.route_of(SOURCE_MELODY), Some(2));
         assert_eq!(graph.route_of(SOURCE_GRANULATOR), Some(3));
         assert_eq!(graph.route_of(SOURCE_LOOPMIXER), Some(3));
     }

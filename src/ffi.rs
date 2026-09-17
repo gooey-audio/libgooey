@@ -19,9 +19,9 @@ use crate::instruments::multisample_control::{
 };
 use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
-    BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, PolyModRoute,
-    PolyModSource, PolySynth, PolySynthConfig, SampleBuffer, SamplerBuffer, SamplerRack,
-    SnareConfig, SnareDrum, Tom2, Tom2Config,
+    BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, MelodyVoice,
+    PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer, SamplerBuffer,
+    SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config,
 };
 use crate::metronome::{Metronome, MetronomeDivision, DEFAULT_METRONOME_LEVEL};
 use crate::mixer::{
@@ -748,6 +748,9 @@ pub struct GooeyEngine {
     poly_presets: [PolySynthConfig; POLY_PRESET_COUNT as usize],
     poly_current_preset: u32,
 
+    // Independent monophonic-control synth for chord-aware live melody.
+    melody: MelodyVoice,
+
     // Mono granular instrument (sample buffer loaded by the host)
     granulator: Granulator,
 
@@ -973,6 +976,7 @@ impl GooeyEngine {
             poly_synth: PolySynth::new(sample_rate),
             poly_presets: factory_poly_presets(),
             poly_current_preset: POLY_PRESET_DEFAULT,
+            melody: MelodyVoice::new(sample_rate),
             // Granulator with a silent placeholder buffer until the host loads samples.
             // The placeholder uses a hardcoded sample rate so this constructor cannot
             // fail on a non-finite or non-positive `sample_rate` argument — `gooey_engine_new`
@@ -1416,6 +1420,7 @@ impl GooeyEngine {
             // spread by its width control). Feed that image into the graph
             // unchanged; the track strip can still balance it later.
             let poly_frame = self.poly_synth.tick_frame(time);
+            let melody_frame = self.melody.tick_frame(time);
             // Granulator remains mono and enters through the equal-power seam.
             let gran_frame = StereoFrame::panned(self.granulator.tick(time), 0.5);
             let sampler_frames: [StereoFrame; SAMPLER_RACK_MAX as usize] =
@@ -1433,6 +1438,7 @@ impl GooeyEngine {
             self.graph.scatter(SOURCE_DRUMKIT, kit_frame);
             self.graph.scatter(SOURCE_BASS, bass_frame);
             self.graph.scatter(SOURCE_POLYSYNTH, poly_frame);
+            self.graph.scatter(SOURCE_MELODY, melody_frame);
             self.graph.scatter(SOURCE_GRANULATOR, gran_frame);
             self.graph.scatter(SOURCE_LOOPMIXER, loop_frame);
             for (rack, frame) in sampler_frames.into_iter().enumerate() {
@@ -2045,6 +2051,9 @@ pub const SOURCE_SAMPLER_BASE: u32 = crate::mixer::graph::SOURCE_SAMPLER_BASE;
 /// First source ID reserved for registered multi-sample instruments. Instrument
 /// `n` uses `SOURCE_PIANO_BASE + n`; only registered instruments are routable.
 pub const SOURCE_PIANO_BASE: u32 = crate::mixer::graph::SOURCE_PIANO_BASE;
+/// Dedicated chord-aware melody synth. This is appended after every sampler
+/// and piano slot so all pre-existing source IDs remain stable.
+pub const SOURCE_MELODY: u32 = crate::mixer::graph::SOURCE_MELODY;
 /// Number of routable mixer graph sources.
 pub const SOURCE_COUNT: u32 = crate::mixer::graph::SOURCE_COUNT as u32;
 
@@ -4249,6 +4258,7 @@ impl GooeyEngine {
 
         let midi_notes = apply_voicing(&chord, voicing_type, octave);
 
+        self.melody.set_harmony(chord);
         self.poly_synth.release_all();
         for note in &midi_notes {
             self.poly_synth.trigger_note(*note, velocity);
@@ -6181,6 +6191,7 @@ pub unsafe extern "C" fn gooey_engine_poly_trigger_chord_set(
     let midi_notes = apply_voicing(&chord, voicing_type, octave_clamped);
 
     // Release any currently sounding notes, then trigger the new chord
+    engine.melody.set_harmony(chord);
     engine.poly_synth.release_all();
     for note in &midi_notes {
         engine.poly_synth.trigger_note(*note, velocity);
@@ -6516,6 +6527,136 @@ pub unsafe extern "C" fn gooey_engine_poly_get_param(
     engine
         .as_ref()
         .and_then(|engine| engine.poly_synth.param(param))
+        .unwrap_or(f32::NAN)
+}
+
+// =============================================================================
+// Chord-aware live melody
+// =============================================================================
+
+/// Begin a melodic gesture from an intended MIDI note.
+///
+/// The note is snapped to the nearest tone of the most recently triggered
+/// chord. Returns the sounding MIDI note, or -1 when the input is invalid or no
+/// harmony has been established yet. A valid gesture begun before the first
+/// chord is retained silently and starts when a chord later becomes active.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_melody_note_on(
+    engine: *mut GooeyEngine,
+    input_note: u32,
+    velocity: f32,
+) -> i32 {
+    if input_note > 127 || !velocity.is_finite() {
+        return -1;
+    }
+    let Some(engine) = engine.as_mut() else {
+        return -1;
+    };
+    engine
+        .melody
+        .note_on(input_note as u8, velocity.clamp(0.0, 1.0))
+        .map_or(-1, i32::from)
+}
+
+/// Move an active melodic gesture to another intended MIDI note.
+///
+/// Retuning is legato: when quantization chooses a different chord tone, the
+/// held synth voice changes pitch without restarting its envelopes or phase.
+/// Returns -1 for invalid input, when no gesture is held, or while a valid
+/// pre-harmony gesture is still silent.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_melody_update_note(
+    engine: *mut GooeyEngine,
+    input_note: u32,
+) -> i32 {
+    if input_note > 127 {
+        return -1;
+    }
+    engine
+        .as_mut()
+        .and_then(|engine| engine.melody.update_note(input_note as u8))
+        .map_or(-1, i32::from)
+}
+
+/// End the active melodic gesture without releasing accompaniment voices.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_melody_note_off(engine: *mut GooeyEngine) {
+    if let Some(engine) = engine.as_mut() {
+        engine.melody.note_off();
+    }
+}
+
+/// Return the currently sounding quantized MIDI note, or -1 when silent.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_melody_get_note(engine: *const GooeyEngine) -> i32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.melody.sounding_note())
+        .map_or(-1, i32::from)
+}
+
+/// Return whether a valid chord has been latched for melody quantization.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_melody_has_harmony(engine: *const GooeyEngine) -> bool {
+    engine
+        .as_ref()
+        .is_some_and(|engine| engine.melody.has_harmony())
+}
+
+/// Clear the latched chord and end any held melody gesture.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_melody_clear_harmony(engine: *mut GooeyEngine) {
+    if let Some(engine) = engine.as_mut() {
+        engine.melody.clear_harmony();
+    }
+}
+
+/// Set one normalized `POLY_PARAM_*` value on the independent melody synth.
+/// Returns false for a null engine, an unknown parameter, or non-finite input.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_melody_set_param(
+    engine: *mut GooeyEngine,
+    param: u32,
+    value: f32,
+) -> bool {
+    engine
+        .as_mut()
+        .is_some_and(|engine| engine.melody.set_param(param, value))
+}
+
+/// Get one melody-synth parameter target, or NaN when invalid.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_melody_get_param(
+    engine: *const GooeyEngine,
+    param: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.melody.param(param))
         .unwrap_or(f32::NAN)
 }
 
@@ -7740,11 +7881,16 @@ pub unsafe extern "C" fn gooey_engine_piano_trigger_chord_set(
     let velocities = instrument.chord_velocities(velocity.clamp(0.0, 1.0), notes.len());
 
     let mut all_sounded = true;
+    let mut any_sounded = false;
     for (note, note_velocity) in notes.into_iter().zip(velocities) {
         // Do not short-circuit: a partially mapped chord should still play all
         // notes for which the sample pack has a zone.
         let sounded = instrument.note_on(note, note_velocity);
         all_sounded &= sounded;
+        any_sounded |= sounded;
+    }
+    if any_sounded {
+        engine.melody.set_harmony(chord);
     }
     all_sounded
 }

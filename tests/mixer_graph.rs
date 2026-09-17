@@ -81,6 +81,9 @@ fn default_layout_names_routes_and_source_constants() {
         assert_eq!(SOURCE_GRANULATOR, 3);
         assert_eq!(SOURCE_LOOPMIXER, 4);
         assert_eq!(SOURCE_COUNT, 5);
+        assert_eq!(SOURCE_SAMPLER_BASE, 5);
+        assert_eq!(SOURCE_PIANO_BASE, 9);
+        assert_eq!(SOURCE_MELODY, 11);
 
         let engine = gooey_engine_new(SAMPLE_RATE);
         assert_eq!(gooey_engine_mixer_get_track_count(engine), 4);
@@ -106,6 +109,10 @@ fn default_layout_names_routes_and_source_constants() {
         assert_eq!(
             gooey_engine_mixer_get_source_route(engine, SOURCE_LOOPMIXER),
             3
+        );
+        assert_eq!(
+            gooey_engine_mixer_get_source_route(engine, SOURCE_MELODY),
+            2
         );
 
         gooey_engine_free(engine);
@@ -174,6 +181,15 @@ fn routing_and_invalid_inputs_are_safe() {
             -1
         );
         assert!(!gooey_engine_mixer_unroute_source(engine, SOURCE_LOOPMIXER));
+        assert!(gooey_engine_mixer_route_source(
+            engine,
+            SOURCE_MELODY,
+            extra
+        ));
+        assert_eq!(
+            gooey_engine_mixer_get_source_route(engine, SOURCE_MELODY),
+            extra as i32
+        );
         assert!(!gooey_engine_mixer_route_source(engine, SOURCE_COUNT, 0));
         assert!(!gooey_engine_mixer_route_source(engine, SOURCE_DRUMKIT, 99));
 

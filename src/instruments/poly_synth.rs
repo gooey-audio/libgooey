@@ -722,6 +722,36 @@ impl PolySynth {
         }
     }
 
+    /// Retune the newest held instance of `from` without restarting it.
+    ///
+    /// Oscillator phase, envelopes, velocity, and trigger order are preserved.
+    /// Note-dependent modulation is recalculated so key-position routes follow
+    /// the new note. Returns false when no matching held voice exists.
+    pub fn retune_note(&mut self, from: u8, to: u8) -> bool {
+        let Some(index) = self
+            .voices
+            .iter()
+            .enumerate()
+            .filter(|(_, voice)| {
+                voice.active
+                    && voice.midi_note == from
+                    && voice.amp_envelope.release_time_start.is_none()
+            })
+            .max_by_key(|(_, voice)| voice.trigger_order)
+            .map(|(index, _)| index)
+        else {
+            return false;
+        };
+
+        let velocity = self.voices[index].velocity;
+        let modulation = self.resolve_modulation(to, velocity);
+        let voice = &mut self.voices[index];
+        voice.midi_note = to;
+        voice.frequency = midi_to_freq(to);
+        voice.modulation = modulation;
+        true
+    }
+
     pub fn release_all(&mut self) {
         let time = self.current_time;
         for voice in &mut self.voices {
@@ -926,6 +956,47 @@ mod tests {
             let right = PolySynth::waveform(phase, increment, anchor + epsilon);
             assert!((left - right).abs() < 1e-4, "{anchor}: {left} != {right}");
         }
+    }
+
+    #[test]
+    fn legato_retune_preserves_phase_envelopes_and_voice_count() {
+        let mut config = open_config();
+        config.mod_routes[0] = PolyModRoute {
+            enabled: true,
+            source: PolyModSource::KeyPosition,
+            destination: POLY_PARAM_FILTER_CUTOFF,
+            depth: 0.5,
+            curve: 0.5,
+            key_scale: 0.0,
+        };
+        let mut synth = PolySynth::with_config(44_100.0, config);
+        synth.trigger_note(60, 0.8);
+        let _ = synth.tick_frame(0.0);
+
+        let before_index = synth
+            .voices
+            .iter()
+            .position(|voice| voice.active && voice.midi_note == 60)
+            .unwrap();
+        let phase_a = synth.voices[before_index].phase_a;
+        let phase_b = synth.voices[before_index].phase_b;
+        let trigger_order = synth.voices[before_index].trigger_order;
+        let modulation = synth.voices[before_index].modulation;
+        let active_count = synth.voices.iter().filter(|voice| voice.active).count();
+
+        assert!(synth.retune_note(60, 72));
+        let voice = &synth.voices[before_index];
+        assert_eq!(voice.midi_note, 72);
+        assert!((voice.frequency - midi_to_freq(72)).abs() < f64::EPSILON);
+        assert_eq!(voice.phase_a, phase_a);
+        assert_eq!(voice.phase_b, phase_b);
+        assert_eq!(voice.trigger_order, trigger_order);
+        assert!(voice.amp_envelope.release_time_start.is_none());
+        assert_ne!(voice.modulation, modulation);
+        assert_eq!(
+            synth.voices.iter().filter(|voice| voice.active).count(),
+            active_count
+        );
     }
 
     #[test]

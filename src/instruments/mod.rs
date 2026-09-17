@@ -3,6 +3,7 @@ pub mod fm_snap;
 pub mod granulator;
 pub mod hihat2;
 pub mod kick;
+pub mod melody;
 pub mod multisample;
 pub(crate) mod multisample_control;
 #[cfg(feature = "bounce")]
@@ -22,6 +23,7 @@ pub use self::fm_snap::*;
 pub use self::granulator::*;
 pub use self::hihat2::*;
 pub use self::kick::*;
+pub use self::melody::*;
 pub use self::multisample::*;
 #[cfg(feature = "bounce")]
 pub use self::multisample_pack::*;
