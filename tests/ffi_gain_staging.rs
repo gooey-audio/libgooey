@@ -158,6 +158,9 @@ fn master_gain_is_applied_before_the_optional_limiter() {
         let dry_engine = gooey_engine_new(SAMPLE_RATE);
         let limited_engine = gooey_engine_new(SAMPLE_RATE);
         gooey_engine_set_global_effect_enabled(limited_engine, EFFECT_LIMITER, true);
+        // Limiter bypass is now click-free, so reach its requested steady
+        // state before asserting the unchanged tanh transfer function.
+        let _ = render(limited_engine, SETTLE_FRAMES);
 
         let dry = render_triggered(dry_engine, &[INSTRUMENT_KICK, INSTRUMENT_TOM]);
         let limited = render_triggered(limited_engine, &[INSTRUMENT_KICK, INSTRUMENT_TOM]);
@@ -174,6 +177,129 @@ fn master_gain_is_applied_before_the_optional_limiter() {
 
         gooey_engine_free(dry_engine);
         gooey_engine_free(limited_engine);
+    }
+}
+
+#[test]
+fn final_output_controls_default_off_clamp_and_ignore_non_finite_values() {
+    unsafe {
+        assert!(!gooey_engine_get_final_output_enabled(std::ptr::null()));
+        assert_eq!(gooey_engine_get_final_output_gain(std::ptr::null()), 1.0);
+        assert_eq!(gooey_engine_take_final_output_peak(std::ptr::null()), 0.0);
+        assert_eq!(
+            gooey_engine_take_final_output_overload_frames(std::ptr::null()),
+            0
+        );
+
+        let engine = gooey_engine_new(SAMPLE_RATE);
+        assert!(!gooey_engine_get_final_output_enabled(engine));
+        assert_eq!(gooey_engine_get_final_output_gain(engine), 1.0);
+
+        gooey_engine_set_final_output_enabled(engine, true);
+        assert!(gooey_engine_get_final_output_enabled(engine));
+        gooey_engine_set_final_output_gain(engine, 5.0);
+        assert_eq!(gooey_engine_get_final_output_gain(engine), 4.0);
+        gooey_engine_set_final_output_gain(engine, -1.0);
+        assert_eq!(gooey_engine_get_final_output_gain(engine), 0.0);
+        gooey_engine_set_final_output_gain(engine, 0.75);
+        gooey_engine_set_final_output_gain(engine, f32::NAN);
+        gooey_engine_set_final_output_gain(engine, f32::INFINITY);
+        assert_eq!(gooey_engine_get_final_output_gain(engine), 0.75);
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn enabled_final_gain_scales_the_complete_tonal_output() {
+    unsafe {
+        let unity_engine = gooey_engine_new(SAMPLE_RATE);
+        let double_engine = gooey_engine_new(SAMPLE_RATE);
+        for engine in [unity_engine, double_engine] {
+            gooey_engine_set_final_output_enabled(engine, true);
+        }
+        gooey_engine_set_final_output_gain(double_engine, 2.0);
+        let _ = render(unity_engine, SETTLE_FRAMES);
+        let _ = render(double_engine, SETTLE_FRAMES);
+
+        let unity = render_triggered(unity_engine, &[INSTRUMENT_KICK]);
+        let doubled = render_triggered(double_engine, &[INSTRUMENT_KICK]);
+        let max_error = doubled
+            .iter()
+            .zip(&unity)
+            .map(|(double, unity)| (double - unity * 2.0).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_abs(&unity) > 0.01);
+        assert!(
+            max_error < 1e-6,
+            "final gain should be linear after settling, max error was {max_error}"
+        );
+
+        gooey_engine_free(unity_engine);
+        gooey_engine_free(double_engine);
+    }
+}
+
+#[test]
+fn final_output_telemetry_reports_and_atomically_resets() {
+    unsafe {
+        let engine = gooey_engine_new(SAMPLE_RATE);
+        gooey_engine_set_master_gain(engine, 2.0);
+        gooey_engine_set_final_output_enabled(engine, true);
+        gooey_engine_set_final_output_gain(engine, 4.0);
+        let _ = render(engine, SETTLE_FRAMES);
+        // Discard silence accumulated while smoothers settled.
+        assert_eq!(gooey_engine_take_final_output_peak(engine), 0.0);
+        assert_eq!(gooey_engine_take_final_output_overload_frames(engine), 0);
+
+        let output = render_triggered(engine, &[INSTRUMENT_KICK, INSTRUMENT_SNARE, INSTRUMENT_TOM]);
+        let expected_peak = max_abs(&output);
+        let reported_peak = gooey_engine_take_final_output_peak(engine);
+        assert!(expected_peak > 1.0, "test signal must exceed full scale");
+        assert_eq!(reported_peak, expected_peak);
+        assert!(gooey_engine_take_final_output_overload_frames(engine) > 0);
+
+        assert_eq!(gooey_engine_take_final_output_peak(engine), 0.0);
+        assert_eq!(gooey_engine_take_final_output_overload_frames(engine), 0);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn final_stage_places_the_metronome_before_the_existing_limiter() {
+    unsafe {
+        unsafe fn click_engine(final_stage: bool) -> *mut GooeyEngine {
+            let engine = gooey_engine_new(SAMPLE_RATE);
+            gooey_engine_set_metronome_enabled(engine, true);
+            gooey_engine_set_metronome_level(engine, 1.0);
+            gooey_engine_set_global_effect_param(
+                engine,
+                EFFECT_LIMITER,
+                LIMITER_PARAM_THRESHOLD,
+                0.1,
+            );
+            gooey_engine_set_global_effect_enabled(engine, EFFECT_LIMITER, true);
+            gooey_engine_set_final_output_enabled(engine, final_stage);
+            // Settle all output smoothers while transport is stopped, then
+            // start on a downbeat so both engines generate the same click.
+            let _ = render(engine, SETTLE_FRAMES);
+            gooey_engine_sequencer_start(engine);
+            engine
+        }
+
+        let legacy_engine = click_engine(false);
+        let final_engine = click_engine(true);
+        let legacy = render(legacy_engine, RENDER_FRAMES);
+        let final_output = render(final_engine, RENDER_FRAMES);
+        assert!(max_abs(&legacy) > 0.2, "legacy click should bypass limiter");
+        assert!(
+            max_abs(&final_output) <= 0.101,
+            "opt-in final click should pass through the 0.1 limiter, peak {}",
+            max_abs(&final_output)
+        );
+
+        gooey_engine_free(legacy_engine);
+        gooey_engine_free(final_engine);
     }
 }
 

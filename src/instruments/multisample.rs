@@ -79,7 +79,14 @@ const LAYER_MEASURE_SECS: f32 = 0.35;
 /// is about *recorded room noise*, which sits at the same absolute level in
 /// every layer's take, so a large boost brings an audible swell of room in on
 /// every soft note.
-const MAX_APPLIED_BOOST_DB: f32 = 20.0;
+/// Historical ceiling used by every preset and instrument until a host opts in
+/// to a different value through [`MultiSampleInstrument::set_compensation_ceiling_db`].
+pub const DEFAULT_COMPENSATION_CEILING_DB: f32 = 20.0;
+
+/// Defensive upper bound for host-supplied layer compensation. Sixty decibels
+/// covers the useful range of acoustic sample libraries while preventing an
+/// accidental unbounded gain from reaching the mix bus.
+pub const MAX_COMPENSATION_CEILING_DB: f32 = 60.0;
 
 /// How a zone's buffer behaves when the cursor reaches the end of the sample.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -258,11 +265,12 @@ pub struct SampleMap {
     zones: Vec<SampleZone>,
     /// For each MIDI note, the zone indices whose key range covers it.
     by_key: Vec<Vec<u16>>,
-    /// Per-zone boost, in decibels, that brings the zone's velocity layer up to
-    /// the loudest layer's measured loudness. Always `>= 0` — the loudest layer
-    /// is exactly `0.0` — and `0.0` for release zones and for maps with too few
-    /// overlapping layers to measure. Computed once in [`SampleMap::build`].
-    layer_boost_db: Vec<f32>,
+    /// Per-zone, per-played-key boost, in decibels, that brings the zone's
+    /// velocity layer up to that key's loudest attack layer. Always `>= 0` —
+    /// the loudest layer is exactly `0.0` — and `0.0` for release/auxiliary
+    /// zones and maps with too few overlapping layers to measure. Computed once
+    /// in [`SampleMap::build`].
+    layer_boost_db: Vec<[f32; 128]>,
 }
 
 impl SampleMap {
@@ -303,7 +311,7 @@ impl SampleMap {
             }
         }
         self.by_key = by_key;
-        self.layer_boost_db = measure_layer_boosts(&self.zones);
+        self.layer_boost_db = measure_layer_boosts(&self.zones, &self.by_key);
         Arc::new(self)
     }
 
@@ -359,7 +367,22 @@ impl SampleMap {
     /// which is faithful but leaves the soft layers unusable next to the hard
     /// ones. See [`MultiSampleConfig::dynamic_range`].
     pub fn layer_boost_db(&self, zone: usize) -> f32 {
-        self.layer_boost_db.get(zone).copied().unwrap_or(0.0)
+        let Some(mapped) = self.zones.get(zone) else {
+            return 0.0;
+        };
+        self.layer_boost_db_for_key(mapped.root_key, zone)
+    }
+
+    /// Decibels of boost for `zone` when it is played by `key`.
+    ///
+    /// Calibration is key-local: a bass key is compared only with the other
+    /// layers available to that bass key, never with the treble. The table is
+    /// populated in [`Self::build`], so this lookup is constant-time and does
+    /// no work proportional to the pack size on the audio thread.
+    pub fn layer_boost_db_for_key(&self, key: u8, zone: usize) -> f32 {
+        self.layer_boost_db
+            .get(zone)
+            .map_or(0.0, |by_key| by_key[key as usize])
     }
 
     /// Every measured velocity layer as `(hivel, offset_db)`, quietest first.
@@ -367,14 +390,43 @@ impl SampleMap {
     /// sits. For host readouts and for checking a pack's layer ladder is
     /// monotonic.
     pub fn layer_levels(&self) -> Vec<(u8, f32)> {
-        let mut levels: Vec<(u8, f32)> = self
-            .zones
-            .iter()
-            .zip(&self.layer_boost_db)
-            .filter(|(zone, _)| zone.trigger == ZoneTrigger::Attack)
-            .map(|(zone, &boost)| (zone.hivel, -boost))
+        let mut by_layer: std::collections::HashMap<u8, Vec<f32>> =
+            std::collections::HashMap::new();
+        for (index, zone) in self.zones.iter().enumerate() {
+            if !is_tonal_attack(zone) {
+                continue;
+            }
+            by_layer
+                .entry(zone.hivel)
+                .or_default()
+                .push(-self.layer_boost_db_for_key(zone.root_key, index));
+        }
+        let mut levels: Vec<_> = by_layer
+            .into_iter()
+            .map(|(hivel, offsets)| (hivel, median(offsets)))
             .collect();
-        levels.sort_by(|a, b| a.0.cmp(&b.0));
+        levels.sort_by_key(|(hivel, _)| *hivel);
+        levels
+    }
+
+    /// Measured velocity ladder for one playable key as
+    /// `(hivel, offset_db)`, quietest layer first.
+    pub fn layer_levels_for_key(&self, key: u8) -> Vec<(u8, f32)> {
+        let mut levels: Vec<_> = self
+            .by_key
+            .get(key as usize)
+            .into_iter()
+            .flatten()
+            .map(|index| *index as usize)
+            .filter(|&index| is_tonal_attack(&self.zones[index]))
+            .map(|index| {
+                (
+                    self.zones[index].hivel,
+                    -self.layer_boost_db_for_key(key, index),
+                )
+            })
+            .collect();
+        levels.sort_by_key(|(hivel, _)| *hivel);
         levels.dedup_by_key(|(hivel, _)| *hivel);
         levels
     }
@@ -779,6 +831,11 @@ pub struct MultiSampleInstrument {
     /// Normalized chord velocity balance: 0 emphasizes low notes, 0.5 is even,
     /// and 1 emphasizes high notes. This affects future chord attacks only.
     chord_velocity_mode: f32,
+    /// Exact dB-native designed span requested by a host. `None` keeps the
+    /// legacy normalized 6–24 dB control authoritative.
+    velocity_span_db: Option<SmoothedParam>,
+    /// Maximum positive layer compensation applied to a newly started voice.
+    compensation_ceiling_db: f32,
     /// Note staged by the sequencer via `Instrument::set_midi_note`.
     pending_note: Option<u8>,
 }
@@ -798,6 +855,8 @@ impl MultiSampleInstrument {
             trigger_counter: 0,
             sustain_pedal: false,
             chord_velocity_mode: 0.0,
+            velocity_span_db: None,
+            compensation_ceiling_db: DEFAULT_COMPENSATION_CEILING_DB,
             pending_note: None,
         }
     }
@@ -825,10 +884,17 @@ impl MultiSampleInstrument {
         self.params.stereo_width.set_target(config.stereo_width);
         self.params.dynamic_range.set_target(config.dynamic_range);
         self.params.velocity_span.set_target(config.velocity_span);
+        // Presets predate the exact dB control. Applying one restores its
+        // historical normalized span while leaving the independently selected
+        // safety ceiling alone.
+        self.velocity_span_db = None;
     }
 
     pub fn snap_params(&mut self) {
         self.params.snap_all();
+        if let Some(span) = &mut self.velocity_span_db {
+            span.snap();
+        }
     }
 
     pub fn sample_rate(&self) -> f32 {
@@ -846,6 +912,53 @@ impl MultiSampleInstrument {
 
     pub fn chord_velocity_mode(&self) -> f32 {
         self.chord_velocity_mode
+    }
+
+    /// Opt into an exact designed soft-to-hard loudness span in decibels.
+    /// Finite values are clamped to 0–24 dB and smoothed like the legacy
+    /// normalized control. A later legacy span or preset write can call
+    /// [`Self::clear_velocity_span_db_override`] to restore the old mapping.
+    pub fn set_velocity_span_db(&mut self, span_db: f32) {
+        if !span_db.is_finite() {
+            return;
+        }
+        let initial = self.current_velocity_span_db();
+        let sample_rate = self.sample_rate;
+        let span = self
+            .velocity_span_db
+            .get_or_insert_with(|| SmoothedParam::new(initial, 0.0, 24.0, sample_rate, 15.0));
+        span.set_target(span_db);
+    }
+
+    pub fn velocity_span_db(&self) -> f32 {
+        self.velocity_span_db.as_ref().map_or_else(
+            || ranges::dynamic_span_db(self.params.velocity_span.target()),
+            SmoothedParam::target,
+        )
+    }
+
+    /// Restore the v1.1.6 normalized 6–24 dB span control.
+    pub fn clear_velocity_span_db_override(&mut self) {
+        self.velocity_span_db = None;
+    }
+
+    /// Set the maximum positive gain available to layer matching. The default
+    /// remains 20 dB; hosts may opt into as much as 60 dB.
+    pub fn set_compensation_ceiling_db(&mut self, ceiling_db: f32) {
+        if ceiling_db.is_finite() {
+            self.compensation_ceiling_db = ceiling_db.clamp(0.0, MAX_COMPENSATION_CEILING_DB);
+        }
+    }
+
+    pub fn compensation_ceiling_db(&self) -> f32 {
+        self.compensation_ceiling_db
+    }
+
+    fn current_velocity_span_db(&self) -> f32 {
+        self.velocity_span_db.as_ref().map_or_else(
+            || ranges::dynamic_span_db(self.params.velocity_span.get()),
+            SmoothedParam::get,
+        )
     }
 
     /// Turn one base chord velocity into a deterministic velocity per voice.
@@ -1024,14 +1137,14 @@ impl MultiSampleInstrument {
         // the term is exactly 0.0, which `db_to_gain` returns 1.0 for, so the
         // whole feature is bit-identical to bypass at its default.
         let shaped_db = if attack {
-            let span = ranges::dynamic_span_db(self.params.velocity_span.get());
-            let boost = map.layer_boost_db(zone_index);
+            let span = self.current_velocity_span_db();
+            let boost = map.layer_boost_db_for_key(note, zone_index);
             let shaped = boost + ranges::velocity_curve_db(velocity, span);
             // The cap is on the *net* boost, not on the layer offset: the curve
             // term is negative, so a deep layer at a low velocity asks for far
             // less than its raw offset. Capping the offset instead would stop
             // the soft layers ever reaching the span they were promised.
-            (shaped * (1.0 - dynamic_range)).min(MAX_APPLIED_BOOST_DB)
+            (shaped * (1.0 - dynamic_range)).min(self.compensation_ceiling_db)
         } else {
             0.0
         };
@@ -1114,6 +1227,9 @@ impl MultiSampleInstrument {
     /// concrete `MultiSampleInstrument` is never ambiguous.
     pub fn tick_frame(&mut self) -> StereoFrame {
         self.params.tick();
+        if let Some(span) = &mut self.velocity_span_db {
+            span.tick();
+        }
 
         let mut out = StereoFrame::default();
         for voice in &mut self.voices {
@@ -1148,88 +1264,69 @@ impl MultiSampleInstrument {
 /// It also makes the function self-disabling: on a map where every key carries
 /// a single layer, every relative offset is zero, so nothing is compensated and
 /// note-to-note variation is left alone.
-fn measure_layer_boosts(zones: &[SampleZone]) -> Vec<f32> {
-    let mut boosts = vec![0.0; zones.len()];
+fn measure_layer_boosts(zones: &[SampleZone], by_key: &[Vec<u16>]) -> Vec<[f32; 128]> {
+    let mut boosts = vec![[0.0; 128]; zones.len()];
 
-    // Effective power per attack zone: what the zone actually puts out, so an
-    // existing `volume=` trim counts. That makes the whole pass idempotent —
-    // run it over an already level-matched pack and the offsets come out zero
-    // rather than correcting a second time.
-    let mut by_key: std::collections::HashMap<u8, Vec<(u8, f32)>> =
-        std::collections::HashMap::new();
-    for zone in zones.iter().filter(|z| z.trigger == ZoneTrigger::Attack) {
-        let window = (LAYER_MEASURE_SECS * zone.buffer.sample_rate()).round() as usize;
-        let available = (zone.end_frame() as usize).saturating_sub(zone.offset);
-        let power = zone.buffer.mean_square(zone.offset, window.min(available));
-        let trim = db_to_gain(zone.volume_db);
-        by_key
-            .entry(zone.root_key)
-            .or_default()
-            .push((zone.hivel, power * trim * trim));
-    }
+    // Measure each eligible PCM buffer once. A zone may span several playable
+    // keys, but its source power is identical for every one of them.
+    let powers: Vec<Option<f32>> = zones
+        .iter()
+        .map(|zone| {
+            if !is_tonal_attack(zone) {
+                return None;
+            }
+            let window = (LAYER_MEASURE_SECS * zone.buffer.sample_rate()).round() as usize;
+            let available = (zone.end_frame() as usize).saturating_sub(zone.offset);
+            let power = zone.buffer.mean_square(zone.offset, window.min(available));
+            let trim = db_to_gain(zone.volume_db);
+            Some(power * trim * trim)
+        })
+        .collect();
 
-    // Per key, express every layer relative to that key's loudest layer. Keys
-    // carrying a single layer contribute nothing: their one offset would be
-    // zero by construction and would only dilute the sample.
-    let mut offsets: std::collections::HashMap<u8, Vec<f32>> = std::collections::HashMap::new();
-    for cells in by_key.values() {
-        // One `(key, hivel)` cell can hold several zones in a round-robin pack;
-        // pool them by power before comparing.
-        let mut layers: std::collections::HashMap<u8, (f64, usize)> =
+    // Build an independent velocity ladder for every playable key. Pool zones
+    // with the same hivel before comparing so round-robin takes share one
+    // layer level, then reference every layer to this key's loudest attack.
+    for (key, candidates) in by_key.iter().enumerate() {
+        let mut layers: std::collections::HashMap<u8, (f64, usize, Vec<usize>)> =
             std::collections::HashMap::new();
-        for &(hivel, power) in cells {
-            let entry = layers.entry(hivel).or_insert((0.0, 0));
+        for &index in candidates {
+            let index = index as usize;
+            let Some(power) = powers[index] else {
+                continue;
+            };
+            let entry = layers
+                .entry(zones[index].hivel)
+                .or_insert_with(|| (0.0, 0, Vec::new()));
             entry.0 += power as f64;
             entry.1 += 1;
+            entry.2.push(index);
         }
         if layers.len() < 2 {
             continue;
         }
-        let levels: Vec<(u8, f32)> = layers
-            .iter()
-            .map(|(&hivel, &(sum, count))| (hivel, power_to_db((sum / count as f64) as f32)))
-            .collect();
-        let loudest = levels
-            .iter()
-            .map(|(_, db)| *db)
+
+        let loudest = layers
+            .values()
+            .map(|(sum, count, _)| power_to_db((*sum / *count as f64) as f32))
             .fold(f32::NEG_INFINITY, f32::max);
-        for (hivel, db) in levels {
-            offsets.entry(hivel).or_default().push(db - loudest);
+        for (sum, count, indices) in layers.into_values() {
+            let level = power_to_db((sum / count as f64) as f32);
+            let boost = (loudest - level).max(0.0);
+            for index in indices {
+                boosts[index][key] = boost;
+            }
         }
-    }
-    if offsets.is_empty() {
-        return boosts;
-    }
-
-    // Median, not mean: one clipped or mis-trimmed zone should not drag a
-    // thirty-key layer with it.
-    let mut layer_offset: std::collections::HashMap<u8, f32> = offsets
-        .into_iter()
-        .map(|(hivel, samples)| (hivel, median(samples)))
-        .collect();
-
-    // Re-reference to the loudest layer so every boost is non-negative. Pure
-    // boost means full-velocity output is untouched no matter how far the
-    // compensation is dialled in, which is what keeps the instrument's fixed
-    // summing headroom valid.
-    let loudest = layer_offset
-        .values()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
-    for offset in layer_offset.values_mut() {
-        *offset -= loudest;
-    }
-
-    for (index, zone) in zones.iter().enumerate() {
-        if zone.trigger != ZoneTrigger::Attack {
-            continue;
-        }
-        boosts[index] = layer_offset
-            .get(&zone.hivel)
-            .map_or(0.0, |offset| -offset)
-            .max(0.0);
     }
     boosts
+}
+
+/// A tonal attack is a normal pitched mapping: it starts on key-down and its
+/// recorded root belongs to the key range it covers. Release/damper samples and
+/// auxiliary key-switch/noise regions deliberately fail one of those tests.
+fn is_tonal_attack(zone: &SampleZone) -> bool {
+    zone.trigger == ZoneTrigger::Attack
+        && zone.root_key >= zone.lokey
+        && zone.root_key <= zone.hikey
 }
 
 /// Median of a non-empty slice, averaging the middle pair on an even count.
@@ -1478,8 +1575,100 @@ mod tests {
         };
         let applied = gain_to_db(render(0.0) / render(1.0));
         assert!(
-            (applied - MAX_APPLIED_BOOST_DB).abs() < 0.1,
-            "applied {applied} dB, cap is {MAX_APPLIED_BOOST_DB}"
+            (applied - DEFAULT_COMPENSATION_CEILING_DB).abs() < 0.1,
+            "applied {applied} dB, cap is {DEFAULT_COMPENSATION_CEILING_DB}"
+        );
+    }
+
+    #[test]
+    fn compensation_is_measured_independently_for_each_played_key() {
+        const ONE_SECOND: usize = SR as usize;
+        let mut map = SampleMap::new();
+        for (key, soft) in [(48_u8, 0.1_f32), (60, 0.01)] {
+            map.push_zone(
+                SampleZone::new(flat_buffer(ONE_SECOND, soft), key)
+                    .with_key_range(key, key)
+                    .with_velocity_range(1, 63),
+            )
+            .unwrap();
+            map.push_zone(
+                SampleZone::new(flat_buffer(ONE_SECOND, 1.0), key)
+                    .with_key_range(key, key)
+                    .with_velocity_range(64, 127),
+            )
+            .unwrap();
+        }
+        let map = map.build();
+
+        assert!((map.layer_boost_db_for_key(48, 0) - 20.0).abs() < 0.1);
+        assert_eq!(map.layer_boost_db_for_key(48, 1), 0.0);
+        assert!((map.layer_boost_db_for_key(60, 2) - 40.0).abs() < 0.1);
+        assert_eq!(map.layer_boost_db_for_key(60, 3), 0.0);
+    }
+
+    #[test]
+    fn auxiliary_attack_mapping_does_not_contaminate_a_tonal_key() {
+        const ONE_SECOND: usize = SR as usize;
+        let mut map = SampleMap::new();
+        for (lovel, hivel, amplitude) in [(1, 63, 0.1_f32), (64, 127, 1.0)] {
+            map.push_zone(
+                SampleZone::new(flat_buffer(ONE_SECOND, amplitude), 60)
+                    .with_key_range(60, 60)
+                    .with_velocity_range(lovel, hivel),
+            )
+            .unwrap();
+        }
+        // Salamander's auxiliary mappings use key zero with a C4 root. They
+        // are attacks, but are not pitched mappings and must remain unrelated
+        // to the C4 velocity ladder.
+        map.push_zone(
+            SampleZone::new(flat_buffer(ONE_SECOND, 0.000_01), 60)
+                .with_key_range(0, 0)
+                .with_velocity_range(127, 127),
+        )
+        .unwrap();
+        let map = map.build();
+
+        assert!((map.layer_boost_db_for_key(60, 0) - 20.0).abs() < 0.1);
+        assert_eq!(map.layer_boost_db_for_key(60, 1), 0.0);
+        assert_eq!(map.layer_boost_db_for_key(0, 2), 0.0);
+        assert_eq!(map.layer_levels_for_key(60).len(), 2);
+    }
+
+    #[test]
+    fn exact_span_and_compensation_ceiling_are_opt_in_and_bounded() {
+        let mut piano = MultiSampleInstrument::new(SR);
+        let legacy_span = ranges::dynamic_span_db(MultiSampleConfig::default().velocity_span);
+        assert_eq!(piano.velocity_span_db(), legacy_span);
+        assert_eq!(
+            piano.compensation_ceiling_db(),
+            DEFAULT_COMPENSATION_CEILING_DB
+        );
+
+        piano.set_velocity_span_db(2.0);
+        piano.set_compensation_ceiling_db(40.0);
+        assert_eq!(piano.velocity_span_db(), 2.0);
+        assert_eq!(piano.compensation_ceiling_db(), 40.0);
+
+        piano.set_velocity_span_db(-5.0);
+        piano.set_compensation_ceiling_db(100.0);
+        assert_eq!(piano.velocity_span_db(), 0.0);
+        assert_eq!(piano.compensation_ceiling_db(), MAX_COMPENSATION_CEILING_DB);
+
+        piano.set_velocity_span_db(f32::NAN);
+        piano.set_compensation_ceiling_db(f32::INFINITY);
+        assert_eq!(piano.velocity_span_db(), 0.0);
+        assert_eq!(piano.compensation_ceiling_db(), MAX_COMPENSATION_CEILING_DB);
+
+        piano.set_config(MultiSampleConfig::soft());
+        assert_eq!(
+            piano.velocity_span_db(),
+            ranges::dynamic_span_db(MultiSampleConfig::soft().velocity_span)
+        );
+        assert_eq!(
+            piano.compensation_ceiling_db(),
+            MAX_COMPENSATION_CEILING_DB,
+            "preset changes must not replace the host's safety ceiling"
         );
     }
 
@@ -2151,5 +2340,168 @@ mod tests {
         let mono = apply_width(wide, 0.0);
         assert!((mono.l - mono.r).abs() < 1e-6);
         assert_eq!(apply_width(wide, 1.0), wide);
+    }
+
+    /// Release-gate validation for the immutable prepared Salamander v2 pack.
+    /// The pack is intentionally not part of the repository, so ordinary test
+    /// runs skip this. The pack build workflow supplies the same environment
+    /// variable after extracting its candidate archive.
+    #[cfg(feature = "bounce")]
+    #[test]
+    #[ignore = "requires GOOEY_MOBILE_PACK_SFZ to point at Salamander mobile v2"]
+    fn salamander_v2_two_db_validation() {
+        use crate::instruments::multisample_pack::{load_sfz, PackLoadOptions};
+
+        fn rendered_level_db(
+            map: &Arc<SampleMap>,
+            key: u8,
+            velocity: u8,
+            expected_zone: usize,
+        ) -> f32 {
+            let mut piano = MultiSampleInstrument::with_map(SR, Arc::clone(map));
+            piano.params.dynamic_range.set_target(0.0);
+            piano.set_velocity_span_db(2.0);
+            piano.set_compensation_ceiling_db(40.0);
+            piano.snap_params();
+            assert!(piano.note_on(key, velocity as f32 / 127.0));
+            assert_eq!(
+                piano.sounding_zones(),
+                vec![(key, expected_zone)],
+                "compensation must never substitute a harder sample"
+            );
+
+            let frames = (LAYER_MEASURE_SECS * SR).round() as usize;
+            let mut sum = 0.0_f64;
+            for _ in 0..frames {
+                let frame = piano.tick_frame();
+                assert!(frame.l.is_finite() && frame.r.is_finite());
+                sum += frame.l as f64 * frame.l as f64 + frame.r as f64 * frame.r as f64;
+            }
+            power_to_db((sum / (frames * 2) as f64) as f32)
+        }
+
+        let sfz = std::env::var("GOOEY_MOBILE_PACK_SFZ")
+            .expect("GOOEY_MOBILE_PACK_SFZ must name Salamander v2 instrument.sfz");
+        let pack = load_sfz(&sfz, &PackLoadOptions::everything()).unwrap();
+        let map = pack.map.build();
+        assert_eq!(map.zone_count(), 244);
+
+        let mut limited_keys = Vec::new();
+        let mut measured_spans = Vec::new();
+        let mut worst_boundary_jump = 0.0_f32;
+        let mut worst_tail_db = f32::NEG_INFINITY;
+        let mut worst_tail = (0_u8, 0_u8, 0.0_f32);
+
+        for key in 21_u8..=108 {
+            let layers = map.layer_levels_for_key(key);
+            assert_eq!(layers.len(), 8, "key {key} must expose all eight layers");
+
+            let maximum_boost = layers
+                .iter()
+                .map(|(_, offset)| -*offset)
+                .fold(0.0_f32, f32::max);
+            if maximum_boost > 40.0 + 1.0e-4 {
+                limited_keys.push(key);
+            }
+
+            // Render both endpoints and both sides of each layer boundary.
+            // Cache by MIDI velocity because endpoints overlap the boundary
+            // set and this release test intentionally renders every key.
+            let mut velocities = vec![1_u8, 127];
+            for &(hivel, _) in &layers[..layers.len() - 1] {
+                velocities.push(hivel);
+                velocities.push(hivel + 1);
+            }
+            velocities.sort_unstable();
+            velocities.dedup();
+            let mut levels = Vec::with_capacity(velocities.len());
+            for velocity in velocities {
+                let selected = map
+                    .select(key, velocity, ZoneTrigger::Attack)
+                    .unwrap_or_else(|| panic!("key {key} velocity {velocity} is unmapped"));
+                let level = rendered_level_db(&map, key, velocity, selected);
+                levels.push((velocity, selected, level));
+
+                let zone = map.zone(selected).unwrap();
+                let tail_frames = (0.35 * zone.buffer.sample_rate()).round() as usize;
+                let end = zone.end_frame() as usize;
+                let start = end.saturating_sub(tail_frames);
+                let boost = map.layer_boost_db_for_key(key, selected);
+                let requested = boost + ranges::velocity_curve_db(velocity as f32 / 127.0, 2.0);
+                let applied = requested.min(40.0);
+                assert!(applied <= 40.0);
+                let tail_db = power_to_db(zone.buffer.mean_square(start, end - start))
+                    + zone.volume_db
+                    + applied;
+                if tail_db > worst_tail_db {
+                    worst_tail_db = tail_db;
+                    worst_tail = (key, velocity, applied);
+                }
+            }
+
+            let soft = levels.iter().find(|(v, _, _)| *v == 1).unwrap().2;
+            let hard = levels.iter().find(|(v, _, _)| *v == 127).unwrap().2;
+            let span = hard - soft;
+            measured_spans.push(span);
+            assert!(
+                (span - 2.0).abs() <= 1.0,
+                "key {key} measured {span:.2} dB instead of approximately 2 dB"
+            );
+
+            for &(hivel, _) in &layers[..layers.len() - 1] {
+                let below = levels.iter().find(|(v, _, _)| *v == hivel).unwrap();
+                let above = levels.iter().find(|(v, _, _)| *v == hivel + 1).unwrap();
+                assert_ne!(below.1, above.1, "boundary must change source layer");
+                let jump = (above.2 - below.2).abs();
+                worst_boundary_jump = worst_boundary_jump.max(jump);
+                assert!(
+                    jump <= 1.0,
+                    "key {key} boundary {hivel}/{} jumped {jump:.2} dB",
+                    hivel + 1
+                );
+            }
+        }
+
+        println!("Salamander v2 compensation-limited keys at 40 dB: {limited_keys:?}");
+        println!(
+            "Salamander v2 measured 2 dB spans: min={:.2}, max={:.2}; worst boundary jump={worst_boundary_jump:.2} dB",
+            measured_spans.iter().copied().fold(f32::INFINITY, f32::min),
+            measured_spans
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max),
+        );
+        println!(
+            "Salamander v2 worst compensated final-350ms level: {worst_tail_db:.2} dBFS at key {}, velocity {}, applied gain {:.2} dB",
+            worst_tail.0, worst_tail.1, worst_tail.2
+        );
+        assert!(limited_keys.is_empty(), "40 dB should reach every key");
+        assert!(
+            worst_tail_db < 0.0,
+            "compensated decay/noise window must remain below full scale"
+        );
+
+        // Two overlapping four-note chords exercise simultaneous compensated
+        // layers, self-masking of the common G, and finite summing.
+        let mut piano = MultiSampleInstrument::with_map(SR, Arc::clone(&map));
+        piano.params.dynamic_range.set_target(0.0);
+        piano.set_velocity_span_db(2.0);
+        piano.set_compensation_ceiling_db(40.0);
+        piano.snap_params();
+        for note in [48_u8, 52, 55, 60] {
+            assert!(piano.note_on(note, 0.35));
+        }
+        for _ in 0..512 {
+            let frame = piano.tick_frame();
+            assert!(frame.l.is_finite() && frame.r.is_finite());
+        }
+        for note in [55_u8, 59, 62, 67] {
+            assert!(piano.note_on(note, 0.75));
+        }
+        assert!(piano.active_voice_count() >= 7);
+        for _ in 0..4096 {
+            let frame = piano.tick_frame();
+            assert!(frame.l.is_finite() && frame.r.is_finite());
+        }
     }
 }

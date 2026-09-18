@@ -640,6 +640,81 @@ fn presets_and_params_are_validated() {
 }
 
 #[test]
+fn db_native_dynamics_controls_are_additive_and_backward_compatible() {
+    unsafe {
+        assert!(gooey_engine_piano_get_velocity_span_db(std::ptr::null(), 0).is_nan());
+        assert!(gooey_engine_piano_get_compensation_ceiling_db(std::ptr::null(), 0).is_nan());
+
+        let engine = gooey_engine_new(SR);
+        let piano = gooey_engine_piano_register(engine) as u32;
+        assert!((gooey_engine_piano_get_velocity_span_db(engine, piano) - 14.1).abs() < 1e-5);
+        assert_eq!(
+            gooey_engine_piano_get_compensation_ceiling_db(engine, piano),
+            20.0
+        );
+
+        assert!(gooey_engine_piano_set_velocity_span_db(engine, piano, 2.0));
+        assert!(gooey_engine_piano_set_compensation_ceiling_db(
+            engine, piano, 40.0
+        ));
+        assert_eq!(gooey_engine_piano_get_velocity_span_db(engine, piano), 2.0);
+        assert_eq!(
+            gooey_engine_piano_get_compensation_ceiling_db(engine, piano),
+            40.0
+        );
+
+        assert!(gooey_engine_piano_set_velocity_span_db(engine, piano, -1.0));
+        assert!(gooey_engine_piano_set_compensation_ceiling_db(
+            engine, piano, 100.0
+        ));
+        assert_eq!(gooey_engine_piano_get_velocity_span_db(engine, piano), 0.0);
+        assert_eq!(
+            gooey_engine_piano_get_compensation_ceiling_db(engine, piano),
+            60.0
+        );
+
+        assert!(!gooey_engine_piano_set_velocity_span_db(
+            engine,
+            piano,
+            f32::NAN
+        ));
+        assert!(!gooey_engine_piano_set_compensation_ceiling_db(
+            engine,
+            piano,
+            f32::INFINITY
+        ));
+        assert!(!gooey_engine_piano_set_velocity_span_db(
+            engine,
+            PIANO_INSTRUMENT_MAX,
+            2.0
+        ));
+
+        // A legacy normalized write regains authority using the old 6–24 dB
+        // mapping, while a preset does not replace the independent ceiling.
+        assert!(gooey_engine_piano_set_param(
+            engine,
+            piano,
+            PIANO_PARAM_VELOCITY_SPAN,
+            0.5
+        ));
+        assert_eq!(gooey_engine_piano_get_velocity_span_db(engine, piano), 15.0);
+        assert!(gooey_engine_piano_set_velocity_span_db(engine, piano, 2.0));
+        assert!(gooey_engine_piano_set_preset(
+            engine,
+            piano,
+            PIANO_PRESET_SOFT
+        ));
+        assert!((gooey_engine_piano_get_velocity_span_db(engine, piano) - 13.2).abs() < 1e-5);
+        assert_eq!(
+            gooey_engine_piano_get_compensation_ceiling_db(engine, piano),
+            60.0
+        );
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
 fn malformed_zone_input_is_rejected_without_committing() {
     unsafe {
         let engine = gooey_engine_new(SR);

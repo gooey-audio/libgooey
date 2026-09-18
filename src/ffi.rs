@@ -35,7 +35,7 @@ use crate::performance::{ChordClipEvent, PerformanceRecorder, PlayerAction, Reco
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 // =============================================================================
 // LFO constants
@@ -711,7 +711,10 @@ pub struct GooeyEngine {
     feedback_waveshaper: FeedbackWaveshaper,
     feedback_waveshaper_enabled: bool,
     limiter: SoftLimiter,
-    limiter_enabled: bool,
+    /// Smoothed dry/wet switch around the existing stateless limiter DSP.
+    limiter_mix: SmoothedParam,
+    /// Smoothed threshold written into `limiter` once per rendered frame.
+    limiter_threshold: SmoothedParam,
 
     /// Order in which the reorderable effects are applied. Stores `EFFECT_*`
     /// IDs (excluding `EFFECT_LIMITER`, which is pinned at the end of the chain).
@@ -724,6 +727,16 @@ pub struct GooeyEngine {
     current_time: f64,
     /// Smoothed gain applied to the complete instrument sum before global effects.
     master_gain: SmoothedParam,
+    /// Smoothed opt-in topology switch. Zero is the historical output order;
+    /// one places metronome and gain before the optional limiter.
+    final_output_mix: SmoothedParam,
+    /// Linear gain for the opt-in final output stage.
+    final_output_gain: SmoothedParam,
+    /// Read-and-reset peak of frames emitted to the host.
+    final_output_peak: AtomicU32,
+    /// Read-and-reset count of frames whose selected pre-limiter path exceeded
+    /// full scale on either channel.
+    final_output_overload_frames: AtomicU64,
 
     // LFO pool (8 LFOs with multi-target routing)
     lfos: [Lfo; LFO_COUNT],
@@ -853,7 +866,61 @@ enum ArmResolution {
     SilentBuffer,
 }
 
+#[inline]
+fn blend_stereo(a: StereoFrame, b: StereoFrame, mix: f32) -> StereoFrame {
+    if mix <= 0.0 {
+        return a;
+    }
+    if mix >= 1.0 {
+        return b;
+    }
+    StereoFrame {
+        l: a.l + (b.l - a.l) * mix,
+        r: a.r + (b.r - a.r) * mix,
+    }
+}
+
+/// Crossfade around the existing limiter. Keeping exact zero/one branches
+/// preserves the old transfer function in settled states and avoids running
+/// unnecessary nonlinear work while bypassed.
+#[inline]
+fn apply_limiter_mix(limiter: &SoftLimiter, input: StereoFrame, mix: f32) -> StereoFrame {
+    if mix <= 0.0 {
+        input
+    } else if mix >= 1.0 {
+        limiter.process_stereo(input)
+    } else {
+        blend_stereo(input, limiter.process_stereo(input), mix)
+    }
+}
+
 impl GooeyEngine {
+    #[inline]
+    fn record_final_output_telemetry(&self, pre_limiter: StereoFrame, output: StereoFrame) {
+        if pre_limiter.l.abs() > 1.0 || pre_limiter.r.abs() > 1.0 {
+            self.final_output_overload_frames
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        let peak = output.l.abs().max(output.r.abs());
+        if !peak.is_finite() {
+            return;
+        }
+        let peak_bits = peak.to_bits();
+        let mut current = self.final_output_peak.load(Ordering::Relaxed);
+        while peak_bits > current {
+            match self.final_output_peak.compare_exchange_weak(
+                current,
+                peak_bits,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     fn new(sample_rate: f32) -> Self {
         let bpm = 120.0;
 
@@ -955,7 +1022,8 @@ impl GooeyEngine {
             feedback_waveshaper,
             feedback_waveshaper_enabled: false,
             limiter: SoftLimiter::new(1.0),
-            limiter_enabled: false,
+            limiter_mix: SmoothedParam::new(0.0, 0.0, 1.0, sample_rate, 15.0),
+            limiter_threshold: SmoothedParam::new(1.0, 0.001, 1.0, sample_rate, 15.0),
             effect_order: DEFAULT_EFFECT_ORDER,
             sample_rate,
             bpm,
@@ -963,6 +1031,10 @@ impl GooeyEngine {
             current_time: 0.0,
             // Match the native Engine's default summing headroom.
             master_gain: SmoothedParam::new(DEFAULT_MASTER_GAIN, 0.0, 2.0, sample_rate, 30.0),
+            final_output_mix: SmoothedParam::new(0.0, 0.0, 1.0, sample_rate, 15.0),
+            final_output_gain: SmoothedParam::new(1.0, 0.0, 4.0, sample_rate, 15.0),
+            final_output_peak: AtomicU32::new(0.0_f32.to_bits()),
+            final_output_overload_frames: AtomicU64::new(0),
             // LFO pool
             lfos,
             lfo_enabled: [false; LFO_COUNT],
@@ -1509,32 +1581,58 @@ impl GooeyEngine {
                 }
             }
 
-            // Optional limiter (always last when enabled)
-            let mut stereo = if self.limiter_enabled {
-                self.limiter.process_stereo(stereo)
+            // The monitoring click is never generated during an offline
+            // bounce. It stays after the limiter in the historical topology,
+            // while the opt-in final topology deliberately includes it before
+            // final gain and limiting.
+            let click = if self.offline_bounce {
+                StereoFrame::default()
             } else {
-                stereo
-            };
-
-            // Monitor click, summed after everything else. The metronome is a
-            // listening aid, not part of the mix: keeping it outside the master
-            // fader, the effect chain, and the limiter means enabling it cannot
-            // change the sound of the material being auditioned, and it cannot
-            // feed a reverb tail, a delay line, or the compressor sidechain.
-            // Skipped entirely during an offline bounce so exports stay clean.
-            if !self.offline_bounce {
-                stereo += self.metronome.tick(
+                self.metronome.tick(
                     transport_running,
                     transport_beat,
                     transport_generation,
                     self.current_time,
-                );
-            }
+                )
+            };
+
+            // Smooth threshold and bypass without replacing SoftLimiter's DSP.
+            // SoftLimiter is stateless, so evaluating both routes during a
+            // short topology crossfade cannot alter either settled result.
+            self.limiter.set_threshold(self.limiter_threshold.tick());
+            let limiter_mix = self.limiter_mix.tick();
+            let final_gain = self.final_output_gain.tick();
+            let final_mix = self.final_output_mix.tick();
+
+            let final_pre_limiter = (stereo + click).scaled(final_gain);
+            let (output, telemetry_pre_limiter) = if final_mix <= 0.0 {
+                // Historical default: effects -> optional limiter -> metronome.
+                (
+                    apply_limiter_mix(&self.limiter, stereo, limiter_mix) + click,
+                    stereo,
+                )
+            } else if final_mix >= 1.0 {
+                // Opt-in: effects -> metronome -> final gain -> limiter.
+                (
+                    apply_limiter_mix(&self.limiter, final_pre_limiter, limiter_mix),
+                    final_pre_limiter,
+                )
+            } else {
+                // Crossfade complete output topologies only while enable state
+                // changes. This keeps either settled path exact.
+                let legacy_output = apply_limiter_mix(&self.limiter, stereo, limiter_mix) + click;
+                let final_output = apply_limiter_mix(&self.limiter, final_pre_limiter, limiter_mix);
+                (
+                    blend_stereo(legacy_output, final_output, final_mix),
+                    blend_stereo(stereo, final_pre_limiter, final_mix),
+                )
+            };
+            self.record_final_output_telemetry(telemetry_pre_limiter, output);
 
             // Write the frame interleaved as [left, right].
-            frame[0] = stereo.l;
+            frame[0] = output.l;
             if let Some(right) = frame.get_mut(1) {
-                *right = stereo.r;
+                *right = output.r;
             }
 
             self.current_time += sample_period;
@@ -3283,7 +3381,9 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
             _ => {} // Unknown parameter, ignore
         },
         EFFECT_LIMITER => match param {
-            LIMITER_PARAM_THRESHOLD => engine.limiter.set_threshold(value),
+            LIMITER_PARAM_THRESHOLD if value.is_finite() => {
+                engine.limiter_threshold.set_target(value)
+            }
             _ => {} // Unknown parameter, ignore
         },
         _ => {} // Unknown effect, ignore
@@ -3371,7 +3471,7 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
             _ => -1.0, // Unknown parameter
         },
         EFFECT_LIMITER => match param {
-            LIMITER_PARAM_THRESHOLD => engine.limiter.get_threshold(),
+            LIMITER_PARAM_THRESHOLD => engine.limiter_threshold.target(),
             _ => -1.0, // Unknown parameter
         },
         _ => -1.0, // Unknown effect
@@ -3409,7 +3509,9 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_enabled(
         EFFECT_SATURATION => engine.saturation_enabled = enabled,
         EFFECT_COMPRESSOR => engine.compressor_enabled = enabled,
         EFFECT_TILT_FILTER => engine.tilt_filter_enabled = enabled,
-        EFFECT_LIMITER => engine.limiter_enabled = enabled,
+        EFFECT_LIMITER => engine
+            .limiter_mix
+            .set_target(if enabled { 1.0 } else { 0.0 }),
         EFFECT_REVERB => engine.reverb_enabled = enabled,
         EFFECT_PLATE_REVERB => engine.plate_reverb_enabled = enabled,
         EFFECT_WAVESHAPER => engine.waveshaper_enabled = enabled,
@@ -3446,7 +3548,7 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_enabled(
         EFFECT_SATURATION => engine.saturation_enabled,
         EFFECT_COMPRESSOR => engine.compressor_enabled,
         EFFECT_TILT_FILTER => engine.tilt_filter_enabled,
-        EFFECT_LIMITER => engine.limiter_enabled,
+        EFFECT_LIMITER => engine.limiter_mix.target() >= 0.5,
         EFFECT_REVERB => engine.reverb_enabled,
         EFFECT_PLATE_REVERB => engine.plate_reverb_enabled,
         EFFECT_WAVESHAPER => engine.waveshaper_enabled,
@@ -3536,6 +3638,100 @@ pub unsafe extern "C" fn gooey_engine_get_master_gain(engine: *const GooeyEngine
         return DEFAULT_MASTER_GAIN;
     }
     (*engine).master_gain.target()
+}
+
+// =============================================================================
+// Opt-in final output stage and telemetry
+// =============================================================================
+
+/// Enable or disable the final output stage.
+///
+/// Disabled is the backward-compatible default. When enabled, the live
+/// metronome is summed after tonal effects, then final gain is applied, and the
+/// existing optional limiter runs last. Topology changes are smoothed.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_final_output_enabled(
+    engine: *mut GooeyEngine,
+    enabled: bool,
+) {
+    if let Some(engine) = engine.as_mut() {
+        engine
+            .final_output_mix
+            .set_target(if enabled { 1.0 } else { 0.0 });
+    }
+}
+
+/// Return the requested final-output enable state, or false for a null engine.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_final_output_enabled(engine: *const GooeyEngine) -> bool {
+    engine
+        .as_ref()
+        .is_some_and(|engine| engine.final_output_mix.target() >= 0.5)
+}
+
+/// Set opt-in final linear gain. Finite values clamp to 0.0–4.0 and are
+/// smoothed; non-finite values are ignored. The default is unity.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_final_output_gain(engine: *mut GooeyEngine, gain: f32) {
+    if !gain.is_finite() {
+        return;
+    }
+    if let Some(engine) = engine.as_mut() {
+        engine.final_output_gain.set_target(gain);
+    }
+}
+
+/// Return the requested final linear gain, or 1.0 for a null engine.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_final_output_gain(engine: *const GooeyEngine) -> f32 {
+    engine
+        .as_ref()
+        .map_or(1.0, |engine| engine.final_output_gain.target())
+}
+
+/// Atomically read and reset the largest absolute sample emitted since the
+/// previous call. Returns zero for a null engine.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_take_final_output_peak(engine: *const GooeyEngine) -> f32 {
+    engine.as_ref().map_or(0.0, |engine| {
+        f32::from_bits(
+            engine
+                .final_output_peak
+                .swap(0.0_f32.to_bits(), Ordering::Relaxed),
+        )
+    })
+}
+
+/// Atomically read and reset the number of rendered stereo frames whose
+/// selected pre-limiter signal exceeded full scale on either channel. A frame
+/// is counted once even when both channels overload. Returns zero for null.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_take_final_output_overload_frames(
+    engine: *const GooeyEngine,
+) -> u64 {
+    engine.as_ref().map_or(0, |engine| {
+        engine
+            .final_output_overload_frames
+            .swap(0, Ordering::Relaxed)
+    })
 }
 
 // =============================================================================
@@ -8134,10 +8330,104 @@ pub unsafe extern "C" fn gooey_engine_piano_set_param(
         2 => instrument.params.release.set_target(value),
         3 => instrument.params.stereo_width.set_target(value),
         4 => instrument.params.dynamic_range.set_target(value),
-        5 => instrument.params.velocity_span.set_target(value),
+        5 => {
+            instrument.clear_velocity_span_db_override();
+            instrument.params.velocity_span.set_target(value);
+        }
         _ => return false,
     }
     true
+}
+
+/// Set the piano's exact designed soft-to-hard loudness span in decibels.
+/// Finite values clamp to 0–24 dB. This opt-in control coexists with the legacy
+/// normalized `PIANO_PARAM_VELOCITY_SPAN`; a later legacy span or preset write
+/// restores the old 6–24 dB mapping.
+///
+/// Returns false for a non-finite value or an unregistered piano.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_set_velocity_span_db(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    span_db: f32,
+) -> bool {
+    if !span_db.is_finite() {
+        return false;
+    }
+    let Some(instrument) = engine
+        .as_mut()
+        .and_then(|engine| engine.pianos.get_mut(piano as usize))
+        .and_then(Option::as_mut)
+    else {
+        return false;
+    };
+    instrument.set_velocity_span_db(span_db);
+    true
+}
+
+/// Return the piano's requested designed loudness span in decibels, or NaN for
+/// a null engine or unregistered piano.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_get_velocity_span_db(
+    engine: *const GooeyEngine,
+    piano: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.pianos.get(piano as usize))
+        .and_then(Option::as_ref)
+        .map_or(f32::NAN, MultiSampleInstrument::velocity_span_db)
+}
+
+/// Set the maximum positive layer-matching gain. Finite values clamp to
+/// 0–60 dB; the backward-compatible default is 20 dB. The ceiling persists
+/// across piano preset changes.
+///
+/// Returns false for a non-finite value or an unregistered piano.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_set_compensation_ceiling_db(
+    engine: *mut GooeyEngine,
+    piano: u32,
+    ceiling_db: f32,
+) -> bool {
+    if !ceiling_db.is_finite() {
+        return false;
+    }
+    let Some(instrument) = engine
+        .as_mut()
+        .and_then(|engine| engine.pianos.get_mut(piano as usize))
+        .and_then(Option::as_mut)
+    else {
+        return false;
+    };
+    instrument.set_compensation_ceiling_db(ceiling_db);
+    true
+}
+
+/// Return the piano's requested layer-compensation ceiling in decibels, or NaN
+/// for a null engine or unregistered piano.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_get_compensation_ceiling_db(
+    engine: *const GooeyEngine,
+    piano: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.pianos.get(piano as usize))
+        .and_then(Option::as_ref)
+        .map_or(f32::NAN, MultiSampleInstrument::compensation_ceiling_db)
 }
 
 /// Load an SFZ pack from disk and queue it for `piano`, thinning it to
@@ -9852,6 +10142,11 @@ impl GooeyEngine {
         }
         self.graph.snap_strip_params();
         self.master_gain.snap();
+        self.final_output_mix.snap();
+        self.final_output_gain.snap();
+        self.limiter_mix.snap();
+        self.limiter_threshold.snap();
+        self.limiter.set_threshold(self.limiter_threshold.get());
 
         // Render in chunks using the same path as real-time playback. `render`
         // writes interleaved stereo (`[l, r]` per frame), so each frame is
@@ -10052,4 +10347,53 @@ pub unsafe extern "C" fn gooey_engine_loop_render_to_wav(
         }
     }
     writer.finalize().is_ok()
+}
+
+#[cfg(test)]
+mod output_stage_tests {
+    use super::*;
+
+    #[test]
+    fn limiter_bypass_and_threshold_changes_ramp_without_a_hard_step() {
+        let mut engine = GooeyEngine::new(44_100.0);
+        let input = StereoFrame::mono(0.8);
+
+        let dry = apply_limiter_mix(&engine.limiter, input, engine.limiter_mix.get());
+        let fully_limited = engine.limiter.process_stereo(input);
+        engine.limiter_mix.set_target(1.0);
+        let first_mix = engine.limiter_mix.tick();
+        let first_enabled = apply_limiter_mix(&engine.limiter, input, first_mix);
+        assert!(
+            (first_enabled.l - dry.l).abs() < (fully_limited.l - dry.l).abs() * 0.01,
+            "first bypass step should be a small fraction of the settled change"
+        );
+        for _ in 0..44_100 {
+            engine.limiter_mix.tick();
+        }
+        assert_eq!(engine.limiter_mix.get(), 1.0);
+        assert_eq!(
+            apply_limiter_mix(&engine.limiter, input, engine.limiter_mix.get()),
+            fully_limited
+        );
+
+        let old_output = engine.limiter.process_stereo(input);
+        engine.limiter_threshold.set_target(0.1);
+        engine
+            .limiter
+            .set_threshold(engine.limiter_threshold.tick());
+        let first_threshold_output = engine.limiter.process_stereo(input);
+        let hard_output = SoftLimiter::new(0.1).process_stereo(input);
+        assert!(
+            (first_threshold_output.l - old_output.l).abs()
+                < (hard_output.l - old_output.l).abs() * 0.01,
+            "first threshold step should be a small fraction of the settled change"
+        );
+        for _ in 0..44_100 {
+            engine
+                .limiter
+                .set_threshold(engine.limiter_threshold.tick());
+        }
+        assert_eq!(engine.limiter_threshold.get(), 0.1);
+        assert_eq!(engine.limiter.process_stereo(input), hard_output);
+    }
 }
