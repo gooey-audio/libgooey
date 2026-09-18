@@ -1,0 +1,32 @@
+[package]
+name = "gooey-kick-vst3"
+version = "0.1.0"
+edition = "2021"
+description = "Gooey Kick POC VST3 instrument and standalone app"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["vst3-plugin"]
+vst3-plugin = ["dep:vst3"]
+standalone = ["dep:cpal"]
+
+[dependencies]
+baseview = "0.3.4"
+cpal = { version = "0.15", optional = true }
+egui = { version = "0.36.1", default-features = false, features = ["default_fonts"] }
+egui-baseview = "0.7.1"
+gooey = { path = "../..", default-features = false }
+raw-window-handle = "0.6"
+vst3 = { version = "0.3.0", optional = true }
+
+[[bin]]
+name = "gooey-kick-standalone"
+path = "src/bin/standalone.rs"
+required-features = ["standalone"]
+
+[package.metadata.bundle]
+name = "Gooey Kick POC"
+identifier = "audio.gooey.kick-poc"
