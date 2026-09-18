@@ -18,7 +18,7 @@ The host can also opt into a final, smoothed linear gain after tonal effects and
 - [x] (2026-09-18 19:02Z) Added integration tests for legacy topology, ordering, smoothing, telemetry, and limiter transitions.
 - [x] (2026-09-18 19:02Z) Ran Salamander v2 validation over all keys, layers and boundaries, noise gain, sample identity, and overlapping chords.
 - [x] (2026-09-18 19:02Z) Generated and inspected the C header; formatting, 481 library tests, every integration target, and both iOS architecture builds pass. Repository-wide strict clippy and example compilation remain blocked by documented pre-existing failures.
-- [ ] Publish the v1.1.7 iOS release after the implementation commit is merged to `main`; never tag the feature branch.
+- [x] (2026-09-18 18:41Z) Merged PR #246, tagged the merged-main commit `b71a08a` as v1.1.7, and verified the published iOS archive and generated header.
 
 ## Surprises & Discoveries
 
@@ -67,7 +67,7 @@ The host can also opt into a final, smoothed linear gain after tonal effects and
 
 ## Outcomes & Retrospective
 
-The implementation is complete and verified locally. Piano calibration is key-local and build-time, legacy defaults remain intact, the new C controls are generated into `include/gooey.h`, final output and telemetry are opt-in, and limiter A/B DSP is unchanged at settled states. Salamander v2 met the 2 dB design on every playable key with no 40 dB ceiling failures. Both `aarch64-apple-ios` and `aarch64-apple-ios-sim` release libraries built successfully at 18 MB each. The remaining external outcome is to merge the change and tag that merged `main` commit as `v1.1.7`, which triggers the repository's iOS release workflow.
+The implementation and release are complete. Piano calibration is key-local and build-time, legacy defaults remain intact, the new C controls are present in the shipped `gooey.h`, final output and telemetry are opt-in, and limiter A/B DSP is unchanged at settled states. Salamander v2 met the 2 dB design on every playable key with no 40 dB ceiling failures. PR #246 passed Linux and macOS CI and merged as `b71a08a`. Tag v1.1.7 then produced a 12 MB public archive containing 19 MB device and simulator libraries plus the verified header. The release is available at `https://github.com/gooey-audio/libgooey/releases/tag/v1.1.7`.
 
 ## Context and Orientation
 
@@ -165,3 +165,5 @@ The generated C interface contains:
 No new crate dependency is needed. Use `SmoothedParam` for gain, topology, bypass, and threshold transitions, and `AtomicU32`/`AtomicU64` with relaxed ordering for telemetry.
 
 Plan revision note (2026-09-18): Created after source and artifact inspection so decisions and release boundaries survive context changes. Updated after implementation to record measured Salamander results, generated-header/iOS verification, and pre-existing repository-wide lint/example blockers.
+
+Plan revision note (2026-09-18): Marked the plan complete after PR #246 merged and the v1.1.7 workflow published and artifact-level verification confirmed the new C symbols.
