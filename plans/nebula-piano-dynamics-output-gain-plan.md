@@ -167,3 +167,4 @@ No new crate dependency is needed. Use `SmoothedParam` for gain, topology, bypas
 Plan revision note (2026-09-18): Created after source and artifact inspection so decisions and release boundaries survive context changes. Updated after implementation to record measured Salamander results, generated-header/iOS verification, and pre-existing repository-wide lint/example blockers.
 
 Plan revision note (2026-09-18): Marked the plan complete after PR #246 merged and the v1.1.7 workflow published and artifact-level verification confirmed the new C symbols.
+||||||| 8fb1b02
