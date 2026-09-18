@@ -93,6 +93,9 @@ jobs:
           GOOEY_MOBILE_PACK_SFZ=packaged/piano-mobile/instrument.sfz \
             cargo test --release --lib --no-default-features --features bounce \
             generated_mobile_pack_matches_release_contract -- --ignored
+          GOOEY_MOBILE_PACK_SFZ=packaged/piano-mobile/instrument.sfz \
+            cargo test --release --lib --no-default-features --features bounce \
+            salamander_v2_two_db_validation -- --ignored --nocapture
 
       - name: Retain the candidate for recovery
         uses: actions/upload-artifact@v4

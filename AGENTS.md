@@ -47,7 +47,7 @@ src/
 │   └── blendable.rs     # PresetBlender: cross-fade between parameter sets
 │
 ├── envelope.rs          # ADSR envelope with curve shaping
-├── metronome.rs         # Optional transport-locked monitor click (post-limiter)
+├── metronome.rs         # Optional transport-locked monitor click (post-limiter by default)
 ├── dsl.rs               # Line-based DSL for declarative instrument setup
 ├── ffi.rs               # C FFI bindings for iOS/Swift integration
 └── visualization.rs     # Waveform display (feature-gated)
@@ -72,10 +72,15 @@ The metronome taps in *after* the limiter deliberately: it is a monitoring aid,
 so enabling it must not alter the material being auditioned, and it is bypassed
 entirely during offline bounce.
 
+The C ABI also exposes an opt-in final-output stage. When enabled, the live
+metronome is summed after tonal effects, then smoothed final gain is applied,
+and the existing optional limiter runs last. This alternate topology is off by
+default so the signal flow above remains the backward-compatible behavior.
+
 ## Key Patterns
 
 - **Config / Params split**: `Config` structs hold static presets (with named constructors like `punchy()`). `Params` structs hold runtime `SmoothedParam` instances for real-time control.
-- **0–1 normalization**: All external parameters use normalized 0–1 range. Instruments denormalize internally.
+- **0–1 normalization**: Legacy indexed parameters use normalized 0–1 ranges and instruments denormalize internally. Explicitly named dB-native C APIs are additive exceptions for controls that require exact engineering units.
 - **Precision**: Audio samples are `f32`. Time accumulation uses `f64` to prevent drift.
 - **Thread safety**: `Engine` wrapped in `Arc<Mutex<>>` for audio thread. Trigger queue decouples main/audio threads.
 - **Click prevention**: `SmoothedParam` (~15ms smoothing) used on all real-time parameter changes.
