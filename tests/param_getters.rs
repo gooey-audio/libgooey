@@ -107,11 +107,44 @@ fn tom_param_round_trip() {
 }
 
 #[test]
+fn piano_param_round_trip() {
+    unsafe {
+        let engine = gooey_engine_new(44100.0);
+        assert!(gooey_engine_piano_get_param(engine, 0, PIANO_PARAM_RELEASE).is_nan());
+
+        let piano = gooey_engine_piano_register(engine) as u32;
+        let cases = [
+            (PIANO_PARAM_VOLUME, -0.5, 0.0),
+            (PIANO_PARAM_VELOCITY_TRACK, 0.22, 0.22),
+            (PIANO_PARAM_RELEASE, 0.33, 0.33),
+            (PIANO_PARAM_STEREO_WIDTH, 0.44, 0.44),
+            (PIANO_PARAM_DYNAMIC_RANGE, 0.55, 0.55),
+            (PIANO_PARAM_VELOCITY_SPAN, 1.5, 1.0),
+        ];
+        for (param, requested, expected) in cases {
+            assert!(gooey_engine_piano_set_param(
+                engine, piano, param, requested
+            ));
+            approx_eq(gooey_engine_piano_get_param(engine, piano, param), expected);
+        }
+
+        assert!(gooey_engine_piano_get_param(engine, piano, 999).is_nan());
+        assert!(
+            gooey_engine_piano_get_param(engine, PIANO_INSTRUMENT_MAX, PIANO_PARAM_RELEASE)
+                .is_nan()
+        );
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
 fn null_engine_returns_nan() {
     unsafe {
         assert!(gooey_engine_get_kick_param(std::ptr::null(), KICK_PARAM_FREQUENCY).is_nan());
         assert!(gooey_engine_get_snare_param(std::ptr::null(), SNARE_PARAM_DECAY).is_nan());
         assert!(gooey_engine_get_hihat_param(std::ptr::null(), HIHAT_PARAM_TONE).is_nan());
         assert!(gooey_engine_get_tom_param(std::ptr::null(), TOM_PARAM_TUNE).is_nan());
+        assert!(gooey_engine_piano_get_param(std::ptr::null(), 0, PIANO_PARAM_RELEASE).is_nan());
     }
 }
