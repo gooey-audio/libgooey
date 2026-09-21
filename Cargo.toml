@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 autoexamples = false
 
+[workspace]
+resolver = "2"
+members = [".", "plugins/gooey-kick-vst3", "xtask"]
+
 [lib]
 name = "gooey"
 crate-type = ["staticlib", "cdylib", "rlib"]

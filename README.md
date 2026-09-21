@@ -124,6 +124,36 @@ See `include/gooey.h` for complete API documentation.
 For apps migrating from the old flat instrument mix assumption to mixer graph
 submixing, see [docs/mixer-graph-migration.md](docs/mixer-graph-migration.md).
 
+## Gooey Kick POC (macOS arm64 VST3)
+
+The workspace contains a native Rust proof-of-concept instrument in
+`plugins/gooey-kick-vst3`. Its hosted library depends on `gooey` with default
+features disabled, so CPAL is linked only by the standalone application and
+never by a VST3 host.
+
+Run the standalone editor and audio output:
+
+```bash
+cargo run -p gooey-kick-vst3 --features standalone --bin gooey-kick-standalone
+```
+
+Use Audition or Space to trigger the monophonic libgooey kick. Build an ad-hoc
+signed bundle, validate it at pluginval strictness 5 with GUI tests, or install
+it to the current user's VST3 directory with:
+
+```bash
+cargo run -p gooey-kick-xtask -- bundle-vst3
+cargo run -p gooey-kick-xtask -- validate-vst3
+cargo run -p gooey-kick-xtask -- install-vst3
+```
+
+Installation refuses to replace a same-named bundle with another bundle
+identifier unless `--force` is explicitly supplied. pluginval 1.0.4 is
+downloaded only by the validation command into ignored `target/tools/` and is
+verified before execution. This POC supports Apple Silicon macOS only; other
+plug-in formats, platforms, universal binaries, notarization, installers,
+presets, resizing, and external standalone MIDI are deliberately out of scope.
+
 ## License
 
 MIT
