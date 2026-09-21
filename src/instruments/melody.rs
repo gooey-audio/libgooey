@@ -3,24 +3,22 @@
 use crate::frame::StereoFrame;
 use crate::music::{quantize_note_to_chord, Chord};
 
-use super::{PolySynth, PolySynthConfig};
+use super::{MonoSynth, PolySynthConfig};
 
 /// A dedicated synth and the harmonic state used to quantize one held melody.
 pub struct MelodyVoice {
-    synth: PolySynth,
+    synth: MonoSynth,
     harmony: Option<Chord>,
     held_input: Option<u8>,
-    sounding_note: Option<u8>,
     velocity: f32,
 }
 
 impl MelodyVoice {
     pub fn new(sample_rate: f32) -> Self {
         Self {
-            synth: PolySynth::with_config(sample_rate, PolySynthConfig::keys()),
+            synth: MonoSynth::with_config(sample_rate, PolySynthConfig::keys()),
             harmony: None,
             held_input: None,
-            sounding_note: None,
             velocity: 1.0,
         }
     }
@@ -40,19 +38,17 @@ impl MelodyVoice {
         self.synth.release_all();
         self.harmony = None;
         self.held_input = None;
-        self.sounding_note = None;
     }
 
     /// Begin a gesture. With no harmony the gesture remains held but silent.
     pub fn note_on(&mut self, input: u8, velocity: f32) -> Option<u8> {
-        if self.sounding_note.is_some() {
+        if self.synth.current_note().is_some() {
             self.synth.release_all();
         }
         self.held_input = Some(input);
-        self.sounding_note = None;
         self.velocity = velocity.clamp(0.0, 1.0);
         self.retarget_held_note();
-        self.sounding_note
+        self.synth.current_note()
     }
 
     /// Move an existing gesture to a new intended note.
@@ -60,18 +56,16 @@ impl MelodyVoice {
         self.held_input?;
         self.held_input = Some(input);
         self.retarget_held_note();
-        self.sounding_note
+        self.synth.current_note()
     }
 
     pub fn note_off(&mut self) {
         self.held_input = None;
-        if let Some(note) = self.sounding_note.take() {
-            self.synth.release_note(note);
-        }
+        self.synth.note_off();
     }
 
     pub fn sounding_note(&self) -> Option<u8> {
-        self.sounding_note
+        self.synth.current_note()
     }
 
     pub fn set_param(&mut self, param: u32, value: f32) -> bool {
@@ -90,19 +84,16 @@ impl MelodyVoice {
         let (Some(input), Some(chord)) = (self.held_input, self.harmony.as_ref()) else {
             return;
         };
-        let quantized = quantize_note_to_chord(input, chord, self.sounding_note);
+        let sounding_note = self.synth.current_note();
+        let quantized = quantize_note_to_chord(input, chord, sounding_note);
 
-        match self.sounding_note {
+        match sounding_note {
             Some(current) if current == quantized => {}
-            Some(current) => {
-                if !self.synth.retune_note(current, quantized) {
-                    self.synth.trigger_note(quantized, self.velocity);
-                }
-                self.sounding_note = Some(quantized);
+            Some(_) => {
+                _ = self.synth.retune(quantized);
             }
             None => {
-                self.synth.trigger_note(quantized, self.velocity);
-                self.sounding_note = Some(quantized);
+                self.synth.note_on(quantized, self.velocity);
             }
         }
     }
