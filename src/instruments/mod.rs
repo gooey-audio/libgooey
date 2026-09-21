@@ -4,6 +4,7 @@ pub mod granulator;
 pub mod hihat2;
 pub mod kick;
 pub mod melody;
+pub mod mono_synth;
 pub mod multisample;
 pub(crate) mod multisample_control;
 #[cfg(feature = "bounce")]
@@ -24,6 +25,7 @@ pub use self::granulator::*;
 pub use self::hihat2::*;
 pub use self::kick::*;
 pub use self::melody::*;
+pub use self::mono_synth::*;
 pub use self::multisample::*;
 #[cfg(feature = "bounce")]
 pub use self::multisample_pack::*;

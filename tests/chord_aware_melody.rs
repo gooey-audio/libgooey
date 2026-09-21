@@ -17,6 +17,33 @@ fn peak(samples: &[f32]) -> f32 {
         .fold(0.0, f32::max)
 }
 
+unsafe fn melody_peak_at_volume(volume: f32) -> f32 {
+    let engine = gooey_engine_new(SR);
+    assert!(gooey_engine_mixer_unroute_source(engine, SOURCE_POLYSYNTH));
+    gooey_engine_poly_trigger_chord(
+        engine,
+        0,
+        SCALE_MAJOR,
+        0,
+        VOICING_ROOT_POSITION,
+        POLY_PRESET_DEFAULT,
+        4,
+        0.8,
+    );
+    assert!(gooey_engine_melody_set_param(
+        engine,
+        POLY_PARAM_VOLUME,
+        volume,
+    ));
+    // Twelve smoothing time constants lets the normalized parameter hit the
+    // smoother's settled threshold before a note begins.
+    let _ = render(engine, 8192);
+    assert_eq!(gooey_engine_melody_note_on(engine, 67, 0.9), 67);
+    let result = peak(&render(engine, 4096));
+    gooey_engine_free(engine);
+    result
+}
+
 unsafe fn commit_piano_map(engine: *mut GooeyEngine, piano: u32, low: u32, high: u32) {
     assert!(gooey_engine_piano_zone_begin(engine, piano));
     let pcm = vec![0.25_f32; 4096 * 2];
@@ -245,6 +272,37 @@ fn invalid_calls_preserve_state_and_parameters_are_independent() {
         assert!(!gooey_engine_melody_has_harmony(std::ptr::null()));
         assert!(gooey_engine_melody_get_param(std::ptr::null(), 0).is_nan());
 
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn melody_volume_attenuates_only_the_lead() {
+    unsafe {
+        let loud = melody_peak_at_volume(0.85);
+        let quiet = melody_peak_at_volume(0.20);
+        let muted = melody_peak_at_volume(0.0);
+        assert!(loud > 0.0001);
+        assert!(quiet < loud * 0.35, "quiet={quiet}, loud={loud}");
+        assert!(muted < 0.000001, "muted peak={muted}");
+
+        let engine = gooey_engine_new(SR);
+        assert!(gooey_engine_melody_set_param(
+            engine,
+            POLY_PARAM_VOLUME,
+            0.0,
+        ));
+        gooey_engine_poly_trigger_chord(
+            engine,
+            0,
+            SCALE_MAJOR,
+            0,
+            VOICING_ROOT_POSITION,
+            POLY_PRESET_DEFAULT,
+            4,
+            0.8,
+        );
+        assert!(peak(&render(engine, 4096)) > 0.0001);
         gooey_engine_free(engine);
     }
 }
