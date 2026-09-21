@@ -279,6 +279,11 @@ pub struct PerformanceRecorder {
     sampler_playback_limit: usize,
     last_sampler_tick: Option<u32>,
     pending_sampler_hits: Vec<SamplerClipEvent>,
+    /// Reusable retirement storage for the legacy public clock helper. The
+    /// helper has no producer-side reclamation channel, so it retains retired
+    /// snapshots until recorder destruction and defers further replacement
+    /// once this fixed capacity is full.
+    legacy_retired: Vec<Arc<ChordLoopSnapshot>>,
 }
 
 impl Default for PerformanceRecorder {
@@ -313,6 +318,7 @@ impl PerformanceRecorder {
             sampler_playback_limit: 0,
             last_sampler_tick: None,
             pending_sampler_hits: Vec::with_capacity(CHORD_LOOP_MAX_EVENTS),
+            legacy_retired: Vec::with_capacity(2),
         }
     }
 
@@ -507,9 +513,12 @@ impl PerformanceRecorder {
     ) -> Option<PlayerAction> {
         let generation =
             self.last_transport_generation + u64::from(transport_running != self.transport_running);
-        let mut retired = Vec::with_capacity(2);
-        self.update_clock_with_transport(beat_position, transport_running, generation, &mut retired)
-            .action
+        let mut retired = std::mem::take(&mut self.legacy_retired);
+        let action = self
+            .update_clock_with_transport(beat_position, transport_running, generation, &mut retired)
+            .action;
+        self.legacy_retired = retired;
+        action
     }
 
     /// Advance from the mixer transport. Called once per rendered sample and
@@ -1246,6 +1255,22 @@ mod tests {
         let _ = rec.update_clock(0.0, true);
         assert!(!rec.record_chord_on(1, 0, 0, 0, 0, 0, 4, 1.0));
         assert_eq!(rec.event_count(), 0);
+    }
+
+    #[test]
+    fn legacy_clock_reuses_preallocated_retirement_storage() {
+        let mut rec = PerformanceRecorder::new();
+        let pointer = rec.legacy_retired.as_ptr();
+        let capacity = rec.legacy_retired.capacity();
+
+        for sample in 0..10_000 {
+            let beat = f64::from(sample) / 48_000.0;
+            let _ = rec.update_clock(beat, true);
+        }
+
+        assert_eq!(rec.legacy_retired.as_ptr(), pointer);
+        assert_eq!(rec.legacy_retired.capacity(), capacity);
+        assert!(rec.legacy_retired.is_empty());
     }
 
     #[test]
