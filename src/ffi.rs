@@ -17,6 +17,7 @@ use crate::instruments::multisample::{
 use crate::instruments::multisample_control::{
     MultiSampleCommand, MultiSampleControl, MULTISAMPLE_INSTRUMENT_COUNT,
 };
+use crate::instruments::poly_synth_control::{PolySynthControl, PolySynthPending};
 use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
     BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, MelodyVoice,
@@ -31,7 +32,11 @@ use crate::mixer::{
 use crate::music::{
     apply_voicing, available_voicings, Chord, ChordSet, Key, NoteName, ScaleType, VoicingType,
 };
-use crate::performance::{ChordClipEvent, PerformanceRecorder, PlayerAction, RecordMode};
+use crate::performance::control::{ChordControl, ChordControlScratch};
+use crate::performance::{
+    prepare_chord_event, ChordCommandAction, ChordLoopSnapshot, PerformanceRecorder, PlayerAction,
+    PreparedChordEvent, RecordMode, CHORD_TARGET_PIANO, CHORD_TARGET_POLY,
+};
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::slice;
@@ -760,6 +765,9 @@ pub struct GooeyEngine {
     // freshly constructed factory config.
     poly_presets: [PolySynthConfig; POLY_PRESET_COUNT as usize],
     poly_current_preset: u32,
+    /// Host-side projected preset bank and coalesced render-boundary handoff.
+    poly_control: PolySynthControl,
+    poly_pending: PolySynthPending,
 
     // Independent monophonic-control synth for chord-aware live melody.
     melody: MelodyVoice,
@@ -803,6 +811,10 @@ pub struct GooeyEngine {
 
     // Live performance clip recorder/player (Stage 1: chord pad events).
     performance: PerformanceRecorder,
+    chord_control: ChordControl,
+    chord_control_scratch: ChordControlScratch,
+    chord_retired: Vec<std::sync::Arc<ChordLoopSnapshot>>,
+    controlled_chord: Option<ControlledChord>,
     // Config-time registered sample-pad instruments. Empty entries are not graph sources.
     samplers: [Option<SamplerRack>; SAMPLER_RACK_MAX as usize],
     /// Control-side sampler replacement endpoint. Producers never mutate
@@ -829,6 +841,15 @@ pub struct GooeyEngine {
     // True only while `bounce_to_buffer` drives `render` offline. The metronome
     // consults it so a monitoring aid can never land in an exported file.
     offline_bounce: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ControlledChord {
+    target: u32,
+    target_id: u32,
+    notes: [u8; 6],
+    note_count: u8,
+    loop_owned: bool,
 }
 
 /// Host-clock reference for the next render buffer. The audio callback sets
@@ -998,6 +1019,9 @@ impl GooeyEngine {
         let mixer_control = mixer.control();
         let sampler_control = SamplerControl::new();
         let piano_control = MultiSampleControl::new();
+        let poly_presets = factory_poly_presets();
+        let poly_control = PolySynthControl::new(poly_presets, POLY_PRESET_DEFAULT);
+        let chord_control = ChordControl::new();
 
         Self {
             kit,
@@ -1046,8 +1070,10 @@ impl GooeyEngine {
             sequencer_triggers_enabled: AtomicBool::new(true),
             // Polyphonic synthesizer for chord playback
             poly_synth: PolySynth::new(sample_rate),
-            poly_presets: factory_poly_presets(),
+            poly_presets,
             poly_current_preset: POLY_PRESET_DEFAULT,
+            poly_control,
+            poly_pending: PolySynthPending::default(),
             melody: MelodyVoice::new(sample_rate),
             // Granulator with a silent placeholder buffer until the host loads samples.
             // The placeholder uses a hardcoded sample rate so this constructor cannot
@@ -1077,6 +1103,10 @@ impl GooeyEngine {
             pending_arm_host_time: None,
             // Chord performance clip (disarmed by default)
             performance: PerformanceRecorder::new(),
+            chord_control,
+            chord_control_scratch: ChordControlScratch::default(),
+            chord_retired: Vec::with_capacity(32),
+            controlled_chord: None,
             samplers: std::array::from_fn(|_| None),
             sampler_control,
             sampler_command_scratch: std::collections::VecDeque::with_capacity(16),
@@ -1120,6 +1150,50 @@ impl GooeyEngine {
             }
         }
         control.reclaim_from_audio(&mut self.piano_retired);
+    }
+
+    fn apply_poly_control_commands(&mut self) {
+        self.poly_control.drain_into(&mut self.poly_pending);
+        for (index, pending) in self.poly_pending.presets.iter_mut().enumerate() {
+            if let Some(config) = pending.take() {
+                self.poly_presets[index] = config;
+                if self.poly_current_preset == index as u32 {
+                    self.poly_synth.set_config(config);
+                }
+            }
+        }
+        if let Some(preset) = self.poly_pending.active_preset.take() {
+            let _ = self.apply_live_poly_preset(preset);
+        }
+    }
+
+    fn apply_chord_control_commands(&mut self) {
+        let control = self.chord_control.clone();
+        let _ = control.reclaim_from_audio(&mut self.chord_retired);
+        control.drain_into(&mut self.chord_control_scratch);
+
+        if self.chord_retired.capacity() - self.chord_retired.len() >= 2 {
+            if let Some(edit) = self.chord_control_scratch.edit.take() {
+                if let Some(generation) = self.performance.apply_clip_edit(
+                    edit,
+                    self.mixer.transport_running(),
+                    &mut self.chord_retired,
+                ) {
+                    self.release_loop_owned_chord();
+                    control.mark_applied(generation);
+                }
+            }
+        }
+
+        while let Some(action) = self.chord_control_scratch.actions.pop_front() {
+            match action {
+                ChordCommandAction::Trigger(event) => {
+                    self.trigger_controlled_chord(event, false);
+                }
+                ChordCommandAction::ReleaseAll => self.release_controlled_chord(),
+            }
+        }
+        let _ = control.reclaim_from_audio(&mut self.chord_retired);
     }
 
     fn apply_sampler_control_commands(&mut self) {
@@ -1239,8 +1313,10 @@ impl GooeyEngine {
         // Commands are applied at buffer boundaries, including buffers that
         // are temporarily silent while a host-time arm is pending.
         self.mixer.apply_control_commands();
+        self.apply_poly_control_commands();
         self.apply_sampler_control_commands();
         self.apply_piano_control_commands();
+        self.apply_chord_control_commands();
 
         // Number of stereo frames this buffer holds (two slots per frame).
         let frame_count = buffer.len() / 2;
@@ -1416,15 +1492,21 @@ impl GooeyEngine {
                 }
             }
 
-            // Advance the performance clip clock and apply any chord trigger/release
-            // from recorded events. Playback must not re-enter the recorder.
+            // Advance the performance clip from the mixer's monotonic pre-tick
+            // transport. Playback is independent of UI polling and does not
+            // re-enter the recorder.
             {
-                let beat = self.compute_beat_position();
-                let running = self
-                    .reference_sequencer()
-                    .map(|s| s.is_running())
-                    .unwrap_or(false);
-                if let Some(action) = self.performance.update_clock(beat, running) {
+                let update = self.performance.update_clock_with_transport(
+                    transport_beat,
+                    transport_running,
+                    transport_generation,
+                    &mut self.chord_retired,
+                );
+                if let Some(generation) = update.installed_generation {
+                    self.release_loop_owned_chord();
+                    self.chord_control.mark_applied(generation);
+                }
+                if let Some(action) = update.action {
                     self.apply_performance_action(action);
                 }
                 let sampler_hits = self.performance.take_sampler_hits();
@@ -4406,77 +4488,116 @@ impl GooeyEngine {
         self.voice(0).map(|v| &v.sequencer)
     }
 
-    /// Fractional beat position (quarter notes) from the reference sequencer.
-    /// Same math as `gooey_engine_sequencer_get_beat_position`.
-    fn compute_beat_position(&self) -> f64 {
-        let Some(seq) = self.reference_sequencer() else {
-            return 0.0;
-        };
-        let step = seq.current_step() as f64;
-        let step_start = seq.step_start_sample();
-        let step_end = seq.next_trigger_sample();
-        let step_duration = step_end.saturating_sub(step_start);
-        let frac = if step_duration > 0 {
-            let elapsed = seq.sample_count().saturating_sub(step_start);
-            (elapsed as f64 / step_duration as f64).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        (step + frac) / 4.0
-    }
-
-    /// Load one editable preset copy into the live synth. Continuous controls
-    /// move through their smoothers; note-on envelope and modulation settings
-    /// apply to subsequently triggered voices.
-    fn apply_poly_preset(&mut self, preset: u32) -> bool {
+    /// Load the render-owned preset copy without touching the producer mutex.
+    fn apply_live_poly_preset(&mut self, preset: u32) -> bool {
         let Some(index) = valid_poly_preset_index(preset) else {
             return false;
         };
         self.poly_current_preset = preset;
         self.poly_synth.set_config(self.poly_presets[index]);
+        self.poly_control.publish_active_from_audio(preset);
         true
+    }
+
+    /// Legacy direct-trigger bridge. These APIs retain their existing
+    /// single-thread contract and may copy projected state before mutating DSP.
+    fn apply_legacy_poly_preset(&mut self, preset: u32) -> bool {
+        let Some(index) = valid_poly_preset_index(preset) else {
+            return false;
+        };
+        let Some(config) = self.poly_control.preset(preset) else {
+            return false;
+        };
+        self.poly_presets[index] = config;
+        self.apply_live_poly_preset(preset)
+    }
+
+    fn release_controlled_chord(&mut self) {
+        let Some(active) = self.controlled_chord.take() else {
+            return;
+        };
+        match active.target {
+            CHORD_TARGET_POLY => self.poly_synth.release_all(),
+            CHORD_TARGET_PIANO => {
+                if let Some(piano) = self
+                    .pianos
+                    .get_mut(active.target_id as usize)
+                    .and_then(Option::as_mut)
+                {
+                    for note in &active.notes[..active.note_count as usize] {
+                        piano.note_off(*note);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn release_loop_owned_chord(&mut self) {
+        if self
+            .controlled_chord
+            .is_some_and(|active| active.loop_owned)
+        {
+            self.release_controlled_chord();
+        }
+    }
+
+    fn trigger_controlled_chord(&mut self, event: PreparedChordEvent, loop_owned: bool) {
+        self.release_controlled_chord();
+        self.melody.set_harmony(event.chord);
+
+        let mut sounding_notes = [0; 6];
+        let mut sounding_count = 0usize;
+        match event.target {
+            CHORD_TARGET_POLY => {
+                if !self.apply_live_poly_preset(event.event.preset) {
+                    return;
+                }
+                self.poly_synth.release_all();
+                for &note in event.notes() {
+                    self.poly_synth
+                        .trigger_note(note, event.event.velocity.clamp(0.0, 1.0));
+                    sounding_notes[sounding_count] = note;
+                    sounding_count += 1;
+                }
+            }
+            CHORD_TARGET_PIANO => {
+                let Some(piano) = self
+                    .pianos
+                    .get_mut(event.target_id as usize)
+                    .and_then(Option::as_mut)
+                else {
+                    return;
+                };
+                let note_count = event.notes().len();
+                for (index, &note) in event.notes().iter().enumerate() {
+                    let velocity = piano.chord_velocity_at(event.event.velocity, index, note_count);
+                    if piano.note_on(note, velocity) {
+                        sounding_notes[sounding_count] = note;
+                        sounding_count += 1;
+                    }
+                }
+            }
+            _ => return,
+        }
+
+        self.controlled_chord = Some(ControlledChord {
+            target: event.target,
+            target_id: event.target_id,
+            notes: sounding_notes,
+            note_count: sounding_count as u8,
+            loop_owned,
+        });
     }
 
     /// Apply a clip player action to the poly synth without recording.
     fn apply_performance_action(&mut self, action: PlayerAction) {
         self.performance.set_applying_playback(true);
         match action {
-            PlayerAction::Trigger(event) => {
-                self.trigger_poly_chord_from_event(event);
-            }
-            PlayerAction::Release => {
-                self.poly_synth.release_all();
-            }
+            PlayerAction::Trigger(event) => self.trigger_controlled_chord(event, true),
+            PlayerAction::Release => self.release_loop_owned_chord(),
         }
         self.performance.set_applying_playback(false);
-    }
-
-    /// Build and trigger a chord from a recorded pad-parameter event.
-    fn trigger_poly_chord_from_event(&mut self, event: ChordClipEvent) {
-        // Replay the palette the pad was recorded with, not the one the host
-        // UI currently shows. An invalid persisted id plays nothing.
-        let Some(chord) =
-            resolve_chord(event.chord_set, event.root, event.scale_type, event.degree)
-        else {
-            return;
-        };
-        let voicing_type = voicing_from_id(event.voicing);
-        let octave = event.octave.clamp(0, 8) as i8;
-        let velocity = event.velocity.clamp(0.0, 1.0);
-
-        // Smoothed targets only — avoid snap_params on every clip replay hit.
-        // An invalid persisted id leaves the current sound and voices alone.
-        if !self.apply_poly_preset(event.preset) {
-            return;
-        }
-
-        let midi_notes = apply_voicing(&chord, voicing_type, octave);
-
-        self.melody.set_harmony(chord);
-        self.poly_synth.release_all();
-        for note in &midi_notes {
-            self.poly_synth.trigger_note(*note, velocity);
-        }
     }
 }
 
@@ -6129,6 +6250,45 @@ pub const POLY_PRESET_KEYS: u32 = 3;
 pub const POLY_PRESET_STRINGS: u32 = 4;
 pub const POLY_PRESET_COUNT: u32 = 5;
 
+/// Queued chord target: the engine's polyphonic synth.
+pub const GOOEY_CHORD_TARGET_POLY: u32 = 0;
+/// Queued chord target: a registered multi-sample piano.
+pub const GOOEY_CHORD_TARGET_PIANO: u32 = 1;
+/// Chord-loop timeline resolution in ticks per quarter note.
+pub const GOOEY_CHORD_LOOP_TICKS_PER_QUARTER: u32 = 96;
+/// Maximum events accepted in one immutable chord-loop snapshot.
+pub const GOOEY_CHORD_LOOP_MAX_EVENTS: u32 = 512;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GooeyChordEvent {
+    pub target: u32,
+    pub target_id: u32,
+    pub chord_set: u32,
+    pub root: u32,
+    pub scale_type: u32,
+    pub degree: u32,
+    pub voicing: u32,
+    pub preset: u32,
+    pub octave: i32,
+    pub velocity: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GooeyChordLoopEvent {
+    pub start_tick: u32,
+    pub duration_ticks: u32,
+    pub chord: GooeyChordEvent,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GooeyPolyParamValue {
+    pub param: u32,
+    pub value: f32,
+}
+
 // Clean poly parameter ABI. All values are normalized 0-1; pitch and filter
 // envelope amounts use 0.5 as their neutral point.
 pub const POLY_PARAM_OSC_A_WAVEFORM: u32 = crate::instruments::POLY_PARAM_OSC_A_WAVEFORM;
@@ -6307,6 +6467,8 @@ fn valid_poly_preset_index(preset: u32) -> Option<usize> {
 ///
 /// Equivalent to `gooey_engine_poly_trigger_chord_set` with
 /// `CHORD_SET_SEVENTHS`, and kept for hosts written before chord sets existed.
+/// This legacy entry point mutates live DSP and must be serialized with render;
+/// concurrent hosts must use `gooey_engine_chord_enqueue_trigger` instead.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -6355,6 +6517,8 @@ pub unsafe extern "C" fn gooey_engine_poly_trigger_chord(
 /// Does nothing at all — no release, no recording — when `engine` is null,
 /// `chord_set` is not below `CHORD_SET_COUNT`, or `preset` is not a valid
 /// preset id.
+/// This legacy entry point mutates live DSP and must be serialized with render;
+/// concurrent hosts must use `gooey_engine_chord_enqueue_trigger` instead.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -6397,7 +6561,7 @@ pub unsafe extern "C" fn gooey_engine_poly_trigger_chord_set(
 
     // Apply the engine's editable preset copy as smoothed targets. Invalid ids
     // fail without releasing the current chord or changing active state.
-    if !engine.apply_poly_preset(preset) {
+    if !engine.apply_legacy_poly_preset(preset) {
         return;
     }
 
@@ -6418,7 +6582,9 @@ pub unsafe extern "C" fn gooey_engine_poly_trigger_chord_set(
     );
 }
 
-/// Release all sounding poly synth notes.
+/// Release all sounding poly synth notes. This legacy entry point must be
+/// serialized with render; concurrent hosts must use
+/// `gooey_engine_chord_enqueue_release_all` instead.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -6448,7 +6614,7 @@ pub unsafe extern "C" fn gooey_engine_poly_set_preset(
     let Some(engine) = engine.as_mut() else {
         return false;
     };
-    engine.apply_poly_preset(preset)
+    engine.poly_control.set_active_preset(preset)
 }
 
 /// Return the active `POLY_PRESET_*` id, or `POLY_PRESET_DEFAULT` for null.
@@ -6457,9 +6623,152 @@ pub unsafe extern "C" fn gooey_engine_poly_set_preset(
 /// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_poly_get_preset(engine: *const GooeyEngine) -> u32 {
+    engine.as_ref().map_or(POLY_PRESET_DEFAULT, |engine| {
+        engine.poly_control.active_preset()
+    })
+}
+
+fn prepare_ffi_chord(event: GooeyChordEvent) -> Option<PreparedChordEvent> {
+    if event.target != GOOEY_CHORD_TARGET_POLY && event.target != GOOEY_CHORD_TARGET_PIANO {
+        return None;
+    }
+    if event.target == GOOEY_CHORD_TARGET_POLY && event.preset >= POLY_PRESET_COUNT {
+        return None;
+    }
+    prepare_chord_event(
+        event.target,
+        event.target_id,
+        event.chord_set,
+        event.root,
+        event.scale_type,
+        event.degree,
+        event.voicing,
+        event.preset,
+        event.octave,
+        event.velocity,
+    )
+}
+
+/// Queue a chord gesture for the next available render-buffer boundary.
+/// Safe for a control thread to call concurrently with rendering. Returns
+/// whether the command was accepted, not whether every piano note was mapped.
+///
+/// # Safety
+/// `engine` must be null or a valid live engine pointer. `event` must be null
+/// or point to a readable `GooeyChordEvent` for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_chord_enqueue_trigger(
+    engine: *const GooeyEngine,
+    event: *const GooeyChordEvent,
+) -> bool {
+    let (Some(engine), Some(event)) = (engine.as_ref(), event.as_ref()) else {
+        return false;
+    };
+    prepare_ffi_chord(*event).is_some_and(|event| engine.chord_control.enqueue_trigger(event))
+}
+
+/// Queue release of the currently controlled chord at the next render boundary.
+///
+/// # Safety
+/// `engine` must be null or a valid live engine pointer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_chord_enqueue_release_all(
+    engine: *const GooeyEngine,
+) -> bool {
     engine
         .as_ref()
-        .map_or(POLY_PRESET_DEFAULT, |engine| engine.poly_current_preset)
+        .is_some_and(|engine| engine.chord_control.enqueue_release_all())
+}
+
+/// Validate, copy, and stage a complete chord-loop snapshot.
+///
+/// # Safety
+/// `engine` must be null or a valid live engine pointer. When `event_count` is
+/// nonzero, `events` must reference that many readable events for this call.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_chord_loop_replace(
+    engine: *const GooeyEngine,
+    events: *const GooeyChordLoopEvent,
+    event_count: u32,
+    length_ticks: u32,
+) -> u64 {
+    let Some(engine) = engine.as_ref() else {
+        return 0;
+    };
+    if event_count > GOOEY_CHORD_LOOP_MAX_EVENTS
+        || length_ticks == 0
+        || (event_count > 0 && events.is_null())
+    {
+        return 0;
+    }
+    let source = if event_count == 0 {
+        &[][..]
+    } else {
+        slice::from_raw_parts(events, event_count as usize)
+    };
+    let mut prepared = Vec::with_capacity(source.len());
+    for source_event in source {
+        let Some(mut event) = prepare_ffi_chord(source_event.chord) else {
+            return 0;
+        };
+        event.event.start_tick = source_event.start_tick;
+        event.event.duration_ticks = source_event.duration_ticks;
+        prepared.push(event);
+    }
+    engine.chord_control.replace(prepared, length_ticks)
+}
+
+/// Clear the shared performance timeline at the next render boundary.
+///
+/// # Safety
+/// `engine` must be null or a valid live engine pointer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_chord_loop_clear(engine: *const GooeyEngine) -> u64 {
+    engine
+        .as_ref()
+        .map_or(0, |engine| engine.chord_control.clear())
+}
+
+/// Return the generation most recently installed by the render thread.
+///
+/// # Safety
+/// `engine` must be null or a valid live engine pointer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_chord_loop_get_applied_generation(
+    engine: *const GooeyEngine,
+) -> u64 {
+    engine
+        .as_ref()
+        .map_or(0, |engine| engine.chord_control.applied_generation())
+}
+
+/// Atomically stage a complete set of normalized edits for one preset.
+///
+/// # Safety
+/// `engine` must be null or a valid live engine pointer. When `value_count` is
+/// nonzero, `values` must reference that many readable values for this call.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_set_preset_params(
+    engine: *const GooeyEngine,
+    preset: u32,
+    values: *const GooeyPolyParamValue,
+    value_count: u32,
+) -> bool {
+    let Some(engine) = engine.as_ref() else {
+        return false;
+    };
+    if preset >= POLY_PRESET_COUNT || (value_count > 0 && values.is_null()) {
+        return false;
+    }
+    if value_count == 0 {
+        return true;
+    }
+    let source = slice::from_raw_parts(values, value_count as usize);
+    let copied: Vec<(u32, f32)> = source
+        .iter()
+        .map(|value| (value.param, value.value))
+        .collect();
+    engine.poly_control.set_params(preset, &copied)
 }
 
 // =============================================================================
@@ -6722,11 +7031,8 @@ pub unsafe extern "C" fn gooey_engine_poly_set_param(
     let Some(engine) = engine.as_mut() else {
         return false;
     };
-    let preset = engine.poly_current_preset as usize;
-    if !engine.poly_presets[preset].set_param(param, value) {
-        return false;
-    }
-    engine.poly_synth.set_param(param, value)
+    let preset = engine.poly_control.active_preset();
+    engine.poly_control.set_param(preset, param, value)
 }
 
 /// Get the target value of one active poly parameter, or NaN when invalid.
@@ -6740,7 +7046,7 @@ pub unsafe extern "C" fn gooey_engine_poly_get_param(
 ) -> f32 {
     engine
         .as_ref()
-        .and_then(|engine| engine.poly_synth.param(param))
+        .and_then(|engine| engine.poly_control.active_param(param))
         .unwrap_or(f32::NAN)
 }
 
@@ -6889,16 +7195,7 @@ pub unsafe extern "C" fn gooey_engine_poly_set_preset_param(
     let Some(engine) = engine.as_mut() else {
         return false;
     };
-    let Some(index) = valid_poly_preset_index(preset) else {
-        return false;
-    };
-    if !engine.poly_presets[index].set_param(param, value) {
-        return false;
-    }
-    if engine.poly_current_preset == preset {
-        engine.poly_synth.set_param(param, value);
-    }
-    true
+    engine.poly_control.set_param(preset, param, value)
 }
 
 /// Get one parameter from an editable preset copy, or NaN when invalid.
@@ -6914,9 +7211,7 @@ pub unsafe extern "C" fn gooey_engine_poly_get_preset_param(
     let Some(engine) = engine.as_ref() else {
         return f32::NAN;
     };
-    valid_poly_preset_index(preset)
-        .and_then(|index| engine.poly_presets[index].param(param))
-        .unwrap_or(f32::NAN)
+    engine.poly_control.param(preset, param).unwrap_or(f32::NAN)
 }
 
 /// Restore one editable preset to its factory parameters and routes.
@@ -6931,17 +7226,10 @@ pub unsafe extern "C" fn gooey_engine_poly_reset_preset(
     let Some(engine) = engine.as_mut() else {
         return false;
     };
-    let Some(index) = valid_poly_preset_index(preset) else {
-        return false;
-    };
     let Some(config) = factory_poly_preset_config(preset) else {
         return false;
     };
-    engine.poly_presets[index] = config;
-    if engine.poly_current_preset == preset {
-        engine.poly_synth.set_config(config);
-    }
-    true
+    engine.poly_control.reset_preset(preset, config)
 }
 
 /// Set one of eight modulation routes on an editable preset.
@@ -6958,19 +7246,12 @@ pub unsafe extern "C" fn gooey_engine_poly_set_mod_route(
     let Some(engine) = engine.as_mut() else {
         return false;
     };
-    let Some(index) = valid_poly_preset_index(preset) else {
-        return false;
-    };
     let Some(route) = route.into_route() else {
         return false;
     };
-    if !engine.poly_presets[index].set_mod_route(slot as usize, route) {
-        return false;
-    }
-    if engine.poly_current_preset == preset {
-        engine.poly_synth.set_mod_route(slot as usize, route);
-    }
-    true
+    engine
+        .poly_control
+        .set_mod_route(preset, slot as usize, route)
 }
 
 /// Copy one modulation route into `out_route`. Returns false for invalid ids
@@ -6988,13 +7269,10 @@ pub unsafe extern "C" fn gooey_engine_poly_get_mod_route(
     let (Some(engine), Some(out_route)) = (engine.as_ref(), out_route.as_mut()) else {
         return false;
     };
-    let Some(index) = valid_poly_preset_index(preset) else {
+    let Some(route) = engine.poly_control.mod_route(preset, slot as usize) else {
         return false;
     };
-    let Some(route) = engine.poly_presets[index].mod_routes.get(slot as usize) else {
-        return false;
-    };
-    *out_route = (*route).into();
+    *out_route = route.into();
     true
 }
 
@@ -7011,16 +7289,7 @@ pub unsafe extern "C" fn gooey_engine_poly_clear_mod_route(
     let Some(engine) = engine.as_mut() else {
         return false;
     };
-    let Some(index) = valid_poly_preset_index(preset) else {
-        return false;
-    };
-    if !engine.poly_presets[index].clear_mod_route(slot as usize) {
-        return false;
-    }
-    if engine.poly_current_preset == preset {
-        engine.poly_synth.clear_mod_route(slot as usize);
-    }
-    true
+    engine.poly_control.clear_mod_route(preset, slot as usize)
 }
 
 /// Query how many voicings are available for a given chord quality.
@@ -7772,6 +8041,7 @@ pub unsafe extern "C" fn gooey_engine_piano_register(engine: *mut GooeyEngine) -
         .graph
         .register_source(SOURCE_PIANO_BASE + index as u32)
     {
+        engine.chord_control.set_piano_registered(index);
         index as i32
     } else {
         // Roll back, so a graph that cannot take the source does not leave a
@@ -8024,6 +8294,8 @@ pub unsafe extern "C" fn gooey_engine_piano_get_velocity_mode(
 /// present in both chords uses the piano's normal self-masking behavior when it
 /// is restruck. Returns true only when every chord note found a mapped sample
 /// zone. Mapped notes still sound when another chord note is outside the map.
+/// This legacy entry point mutates live DSP and must be serialized with render;
+/// concurrent hosts must use `gooey_engine_chord_enqueue_trigger` instead.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
@@ -8058,6 +8330,8 @@ pub unsafe extern "C" fn gooey_engine_piano_trigger_chord(
 /// the harmonic palette (`CHORD_SET_SEVENTHS`, `CHORD_SET_NEO_SOUL`, ...)
 /// instead of always using the diatonic sevenths. Returns false — sounding
 /// nothing — when `chord_set` is not below `CHORD_SET_COUNT`.
+/// This legacy entry point mutates live DSP and must be serialized with render;
+/// concurrent hosts must use `gooey_engine_chord_enqueue_trigger` instead.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
@@ -8116,6 +8390,7 @@ pub unsafe extern "C" fn gooey_engine_piano_trigger_chord_set(
 /// note-off. MIDI hosts that forward a raw note-on with velocity 0 (which the
 /// MIDI spec treats as a note-off) must translate it to
 /// `gooey_engine_piano_note_off` themselves.
+/// This legacy direct-note entry point must be serialized with rendering.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
@@ -8141,6 +8416,7 @@ pub unsafe extern "C" fn gooey_engine_piano_note_on(
 
 /// Release a key. With the sustain pedal down the note keeps ringing until the
 /// pedal is lifted.
+/// This legacy direct-note entry point must be serialized with rendering.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.

@@ -40,7 +40,7 @@ pub fn quantize_note_to_chord(input: u8, chord: &Chord, preferred: Option<u8>) -
 fn chord_pitch_classes(chord: &Chord) -> [bool; 12] {
     let mut allowed = [false; 12];
     let root = chord.root.to_index();
-    for interval in chord.quality.intervals() {
+    for interval in chord.quality.interval_slice() {
         let pitch_class = root.wrapping_add(interval.semitones()) % 12;
         allowed[pitch_class as usize] = true;
     }

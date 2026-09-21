@@ -90,38 +90,38 @@ impl ChordQuality {
     /// is the seventh **or the sixth**, and any remaining entries are extensions
     /// in ascending order. `VoicingType::Shell` in `src/music/voicing.rs` reads
     /// indices 0, 1 and 3 directly, so new qualities must preserve this layout.
-    pub fn intervals(self) -> Vec<Interval> {
+    pub fn interval_slice(self) -> &'static [Interval] {
         use Interval::*;
         match self {
             // Triads
-            ChordQuality::Major => vec![Unison, MajorThird, PerfectFifth],
-            ChordQuality::Minor => vec![Unison, MinorThird, PerfectFifth],
-            ChordQuality::Diminished => vec![Unison, MinorThird, Tritone],
-            ChordQuality::Augmented => vec![Unison, MajorThird, MinorSixth],
-            ChordQuality::Sus2 => vec![Unison, MajorSecond, PerfectFifth],
-            ChordQuality::Sus4 => vec![Unison, PerfectFourth, PerfectFifth],
+            ChordQuality::Major => &[Unison, MajorThird, PerfectFifth],
+            ChordQuality::Minor => &[Unison, MinorThird, PerfectFifth],
+            ChordQuality::Diminished => &[Unison, MinorThird, Tritone],
+            ChordQuality::Augmented => &[Unison, MajorThird, MinorSixth],
+            ChordQuality::Sus2 => &[Unison, MajorSecond, PerfectFifth],
+            ChordQuality::Sus4 => &[Unison, PerfectFourth, PerfectFifth],
             // 6ths and added-note chords (no 7th)
-            ChordQuality::Major6 => vec![Unison, MajorThird, PerfectFifth, MajorSixth],
-            ChordQuality::Minor6 => vec![Unison, MinorThird, PerfectFifth, MajorSixth],
-            ChordQuality::Add9 => vec![Unison, MajorThird, PerfectFifth, MajorNinth],
-            ChordQuality::MinorAdd9 => vec![Unison, MinorThird, PerfectFifth, MajorNinth],
+            ChordQuality::Major6 => &[Unison, MajorThird, PerfectFifth, MajorSixth],
+            ChordQuality::Minor6 => &[Unison, MinorThird, PerfectFifth, MajorSixth],
+            ChordQuality::Add9 => &[Unison, MajorThird, PerfectFifth, MajorNinth],
+            ChordQuality::MinorAdd9 => &[Unison, MinorThird, PerfectFifth, MajorNinth],
             // 7th chords
-            ChordQuality::Major7 => vec![Unison, MajorThird, PerfectFifth, MajorSeventh],
-            ChordQuality::Minor7 => vec![Unison, MinorThird, PerfectFifth, MinorSeventh],
-            ChordQuality::Dominant7 => vec![Unison, MajorThird, PerfectFifth, MinorSeventh],
-            ChordQuality::Diminished7 => vec![Unison, MinorThird, Tritone, MajorSixth],
-            ChordQuality::HalfDiminished7 => vec![Unison, MinorThird, Tritone, MinorSeventh],
-            ChordQuality::MinorMajor7 => vec![Unison, MinorThird, PerfectFifth, MajorSeventh],
-            ChordQuality::Dominant7Sus4 => vec![Unison, PerfectFourth, PerfectFifth, MinorSeventh],
-            ChordQuality::Dominant7Sharp5 => vec![Unison, MajorThird, MinorSixth, MinorSeventh],
+            ChordQuality::Major7 => &[Unison, MajorThird, PerfectFifth, MajorSeventh],
+            ChordQuality::Minor7 => &[Unison, MinorThird, PerfectFifth, MinorSeventh],
+            ChordQuality::Dominant7 => &[Unison, MajorThird, PerfectFifth, MinorSeventh],
+            ChordQuality::Diminished7 => &[Unison, MinorThird, Tritone, MajorSixth],
+            ChordQuality::HalfDiminished7 => &[Unison, MinorThird, Tritone, MinorSeventh],
+            ChordQuality::MinorMajor7 => &[Unison, MinorThird, PerfectFifth, MajorSeventh],
+            ChordQuality::Dominant7Sus4 => &[Unison, PerfectFourth, PerfectFifth, MinorSeventh],
+            ChordQuality::Dominant7Sharp5 => &[Unison, MajorThird, MinorSixth, MinorSeventh],
             // Altered / colour dominants and lydian major
             ChordQuality::Dominant7Flat9 => {
-                vec![Unison, MajorThird, PerfectFifth, MinorSeventh, MinorNinth]
+                &[Unison, MajorThird, PerfectFifth, MinorSeventh, MinorNinth]
             }
             ChordQuality::Dominant7Sharp9 => {
-                vec![Unison, MajorThird, PerfectFifth, MinorSeventh, MinorTenth]
+                &[Unison, MajorThird, PerfectFifth, MinorSeventh, MinorTenth]
             }
-            ChordQuality::Major7Sharp11 => vec![
+            ChordQuality::Major7Sharp11 => &[
                 Unison,
                 MajorThird,
                 PerfectFifth,
@@ -129,39 +129,27 @@ impl ChordQuality {
                 SharpEleventh,
             ],
             // 9th chords
-            ChordQuality::Major9 => {
-                vec![Unison, MajorThird, PerfectFifth, MajorSeventh, MajorNinth]
-            }
-            ChordQuality::Minor9 => {
-                vec![Unison, MinorThird, PerfectFifth, MinorSeventh, MajorNinth]
-            }
+            ChordQuality::Major9 => &[Unison, MajorThird, PerfectFifth, MajorSeventh, MajorNinth],
+            ChordQuality::Minor9 => &[Unison, MinorThird, PerfectFifth, MinorSeventh, MajorNinth],
             ChordQuality::Dominant9 => {
-                vec![Unison, MajorThird, PerfectFifth, MinorSeventh, MajorNinth]
+                &[Unison, MajorThird, PerfectFifth, MinorSeventh, MajorNinth]
             }
-            ChordQuality::Dominant9Sus4 => {
-                vec![
-                    Unison,
-                    PerfectFourth,
-                    PerfectFifth,
-                    MinorSeventh,
-                    MajorNinth,
-                ]
-            }
-            ChordQuality::Minor9Flat5 => {
-                vec![Unison, MinorThird, Tritone, MinorSeventh, MajorNinth]
-            }
+            ChordQuality::Dominant9Sus4 => &[
+                Unison,
+                PerfectFourth,
+                PerfectFifth,
+                MinorSeventh,
+                MajorNinth,
+            ],
+            ChordQuality::Minor9Flat5 => &[Unison, MinorThird, Tritone, MinorSeventh, MajorNinth],
             ChordQuality::MinorMajor9 => {
-                vec![Unison, MinorThird, PerfectFifth, MajorSeventh, MajorNinth]
+                &[Unison, MinorThird, PerfectFifth, MajorSeventh, MajorNinth]
             }
             // 6/9 chords
-            ChordQuality::Major69 => {
-                vec![Unison, MajorThird, PerfectFifth, MajorSixth, MajorNinth]
-            }
-            ChordQuality::Minor69 => {
-                vec![Unison, MinorThird, PerfectFifth, MajorSixth, MajorNinth]
-            }
+            ChordQuality::Major69 => &[Unison, MajorThird, PerfectFifth, MajorSixth, MajorNinth],
+            ChordQuality::Minor69 => &[Unison, MinorThird, PerfectFifth, MajorSixth, MajorNinth],
             // 11th chords
-            ChordQuality::Major11 => vec![
+            ChordQuality::Major11 => &[
                 Unison,
                 MajorThird,
                 PerfectFifth,
@@ -169,7 +157,7 @@ impl ChordQuality {
                 MajorNinth,
                 PerfectEleventh,
             ],
-            ChordQuality::Minor11 => vec![
+            ChordQuality::Minor11 => &[
                 Unison,
                 MinorThird,
                 PerfectFifth,
@@ -177,7 +165,7 @@ impl ChordQuality {
                 MajorNinth,
                 PerfectEleventh,
             ],
-            ChordQuality::Dominant11 => vec![
+            ChordQuality::Dominant11 => &[
                 Unison,
                 MajorThird,
                 PerfectFifth,
@@ -186,7 +174,7 @@ impl ChordQuality {
                 PerfectEleventh,
             ],
             // 13th chords
-            ChordQuality::Major13 => vec![
+            ChordQuality::Major13 => &[
                 Unison,
                 MajorThird,
                 PerfectFifth,
@@ -194,7 +182,7 @@ impl ChordQuality {
                 MajorNinth,
                 MajorThirteenth,
             ],
-            ChordQuality::Minor13 => vec![
+            ChordQuality::Minor13 => &[
                 Unison,
                 MinorThird,
                 PerfectFifth,
@@ -202,7 +190,7 @@ impl ChordQuality {
                 MajorNinth,
                 MajorThirteenth,
             ],
-            ChordQuality::Dominant13 => vec![
+            ChordQuality::Dominant13 => &[
                 Unison,
                 MajorThird,
                 PerfectFifth,
@@ -211,6 +199,12 @@ impl ChordQuality {
                 MajorThirteenth,
             ],
         }
+    }
+
+    /// Owned interval list retained for Rust API compatibility. Real-time
+    /// callers should use [`Self::interval_slice`] to avoid allocation.
+    pub fn intervals(self) -> Vec<Interval> {
+        self.interval_slice().to_vec()
     }
 
     /// True when the quality contains a seventh (or a higher tertian extension
@@ -235,7 +229,7 @@ impl ChordQuality {
     }
 
     pub fn note_count(self) -> usize {
-        self.intervals().len()
+        self.interval_slice().len()
     }
 
     /// The chord-symbol suffix appended to the root name ("m7", "maj9", "9sus4").
@@ -295,7 +289,7 @@ impl fmt::Display for ChordQuality {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Chord {
     pub root: NoteName,
     pub quality: ChordQuality,

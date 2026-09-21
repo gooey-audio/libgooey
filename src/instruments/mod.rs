@@ -12,6 +12,7 @@ pub mod multisample_pack;
 #[cfg(feature = "bounce")]
 pub mod multisample_prep;
 pub mod poly_synth;
+pub(crate) mod poly_synth_control;
 pub mod reso_kick;
 pub mod sampler;
 pub(crate) mod sampler_control;
