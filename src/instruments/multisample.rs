@@ -981,22 +981,25 @@ impl MultiSampleInstrument {
     /// Turn one base chord velocity into a deterministic velocity per voice.
     /// Voice zero is the lowest note, matching `apply_voicing`'s sorted output.
     pub fn chord_velocities(&self, base: f32, count: usize) -> Vec<f32> {
+        (0..count)
+            .map(|index| self.chord_velocity_at(base, index, count))
+            .collect()
+    }
+
+    /// Allocation-free counterpart used by the realtime chord player.
+    pub fn chord_velocity_at(&self, base: f32, index: usize, count: usize) -> f32 {
         let base = base.clamp(0.0, 1.0);
         if count <= 1 {
-            return (0..count).map(|_| base.max(0.05)).collect();
+            return base.max(0.05);
         }
         let bias = (self.chord_velocity_mode - 0.5) * 2.0;
-        (0..count)
-            .map(|index| {
-                let position = index as f32 / (count - 1) as f32;
-                let attenuation = if bias < 0.0 {
-                    -bias * position
-                } else {
-                    bias * (1.0 - position)
-                };
-                (base * (1.0 - MAX_CHORD_VELOCITY_TILT * attenuation)).clamp(0.05, 1.0)
-            })
-            .collect()
+        let position = index as f32 / (count - 1) as f32;
+        let attenuation = if bias < 0.0 {
+            -bias * position
+        } else {
+            bias * (1.0 - position)
+        };
+        (base * (1.0 - MAX_CHORD_VELOCITY_TILT * attenuation)).clamp(0.05, 1.0)
     }
 
     /// Strike a key. `velocity` is normalized 0–1 and is converted to the MIDI
