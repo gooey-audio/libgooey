@@ -1,6 +1,6 @@
 //! Cross-thread projection and render-boundary handoff for editable poly presets.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{PolyModRoute, PolySynthConfig};
@@ -9,13 +9,13 @@ pub(crate) const POLY_PRESET_BANK_SIZE: usize = 5;
 
 struct ControlState {
     projected: [PolySynthConfig; POLY_PRESET_BANK_SIZE],
-    active_preset: u32,
     pending: [Option<PolySynthConfig>; POLY_PRESET_BANK_SIZE],
     pending_active: Option<u32>,
 }
 
 struct SharedControl {
     state: Mutex<ControlState>,
+    active_preset: AtomicU32,
     has_pending: AtomicBool,
 }
 
@@ -47,10 +47,10 @@ impl PolySynthControl {
             shared: Arc::new(SharedControl {
                 state: Mutex::new(ControlState {
                     projected: presets,
-                    active_preset,
                     pending: [None; POLY_PRESET_BANK_SIZE],
                     pending_active: None,
                 }),
+                active_preset: AtomicU32::new(active_preset),
                 has_pending: AtomicBool::new(false),
             }),
         }
@@ -80,27 +80,22 @@ impl PolySynthControl {
         let Ok(mut state) = self.shared.state.lock() else {
             return false;
         };
-        state.active_preset = preset;
         state.pending_active = Some(preset);
+        self.shared.active_preset.store(preset, Ordering::Release);
         self.shared.has_pending.store(true, Ordering::Release);
         true
     }
 
     pub(crate) fn active_preset(&self) -> u32 {
-        self.shared
-            .state
-            .lock()
-            .map_or(0, |state| state.active_preset)
+        self.shared.active_preset.load(Ordering::Acquire)
     }
 
     /// Publish an audio-thread-selected preset (for example a clip event) to
-    /// legacy getters. This is a single atomic-sized state edit and never waits
-    /// on the render path: a contended lock simply leaves the projected host
-    /// selection untouched until its next explicit write.
+    /// legacy getters. The atomic publication cannot be lost when the producer
+    /// mutex is contended and never waits on the render path.
     pub(crate) fn publish_active_from_audio(&self, preset: u32) {
-        if let Ok(mut state) = self.shared.state.try_lock() {
-            state.active_preset = preset;
-        }
+        debug_assert!(valid_index(preset).is_some());
+        self.shared.active_preset.store(preset, Ordering::Release);
     }
 
     pub(crate) fn preset(&self, preset: u32) -> Option<PolySynthConfig> {
@@ -117,8 +112,10 @@ impl PolySynthControl {
     }
 
     pub(crate) fn active_param(&self, param: u32) -> Option<f32> {
+        let active_preset = self.active_preset();
+        let index = valid_index(active_preset)?;
         let state = self.shared.state.lock().ok()?;
-        state.projected[state.active_preset as usize].param(param)
+        state.projected[index].param(param)
     }
 
     pub(crate) fn set_param(&self, preset: u32, param: u32, value: f32) -> bool {
@@ -231,5 +228,19 @@ mod tests {
         let mut pending = PolySynthPending::default();
         control.drain_into(&mut pending);
         assert!(pending.presets.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn audio_selected_preset_publication_survives_control_lock_contention() {
+        let control = PolySynthControl::new(presets(), 0);
+        let guard = control.shared.state.lock().unwrap();
+
+        control.publish_active_from_audio(2);
+        assert_eq!(control.active_preset(), 2);
+
+        drop(guard);
+        assert!(control.set_param(control.active_preset(), POLY_PARAM_VOLUME, 0.37));
+        assert_eq!(control.param(2, POLY_PARAM_VOLUME), Some(0.37));
+        assert_ne!(control.param(0, POLY_PARAM_VOLUME), Some(0.37));
     }
 }
