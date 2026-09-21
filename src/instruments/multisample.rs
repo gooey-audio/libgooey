@@ -455,9 +455,14 @@ mod ranges {
     /// Multiplier applied to each zone's authored release time (damper speed).
     /// Deliberately **centered**: 0.5 is exactly 1.0x, so the default preset
     /// honors a pack's `ampeg_release` rather than quietly rescaling it.
-    /// 0.0 = 0.25x (tight damper), 1.0 = 4.0x (slow damper).
+    /// 0.0 = 0.0625x (tight damper), 1.0 = 4.0x (slow damper).
     pub fn release_multiplier(normalized: f32) -> f32 {
-        0.25 * 16.0_f32.powf(normalized.clamp(0.0, 1.0))
+        let x = normalized.clamp(0.0, 1.0);
+        if x < 0.5 {
+            256.0_f32.powf(x - 0.5)
+        } else {
+            16.0_f32.powf(x - 0.5)
+        }
     }
 
     /// Designed pp-to-ff span in decibels, used in place of the pack's recorded
@@ -493,8 +498,9 @@ pub struct MultiSampleConfig {
     pub volume: f32,
     /// How strongly velocity scales amplitude on top of layer selection.
     pub velocity_track: f32,
-    /// Damper speed, as a multiplier on each zone's authored release.
-    /// **0.5 is neutral** — the pack plays exactly as authored.
+    /// Damper speed, as a multiplier on each zone's authored release. The
+    /// normalized range is 0.0625x–4.0x and **0.5 is neutral** — the pack plays
+    /// exactly as authored.
     pub release: f32,
     /// Stereo width of the recorded image. 0.5 is the recorded image.
     pub stereo_width: f32,
@@ -548,7 +554,7 @@ impl MultiSampleConfig {
         Self {
             volume: 0.85,
             velocity_track: 0.45,
-            release: 0.38, // ~0.7x
+            release: 0.38, // ~0.51x
             stereo_width: 0.65,
             dynamic_range: 0.9,
             velocity_span: 0.55, // ~16 dB
@@ -620,6 +626,8 @@ struct MsVoice {
     gain: f32,
     pan: f32,
     envelope: Envelope,
+    /// Release duration authored by the zone, before the live damper control.
+    authored_release_secs: f32,
     elapsed_secs: f64,
     dt: f64,
     trigger_order: u64,
@@ -651,6 +659,7 @@ impl Default for MsVoice {
             gain: 0.0,
             pan: 0.5,
             envelope: Envelope::new(),
+            authored_release_secs: ADSRConfig::default().release_time,
             elapsed_secs: 0.0,
             dt: 0.0,
             trigger_order: 0,
@@ -680,7 +689,6 @@ impl MsVoice {
         zone: &SampleZone,
         engine_rate: f32,
         gain: f32,
-        release_scale: f32,
         trigger_order: u64,
     ) {
         let frames = zone.buffer.len() as f64;
@@ -702,12 +710,11 @@ impl MsVoice {
         self.gain = gain;
         self.pan = zone.pan.clamp(0.0, 1.0);
 
-        // The zone's own release is the damper character of the recording;
-        // the instrument's `release` param scales it so a host can play the
-        // whole map tighter or looser without re-authoring the pack.
-        let mut config = zone.envelope;
-        config.release_time = (config.release_time * release_scale).clamp(0.001, MAX_RELEASE_SECS);
-        self.envelope.set_config(config);
+        // Keep the zone's damper character unscaled until note-off. A held
+        // voice can then observe the live release control instead of the value
+        // that happened to be active when the key was struck.
+        self.authored_release_secs = zone.envelope.release_time;
+        self.envelope.set_config(zone.envelope);
         self.envelope.trigger(0.0);
 
         self.elapsed_secs = 0.0;
@@ -737,10 +744,20 @@ impl MsVoice {
         self.loop_mode == LoopMode::OneShot
     }
 
-    fn release(&mut self) {
-        if self.ignores_note_off() {
+    fn release(&mut self, release_scale: f32) {
+        if self.ignores_note_off() || self.envelope.release_time_start.is_some() {
             return;
         }
+
+        let requested = (self.authored_release_secs * release_scale).clamp(0.001, MAX_RELEASE_SECS);
+        let release_secs = if self.loop_mode == LoopMode::LoopContinuous {
+            requested
+        } else {
+            let source_frames = (self.end - self.position).max(0.0);
+            let output_frames = source_frames / self.increment.max(f64::MIN_POSITIVE);
+            requested.min((output_frames * self.dt) as f32)
+        };
+        self.envelope.set_release_time(release_secs);
         self.envelope.release(self.elapsed_secs);
     }
 
@@ -1007,6 +1024,7 @@ impl MultiSampleInstrument {
     /// is only released when the pedal lifts. Voices from
     /// [`LoopMode::OneShot`] zones ignore this entirely and play to the end.
     pub fn note_off(&mut self, note: u8) {
+        let release_scale = ranges::release_multiplier(self.params.release.get());
         let mut damped_a_string = false;
         for voice in &mut self.voices {
             if !voice.active() || voice.note != note || !voice.held {
@@ -1021,7 +1039,7 @@ impl MultiSampleInstrument {
             if self.sustain_pedal {
                 voice.sustained = true;
             } else {
-                voice.release();
+                voice.release(release_scale);
                 damped_a_string = true;
             }
         }
@@ -1041,10 +1059,11 @@ impl MultiSampleInstrument {
         if down {
             return;
         }
+        let release_scale = ranges::release_multiplier(self.params.release.get());
         for voice in &mut self.voices {
             if voice.active() && voice.sustained {
                 voice.sustained = false;
-                voice.release();
+                voice.release(release_scale);
             }
         }
     }
@@ -1056,11 +1075,12 @@ impl MultiSampleInstrument {
     /// Release every sounding voice, ignoring the pedal. One-shot voices still
     /// play out; use [`Self::stop_all`] to cut everything.
     pub fn release_all(&mut self) {
+        let release_scale = ranges::release_multiplier(self.params.release.get());
         for voice in &mut self.voices {
             if voice.active() {
                 voice.held = false;
                 voice.sustained = false;
-                voice.release();
+                voice.release(release_scale);
             }
         }
     }
@@ -1150,20 +1170,11 @@ impl MultiSampleInstrument {
         };
 
         let gain = velocity_gain * db_to_gain(zone.volume_db) * db_to_gain(shaped_db);
-        let release_scale = ranges::release_multiplier(self.params.release.get());
 
         let voice_index = self.allocate_voice();
         self.trigger_counter = self.trigger_counter.wrapping_add(1);
         let order = self.trigger_counter;
-        self.voices[voice_index].start(
-            note,
-            zone_index,
-            zone,
-            self.sample_rate,
-            gain,
-            release_scale,
-            order,
-        );
+        self.voices[voice_index].start(note, zone_index, zone, self.sample_rate, gain, order);
         true
     }
 
@@ -2317,9 +2328,21 @@ mod tests {
 
     #[test]
     fn the_release_param_is_centered_on_neutral() {
-        assert!((ranges::release_multiplier(0.5) - 1.0).abs() < 1e-5);
-        assert!(ranges::release_multiplier(0.0) < 0.5, "0.0 tightens");
-        assert!(ranges::release_multiplier(1.0) > 2.0, "1.0 lengthens");
+        for (normalized, expected) in [
+            (-1.0, 0.0625),
+            (0.0, 0.0625),
+            (0.25, 0.25),
+            (0.5, 1.0),
+            (0.75, 2.0),
+            (1.0, 4.0),
+            (2.0, 4.0),
+        ] {
+            let actual = ranges::release_multiplier(normalized);
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "release {normalized} mapped to {actual}, expected {expected}"
+            );
+        }
 
         // And the presets land where their names claim.
         let tight = release_frames(MultiSampleConfig::bright());
@@ -2329,6 +2352,154 @@ mod tests {
             tight < neutral && neutral < slow,
             "bright {tight} < default {neutral} < soft {slow}"
         );
+    }
+
+    fn release_test_piano(loop_mode: LoopMode) -> MultiSampleInstrument {
+        let mut map = SampleMap::new();
+        let mut zone =
+            SampleZone::new(flat_buffer(3 * SR as usize, 1.0), 60).with_key_range(60, 72);
+        zone.loop_mode = loop_mode;
+        if loop_mode != LoopMode::NoLoop {
+            zone.loop_start = 1024;
+            zone.loop_end = 2048;
+        }
+        zone.envelope = ADSRConfig::new(0.001, 0.001, 1.0, 0.4);
+        map.push_zone(zone).unwrap();
+
+        let mut piano = MultiSampleInstrument::with_map(SR, map.build());
+        piano.snap_params();
+        piano
+    }
+
+    fn sounding_voice(piano: &MultiSampleInstrument) -> &MsVoice {
+        piano.voices.iter().find(|voice| voice.active()).unwrap()
+    }
+
+    #[test]
+    fn held_voices_read_the_release_control_at_each_release_path() {
+        let expected = 0.4 * 0.0625;
+
+        let mut note_off = release_test_piano(LoopMode::NoLoop);
+        assert!(note_off.note_on(60, 1.0));
+        note_off.params.release.set_target(0.0);
+        note_off.snap_params();
+        note_off.note_off(60);
+        assert!((sounding_voice(&note_off).envelope.release_time - expected).abs() < 1e-6);
+
+        let mut pedal = release_test_piano(LoopMode::NoLoop);
+        pedal.set_sustain_pedal(true);
+        assert!(pedal.note_on(60, 1.0));
+        pedal.note_off(60);
+        assert!(sounding_voice(&pedal).envelope.release_time_start.is_none());
+        pedal.params.release.set_target(0.0);
+        pedal.snap_params();
+        pedal.set_sustain_pedal(false);
+        assert!((sounding_voice(&pedal).envelope.release_time - expected).abs() < 1e-6);
+
+        let mut all = release_test_piano(LoopMode::NoLoop);
+        assert!(all.note_on(60, 1.0));
+        all.params.release.set_target(0.0);
+        all.snap_params();
+        all.release_all();
+        assert!((sounding_voice(&all).envelope.release_time - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn release_events_use_the_smoothed_value_not_the_pending_target() {
+        let mut piano = release_test_piano(LoopMode::NoLoop);
+        assert!(piano.note_on(60, 1.0));
+        piano.params.release.set_target(0.0);
+        assert_eq!(piano.params.release.target(), 0.0);
+        assert_eq!(piano.params.release.get(), 0.5);
+
+        piano.note_off(60);
+        assert!((sounding_voice(&piano).envelope.release_time - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_release_in_progress_is_never_retimed() {
+        let mut piano = release_test_piano(LoopMode::NoLoop);
+        assert!(piano.note_on(60, 1.0));
+        piano.params.release.set_target(0.0);
+        piano.snap_params();
+        piano.note_off(60);
+
+        let chosen_time = sounding_voice(&piano).envelope.release_time;
+        let started_at = sounding_voice(&piano).envelope.release_time_start;
+        piano.params.release.set_target(1.0);
+        piano.snap_params();
+        piano.release_all();
+
+        let voice = sounding_voice(&piano);
+        assert_eq!(voice.envelope.release_time, chosen_time);
+        assert_eq!(voice.envelope.release_time_start, started_at);
+    }
+
+    #[test]
+    fn release_is_clamped_to_pitch_adjusted_pcm_remaining() {
+        let mut piano = release_test_piano(LoopMode::NoLoop);
+        piano.params.release.set_target(1.0);
+        piano.snap_params();
+        assert!(piano.note_on(72, 1.0));
+        for _ in 0..(SR as usize / 10) {
+            piano.tick_frame();
+        }
+
+        let voice = sounding_voice(&piano);
+        let expected = ((voice.end - voice.position) / voice.increment * voice.dt) as f32;
+        assert!(expected < 1.6, "fixture must exercise the PCM clamp");
+        piano.note_off(72);
+        let clamped = sounding_voice(&piano).envelope.release_time;
+        assert!((clamped - expected).abs() <= 1.0 / SR);
+
+        let mut rendered = 0;
+        while piano.is_active() {
+            piano.tick_frame();
+            rendered += 1;
+        }
+        assert!(rendered <= (expected * SR).ceil() as usize + 1);
+    }
+
+    #[test]
+    fn sustain_loop_release_is_clamped_from_its_current_cursor() {
+        let mut map = SampleMap::new();
+        let mut zone = SampleZone::new(flat_buffer(SR as usize / 2, 1.0), 60);
+        zone.loop_mode = LoopMode::LoopSustain;
+        zone.loop_start = 1024;
+        zone.loop_end = 2048;
+        zone.envelope = ADSRConfig::new(0.001, 0.001, 1.0, 0.4);
+        map.push_zone(zone).unwrap();
+        let mut piano = MultiSampleInstrument::with_map(SR, map.build());
+        piano.params.release.set_target(1.0);
+        piano.snap_params();
+        assert!(piano.note_on(60, 1.0));
+        for _ in 0..4096 {
+            piano.tick_frame();
+        }
+
+        let voice = sounding_voice(&piano);
+        assert!(voice.position >= voice.loop_start && voice.position < voice.loop_end);
+        let expected = ((voice.end - voice.position) / voice.increment * voice.dt) as f32;
+        piano.note_off(60);
+        let voice = sounding_voice(&piano);
+        assert!((voice.envelope.release_time - expected).abs() <= 1.0 / SR);
+        assert!(voice.envelope.release_time_start.is_some());
+    }
+
+    #[test]
+    fn continuous_loop_release_uses_the_requested_duration() {
+        let mut piano = release_test_piano(LoopMode::LoopContinuous);
+        piano.params.release.set_target(1.0);
+        piano.snap_params();
+        assert!(piano.note_on(60, 1.0));
+        for _ in 0..4096 {
+            piano.tick_frame();
+        }
+        piano.note_off(60);
+
+        let voice = sounding_voice(&piano);
+        assert!((voice.envelope.release_time - 1.6).abs() < 1e-6);
+        assert!(voice.envelope.release_time_start.is_some());
     }
 
     #[test]

@@ -2169,7 +2169,8 @@ pub const PIANO_PRESET_BRIGHT: u32 = 2;
 pub const PIANO_PARAM_VOLUME: u32 = 0;
 /// Piano parameter: how strongly velocity scales amplitude within a layer.
 pub const PIANO_PARAM_VELOCITY_TRACK: u32 = 1;
-/// Piano parameter: damper speed, 0.5 being the pack's authored release.
+/// Piano parameter: damper speed. 0.0 is 0.0625x, 0.5 is the pack's authored
+/// release (1.0x), and 1.0 is 4.0x.
 pub const PIANO_PARAM_RELEASE: u32 = 2;
 /// Piano parameter: stereo width, 0.5 being the recorded image.
 pub const PIANO_PARAM_STEREO_WIDTH: u32 = 3;
@@ -8337,6 +8338,40 @@ pub unsafe extern "C" fn gooey_engine_piano_set_param(
         _ => return false,
     }
     true
+}
+
+/// Read one normalized piano parameter in the same form used by
+/// `gooey_engine_piano_set_param`.
+///
+/// Returns the most-recently-set target value rather than the in-flight
+/// smoothed sample, so set-to-get round trips are immediate. Returns NaN for a
+/// null engine, an unregistered piano, or an unknown parameter index. Call this
+/// from the thread that drives the engine, not concurrently with rendering.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_piano_get_param(
+    engine: *const GooeyEngine,
+    piano: u32,
+    param: u32,
+) -> f32 {
+    let Some(instrument) = engine
+        .as_ref()
+        .and_then(|engine| engine.pianos.get(piano as usize))
+        .and_then(Option::as_ref)
+    else {
+        return f32::NAN;
+    };
+    match param {
+        PIANO_PARAM_VOLUME => instrument.params.volume.target(),
+        PIANO_PARAM_VELOCITY_TRACK => instrument.params.velocity_track.target(),
+        PIANO_PARAM_RELEASE => instrument.params.release.target(),
+        PIANO_PARAM_STEREO_WIDTH => instrument.params.stereo_width.target(),
+        PIANO_PARAM_DYNAMIC_RANGE => instrument.params.dynamic_range.target(),
+        PIANO_PARAM_VELOCITY_SPAN => instrument.params.velocity_span.target(),
+        _ => f32::NAN,
+    }
 }
 
 /// Set the piano's exact designed soft-to-hard loudness span in decibels.
