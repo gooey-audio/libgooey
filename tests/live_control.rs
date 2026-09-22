@@ -95,6 +95,15 @@ fn complete_drum_snapshot_lands_atomically_and_empty_lanes_stay_empty() {
         let _ = render(engine, 0);
         assert_eq!(
             gooey_live_control_get_last_applied_generation(control),
+            0,
+            "a zero-frame call is not a render boundary"
+        );
+        assert!(gooey_engine_sequencer_get_instrument_step_enabled(
+            engine, 0, 0
+        ));
+        let _ = render(engine, 1);
+        assert_eq!(
+            gooey_live_control_get_last_applied_generation(control),
             generation
         );
         for lane in 0..4 {

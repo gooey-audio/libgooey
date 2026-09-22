@@ -1441,6 +1441,12 @@ impl GooeyEngine {
     }
 
     fn render(&mut self, buffer: &mut [f32]) {
+        // A zero-frame host call is not an audio render boundary. In
+        // particular, it must not acknowledge live-control commands that have
+        // never been observed by a real callback buffer.
+        if buffer.is_empty() {
+            return;
+        }
         self.apply_live_control_commands();
         self.retire_live_control_racks();
         // Clear pending MIDI events from previous render pass

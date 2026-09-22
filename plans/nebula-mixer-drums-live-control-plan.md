@@ -14,6 +14,7 @@ Nebula owns one Gooey engine and needs to change submix gains, calibrate individ
 - [x] (2026-09-22) Exported the versioned POD ABI through cbindgen and documented ownership, ordering, rejection, generation, reclamation, and shutdown contracts.
 - [x] (2026-09-22) Added focused graph, FFI, concurrency, allocation-counting, tail-preservation, and lifecycle coverage.
 - [x] (2026-09-22) Passed formatting, the full library/integration suite, the iOS-feature release build, generated-header inspection, and `git diff --check`; re-confirmed the unrelated all-features example failure and re-queried Nexus with no matching task.
+- [x] (2026-09-22) Added a generated-header C consumer regression that submits kick step zero at velocity 0.8, crosses a real render boundary, checks getters, starts transport, and verifies audible output; zero-frame calls no longer consume queued commands.
 
 ## Surprises & Discoveries
 
@@ -23,6 +24,8 @@ Nebula owns one Gooey engine and needs to change submix gains, calibrate individ
   Evidence: The clean baseline reports 14 compile errors, while `cargo test --all-features --lib --tests` passes 501 library tests with two ignored and every integration target.
 - Observation: cbindgen preserves private Rust array-dimension constant names inside C declarations even when equivalent public constants are exported.
   Evidence: The first generated header used undefined `DRUM_LANE_COUNT` / `DRUM_STEP_COUNT`; literal Rust dimensions regenerate correctly as `GooeyDrumStep lanes[4][16]` alongside the public `GOOEY_*` macros.
+- Observation: The original Rust drum snapshot test called render with zero frames, and the implementation treated that as a boundary even though no audio callback frame existed.
+  Evidence: The new C consumer passes through generated `gooey.h` with a one-frame boundary and audible transport render; the Rust test now proves a zero-frame call leaves the generation pending before the one-frame call installs it.
 
 ## Decision Log
 
@@ -41,6 +44,8 @@ Nebula owns one Gooey engine and needs to change submix gains, calibrate individ
 The additive API is implemented without a new runtime dependency or changes to Nebula. The generated header exposes API version 1, a 64-command queue, fixed 4-by-16 drum PODs, explicit effect descriptors, all seven live-control functions, and the documented constants. Render-boundary application is allocation/deallocation-free, and replaced racks are returned through a second SPSC ring for control-thread destruction.
 
 `cargo test --all-features --lib --tests` passes with 507 library tests, two private-pack tests ignored, and every integration test green. `cargo build --release --no-default-features --features ios`, `cargo fmt --all -- --check`, header inspection, and `git diff --check` pass. `cargo test --all-features` still stops on the same 14 pre-existing `examples/hihat.rs` API-drift errors observed at the starting commit; that example was intentionally left untouched. A second Nexus search returned no matching task, so there was nothing to claim or update.
+
+The follow-up C ABI regression is compiled as a real C11 executable against the generated header and libgooey dynamic library by `scripts/test-live-control.sh`. It confirms kick step zero is enabled at exactly velocity 0.8 after a nonempty render boundary and that starting transport produces nonzero finite audio.
 
 ## Context and Orientation
 

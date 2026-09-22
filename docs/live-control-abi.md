@@ -30,10 +30,11 @@ null plus a zero rack count means clear the rack.
 
 The producer-to-render queue contains exactly
 `GOOEY_LIVE_CONTROL_QUEUE_CAPACITY` (64) commands. Commands are FIFO, and one
-render call consumes the complete bounded queue before producing its first
-sample. Therefore every accepted command published before the boundary becomes
-active at that boundary. A full queue rejects the new call without displacing
-or modifying earlier state.
+render call containing at least one frame consumes the complete bounded queue
+before producing its first sample. A zero-frame call is not a render boundary
+and does not apply or acknowledge commands. Therefore every accepted command
+published before a real boundary becomes active at that boundary. A full queue
+rejects the new call without displacing or modifying earlier state.
 
 Every accepted submission returns a unique monotonically increasing nonzero
 `uint64_t`. Zero always means rejection. Gaps are possible after an internal
