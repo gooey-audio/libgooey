@@ -24,10 +24,15 @@ use crate::instruments::{
     PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer, SamplerBuffer,
     SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config,
 };
+use crate::live_control::{
+    DrumCell, EngineLifecycle, LiveCommand, LiveControlShared, DRUM_LANE_COUNT, DRUM_STEP_COUNT,
+    LIVE_QUEUE_CAPACITY,
+};
 use crate::metronome::{Metronome, MetronomeDivision, DEFAULT_METRONOME_LEVEL};
+use crate::mixer::graph::SOURCE_CAPACITY;
 use crate::mixer::{
-    ChannelEffect, LaunchQuantization, Mixer, MixerControl, MixerGraph, PitchMode, RetrimTiming,
-    StereoSampleBuffer,
+    ChannelEffect, EffectChain, LaunchQuantization, Mixer, MixerControl, MixerGraph, PitchMode,
+    RetrimTiming, StereoSampleBuffer,
 };
 use crate::music::{
     apply_voicing, available_voicings, Chord, ChordSet, Key, NoteName, ScaleType, VoicingType,
@@ -40,7 +45,8 @@ use crate::performance::{
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 // =============================================================================
 // LFO constants
@@ -97,6 +103,74 @@ pub struct GooeyMidiEvent {
     pub instrument_index: u32,
     pub velocity: f32,
     pub sample_offset: u32,
+}
+
+// =============================================================================
+// Live-control ABI data
+// =============================================================================
+
+/// Version of the additive live-control C ABI.
+pub const GOOEY_LIVE_CONTROL_API_VERSION: u32 = 1;
+/// Maximum accepted commands waiting for one render-buffer boundary.
+pub const GOOEY_LIVE_CONTROL_QUEUE_CAPACITY: u32 = 64;
+/// Fixed number of drum lanes in a submitted snapshot.
+pub const GOOEY_DRUM_LANE_COUNT: u32 = 4;
+/// Fixed number of steps in each drum lane.
+pub const GOOEY_DRUM_STEP_COUNT: u32 = 16;
+/// Maximum effects in one submitted track rack.
+pub const GOOEY_TRACK_RACK_MAX_EFFECTS: u32 = 8;
+
+pub const GOOEY_DRUM_LANE_KICK: u32 = 0;
+pub const GOOEY_DRUM_LANE_SNARE: u32 = 1;
+pub const GOOEY_DRUM_LANE_HIHAT: u32 = 2;
+pub const GOOEY_DRUM_LANE_TOM: u32 = 3;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GooeyDrumStep {
+    pub enabled: u32,
+    pub velocity: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GooeyDrumPattern {
+    // Keep these dimensions literal so cbindgen emits a standalone C POD;
+    // matching public GOOEY_* constants are documented alongside it.
+    pub lanes: [[GooeyDrumStep; 16]; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GooeyEffectParamDescriptor {
+    pub param: u32,
+    pub value: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GooeyEffectDescriptor {
+    pub effect: u32,
+    pub params: *const GooeyEffectParamDescriptor,
+    pub param_count: u32,
+}
+
+/// Opaque, single-producer endpoint for controls that are safe while rendering.
+pub struct GooeyLiveControl {
+    shared: Arc<LiveControlShared>,
+    track_count: usize,
+    active_sources: Vec<bool>,
+    projected_rack_generations: Vec<u64>,
+    projected_rack_layouts: Vec<Vec<u32>>,
+    sample_rate: f32,
+    bpm: f32,
+}
+
+impl Drop for GooeyLiveControl {
+    fn drop(&mut self) {
+        self.shared.reap_retired();
+        self.shared.lifecycle.detach_control();
+    }
 }
 
 // =============================================================================
@@ -686,6 +760,9 @@ struct DrumKit {
 }
 
 pub struct GooeyEngine {
+    /// Installed once, before rendering, by `gooey_engine_live_control_new`.
+    live_control: Option<Arc<LiveControlShared>>,
+
     // Drum voices (kick, snare, hihat, tom) grouped as one submixable kit.
     kit: DrumKit,
 
@@ -1024,6 +1101,7 @@ impl GooeyEngine {
         let chord_control = ChordControl::new();
 
         Self {
+            live_control: None,
             kit,
             bass,
             delay,
@@ -1220,6 +1298,57 @@ impl GooeyEngine {
         control.reclaim_from_audio(&mut self.sampler_retired);
     }
 
+    /// Apply every command that was fully published before this render
+    /// boundary. Queue capacity is the hard work bound, so an accepted drum
+    /// snapshot always lands atomically at the next boundary.
+    fn apply_live_control_commands(&mut self) {
+        let Some(shared) = self.live_control.as_ref().cloned() else {
+            return;
+        };
+        for _ in 0..LIVE_QUEUE_CAPACITY {
+            let Some(command) = shared.pop_command() else {
+                break;
+            };
+            let generation = command.generation();
+            match command {
+                LiveCommand::SetTrackGain { track, gain, .. } => {
+                    self.graph.set_track_gain(track, gain);
+                }
+                LiveCommand::SetSourceTrim { source, trim, .. } => {
+                    self.graph.set_source_trim(source, trim);
+                }
+                LiveCommand::ReplaceDrumPattern { lanes, .. } => {
+                    for (voice, lane) in self.kit.voices.iter_mut().zip(lanes) {
+                        let pattern = lane.map(|step| (step.enabled, step.velocity));
+                        let replaced = voice.sequencer.replace_live_drum_pattern(&pattern);
+                        debug_assert!(replaced);
+                    }
+                }
+                LiveCommand::ReplaceTrackRack { track, rack, .. } => {
+                    // Layout mutation after control attachment is forbidden, so
+                    // validation on the producer guarantees this succeeds.
+                    assert!(self.graph.replace_rack(track, rack));
+                }
+                LiveCommand::SetTrackEffectParam {
+                    track,
+                    slot,
+                    param,
+                    value,
+                    ..
+                } => self.graph.effect_set_param(track, slot, param, value),
+            }
+            shared.mark_applied(generation);
+        }
+    }
+
+    fn retire_live_control_racks(&mut self) {
+        let Some(shared) = self.live_control.as_ref().cloned() else {
+            return;
+        };
+        self.graph
+            .retire_completed_racks(|track, rack| shared.retire_rack(track, rack));
+    }
+
     /// Resolve any `pending_arm_host_time` against the current
     /// `host_clock_anchor` for a buffer of `frames` samples. Called once at
     /// the top of `render`; the result drives whether (and at which sample
@@ -1308,6 +1437,14 @@ impl GooeyEngine {
     }
 
     fn render(&mut self, buffer: &mut [f32]) {
+        // A zero-frame host call is not an audio render boundary. In
+        // particular, it must not acknowledge live-control commands that have
+        // never been observed by a real callback buffer.
+        if buffer.is_empty() {
+            return;
+        }
+        self.apply_live_control_commands();
+        self.retire_live_control_racks();
         // Clear pending MIDI events from previous render pass
         self.pending_midi_events.clear();
         // Commands are applied at buffer boundaries, including buffers that
@@ -1724,6 +1861,7 @@ impl GooeyEngine {
         // sample. Silent buffers publish from `apply_control_commands` above.
         self.mixer.publish_control_snapshot();
         self.publish_piano_meters();
+        self.retire_live_control_racks();
     }
 
     /// Hand piano metering to the control side once per buffer.
@@ -2410,6 +2548,47 @@ pub const BLEND_CORNER_TOP_RIGHT: u32 = 3;
 // Engine lifecycle
 // =============================================================================
 
+/// Allocation prefix kept separate from render-owned mutable DSP state. The C
+/// pointer addresses `engine`, but render/free recover this prefix so shutdown
+/// never has to borrow the live DSP graph merely to inspect lifecycle state.
+#[repr(C)]
+struct GooeyEngineAllocation {
+    lifecycle: Arc<EngineLifecycle>,
+    engine: GooeyEngine,
+}
+
+/// Counts callbacks between FFI entry and acquisition of their per-engine
+/// render guard. It is static, so a callback registers before dereferencing
+/// engine-owned storage; free waits for this short entry window before dropping
+/// the allocation. Hosts must still stop initiating new callbacks before free.
+static ENGINE_RENDER_ENTRANTS: AtomicUsize = AtomicUsize::new(0);
+
+struct EngineRenderEntryGuard;
+
+impl EngineRenderEntryGuard {
+    fn enter() -> Self {
+        ENGINE_RENDER_ENTRANTS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for EngineRenderEntryGuard {
+    fn drop(&mut self) {
+        ENGINE_RENDER_ENTRANTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+unsafe fn engine_allocation(engine: *mut GooeyEngine) -> *mut GooeyEngineAllocation {
+    engine
+        .cast::<u8>()
+        .sub(std::mem::offset_of!(GooeyEngineAllocation, engine))
+        .cast()
+}
+
+unsafe fn clone_engine_lifecycle(engine: *mut GooeyEngine) -> Arc<EngineLifecycle> {
+    Arc::clone(&(*engine_allocation(engine)).lifecycle)
+}
+
 /// Create a new gooey engine
 ///
 /// # Arguments
@@ -2422,8 +2601,14 @@ pub const BLEND_CORNER_TOP_RIGHT: u32 = 3;
 /// The returned pointer must be freed with `gooey_engine_free` to avoid memory leaks.
 #[no_mangle]
 pub extern "C" fn gooey_engine_new(sample_rate: f32) -> *mut GooeyEngine {
-    let engine = Box::new(GooeyEngine::new(sample_rate));
-    Box::into_raw(engine)
+    let allocation = Box::new(GooeyEngineAllocation {
+        lifecycle: EngineLifecycle::new(),
+        engine: GooeyEngine::new(sample_rate),
+    });
+    let allocation = Box::into_raw(allocation);
+    // SAFETY: the Box is now pinned at a stable address and is recovered only
+    // by `gooey_engine_free` using the inverse offset calculation above.
+    unsafe { std::ptr::addr_of_mut!((*allocation).engine) }
 }
 
 /// Free a gooey engine
@@ -2433,9 +2618,16 @@ pub extern "C" fn gooey_engine_new(sample_rate: f32) -> *mut GooeyEngine {
 /// After calling this function, the pointer is invalid and must not be used.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_free(engine: *mut GooeyEngine) {
-    if !engine.is_null() {
-        drop(Box::from_raw(engine));
+    if engine.is_null() {
+        return;
     }
+    let allocation = engine_allocation(engine);
+    let lifecycle = Arc::clone(&(*allocation).lifecycle);
+    lifecycle.begin_shutdown();
+    while ENGINE_RENDER_ENTRANTS.load(Ordering::Acquire) != 0 || lifecycle.has_users() {
+        std::thread::yield_now();
+    }
+    drop(Box::from_raw(allocation));
 }
 
 // =============================================================================
@@ -2473,8 +2665,18 @@ pub unsafe extern "C" fn gooey_engine_render(
         return;
     }
 
-    let engine_ref = &mut *engine;
+    // Register in static storage before the first engine-pointer dereference.
+    // Once `begin_render` succeeds, the per-engine active count protects the
+    // allocation and this short-lived global entry guard can be released.
+    let entry_guard = EngineRenderEntryGuard::enter();
     let buffer_slice = slice::from_raw_parts_mut(buffer, frames as usize * 2);
+    let lifecycle = clone_engine_lifecycle(engine);
+    let Some(_render_guard) = lifecycle.begin_render() else {
+        buffer_slice.fill(0.0);
+        return;
+    };
+    drop(entry_guard);
+    let engine_ref = &mut *engine;
 
     // If engine is already in error state, output silence
     if engine_ref.error_occurred.load(Ordering::Relaxed) {
@@ -8793,7 +8995,338 @@ pub unsafe extern "C" fn gooey_engine_piano_load_sfz(
         .queue_set_map(piano as usize, pack.map.build())
 }
 
+fn live_effect_param_is_valid(effect: u32, param: u32, value: f32) -> bool {
+    if !value.is_finite() {
+        return false;
+    }
+    match (effect, param) {
+        (EFFECT_LOWPASS_FILTER, FILTER_PARAM_CUTOFF) => (20.0..=20_000.0).contains(&value),
+        (EFFECT_LOWPASS_FILTER, FILTER_PARAM_RESONANCE) => (0.0..=0.95).contains(&value),
+        (EFFECT_DELAY, DELAY_PARAM_TIMING) => (DELAY_TIMING_WHOLE..=DELAY_TIMING_SIXTEENTH_TRIPLET)
+            .any(|timing| value == timing as f32),
+        (EFFECT_DELAY, DELAY_PARAM_FEEDBACK) => (0.0..=0.95).contains(&value),
+        (EFFECT_DELAY, DELAY_PARAM_MIX) => (0.0..=1.0).contains(&value),
+        (EFFECT_REVERB, REVERB_PARAM_DECAY | REVERB_PARAM_MIX | REVERB_PARAM_DAMPING) => {
+            (0.0..=1.0).contains(&value)
+        }
+        _ => false,
+    }
+}
+
+unsafe fn build_live_rack(
+    effects: *const GooeyEffectDescriptor,
+    effect_count: u32,
+    sample_rate: f32,
+    bpm: f32,
+) -> Option<(EffectChain, Vec<u32>)> {
+    if effect_count > GOOEY_TRACK_RACK_MAX_EFFECTS || (effect_count != 0 && effects.is_null()) {
+        return None;
+    }
+    let descriptors: &[GooeyEffectDescriptor] = if effect_count == 0 {
+        &[]
+    } else {
+        slice::from_raw_parts(effects, effect_count as usize)
+    };
+    let mut rack = EffectChain::new();
+    let mut layout = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        if !matches!(
+            descriptor.effect,
+            EFFECT_LOWPASS_FILTER | EFFECT_DELAY | EFFECT_REVERB
+        ) || descriptor.param_count > 3
+            || (descriptor.param_count != 0 && descriptor.params.is_null())
+        {
+            return None;
+        }
+        let params: &[GooeyEffectParamDescriptor] = if descriptor.param_count == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(descriptor.params, descriptor.param_count as usize)
+        };
+        let mut seen = [false; 5];
+        for parameter in params {
+            let Some(flag) = seen.get_mut(parameter.param as usize) else {
+                return None;
+            };
+            if *flag
+                || !live_effect_param_is_valid(descriptor.effect, parameter.param, parameter.value)
+            {
+                return None;
+            }
+            *flag = true;
+        }
+        let slot = rack.add(descriptor.effect, sample_rate, bpm)?;
+        for parameter in params {
+            rack.set_param(slot, parameter.param, parameter.value);
+        }
+        layout.push(descriptor.effect);
+    }
+    Some((rack, layout))
+}
+
+/// Attach the engine's one single-producer live-control endpoint.
+///
+/// Call only after stopped-render graph creation/routing is complete and before
+/// the first concurrent render. Returns null if a handle was already created or
+/// engine shutdown has begun. The returned handle must be released with
+/// `gooey_live_control_free`; engine destruction waits for that detach.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_live_control_new(
+    engine: *mut GooeyEngine,
+) -> *mut GooeyLiveControl {
+    if engine.is_null() {
+        return std::ptr::null_mut();
+    }
+    let lifecycle = clone_engine_lifecycle(engine);
+    let Some(engine) = engine.as_mut() else {
+        return std::ptr::null_mut();
+    };
+    if engine.live_control.is_some() || !lifecycle.try_attach_control() {
+        return std::ptr::null_mut();
+    }
+    debug_assert_eq!(
+        LIVE_QUEUE_CAPACITY,
+        GOOEY_LIVE_CONTROL_QUEUE_CAPACITY as usize
+    );
+    let shared = LiveControlShared::new(lifecycle, engine.graph.track_count());
+    let projected_rack_layouts = (0..engine.graph.track_count())
+        .map(|track| {
+            (0..engine.graph.effect_count(track))
+                .filter_map(|slot| engine.graph.effect_type_at(track, slot))
+                .collect()
+        })
+        .collect::<Vec<_>>();
+    let control = GooeyLiveControl {
+        shared: Arc::clone(&shared),
+        track_count: engine.graph.track_count(),
+        active_sources: (0..SOURCE_CAPACITY)
+            .map(|source| engine.graph.source_is_active_for_control(source as u32))
+            .collect(),
+        projected_rack_generations: vec![0; engine.graph.track_count()],
+        projected_rack_layouts,
+        sample_rate: engine.sample_rate,
+        bpm: engine.bpm,
+    };
+    engine.live_control = Some(shared);
+    Box::into_raw(Box::new(control))
+}
+
+/// Release a live-control endpoint. Null is accepted.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_free(control: *mut GooeyLiveControl) {
+    if !control.is_null() {
+        drop(Box::from_raw(control));
+    }
+}
+
+fn live_generation(control: &GooeyLiveControl) -> Option<u64> {
+    (!control.shared.queue_is_full())
+        .then(|| control.shared.next_generation())
+        .flatten()
+}
+
+/// Queue a finite track fader target in the inclusive range 0...2.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_set_track_gain(
+    control: *mut GooeyLiveControl,
+    track: u32,
+    gain: f32,
+) -> u64 {
+    let Some(control) = control.as_mut() else {
+        return 0;
+    };
+    control.shared.reap_retired();
+    if track as usize >= control.track_count || !gain.is_finite() || !(0.0..=2.0).contains(&gain) {
+        return 0;
+    }
+    let Some(generation) = live_generation(control) else {
+        return 0;
+    };
+    control
+        .shared
+        .submit(LiveCommand::SetTrackGain {
+            generation,
+            track: track as usize,
+            gain,
+        })
+        .map_or(0, |_| generation)
+}
+
+/// Queue a finite pre-route source trim target in the inclusive range 0...2.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_set_source_trim(
+    control: *mut GooeyLiveControl,
+    source: u32,
+    trim: f32,
+) -> u64 {
+    let Some(control) = control.as_mut() else {
+        return 0;
+    };
+    control.shared.reap_retired();
+    if !control
+        .active_sources
+        .get(source as usize)
+        .copied()
+        .unwrap_or(false)
+        || !trim.is_finite()
+        || !(0.0..=2.0).contains(&trim)
+    {
+        return 0;
+    }
+    let Some(generation) = live_generation(control) else {
+        return 0;
+    };
+    control
+        .shared
+        .submit(LiveCommand::SetSourceTrim {
+            generation,
+            source,
+            trim,
+        })
+        .map_or(0, |_| generation)
+}
+
+/// Copy and queue one complete four-lane by sixteen-step drum snapshot.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_submit_drum_pattern(
+    control: *mut GooeyLiveControl,
+    pattern: *const GooeyDrumPattern,
+) -> u64 {
+    let (Some(control), Some(pattern)) = (control.as_mut(), pattern.as_ref()) else {
+        return 0;
+    };
+    control.shared.reap_retired();
+    let mut lanes = [[DrumCell::default(); DRUM_STEP_COUNT]; DRUM_LANE_COUNT];
+    for (output_lane, input_lane) in lanes.iter_mut().zip(pattern.lanes) {
+        for (output, input) in output_lane.iter_mut().zip(input_lane) {
+            if input.enabled > 1
+                || !input.velocity.is_finite()
+                || !(0.0..=1.0).contains(&input.velocity)
+            {
+                return 0;
+            }
+            *output = DrumCell {
+                enabled: input.enabled == 1,
+                velocity: input.velocity,
+            };
+        }
+    }
+    let Some(generation) = live_generation(control) else {
+        return 0;
+    };
+    control
+        .shared
+        .submit(LiveCommand::ReplaceDrumPattern { generation, lanes })
+        .map_or(0, |_| generation)
+}
+
+/// Prepare and queue an ordered replacement rack. Null plus zero clears it.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_replace_track_rack(
+    control: *mut GooeyLiveControl,
+    track: u32,
+    effects: *const GooeyEffectDescriptor,
+    effect_count: u32,
+) -> u64 {
+    let Some(control) = control.as_mut() else {
+        return 0;
+    };
+    control.shared.reap_retired();
+    let track = track as usize;
+    if track >= control.track_count || control.shared.queue_is_full() {
+        return 0;
+    }
+    if !control.shared.begin_rack_transition(track) {
+        return 0;
+    }
+    let Some((rack, layout)) =
+        build_live_rack(effects, effect_count, control.sample_rate, control.bpm)
+    else {
+        control.shared.cancel_rack_transition(track);
+        return 0;
+    };
+    let Some(generation) = control.shared.next_generation() else {
+        control.shared.cancel_rack_transition(track);
+        return 0;
+    };
+    match control.shared.submit(LiveCommand::ReplaceTrackRack {
+        generation,
+        track,
+        rack,
+    }) {
+        Ok(()) => {
+            control.projected_rack_generations[track] = generation;
+            control.projected_rack_layouts[track] = layout;
+            generation
+        }
+        Err(_) => {
+            control.shared.cancel_rack_transition(track);
+            0
+        }
+    }
+}
+
+/// Queue one scalar edit for the exact rack generation and slot.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_set_track_effect_param(
+    control: *mut GooeyLiveControl,
+    track: u32,
+    slot: u32,
+    rack_generation: u64,
+    param: u32,
+    value: f32,
+) -> u64 {
+    let Some(control) = control.as_mut() else {
+        return 0;
+    };
+    control.shared.reap_retired();
+    let track = track as usize;
+    let slot = slot as usize;
+    if rack_generation == 0
+        || control.projected_rack_generations.get(track).copied() != Some(rack_generation)
+    {
+        return 0;
+    }
+    let Some(effect) = control
+        .projected_rack_layouts
+        .get(track)
+        .and_then(|rack| rack.get(slot))
+        .copied()
+    else {
+        return 0;
+    };
+    if !live_effect_param_is_valid(effect, param, value) {
+        return 0;
+    }
+    let Some(generation) = live_generation(control) else {
+        return 0;
+    };
+    control
+        .shared
+        .submit(LiveCommand::SetTrackEffectParam {
+            generation,
+            track,
+            slot,
+            param,
+            value,
+        })
+        .map_or(0, |_| generation)
+}
+
+/// Return the generation of the last complete command installed by render.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_get_last_applied_generation(
+    control: *const GooeyLiveControl,
+) -> u64 {
+    control
+        .as_ref()
+        .map_or(0, |control| control.shared.last_applied())
+}
+
 /// Restore the default graph layout: Drums, Bass, Synth, Loops.
+///
+/// This stopped-render configuration call must not run concurrently with audio
+/// rendering or after a live-control handle has been attached.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
@@ -10665,6 +11198,26 @@ pub unsafe extern "C" fn gooey_engine_loop_render_to_wav(
 #[cfg(test)]
 mod output_stage_tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn engine_free_waits_for_a_callback_in_the_entry_window() {
+        let engine = gooey_engine_new(44_100.0);
+        let entry_guard = EngineRenderEntryGuard::enter();
+        let engine_address = engine as usize;
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || unsafe {
+            gooey_engine_free(engine_address as *mut GooeyEngine);
+            done_tx.send(()).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(done_rx.try_recv().is_err());
+        drop(entry_guard);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+    }
 
     #[test]
     fn limiter_bypass_and_threshold_changes_ramp_without_a_hard_step() {

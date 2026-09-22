@@ -13,6 +13,7 @@ pub mod ffi;
 pub mod frame;
 pub mod gen;
 pub mod instruments;
+pub(crate) mod live_control;
 pub mod mixer;
 pub mod music;
 pub mod performance;
