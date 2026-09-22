@@ -19,7 +19,11 @@ callback, release the handle, and then call `gooey_engine_free`. Engine free set
 a shutdown flag, rejects new submissions/renders, and waits for an in-flight
 render and the attached control handle to detach. The host must prevent new raw
 engine-pointer calls once free begins; no C API can make a call that starts
-after the pointer was destroyed safe.
+after the pointer was destroyed safe. A static entry counter is acquired before
+render first dereferences the engine pointer, then handed off to a per-engine
+active-render count. Lifecycle state lives in an allocation prefix separate
+from mutable DSP state, so free cannot release either region during that entry
+window or an active callback.
 
 Caller-owned pattern and descriptor memory only needs to remain valid for the
 duration of its submission call. The function copies every POD and constructs

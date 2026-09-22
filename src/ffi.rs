@@ -45,7 +45,7 @@ use crate::performance::{
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // =============================================================================
@@ -760,9 +760,6 @@ struct DrumKit {
 }
 
 pub struct GooeyEngine {
-    /// Raw C ownership remains with the engine pointer; this shared state only
-    /// coordinates render entry, live-control attachment, and shutdown.
-    lifecycle: Arc<EngineLifecycle>,
     /// Installed once, before rendering, by `gooey_engine_live_control_new`.
     live_control: Option<Arc<LiveControlShared>>,
 
@@ -1024,7 +1021,6 @@ impl GooeyEngine {
 
     fn new(sample_rate: f32) -> Self {
         let bpm = 120.0;
-        let lifecycle = EngineLifecycle::new();
 
         // Drum kit: four voices (kick, snare, hihat, tom), each with its own
         // 16-step sequencer, blender, and mixer strip.
@@ -1105,7 +1101,6 @@ impl GooeyEngine {
         let chord_control = ChordControl::new();
 
         Self {
-            lifecycle,
             live_control: None,
             kit,
             bass,
@@ -2553,6 +2548,47 @@ pub const BLEND_CORNER_TOP_RIGHT: u32 = 3;
 // Engine lifecycle
 // =============================================================================
 
+/// Allocation prefix kept separate from render-owned mutable DSP state. The C
+/// pointer addresses `engine`, but render/free recover this prefix so shutdown
+/// never has to borrow the live DSP graph merely to inspect lifecycle state.
+#[repr(C)]
+struct GooeyEngineAllocation {
+    lifecycle: Arc<EngineLifecycle>,
+    engine: GooeyEngine,
+}
+
+/// Counts callbacks between FFI entry and acquisition of their per-engine
+/// render guard. It is static, so a callback registers before dereferencing
+/// engine-owned storage; free waits for this short entry window before dropping
+/// the allocation. Hosts must still stop initiating new callbacks before free.
+static ENGINE_RENDER_ENTRANTS: AtomicUsize = AtomicUsize::new(0);
+
+struct EngineRenderEntryGuard;
+
+impl EngineRenderEntryGuard {
+    fn enter() -> Self {
+        ENGINE_RENDER_ENTRANTS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for EngineRenderEntryGuard {
+    fn drop(&mut self) {
+        ENGINE_RENDER_ENTRANTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+unsafe fn engine_allocation(engine: *mut GooeyEngine) -> *mut GooeyEngineAllocation {
+    engine
+        .cast::<u8>()
+        .sub(std::mem::offset_of!(GooeyEngineAllocation, engine))
+        .cast()
+}
+
+unsafe fn clone_engine_lifecycle(engine: *mut GooeyEngine) -> Arc<EngineLifecycle> {
+    Arc::clone(&(*engine_allocation(engine)).lifecycle)
+}
+
 /// Create a new gooey engine
 ///
 /// # Arguments
@@ -2565,8 +2601,14 @@ pub const BLEND_CORNER_TOP_RIGHT: u32 = 3;
 /// The returned pointer must be freed with `gooey_engine_free` to avoid memory leaks.
 #[no_mangle]
 pub extern "C" fn gooey_engine_new(sample_rate: f32) -> *mut GooeyEngine {
-    let engine = Box::new(GooeyEngine::new(sample_rate));
-    Box::into_raw(engine)
+    let allocation = Box::new(GooeyEngineAllocation {
+        lifecycle: EngineLifecycle::new(),
+        engine: GooeyEngine::new(sample_rate),
+    });
+    let allocation = Box::into_raw(allocation);
+    // SAFETY: the Box is now pinned at a stable address and is recovered only
+    // by `gooey_engine_free` using the inverse offset calculation above.
+    unsafe { std::ptr::addr_of_mut!((*allocation).engine) }
 }
 
 /// Free a gooey engine
@@ -2576,15 +2618,16 @@ pub extern "C" fn gooey_engine_new(sample_rate: f32) -> *mut GooeyEngine {
 /// After calling this function, the pointer is invalid and must not be used.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_free(engine: *mut GooeyEngine) {
-    let Some(engine_ref) = engine.as_ref() else {
+    if engine.is_null() {
         return;
-    };
-    let lifecycle = Arc::clone(&engine_ref.lifecycle);
+    }
+    let allocation = engine_allocation(engine);
+    let lifecycle = Arc::clone(&(*allocation).lifecycle);
     lifecycle.begin_shutdown();
-    while lifecycle.has_users() {
+    while ENGINE_RENDER_ENTRANTS.load(Ordering::Acquire) != 0 || lifecycle.has_users() {
         std::thread::yield_now();
     }
-    drop(Box::from_raw(engine));
+    drop(Box::from_raw(allocation));
 }
 
 // =============================================================================
@@ -2622,12 +2665,17 @@ pub unsafe extern "C" fn gooey_engine_render(
         return;
     }
 
+    // Register in static storage before the first engine-pointer dereference.
+    // Once `begin_render` succeeds, the per-engine active count protects the
+    // allocation and this short-lived global entry guard can be released.
+    let entry_guard = EngineRenderEntryGuard::enter();
     let buffer_slice = slice::from_raw_parts_mut(buffer, frames as usize * 2);
-    let lifecycle = Arc::clone(&(*engine).lifecycle);
+    let lifecycle = clone_engine_lifecycle(engine);
     let Some(_render_guard) = lifecycle.begin_render() else {
         buffer_slice.fill(0.0);
         return;
     };
+    drop(entry_guard);
     let engine_ref = &mut *engine;
 
     // If engine is already in error state, output silence
@@ -9026,17 +9074,21 @@ unsafe fn build_live_rack(
 pub unsafe extern "C" fn gooey_engine_live_control_new(
     engine: *mut GooeyEngine,
 ) -> *mut GooeyLiveControl {
+    if engine.is_null() {
+        return std::ptr::null_mut();
+    }
+    let lifecycle = clone_engine_lifecycle(engine);
     let Some(engine) = engine.as_mut() else {
         return std::ptr::null_mut();
     };
-    if engine.live_control.is_some() || !engine.lifecycle.try_attach_control() {
+    if engine.live_control.is_some() || !lifecycle.try_attach_control() {
         return std::ptr::null_mut();
     }
     debug_assert_eq!(
         LIVE_QUEUE_CAPACITY,
         GOOEY_LIVE_CONTROL_QUEUE_CAPACITY as usize
     );
-    let shared = LiveControlShared::new(Arc::clone(&engine.lifecycle), engine.graph.track_count());
+    let shared = LiveControlShared::new(lifecycle, engine.graph.track_count());
     let projected_rack_layouts = (0..engine.graph.track_count())
         .map(|track| {
             (0..engine.graph.effect_count(track))
@@ -11146,6 +11198,26 @@ pub unsafe extern "C" fn gooey_engine_loop_render_to_wav(
 #[cfg(test)]
 mod output_stage_tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn engine_free_waits_for_a_callback_in_the_entry_window() {
+        let engine = gooey_engine_new(44_100.0);
+        let entry_guard = EngineRenderEntryGuard::enter();
+        let engine_address = engine as usize;
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || unsafe {
+            gooey_engine_free(engine_address as *mut GooeyEngine);
+            done_tx.send(()).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(done_rx.try_recv().is_err());
+        drop(entry_guard);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+    }
 
     #[test]
     fn limiter_bypass_and_threshold_changes_ramp_without_a_hard_step() {

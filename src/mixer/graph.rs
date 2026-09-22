@@ -446,6 +446,9 @@ impl MixerGraph {
     /// changes from sample zero instead of replaying a real-time fade.
     pub fn snap_strip_params(&mut self) {
         self.update_mute_solo_targets();
+        for trim in &mut self.source_trims {
+            trim.snap();
+        }
         for t in &mut self.tracks {
             t.gain.snap();
             t.pan.snap();
@@ -644,6 +647,19 @@ mod tests {
         }
         assert!((calibrated.l - 0.241_062).abs() < 1e-5);
         assert!((calibrated.r - 0.241_062).abs() < 1e-5);
+    }
+
+    #[test]
+    fn offline_strip_snap_includes_source_trim() {
+        let mut graph = MixerGraph::new(SR, BPM);
+        let track = graph.add_track(CString::new("Drums").unwrap());
+        assert!(graph.route(SOURCE_DRUMKIT, track));
+        graph.set_source_trim(SOURCE_DRUMKIT, 0.0);
+        graph.snap_strip_params();
+
+        graph.clear_scratch();
+        graph.scatter(SOURCE_DRUMKIT, StereoFrame::mono(1.0));
+        assert_eq!(graph.mix_down(), StereoFrame::default());
     }
 
     #[test]

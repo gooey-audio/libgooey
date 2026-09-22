@@ -16,6 +16,7 @@ Nebula owns one Gooey engine and needs to change submix gains, calibrate individ
 - [x] (2026-09-22) Passed formatting, the full library/integration suite, the iOS-feature release build, generated-header inspection, and `git diff --check`; re-confirmed the unrelated all-features example failure and re-queried Nexus with no matching task.
 - [x] (2026-09-22) Added a generated-header C consumer regression that submits kick step zero at velocity 0.8, crosses a real render boundary, checks getters, starts transport, and verifies audible output; zero-frame calls no longer consume queued commands.
 - [x] (2026-09-22) Fixed release builds dropping drum installation from a `debug_assert!`, and moved the C round-trip to optimized native and iOS-simulator XCFramework artifacts.
+- [x] (2026-09-22) Addressed review feedback by protecting pre-dereference render entry during destruction and snapping source trims for deterministic offline bounce.
 
 ## Surprises & Discoveries
 
@@ -29,6 +30,8 @@ Nebula owns one Gooey engine and needs to change submix gains, calibrate individ
   Evidence: The new C consumer passes through generated `gooey.h` with a one-frame boundary and audible transport render; the Rust test now proves a zero-frame call leaves the generation pending before the one-frame call installs it.
 - Observation: `debug_assert!` removes its entire condition in optimized builds, including side effects.
   Evidence: `ReplaceDrumPattern` acknowledged its command but skipped `replace_live_drum_pattern` in release/iOS artifacts; storing the result before asserting makes installation unconditional.
+- Observation: An active-render counter stored inside the engine cannot protect the pointer access needed to reach that counter.
+  Evidence: Lifecycle state now occupies a disjoint allocation prefix and a static entry counter covers the interval before the per-engine render guard is acquired; a regression holds that interval open and proves free waits.
 
 ## Decision Log
 
