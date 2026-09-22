@@ -9,7 +9,7 @@ use crossterm::{
 use gooey::effects::{Effect, EntityDynamics, SoftLimiter};
 use gooey::engine::{Engine, EngineOutput, Instrument};
 use gooey::frame::StereoFrame;
-use gooey::instruments::{ResoKick, ResoKickConfig};
+use gooey::instruments::{ResoKick, ResoKickConfig, ResonatorVoice, ResonatorVoiceConfig};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
@@ -101,6 +101,176 @@ impl Instrument for SharedResoKick {
     fn is_active(&self) -> bool {
         self.0.lock().unwrap().is_active()
     }
+}
+
+struct SharedResonatorVoice(Arc<Mutex<ResonatorVoice>>);
+
+impl Instrument for SharedResonatorVoice {
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
+        self.0.lock().unwrap().trigger_with_velocity(time, velocity);
+    }
+
+    fn tick(&mut self, current_time: f64) -> f32 {
+        self.0.lock().unwrap().tick(current_time)
+    }
+
+    fn is_active(&self) -> bool {
+        self.0.lock().unwrap().is_active()
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LabPage {
+    Legacy,
+    Macros,
+    Advanced,
+}
+
+const GENERIC_MACROS: [&str; 9] = [
+    "pitch",
+    "pitch_sweep",
+    "sweep_time",
+    "decay",
+    "body_character",
+    "noise",
+    "coupling",
+    "drive",
+    "volume",
+];
+
+const ADVANCED_NAMES: [&str; 8] = [
+    "mode1 ratio",
+    "mode1 decay",
+    "mode1 feedback",
+    "mode2 ratio",
+    "mode2 decay",
+    "mode2 feedback",
+    "mode1->mode2",
+    "noise level",
+];
+
+fn generic_macro_value(voice: &ResonatorVoice, index: usize) -> f32 {
+    match index {
+        0 => voice.params.pitch.target(),
+        1 => voice.params.pitch_sweep.target(),
+        2 => voice.params.sweep_time.target(),
+        3 => voice.params.decay.target(),
+        4 => voice.params.body_character.target(),
+        5 => voice.params.noise.target(),
+        6 => voice.params.coupling.target(),
+        7 => voice.params.drive.target(),
+        8 => voice.params.volume.target(),
+        _ => 0.0,
+    }
+}
+
+fn advanced_value(config: &ResonatorVoiceConfig, index: usize) -> f32 {
+    match index {
+        0 => config.mode1.frequency_ratio / 8.0,
+        1 => config.mode1.decay_seconds / 5.0,
+        2 => config.mode1.feedback / 0.8,
+        3 => config.mode2.frequency_ratio / 8.0,
+        4 => config.mode2.decay_seconds / 5.0,
+        5 => config.mode2.feedback / 0.8,
+        6 => config.routing.mode1_to_mode2,
+        7 => config.noise.level / 2.0,
+        _ => 0.0,
+    }
+    .clamp(0.0, 1.0)
+}
+
+fn set_advanced(
+    voice: &mut ResonatorVoice,
+    config: &mut ResonatorVoiceConfig,
+    index: usize,
+    normalized: f32,
+) {
+    let value = normalized.clamp(0.0, 1.0);
+    match index {
+        0 => {
+            config.mode1.frequency_ratio = 0.125 + value * 7.875;
+            voice.set_mode_frequency_ratio(0, config.mode1.frequency_ratio);
+        }
+        1 => {
+            config.mode1.decay_seconds = 0.005 + value * 4.995;
+            voice.set_mode_decay_seconds(0, config.mode1.decay_seconds);
+        }
+        2 => {
+            config.mode1.feedback = value * 0.8;
+            voice.set_mode_feedback(0, config.mode1.feedback);
+        }
+        3 => {
+            config.mode2.frequency_ratio = 0.125 + value * 7.875;
+            voice.set_mode_frequency_ratio(1, config.mode2.frequency_ratio);
+        }
+        4 => {
+            config.mode2.decay_seconds = 0.005 + value * 4.995;
+            voice.set_mode_decay_seconds(1, config.mode2.decay_seconds);
+        }
+        5 => {
+            config.mode2.feedback = value * 0.8;
+            voice.set_mode_feedback(1, config.mode2.feedback);
+        }
+        6 => {
+            config.routing.mode1_to_mode2 = value;
+            voice.set_routing(config.routing);
+        }
+        7 => {
+            config.noise.level = value * 2.0;
+            voice.set_noise_config(config.noise);
+        }
+        _ => {}
+    }
+}
+
+fn render_generic_display(
+    voice: &ResonatorVoice,
+    config: &ResonatorVoiceConfig,
+    page: LabPage,
+    selected: usize,
+    preset_name: &str,
+    velocity: f32,
+) {
+    print!("\x1b[2J\x1b[H\x1b[?7l");
+    let page_name = if page == LabPage::Macros {
+        "MACROS"
+    } else {
+        "ADVANCED"
+    };
+    print!("=== Resonator Voice Lab / {page_name} ===\r\n");
+    print!("TAB=page  SPACE=hit  Q=quit  arrows/[]=adjust\r\n");
+    print!("1-6=legacy kicks  7=kick 8=tom 9=snare 0=hybrid -=drone\r\n");
+    print!(
+        "Preset: {preset_name} | Velocity: {:.0}%\r\n\r\n",
+        velocity * 100.0
+    );
+    if page == LabPage::Macros {
+        for (index, name) in GENERIC_MACROS.iter().enumerate() {
+            let value = generic_macro_value(voice, index);
+            let indicator = if index == selected { ">" } else { " " };
+            print!(
+                "{} {:<17} [{}] {:>4.2}\r\n",
+                indicator,
+                name,
+                make_bar(value, 12),
+                value
+            );
+        }
+    } else {
+        for (index, name) in ADVANCED_NAMES.iter().enumerate() {
+            let value = advanced_value(config, index);
+            let indicator = if index == selected { ">" } else { " " };
+            print!(
+                "{} {:<17} [{}] {:>4.2}\r\n",
+                indicator,
+                name,
+                make_bar(value, 12),
+                value
+            );
+        }
+    }
+    print!("\r\nSignal: transient + noise → two routed modes → driven tap mix\r\n");
+    io::stdout().flush().unwrap();
 }
 
 struct SharedEntityDynamics(Arc<EntityDynamics>);
@@ -204,8 +374,8 @@ fn render_display(
 ) {
     print!("\x1b[2J\x1b[H\x1b[?7l");
     print!("=== Reso Kick Lab ===\r\n");
-    print!("SPACE=hit  Q=quit  ↑↓=select  ←→=adjust  []=fine\r\n");
-    print!("V=cycle velocity  1-6=presets\r\n");
+    print!("SPACE=hit  Q=quit  ↑↓=select  ←→=adjust  []=fine  TAB=page\r\n");
+    print!("V=velocity  1-6=legacy presets  7-9/0/-=generic patches\r\n");
     print!("Preset: {preset_name}\r\n\r\n");
 
     for (index, info) in PARAM_INFO.iter().enumerate() {
@@ -245,6 +415,11 @@ fn preset(number: char) -> Option<(&'static str, ResoKickConfig)> {
 fn main() -> anyhow::Result<()> {
     let sample_rate = 44_100.0;
     let kick = Arc::new(Mutex::new(ResoKick::new(sample_rate)));
+    let mut generic_config = ResonatorVoiceConfig::kick();
+    let generic = Arc::new(Mutex::new(ResonatorVoice::with_config(
+        sample_rate,
+        generic_config,
+    )));
     let dynamics = Arc::new(EntityDynamics::new(sample_rate));
     dynamics.set_bass_drive(0.55);
     dynamics.set_gain_dist_db(6.0);
@@ -253,6 +428,10 @@ fn main() -> anyhow::Result<()> {
     let mut engine = Engine::new(sample_rate);
     engine.set_master_gain(0.85);
     engine.add_instrument("reso_kick", Box::new(SharedResoKick(kick.clone())));
+    engine.add_instrument(
+        "resonator_voice",
+        Box::new(SharedResonatorVoice(generic.clone())),
+    );
     engine.clear_global_effects();
     engine.add_global_effect(Box::new(SharedEntityDynamics(dynamics.clone())));
     engine.add_global_effect(Box::new(SoftLimiter::new(1.0)));
@@ -264,6 +443,7 @@ fn main() -> anyhow::Result<()> {
     engine_output.start()?;
 
     let mut selected = 0;
+    let mut page = LabPage::Legacy;
     let mut trigger_count = 0;
     let velocities = [0.25, 0.5, 0.75, 1.0];
     let mut velocity_index = 2;
@@ -275,15 +455,27 @@ fn main() -> anyhow::Result<()> {
 
     let result = loop {
         if needs_redraw {
-            let voice = kick.lock().unwrap();
-            render_display(
-                &voice,
-                &dynamics,
-                selected,
-                trigger_count,
-                velocities[velocity_index],
-                preset_name,
-            );
+            if page == LabPage::Legacy {
+                let voice = kick.lock().unwrap();
+                render_display(
+                    &voice,
+                    &dynamics,
+                    selected,
+                    trigger_count,
+                    velocities[velocity_index],
+                    preset_name,
+                );
+            } else {
+                let voice = generic.lock().unwrap();
+                render_generic_display(
+                    &voice,
+                    &generic_config,
+                    page,
+                    selected,
+                    preset_name,
+                    velocities[velocity_index],
+                );
+            }
             needs_redraw = false;
         }
 
@@ -295,28 +487,63 @@ fn main() -> anyhow::Result<()> {
                         needs_redraw = true;
                     }
                     KeyCode::Down => {
-                        selected = (selected + 1).min(PARAM_INFO.len() - 1);
+                        let len = match page {
+                            LabPage::Legacy => PARAM_INFO.len(),
+                            LabPage::Macros => GENERIC_MACROS.len(),
+                            LabPage::Advanced => ADVANCED_NAMES.len(),
+                        };
+                        selected = (selected + 1).min(len - 1);
                         needs_redraw = true;
                     }
                     KeyCode::Left | KeyCode::Right | KeyCode::Char('[') | KeyCode::Char(']') => {
-                        let info = &PARAM_INFO[selected];
+                        let (coarse, fine) = if page == LabPage::Legacy {
+                            let info = &PARAM_INFO[selected];
+                            (info.coarse_step, info.fine_step)
+                        } else {
+                            (0.05, 0.01)
+                        };
                         let delta = match code {
-                            KeyCode::Left => -info.coarse_step,
-                            KeyCode::Right => info.coarse_step,
-                            KeyCode::Char('[') => -info.fine_step,
-                            KeyCode::Char(']') => info.fine_step,
+                            KeyCode::Left => -coarse,
+                            KeyCode::Right => coarse,
+                            KeyCode::Char('[') => -fine,
+                            KeyCode::Char(']') => fine,
                             _ => unreachable!(),
                         };
-                        adjust_param(&mut kick.lock().unwrap(), &dynamics, selected, delta);
+                        match page {
+                            LabPage::Legacy => {
+                                adjust_param(&mut kick.lock().unwrap(), &dynamics, selected, delta)
+                            }
+                            LabPage::Macros => {
+                                let mut voice = generic.lock().unwrap();
+                                let value =
+                                    (generic_macro_value(&voice, selected) + delta).clamp(0.0, 1.0);
+                                voice.set_macro(GENERIC_MACROS[selected], value).unwrap();
+                            }
+                            LabPage::Advanced => {
+                                let value = (advanced_value(&generic_config, selected) + delta)
+                                    .clamp(0.0, 1.0);
+                                set_advanced(
+                                    &mut generic.lock().unwrap(),
+                                    &mut generic_config,
+                                    selected,
+                                    value,
+                                );
+                            }
+                        }
                         preset_name = "Custom";
                         needs_redraw = true;
                     }
                     KeyCode::Char(' ') => {
+                        let instrument = if page == LabPage::Legacy {
+                            "reso_kick"
+                        } else {
+                            "resonator_voice"
+                        };
                         audio_engine
                             .lock()
                             .unwrap()
                             .trigger_instrument_with_velocity(
-                                "reso_kick",
+                                instrument,
                                 velocities[velocity_index],
                             );
                         trigger_count += 1;
@@ -330,8 +557,45 @@ fn main() -> anyhow::Result<()> {
                         if let Some((name, config)) = preset(number) {
                             kick.lock().unwrap().set_config(config);
                             preset_name = name;
+                            page = LabPage::Legacy;
+                            selected = 0;
                             needs_redraw = true;
                         }
+                    }
+                    KeyCode::Char(number @ '7'..='9') => {
+                        let (name, config) = match number {
+                            '7' => ("Resonator Kick", ResonatorVoiceConfig::kick()),
+                            '8' => ("Resonator Tom", ResonatorVoiceConfig::tom()),
+                            _ => ("Resonator Snare", ResonatorVoiceConfig::snare()),
+                        };
+                        generic_config = config;
+                        *generic.lock().unwrap() = ResonatorVoice::with_config(sample_rate, config);
+                        page = LabPage::Macros;
+                        selected = 0;
+                        preset_name = name;
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('0') | KeyCode::Char('-') => {
+                        let (name, config) = if code == KeyCode::Char('0') {
+                            ("Hybrid", ResonatorVoiceConfig::hybrid())
+                        } else {
+                            ("Metallic Drone", ResonatorVoiceConfig::metallic_drone())
+                        };
+                        generic_config = config;
+                        *generic.lock().unwrap() = ResonatorVoice::with_config(sample_rate, config);
+                        page = LabPage::Macros;
+                        selected = 0;
+                        preset_name = name;
+                        needs_redraw = true;
+                    }
+                    KeyCode::Tab => {
+                        page = match page {
+                            LabPage::Legacy => LabPage::Macros,
+                            LabPage::Macros => LabPage::Advanced,
+                            LabPage::Advanced => LabPage::Legacy,
+                        };
+                        selected = 0;
+                        needs_redraw = true;
                     }
                     KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => break Ok(()),
                     _ => {}

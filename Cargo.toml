@@ -110,6 +110,10 @@ name = "polysynth_gui"
 required-features = ["native", "visualization"]
 
 [[example]]
+name = "resonator_voice_gui"
+required-features = ["native", "visualization"]
+
+[[example]]
 name = "bounce"
 required-features = ["bounce"]
 

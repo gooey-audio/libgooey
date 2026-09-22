@@ -29,6 +29,36 @@ fn first_difference_rms(samples: &[f32]) -> f64 {
     (differences.map(|sample| sample * sample).sum::<f64>() / count as f64).sqrt()
 }
 
+fn sample_hash(samples: &[f32]) -> u64 {
+    samples.iter().fold(0xcbf2_9ce4_8422_2325, |hash, sample| {
+        (hash ^ u64::from(sample.to_bits())).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+#[test]
+fn legacy_presets_keep_their_deterministic_render() {
+    let presets = [
+        ResoKickConfig::classic808(),
+        ResoKickConfig::punch909(),
+        ResoKickConfig::soft_bounce(),
+        ResoKickConfig::tom(),
+        ResoKickConfig::laser(),
+        ResoKickConfig::sub_drone(),
+    ];
+    let hashes = presets.map(|preset| sample_hash(&render(preset, 0.75, 0.5)));
+    assert_eq!(
+        hashes,
+        [
+            0xa865_8a48_2b5f_9b9c,
+            0x87a7_fb1c_255d_12b5,
+            0x9e30_feb6_d093_bf3e,
+            0x45f0_0b0e_3fa7_45c0,
+            0xe91f_59ee_c966_a67c,
+            0xe182_2c66_a0c7_3e1,
+        ]
+    );
+}
+
 fn positive_crossing_rate(samples: &[f32]) -> f32 {
     let crossings = samples
         .windows(2)
