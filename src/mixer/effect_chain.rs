@@ -445,4 +445,22 @@ mod tests {
         let f = StereoFrame { l: 0.5, r: -0.25 };
         assert_eq!(chain.process(f), f);
     }
+
+    #[test]
+    fn scalar_delay_edit_preserves_the_existing_tail() {
+        let mut chain = EffectChain::new();
+        assert_eq!(chain.add(EFFECT_DELAY, SR, 120.0), Some(0));
+        chain.set_param(0, DELAY_PARAM_MIX, 1.0);
+        chain.set_param(0, DELAY_PARAM_FEEDBACK, 0.5);
+        let _ = chain.process(StereoFrame::mono(1.0));
+        for _ in 0..22_040 {
+            let _ = chain.process(StereoFrame::default());
+        }
+        chain.set_param(0, DELAY_PARAM_FEEDBACK, 0.7);
+        let peak = (0..32)
+            .map(|_| chain.process(StereoFrame::default()))
+            .map(|frame| frame.l.abs().max(frame.r.abs()))
+            .fold(0.0_f32, f32::max);
+        assert!(peak > 1e-4);
+    }
 }

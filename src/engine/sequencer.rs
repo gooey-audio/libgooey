@@ -836,6 +836,23 @@ impl Sequencer {
         }
     }
 
+    /// Replace a fixed 16-step host pattern in place. This is used by the live
+    /// control path so applying a complete drum snapshot neither allocates nor
+    /// drops a backing vector in the render callback. Optional note/blend data
+    /// is cleared because it is not part of the submitted snapshot.
+    pub(crate) fn replace_live_drum_pattern(&mut self, pattern: &[(bool, f32); 16]) -> bool {
+        if self.pattern.len() != pattern.len() {
+            return false;
+        }
+        for (step, &(enabled, velocity)) in self.pattern.iter_mut().zip(pattern) {
+            step.enabled = enabled;
+            step.velocity = velocity;
+            step.blend = None;
+            step.note = None;
+        }
+        true
+    }
+
     /// Get the current playhead step (the step currently being played)
     /// This is suitable for UI display
     pub fn current_step(&self) -> usize {

@@ -13,6 +13,11 @@ include = [
     "GooeyChordEvent",
     "GooeyChordLoopEvent",
     "GooeyPolyParamValue",
+    "GooeyLiveControl",
+    "GooeyDrumStep",
+    "GooeyDrumPattern",
+    "GooeyEffectParamDescriptor",
+    "GooeyEffectDescriptor",
 ]
 
 # Function settings
