@@ -120,24 +120,67 @@ jobs:
             -H "Authorization: Bearer $BLOB_READ_WRITE_TOKEN" \
             --data-urlencode "limit=10" \
             --data-urlencode "prefix=$BLOB_PREFIX/$ARCHIVE_NAME")"
-          count="$(jq --arg archive "$BLOB_PREFIX/$ARCHIVE_NAME" \
-            --arg checksum "$BLOB_PREFIX/$ARCHIVE_NAME.sha256" \
-            '[.blobs[] | select(.pathname == $archive or .pathname == $checksum)] | length' \
-            <<<"$response")"
-          case "$count" in
-            0) echo "upload=true" >> "$GITHUB_OUTPUT" ;;
-            2)
-              echo "Both immutable v2 objects already exist; verifying them without overwriting."
-              echo "upload=false" >> "$GITHUB_OUTPUT"
+
+          archive_path="$BLOB_PREFIX/$ARCHIVE_NAME"
+          archive_count="$(jq --arg path "$archive_path" \
+            '[.blobs[] | select(.pathname == $path)] | length' <<<"$response")"
+          case "$archive_count" in
+            0)
+              echo "Archive is missing and will be uploaded."
+              echo "archive_missing=true" >> "$GITHUB_OUTPUT"
+              ;;
+            1)
+              archive_url="$(jq -r --arg path "$archive_path" \
+                '.blobs[] | select(.pathname == $path) | .url' <<<"$response")"
+              remote_size="$(jq -r --arg path "$archive_path" \
+                '.blobs[] | select(.pathname == $path) | .size' <<<"$response")"
+              local_size="$(stat --format='%s' "dist/$ARCHIVE_NAME")"
+              test "$remote_size" = "$local_size"
+              expected="$(cut -d' ' -f1 "dist/$ARCHIVE_NAME.sha256")"
+              actual="$(curl --fail --silent --show-error "$archive_url" \
+                -H "Authorization: Bearer $BLOB_READ_WRITE_TOKEN" \
+                | sha256sum | cut -d' ' -f1)"
+              test "$actual" = "$expected"
+              echo "Existing immutable archive matches the generated archive."
+              echo "archive_missing=false" >> "$GITHUB_OUTPUT"
               ;;
             *)
-              echo "Only one v2 object exists; refusing an incomplete or ambiguous publication." >&2
+              echo "Found multiple objects at the immutable archive pathname." >&2
+              exit 1
+              ;;
+          esac
+
+          checksum_path="$BLOB_PREFIX/$ARCHIVE_NAME.sha256"
+          checksum_count="$(jq --arg path "$checksum_path" \
+            '[.blobs[] | select(.pathname == $path)] | length' <<<"$response")"
+          case "$checksum_count" in
+            0)
+              echo "Checksum is missing and will be uploaded."
+              echo "checksum_missing=true" >> "$GITHUB_OUTPUT"
+              ;;
+            1)
+              checksum_url="$(jq -r --arg path "$checksum_path" \
+                '.blobs[] | select(.pathname == $path) | .url' <<<"$response")"
+              curl --fail --silent --show-error "$checksum_url" \
+                -H "Authorization: Bearer $BLOB_READ_WRITE_TOKEN" \
+                --output existing.sha256
+              cmp "dist/$ARCHIVE_NAME.sha256" existing.sha256
+              echo "Existing immutable checksum matches the generated checksum."
+              echo "checksum_missing=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Found multiple objects at the immutable checksum pathname." >&2
               exit 1
               ;;
           esac
 
       - name: Publish immutable private blobs
-        if: steps.blob-preflight.outputs.upload == 'true'
+        if: >-
+          steps.blob-preflight.outputs.archive_missing == 'true' ||
+          steps.blob-preflight.outputs.checksum_missing == 'true'
+        env:
+          UPLOAD_ARCHIVE: ${{ steps.blob-preflight.outputs.archive_missing }}
+          UPLOAD_CHECKSUM: ${{ steps.blob-preflight.outputs.checksum_missing }}
         run: |
           cd "$RUNNER_TEMP/blob-upload"
           ARCHIVE_PATH="$GITHUB_WORKSPACE/dist/$ARCHIVE_NAME" \
@@ -147,10 +190,10 @@ jobs:
           import { put } from '@vercel/blob';
 
           const uploads = [
-            [process.env.ARCHIVE_PATH, `${process.env.BLOB_PREFIX}/${process.env.ARCHIVE_NAME}`],
-            [process.env.CHECKSUM_PATH, `${process.env.BLOB_PREFIX}/${process.env.ARCHIVE_NAME}.sha256`],
-          ];
-          for (const [file, pathname] of uploads) {
+            [process.env.UPLOAD_ARCHIVE === 'true', process.env.ARCHIVE_PATH, `${process.env.BLOB_PREFIX}/${process.env.ARCHIVE_NAME}`],
+            [process.env.UPLOAD_CHECKSUM === 'true', process.env.CHECKSUM_PATH, `${process.env.BLOB_PREFIX}/${process.env.ARCHIVE_NAME}.sha256`],
+          ].filter(([enabled]) => enabled);
+          for (const [, file, pathname] of uploads) {
             const result = await put(pathname, await openAsBlob(file), {
               access: 'private',
               addRandomSuffix: false,
