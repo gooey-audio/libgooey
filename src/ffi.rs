@@ -1325,7 +1325,8 @@ impl GooeyEngine {
                 LiveCommand::ReplaceDrumPattern { lanes, .. } => {
                     for (voice, lane) in self.kit.voices.iter_mut().zip(lanes) {
                         let pattern = lane.map(|step| (step.enabled, step.velocity));
-                        debug_assert!(voice.sequencer.replace_live_drum_pattern(&pattern));
+                        let replaced = voice.sequencer.replace_live_drum_pattern(&pattern);
+                        debug_assert!(replaced);
                     }
                 }
                 LiveCommand::ReplaceTrackRack { track, rack, .. } => {
