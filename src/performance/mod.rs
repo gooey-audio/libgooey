@@ -470,8 +470,9 @@ impl PerformanceRecorder {
     }
 
     /// Stage a validated host edit at a render boundary. A running non-empty
-    /// clip keeps playing until its next wrap; stopped or empty clips install
-    /// immediately.
+    /// clip hands the snapshot to the sample clock so it can install on the
+    /// first sample of the render buffer without resetting transport phase;
+    /// stopped or empty clips install immediately.
     pub(crate) fn apply_clip_edit(
         &mut self,
         edit: ChordClipEdit,
@@ -563,7 +564,11 @@ impl PerformanceRecorder {
         });
 
         let mut installed_generation = None;
-        if wrapped && retired.len() < retired.capacity() {
+        // Host replacements are drained once per render buffer. Install the
+        // newest one on that buffer's first clock sample instead of waiting for
+        // the old clip to wrap. The monotonic transport beat remains the source
+        // of phase, so changing clip length cannot restart or desynchronise it.
+        if retired.len() < retired.capacity() {
             if let Some(snapshot) = self.pending_snapshot.take() {
                 installed_generation = Some(self.install_snapshot(snapshot, retired));
             }
@@ -642,7 +647,7 @@ impl PerformanceRecorder {
         ClockUpdate {
             action: self.playback_action_at(
                 tick,
-                discontinuity || wrapped,
+                discontinuity || wrapped || installed_generation.is_some(),
                 wrapped && !discontinuity,
             ),
             installed_generation,
@@ -1342,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn running_replacement_installs_at_old_wrap_and_uses_global_phase() {
+    fn running_replacement_installs_on_next_clock_sample_and_uses_global_phase() {
         let mut rec = PerformanceRecorder::new();
         let mut retired = Vec::with_capacity(8);
         assert_eq!(
@@ -1358,18 +1363,16 @@ mod tests {
 
         assert_eq!(
             rec.apply_clip_edit(
-                snapshot(2, 192, vec![host_event(90, 20, 5)]),
+                snapshot(2, 192, vec![host_event(40, 20, 5)]),
                 true,
                 &mut retired,
             ),
             None
         );
-        let before = rec.update_clock_with_transport(95.0 / 96.0, true, 1, &mut retired);
-        assert_eq!(before.installed_generation, None);
-        let wrap = rec.update_clock_with_transport(1.0, true, 1, &mut retired);
-        assert_eq!(wrap.installed_generation, Some(2));
+        let next_sample = rec.update_clock_with_transport(48.0 / 96.0, true, 1, &mut retired);
+        assert_eq!(next_sample.installed_generation, Some(2));
         assert!(
-            matches!(wrap.action, Some(PlayerAction::Trigger(event)) if event.event.degree == 5)
+            matches!(next_sample.action, Some(PlayerAction::Trigger(event)) if event.event.degree == 5)
         );
         assert_eq!(rec.length_ticks(), 192);
         assert_eq!(retired.len(), 1);

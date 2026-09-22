@@ -479,7 +479,7 @@ fn piano_events_trigger_on_exact_tick_samples_for_all_nebula_lengths() {
 }
 
 #[test]
-fn running_replacements_coalesce_at_old_wrap_and_clear_preserves_transport() {
+fn running_replacements_coalesce_at_next_render_and_clear_preserves_transport() {
     unsafe {
         let engine = gooey_engine_new(SR);
         gooey_engine_set_bpm(engine, 120.0);
@@ -500,17 +500,13 @@ fn running_replacements_coalesce_at_old_wrap_and_clear_preserves_transport() {
             old_generation
         );
 
-        gooey_engine_sequencer_set_beat_position(engine, 0.99);
-        let _ = render(engine, 240);
-        assert_eq!(
-            gooey_engine_chord_loop_get_applied_generation(engine),
-            old_generation
-        );
+        let beat_before_replace = gooey_engine_transport_get_beat_position(engine);
         let _ = render(engine, 1);
         assert_eq!(
             gooey_engine_chord_loop_get_applied_generation(engine),
             newest_generation
         );
+        assert!(gooey_engine_transport_get_beat_position(engine) > beat_before_replace);
         assert_eq!(gooey_engine_perf_get_length_ticks(engine), 192);
         let mut degree = u32::MAX;
         assert!(gooey_engine_perf_get_event(

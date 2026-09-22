@@ -6680,7 +6680,9 @@ pub unsafe extern "C" fn gooey_engine_chord_enqueue_release_all(
         .is_some_and(|engine| engine.chord_control.enqueue_release_all())
 }
 
-/// Validate, copy, and stage a complete chord-loop snapshot.
+/// Validate, copy, and stage a complete chord-loop snapshot. While transport
+/// is running, the newest accepted snapshot takes effect on the first sample
+/// of the next render buffer without resetting transport phase.
 ///
 /// # Safety
 /// `engine` must be null or a valid live engine pointer. When `event_count` is
