@@ -1,5 +1,6 @@
 //! Shared audio engine logic for native (CPAL) and iOS targets
 
+pub mod automation;
 pub mod dsl;
 pub mod envelope;
 pub mod filters;

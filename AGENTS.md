@@ -42,6 +42,11 @@ src/
 │   ├── waveshaper.rs
 │   └── limiter.rs       # Brick-wall limiter
 │
+├── automation/          # Macros (one 0-1 control → many params) + motions (one-shot macro automation)
+│   ├── macros.rs        # ParamTarget, MacroMapping/Definition, render-owned MacroBank
+│   ├── motion.rs        # MotionDefinition, curves/end modes/quantize, MotionRunner pool
+│   └── control.rs       # Host→render command queue + published values (C ABI in ffi.rs)
+│
 ├── utils/
 │   ├── smoother.rs      # SmoothedParam: bounded param with ~15ms exponential smoothing
 │   └── blendable.rs     # PresetBlender: cross-fade between parameter sets
