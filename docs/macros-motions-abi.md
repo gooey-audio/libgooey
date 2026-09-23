@@ -62,7 +62,7 @@ A macro writes its parameters only when its value changes. If the host edits a m
 | curve | linear | `gooey_engine_motion_set_curve` | `MOTION_CURVE_LINEAR`, `EASE_IN`, `EASE_OUT`, `S_CURVE` |
 | end mode | hold | `gooey_engine_motion_set_end_mode` | `MOTION_END_HOLD` stays at the target; `MOTION_END_RETURN` retraces back to the start over the same duration; `MOTION_END_SNAP_BACK` jumps back once the target is reached |
 | start value | the macro's current value | `gooey_engine_motion_set_start` | a value in 0–1, or NaN for the current value. An explicit start makes a hold motion repeatable. |
-| quantize | none | `gooey_engine_motion_set_quantize` | `MOTION_QUANTIZE_BEAT` or `MOTION_QUANTIZE_BAR` wait for the next beat or 4-beat bar while the transport runs. With the transport stopped, the motion starts immediately. |
+| quantize | none | `gooey_engine_motion_set_quantize` | `MOTION_QUANTIZE_BEAT` or `MOTION_QUANTIZE_BAR` wait for the next beat or 4-beat bar while the transport runs. A seek while waiting re-aims at the next boundary from the new position. With the transport stopped, the motion starts immediately. |
 
 Every setter has a matching getter. `gooey_engine_motion_clear` unconfigures a slot.
 
@@ -79,7 +79,7 @@ To run and watch motions:
 - Macros and motions update every 32 frames. The parameters' existing 10–15 ms smoothers fill in between updates.
 - While a motion runs, it re-applies its macro on every update. It therefore overrides a poly preset re-apply and a sequencer blend snap.
 - LFOs are applied after macros. An LFO routed to the same drum parameter wins.
-- When two macros map the same parameter, the higher-numbered macro wins.
+- When two macros map the same parameter, the higher-numbered macro owns it. The lower macro's mapping has no effect, whichever macro moved last.
 - Poly parameter getters (`gooey_engine_poly_get_param`) show where a macro puts the parameter:
   - After a manual macro move, the getter reports the new value.
   - When a hold motion is triggered, the getter reports the motion's end value straight away.

@@ -184,6 +184,9 @@ pub struct MotionClock {
     pub sample_rate: f32,
     pub transport_running: bool,
     pub transport_beat: f64,
+    /// Changes whenever the transport jumps (seek, reset, start), so a
+    /// pending quantized start can re-aim at the grid from the new position.
+    pub transport_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -194,6 +197,8 @@ struct MotionInstance {
     /// Progress through the current leg, 0-1.
     progress: f64,
     start_beat: f64,
+    /// Transport generation `start_beat` was computed against.
+    generation: u64,
 }
 
 impl Default for MotionInstance {
@@ -204,6 +209,7 @@ impl Default for MotionInstance {
             from: 0.0,
             progress: 0.0,
             start_beat: 0.0,
+            generation: 0,
         }
     }
 }
@@ -250,20 +256,29 @@ impl MotionRunner {
         instance.definition = definition;
         instance.progress = 0.0;
 
-        let grid = definition.quantize.grid_beats();
-        match grid {
-            Some(grid) if clock.transport_running => {
-                let beat = clock.transport_beat;
-                let boundary = (beat / grid).ceil() * grid;
-                // Already on the grid (within one sample-ish): start now.
-                if boundary - beat < 1e-6 {
-                    Self::begin(instance, bank);
-                } else {
-                    instance.start_beat = boundary;
-                    instance.phase = MotionPhase::Pending;
-                }
-            }
-            _ => Self::begin(instance, bank),
+        if clock.transport_running && definition.quantize.grid_beats().is_some() {
+            instance.phase = MotionPhase::Pending;
+            Self::aim(instance, clock, bank);
+        } else {
+            Self::begin(instance, bank);
+        }
+    }
+
+    /// Point a pending motion at the next grid boundary from the current
+    /// transport position, starting it now if already on the grid.
+    fn aim(instance: &mut MotionInstance, clock: &MotionClock, bank: &mut MacroBank) {
+        let Some(grid) = instance.definition.quantize.grid_beats() else {
+            Self::begin(instance, bank);
+            return;
+        };
+        let beat = clock.transport_beat;
+        let boundary = (beat / grid).ceil() * grid;
+        instance.generation = clock.transport_generation;
+        // Already on the grid (within one sample-ish): start now.
+        if boundary - beat < 1e-6 {
+            Self::begin(instance, bank);
+        } else {
+            instance.start_beat = boundary;
         }
     }
 
@@ -337,7 +352,12 @@ impl MotionRunner {
             match instance.phase {
                 MotionPhase::Idle => continue,
                 MotionPhase::Pending => {
-                    if !clock.transport_running || clock.transport_beat >= instance.start_beat {
+                    if !clock.transport_running {
+                        Self::begin(instance, bank);
+                    } else if clock.transport_generation != instance.generation {
+                        // The transport jumped; the old boundary is stale.
+                        Self::aim(instance, clock, bank);
+                    } else if clock.transport_beat >= instance.start_beat {
                         Self::begin(instance, bank);
                     }
                     continue;
@@ -395,6 +415,7 @@ mod tests {
             sample_rate: SR,
             transport_running: false,
             transport_beat: 0.0,
+            transport_generation: 0,
         }
     }
 
@@ -550,6 +571,39 @@ mod tests {
         assert_eq!(runner.phase(0), MotionPhase::Pending);
 
         clock.transport_beat = 4.0;
+        runner.advance(32, &clock, &mut bank);
+        assert_eq!(runner.phase(0), MotionPhase::Forward);
+    }
+
+    #[test]
+    fn pending_start_re_aims_after_a_transport_seek() {
+        let mut bank = MacroBank::new();
+        let mut runner = MotionRunner::new();
+        let mut def = MotionDefinition::new(0, 1.0);
+        def.quantize = MotionQuantize::Bar;
+        let mut clock = clock();
+        clock.transport_running = true;
+        clock.transport_beat = 5.0;
+        runner.start(0, def, &clock, &mut bank);
+
+        // Seek back to beat 0.5: wait for beat 4, not the stale beat 8.
+        clock.transport_beat = 0.5;
+        clock.transport_generation += 1;
+        runner.advance(32, &clock, &mut bank);
+        assert_eq!(runner.phase(0), MotionPhase::Pending);
+        clock.transport_beat = 4.0;
+        runner.advance(32, &clock, &mut bank);
+        assert_eq!(runner.phase(0), MotionPhase::Forward);
+
+        // Seeking past the boundary waits for the next bar instead of
+        // starting off-grid.
+        clock.transport_beat = 5.0;
+        runner.start(0, def, &clock, &mut bank);
+        clock.transport_beat = 9.5;
+        clock.transport_generation += 1;
+        runner.advance(32, &clock, &mut bank);
+        assert_eq!(runner.phase(0), MotionPhase::Pending);
+        clock.transport_beat = 12.0;
         runner.advance(32, &clock, &mut bank);
         assert_eq!(runner.phase(0), MotionPhase::Forward);
     }

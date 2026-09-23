@@ -11,7 +11,8 @@ pub mod macros;
 pub mod motion;
 
 pub use macros::{
-    MacroBank, MacroDefinition, MacroMapping, ParamTarget, MACRO_COUNT, MACRO_MAX_MAPPINGS,
+    active_definition, MacroBank, MacroDefinition, MacroMapping, ParamTarget, MACRO_COUNT,
+    MACRO_MAX_MAPPINGS,
 };
 pub use motion::{
     MotionClock, MotionCurve, MotionDefinition, MotionDuration, MotionEndMode, MotionPhase,

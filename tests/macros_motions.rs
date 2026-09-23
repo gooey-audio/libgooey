@@ -670,3 +670,100 @@ fn hold_motion_projects_poly_getter_to_its_end_value() {
         );
     }
 }
+
+#[test]
+fn higher_macro_keeps_a_shared_parameter_when_a_lower_one_moves() {
+    let engine = Engine::new();
+    cutoff_macro(&engine);
+    unsafe {
+        assert!(gooey_engine_macro_add_mapping(
+            engine.0,
+            1,
+            PARAM_TARGET_GLOBAL_EFFECT,
+            EFFECT_LOWPASS_FILTER,
+            FILTER_PARAM_CUTOFF,
+            200.0,
+            600.0,
+        ));
+        assert!(gooey_engine_macro_set_value(engine.0, 1, 0.5));
+        engine.render_seconds(0.01);
+        close(engine.cutoff(), 400.0, 1e-3);
+
+        // Macro 0 moving later (by hand or by motion) does not take it over.
+        assert!(gooey_engine_macro_set_value(engine.0, 0, 1.0));
+        engine.render_seconds(0.01);
+        close(engine.cutoff(), 400.0, 1e-3);
+        assert!(gooey_engine_motion_configure(engine.0, 0, 0, 0.0));
+        assert!(gooey_engine_motion_set_duration(
+            engine.0,
+            0,
+            MOTION_DURATION_MS,
+            20.0
+        ));
+        assert!(gooey_engine_motion_trigger(engine.0, 0));
+        engine.render_seconds(0.05);
+        close(engine.cutoff(), 400.0, 1e-3);
+    }
+}
+
+#[test]
+fn clear_keeps_the_slot_configured_when_the_queue_is_full() {
+    let engine = Engine::new();
+    unsafe {
+        assert!(gooey_engine_motion_configure(engine.0, 0, 0, 1.0));
+        // Alternate macros so manual values cannot coalesce.
+        let mut pushed = 0;
+        while gooey_engine_macro_set_value(engine.0, pushed % 2, 0.5) {
+            pushed += 1;
+        }
+        assert!(!gooey_engine_motion_clear(engine.0, 0));
+        assert!(gooey_engine_motion_is_configured(engine.0, 0));
+
+        engine.render_seconds(0.01);
+        assert!(gooey_engine_motion_clear(engine.0, 0));
+        assert!(!gooey_engine_motion_is_configured(engine.0, 0));
+    }
+}
+
+#[test]
+fn pending_motion_re_aims_after_a_seek() {
+    let engine = Engine::new();
+    cutoff_macro(&engine);
+    unsafe {
+        gooey_engine_sequencer_start(engine.0);
+        gooey_engine_sequencer_set_beat_position(engine.0, 5.0);
+        engine.render_seconds(0.01);
+        assert!(gooey_engine_motion_configure(engine.0, 0, 0, 1.0));
+        assert!(gooey_engine_motion_set_duration(
+            engine.0,
+            0,
+            MOTION_DURATION_MS,
+            20.0
+        ));
+        assert!(gooey_engine_motion_set_quantize(
+            engine.0,
+            0,
+            MOTION_QUANTIZE_BAR
+        ));
+        assert!(gooey_engine_motion_trigger(engine.0, 0));
+        engine.render_seconds(0.01);
+        assert_eq!(
+            gooey_engine_motion_get_state(engine.0, 0),
+            MOTION_STATE_PENDING
+        );
+
+        // Back to beat 3.5: the next bar is beat 4 (0.25 s away), not beat 8.
+        gooey_engine_sequencer_set_beat_position(engine.0, 3.5);
+        engine.render_seconds(0.2);
+        assert_eq!(
+            gooey_engine_motion_get_state(engine.0, 0),
+            MOTION_STATE_PENDING
+        );
+        engine.render_seconds(0.1);
+        assert_eq!(
+            gooey_engine_motion_get_state(engine.0, 0),
+            MOTION_STATE_IDLE
+        );
+        close(engine.cutoff(), 5000.0, 1e-3);
+    }
+}

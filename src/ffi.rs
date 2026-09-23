@@ -7,8 +7,9 @@ use crate::automation::control::{
     AutomationCommand, AutomationControl, AutomationState, AUTOMATION_QUEUE_CAPACITY,
 };
 use crate::automation::{
-    MacroBank, MacroDefinition, MacroMapping, MotionClock, MotionCurve, MotionDefinition,
-    MotionDuration, MotionEndMode, MotionPhase, MotionQuantize, MotionRunner, ParamTarget,
+    active_definition, MacroBank, MacroDefinition, MacroMapping, MotionClock, MotionCurve,
+    MotionDefinition, MotionDuration, MotionEndMode, MotionPhase, MotionQuantize, MotionRunner,
+    ParamTarget,
 };
 use crate::effects::{
     DelayEffect, DelayTiming, Effect, FeedbackWaveshaper, LowpassFilterEffect, PlateReverbEffect,
@@ -2055,6 +2056,7 @@ impl GooeyEngine {
             sample_rate: self.sample_rate,
             transport_running,
             transport_beat,
+            transport_generation: self.mixer.transport_generation(),
         }
     }
 
@@ -2234,7 +2236,13 @@ impl GooeyEngine {
     /// Mirror a macro position into the poly preset projection, so poly
     /// getters report macro-driven values and a later unrelated preset edit
     /// does not snap those parameters back. Host thread only.
-    fn project_poly_macro(&self, definition: &MacroDefinition, value: f32) {
+    fn project_poly_macro(&self, index: usize, value: f32) {
+        let Some(definition) = self
+            .automation_control
+            .read(|state| active_definition(&state.macros, index))
+        else {
+            return;
+        };
         for mapping in definition.mappings() {
             if mapping.target.kind == PARAM_TARGET_POLY {
                 self.poly_control
@@ -11592,11 +11600,8 @@ impl GooeyEngine {
 
     /// Mirror a macro's latest published value into the poly projection.
     fn project_poly_macro_current(&self, index: usize) {
-        if let (Some(definition), Some(value)) = (
-            self.macro_definition(index),
-            self.automation_control.macro_value(index),
-        ) {
-            self.project_poly_macro(&definition, value);
+        if let Some(value) = self.automation_control.macro_value(index) {
+            self.project_poly_macro(index, value);
         }
     }
 
@@ -11741,7 +11746,7 @@ pub unsafe extern "C" fn gooey_engine_macro_capture_commit(
         engine.automation_param_host_write(change.target, change.from);
     }
     engine.automation_control.publish_macro_value(index, 0.0);
-    engine.project_poly_macro(&definition, 0.0);
+    engine.project_poly_macro(index, 0.0);
     engine.macro_capture = None;
     definition.len() as i32
 }
@@ -11930,16 +11935,14 @@ pub unsafe extern "C" fn gooey_engine_macro_set_value(
         return false;
     }
     let value = value.clamp(0.0, 1.0);
-    let definition = engine.automation_control.edit(|state| {
-        state
-            .push(AutomationCommand::SetMacroValue { index, value })
-            .then_some(state.macros[index])
-    });
-    let Some(Some(definition)) = definition else {
+    let queued = engine
+        .automation_control
+        .edit(|state| state.push(AutomationCommand::SetMacroValue { index, value }));
+    if queued != Some(true) {
         return false;
-    };
+    }
     engine.automation_control.publish_macro_value(index, value);
-    engine.project_poly_macro(&definition, value);
+    engine.project_poly_macro(index, value);
     true
 }
 
@@ -12009,8 +12012,13 @@ pub unsafe extern "C" fn gooey_engine_motion_clear(engine: *const GooeyEngine, s
     engine
         .automation_control
         .edit(|state| {
+            // Leave the slot configured when the stop cannot be queued, so
+            // getters never report a motion gone that is still running.
+            if !state.push(AutomationCommand::StopMotion { slot }) {
+                return false;
+            }
             state.motions[slot] = None;
-            state.push(AutomationCommand::StopMotion { slot })
+            true
         })
         .unwrap_or(false)
 }
@@ -12296,9 +12304,9 @@ pub unsafe extern "C" fn gooey_engine_motion_trigger(
         let definition = state.motions[slot]?;
         state
             .push(AutomationCommand::StartMotion { slot, definition })
-            .then_some((definition, state.macros[definition.macro_index]))
+            .then_some(definition)
     });
-    let Some(Some((definition, macro_definition))) = started else {
+    let Some(Some(definition)) = started else {
         return false;
     };
     // Project where the macro will come to rest so poly getters and later
@@ -12312,7 +12320,7 @@ pub unsafe extern "C" fn gooey_engine_motion_trigger(
         }),
     };
     if let Some(resting) = resting {
-        engine.project_poly_macro(&macro_definition, resting);
+        engine.project_poly_macro(definition.macro_index, resting);
     }
     true
 }

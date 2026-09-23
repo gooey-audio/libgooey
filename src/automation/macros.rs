@@ -108,9 +108,33 @@ impl MacroDefinition {
     }
 }
 
+/// The mappings of macro `index` that it actually writes. When two macros map
+/// the same parameter the higher-numbered macro owns it, so the lower macro's
+/// mapping is dropped regardless of which macro moved last.
+pub fn active_definition(
+    definitions: &[MacroDefinition; MACRO_COUNT],
+    index: usize,
+) -> MacroDefinition {
+    let mut active = MacroDefinition::default();
+    let Some(definition) = definitions.get(index) else {
+        return active;
+    };
+    for mapping in definition.mappings() {
+        let owned_above = definitions[index + 1..]
+            .iter()
+            .any(|higher| higher.find(mapping.target).is_some());
+        if !owned_above {
+            active.upsert(*mapping);
+        }
+    }
+    active
+}
+
 /// Render-owned macro state: definitions, values, and pending writes.
 pub struct MacroBank {
     definitions: [MacroDefinition; MACRO_COUNT],
+    /// `definitions` with parameters owned by a higher macro removed.
+    active: [MacroDefinition; MACRO_COUNT],
     values: [f32; MACRO_COUNT],
     dirty: [bool; MACRO_COUNT],
 }
@@ -125,6 +149,7 @@ impl MacroBank {
     pub fn new() -> Self {
         Self {
             definitions: [MacroDefinition::default(); MACRO_COUNT],
+            active: [MacroDefinition::default(); MACRO_COUNT],
             values: [0.0; MACRO_COUNT],
             dirty: [false; MACRO_COUNT],
         }
@@ -133,8 +158,13 @@ impl MacroBank {
     /// Replace a definition without writing its parameters. Parameters follow
     /// the new mappings the next time the macro value changes.
     pub fn replace(&mut self, index: usize, definition: MacroDefinition) {
-        if let Some(slot) = self.definitions.get_mut(index) {
-            *slot = definition;
+        let Some(slot) = self.definitions.get_mut(index) else {
+            return;
+        };
+        *slot = definition;
+        // Ownership of shared parameters can change for any lower macro.
+        for lower in 0..=index {
+            self.active[lower] = active_definition(&self.definitions, lower);
         }
     }
 
@@ -167,19 +197,18 @@ impl MacroBank {
         }
     }
 
-    /// Clear a macro's dirty flag, returning a copy of its definition and
-    /// value when it needed writing. Returning a copy lets the owning engine
-    /// write parameters without holding a borrow of the bank.
+    /// Clear a macro's dirty flag, returning a copy of the mappings it owns
+    /// and its value when it needed writing. Returning a copy lets the owning
+    /// engine write parameters without holding a borrow of the bank.
     pub fn take_dirty(&mut self, index: usize) -> Option<(MacroDefinition, f32)> {
         let dirty = self.dirty.get_mut(index)?;
         if !std::mem::take(dirty) {
             return None;
         }
-        Some((self.definitions[index], self.values[index]))
+        Some((self.active[index], self.values[index]))
     }
 
-    /// Write every dirty macro's parameters through `write`, in macro index
-    /// order (so a higher macro wins when two map the same parameter).
+    /// Write every dirty macro's owned parameters through `write`.
     pub fn flush(&mut self, mut write: impl FnMut(ParamTarget, f32)) {
         for index in 0..MACRO_COUNT {
             if let Some((definition, value)) = self.take_dirty(index) {
@@ -273,6 +302,36 @@ mod tests {
         bank.touch(0);
         bank.flush(|t, v| writes.push((t.param, v)));
         assert_eq!(writes, vec![(7, 0.5)]);
+    }
+
+    #[test]
+    fn higher_macro_owns_shared_parameter_whichever_moves_last() {
+        let mut bank = MacroBank::new();
+        let mut low = MacroDefinition::default();
+        low.upsert(mapping(1, 0.0, 1.0));
+        low.upsert(mapping(2, 0.0, 1.0));
+        let mut high = MacroDefinition::default();
+        high.upsert(mapping(1, 0.5, 0.5));
+        bank.replace(0, low);
+        bank.replace(3, high);
+
+        let mut writes = Vec::new();
+        bank.set_value(3, 1.0);
+        bank.flush(|t, v| writes.push((t.param, v)));
+        assert_eq!(writes, vec![(1, 0.5)]);
+
+        // Moving the lower macro later leaves the shared parameter alone.
+        writes.clear();
+        bank.set_value(0, 1.0);
+        bank.flush(|t, v| writes.push((t.param, v)));
+        assert_eq!(writes, vec![(2, 1.0)]);
+
+        // Dropping the higher mapping hands the parameter back.
+        bank.replace(3, MacroDefinition::default());
+        writes.clear();
+        bank.set_value(0, 0.25);
+        bank.flush(|t, v| writes.push((t.param, v)));
+        assert_eq!(writes, vec![(1, 0.25), (2, 0.25)]);
     }
 
     #[test]
