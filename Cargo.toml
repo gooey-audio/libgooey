@@ -142,6 +142,10 @@ name = "metronome"
 required-features = ["native", "crossterm"]
 
 [[example]]
+name = "macro_motion"
+required-features = ["native", "crossterm"]
+
+[[example]]
 name = "piano"
 required-features = ["native", "crossterm", "bounce"]
 
