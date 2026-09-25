@@ -38,6 +38,41 @@ fn kick_param_round_trip() {
 }
 
 #[test]
+fn extended_kick_params_round_trip() {
+    unsafe {
+        let engine = gooey_engine_new(44100.0);
+        assert_eq!(gooey_engine_kick_param_count(), 19);
+
+        for (i, param) in (KICK_PARAM_PITCH_ENVELOPE_CURVE..=KICK_PARAM_AMP_DECAY_CURVE).enumerate()
+        {
+            let value = 0.05 + i as f32 * 0.08;
+            gooey_engine_set_kick_param(engine, param, value);
+            approx_eq(gooey_engine_get_kick_param(engine, param), value);
+        }
+        assert!(gooey_engine_get_kick_param(engine, KICK_PARAM_AMP_DECAY_CURVE + 1).is_nan());
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn hihat_discrete_params_round_trip() {
+    unsafe {
+        let engine = gooey_engine_new(44100.0);
+        assert_eq!(gooey_engine_hihat_param_count(), 8);
+
+        for param in [HIHAT_PARAM_NOISE_COLOR, HIHAT_PARAM_FILTER_SLOPE] {
+            gooey_engine_set_hihat_param(engine, param, 0.7);
+            assert_eq!(gooey_engine_get_hihat_param(engine, param), 1.0);
+            gooey_engine_set_hihat_param(engine, param, 0.3);
+            assert_eq!(gooey_engine_get_hihat_param(engine, param), 0.0);
+        }
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
 fn snare_param_round_trip() {
     unsafe {
         let engine = gooey_engine_new(44100.0);

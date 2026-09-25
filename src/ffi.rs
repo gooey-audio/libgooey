@@ -28,9 +28,9 @@ use crate::instruments::multisample_control::{
 use crate::instruments::poly_synth_control::{PolySynthControl, PolySynthPending};
 use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
-    BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, MelodyVoice,
-    PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer, SamplerBuffer,
-    SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config,
+    BassConfig, BassSynth, FilterSlope, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum,
+    MelodyVoice, NoiseColor, PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer,
+    SamplerBuffer, SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config,
 };
 use crate::live_control::{
     DrumCell, EngineLifecycle, LiveCommand, LiveControlShared, DRUM_LANE_COUNT, DRUM_STEP_COUNT,
@@ -275,6 +275,17 @@ impl ChannelInstrument {
                 KICK_PARAM_PITCH_ENVELOPE => k.set_pitch_envelope_amount(value),
                 KICK_PARAM_VOLUME => k.set_volume(value),
                 KICK_PARAM_TUNING => k.set_tuning(value),
+                KICK_PARAM_PITCH_ENVELOPE_CURVE => k.set_pitch_envelope_curve(value),
+                KICK_PARAM_PITCH_START_RATIO => k.set_pitch_start_ratio(value),
+                KICK_PARAM_PHASE_MOD_AMOUNT => k.set_phase_mod_amount(value),
+                KICK_PARAM_NOISE_AMOUNT => k.set_noise_amount(value),
+                KICK_PARAM_NOISE_CUTOFF => k.set_noise_cutoff(value),
+                KICK_PARAM_NOISE_RESONANCE => k.set_noise_resonance(value),
+                KICK_PARAM_OVERDRIVE => k.set_overdrive(value),
+                KICK_PARAM_FEEDBACK_AMOUNT => k.set_feedback(value),
+                KICK_PARAM_FEEDBACK_CUTOFF => k.set_feedback_cutoff(value),
+                KICK_PARAM_AMP_DECAY => k.set_amp_decay(value),
+                KICK_PARAM_AMP_DECAY_CURVE => k.set_amp_decay_curve(value),
                 _ => {}
             },
             Self::Snare(s) => match param {
@@ -307,6 +318,16 @@ impl ChannelInstrument {
                 HIHAT_PARAM_VOLUME => h.set_volume(value),
                 HIHAT_PARAM_TONE => h.set_tone(value),
                 HIHAT_PARAM_TUNING => h.set_tuning(value),
+                HIHAT_PARAM_NOISE_COLOR => h.set_noise_color(if value.round() >= 1.0 {
+                    NoiseColor::Pink
+                } else {
+                    NoiseColor::White
+                }),
+                HIHAT_PARAM_FILTER_SLOPE => h.set_filter_slope(if value.round() >= 1.0 {
+                    FilterSlope::Db24
+                } else {
+                    FilterSlope::Db12
+                }),
                 _ => {}
             },
             Self::Tom(t) => {
@@ -365,6 +386,17 @@ impl ChannelInstrument {
                 KICK_PARAM_PITCH_ENVELOPE => k.params.pitch_envelope_amount.target(),
                 KICK_PARAM_VOLUME => k.params.volume.target(),
                 KICK_PARAM_TUNING => k.params.tuning.target(),
+                KICK_PARAM_PITCH_ENVELOPE_CURVE => k.params.pitch_envelope_curve.target(),
+                KICK_PARAM_PITCH_START_RATIO => k.params.pitch_start_ratio.target(),
+                KICK_PARAM_PHASE_MOD_AMOUNT => k.params.phase_mod_amount.target(),
+                KICK_PARAM_NOISE_AMOUNT => k.params.noise_amount.target(),
+                KICK_PARAM_NOISE_CUTOFF => k.params.noise_cutoff.target(),
+                KICK_PARAM_NOISE_RESONANCE => k.params.noise_resonance.target(),
+                KICK_PARAM_OVERDRIVE => k.params.overdrive.target(),
+                KICK_PARAM_FEEDBACK_AMOUNT => k.params.feedback.target(),
+                KICK_PARAM_FEEDBACK_CUTOFF => k.params.feedback_cutoff.target(),
+                KICK_PARAM_AMP_DECAY => k.params.amp_decay.target(),
+                KICK_PARAM_AMP_DECAY_CURVE => k.params.amp_decay_curve.target(),
                 _ => f32::NAN,
             },
             Self::Snare(s) => match param {
@@ -397,6 +429,14 @@ impl ChannelInstrument {
                 HIHAT_PARAM_VOLUME => h.params.volume.target(),
                 HIHAT_PARAM_TONE => h.params.tone.target(),
                 HIHAT_PARAM_TUNING => h.params.tuning.target(),
+                HIHAT_PARAM_NOISE_COLOR => match h.noise_color {
+                    NoiseColor::White => 0.0,
+                    NoiseColor::Pink => 1.0,
+                },
+                HIHAT_PARAM_FILTER_SLOPE => match h.filter_slope {
+                    FilterSlope::Db12 => 0.0,
+                    FilterSlope::Db24 => 1.0,
+                },
                 _ => f32::NAN,
             },
             Self::Tom(t) => match param {
@@ -413,7 +453,25 @@ impl ChannelInstrument {
                 TOM_PARAM_TUNING => t.tuning(),
                 _ => f32::NAN,
             },
-            Self::Bass(_) => f32::NAN,
+            Self::Bass(b) => match param {
+                BASS_PARAM_FREQUENCY => b.params.frequency.target(),
+                BASS_PARAM_SUB_LEVEL => b.params.sub_level.target(),
+                BASS_PARAM_OSC_LEVEL => b.params.osc_level.target(),
+                BASS_PARAM_DETUNE_LEVEL => b.params.detune_level.target(),
+                BASS_PARAM_DETUNE_AMOUNT => b.params.detune_amount.target(),
+                BASS_PARAM_OSC_SHAPE => b.params.osc_shape.target(),
+                BASS_PARAM_FILTER_CUTOFF => b.params.filter_cutoff.target(),
+                BASS_PARAM_FILTER_RESONANCE => b.params.filter_resonance.target(),
+                BASS_PARAM_FILTER_ENV_AMOUNT => b.params.filter_env_amount.target(),
+                BASS_PARAM_FILTER_ENV_DECAY => b.params.filter_env_decay.target(),
+                BASS_PARAM_FILTER_ENV_CURVE => b.params.filter_env_curve.target(),
+                BASS_PARAM_AMP_DECAY => b.params.amp_decay.target(),
+                BASS_PARAM_AMP_DECAY_CURVE => b.params.amp_decay_curve.target(),
+                BASS_PARAM_OVERDRIVE => b.params.overdrive.target(),
+                BASS_PARAM_VOLUME => b.params.volume.target(),
+                BASS_PARAM_TUNING => b.params.tuning.target(),
+                _ => f32::NAN,
+            },
         }
     }
 
@@ -431,6 +489,19 @@ impl ChannelInstrument {
                 // for live pitch modulation instead.
                 KICK_PARAM_VOLUME => k.params.volume.set_bipolar(value),
                 KICK_PARAM_TUNING => k.params.tuning.set_bipolar(value),
+                // Curve, start ratio and amp decay are latched at trigger, so
+                // modulating them shapes the next hit rather than the current one.
+                KICK_PARAM_PITCH_ENVELOPE_CURVE => k.params.pitch_envelope_curve.set_bipolar(value),
+                KICK_PARAM_PITCH_START_RATIO => k.params.pitch_start_ratio.set_bipolar(value),
+                KICK_PARAM_PHASE_MOD_AMOUNT => k.params.phase_mod_amount.set_bipolar(value),
+                KICK_PARAM_NOISE_AMOUNT => k.params.noise_amount.set_bipolar(value),
+                KICK_PARAM_NOISE_CUTOFF => k.params.noise_cutoff.set_bipolar(value),
+                KICK_PARAM_NOISE_RESONANCE => k.params.noise_resonance.set_bipolar(value),
+                KICK_PARAM_OVERDRIVE => k.params.overdrive.set_bipolar(value),
+                KICK_PARAM_FEEDBACK_AMOUNT => k.params.feedback.set_bipolar(value),
+                KICK_PARAM_FEEDBACK_CUTOFF => k.params.feedback_cutoff.set_bipolar(value),
+                KICK_PARAM_AMP_DECAY => k.params.amp_decay.set_bipolar(value),
+                KICK_PARAM_AMP_DECAY_CURVE => k.params.amp_decay_curve.set_bipolar(value),
                 _ => {}
             },
             Self::Snare(s) => match param {
@@ -680,6 +751,8 @@ impl ChannelBlender {
 /// separate top-level voice, so the addressable voice space
 /// (`NUM_INSTRUMENTS` = 5) is the kit voices plus bass at index 4.
 const KIT_VOICE_COUNT: usize = 4;
+/// Parameter-lock slots per channel; covers the largest instrument param set.
+const CHANNEL_PARAM_LOCK_CAPACITY: usize = 32;
 /// Maximum independently routable sampler racks in one FFI engine.
 pub const SAMPLER_RACK_MAX: u32 = 4;
 /// PCM pads in each sampler rack and steps in its sequencer.
@@ -717,6 +790,10 @@ struct VoiceStrip {
     trigger_velocity: AtomicU32, // f32 bits stored atomically
     /// Saved global frequency for restoring after per-step MIDI note overrides.
     saved_global_freq: Option<f32>,
+    /// Per-parameter locks, indexed by the channel instrument's param index.
+    /// A locked value is re-applied after every preset blend so the XY pad
+    /// and per-step blends cannot overwrite it. LFOs still modulate on top.
+    param_locks: [Option<f32>; CHANNEL_PARAM_LOCK_CAPACITY],
 }
 
 impl VoiceStrip {
@@ -745,6 +822,33 @@ impl VoiceStrip {
             trigger_pending: AtomicBool::new(false),
             trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
             saved_global_freq: None,
+            param_locks: [None; CHANNEL_PARAM_LOCK_CAPACITY],
+        }
+    }
+
+    /// Blend the corner presets at (x,y) into the instrument, then re-apply
+    /// any parameter locks so they win over the blended values.
+    fn apply_blend(&mut self, x: f32, y: f32) {
+        self.blender.blend_and_apply(&mut self.instrument, x, y);
+        self.apply_param_locks();
+    }
+
+    /// Write every locked value back into the instrument. Allocation-free, so
+    /// it is safe on the audio thread.
+    fn apply_param_locks(&mut self) {
+        for (param, lock) in self.param_locks.iter().enumerate() {
+            if let Some(value) = *lock {
+                self.instrument.set_param(param as u32, value);
+            }
+        }
+    }
+
+    /// Re-run the channel's blend (if enabled) so unlocked parameters return
+    /// to their blended values. With blend disabled, values stay where they are.
+    fn restore_blend(&mut self) {
+        if self.blend_enabled {
+            let (x, y) = (self.blend_x, self.blend_y);
+            self.apply_blend(x, y);
         }
     }
 
@@ -2129,13 +2233,13 @@ impl GooeyEngine {
             PARAM_TARGET_DRUM => {
                 let voice = self.voice(index as usize)?;
                 let continuous = match &voice.instrument {
-                    ChannelInstrument::Kick(_) => param <= KICK_PARAM_TUNING,
+                    ChannelInstrument::Kick(_) => param <= KICK_PARAM_AMP_DECAY_CURVE,
                     ChannelInstrument::Snare(_) => {
                         param <= SNARE_PARAM_TUNING && param != SNARE_PARAM_FILTER_TYPE
                     }
                     ChannelInstrument::HiHat(_) => param <= HIHAT_PARAM_TUNING,
                     ChannelInstrument::Tom(_) => param <= TOM_PARAM_TUNING,
-                    // Bass has no parameter getters, so it cannot be captured.
+                    // Bass is not exposed as a macro target.
                     ChannelInstrument::Bass(_) => false,
                 };
                 continuous.then_some((0.0, 1.0))
@@ -2288,7 +2392,7 @@ impl GooeyEngine {
         let y = y.clamp(0.0, 1.0);
         let idx = channel as usize;
         if let Some(voice) = self.voice_mut(idx) {
-            voice.blender.blend_and_apply(&mut voice.instrument, x, y);
+            voice.apply_blend(x, y);
         }
     }
 
@@ -2615,7 +2719,7 @@ pub const FEEDBACK_WAVESHAPER_PARAM_MIX: u32 = 3;
 // Kick drum parameter indices (must match Swift KickParam enum)
 // =============================================================================
 
-/// Kick parameter: base frequency (30-80 Hz)
+/// Kick parameter: base frequency (0-1 → 30-120 Hz)
 pub const KICK_PARAM_FREQUENCY: u32 = 0;
 /// Kick parameter: punch/mid presence (0-1)
 pub const KICK_PARAM_PUNCH: u32 = 1;
@@ -2623,7 +2727,7 @@ pub const KICK_PARAM_PUNCH: u32 = 1;
 pub const KICK_PARAM_SUB: u32 = 2;
 /// Kick parameter: click/transient amount (0-1)
 pub const KICK_PARAM_CLICK: u32 = 3;
-/// Kick parameter: decay time (0.01-5.0 seconds)
+/// Kick parameter: decay time (0-1 → 0.01-4.0 seconds)
 pub const KICK_PARAM_DECAY: u32 = 4;
 /// Kick parameter: pitch envelope amount (0-1)
 pub const KICK_PARAM_PITCH_ENVELOPE: u32 = 5;
@@ -2631,6 +2735,28 @@ pub const KICK_PARAM_PITCH_ENVELOPE: u32 = 5;
 pub const KICK_PARAM_VOLUME: u32 = 6;
 /// Kick parameter: tuning offset (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
 pub const KICK_PARAM_TUNING: u32 = 7;
+/// Kick parameter: pitch envelope curve (0-1 → 0.1-4.0; 0 = fast drop, 1 = slow)
+pub const KICK_PARAM_PITCH_ENVELOPE_CURVE: u32 = 8;
+/// Kick parameter: starting pitch multiplier (0-1 → 1.0-10.0x)
+pub const KICK_PARAM_PITCH_START_RATIO: u32 = 9;
+/// Kick parameter: phase modulation depth (0-1, 0 = disabled)
+pub const KICK_PARAM_PHASE_MOD_AMOUNT: u32 = 10;
+/// Kick parameter: pink noise layer amount (0-1)
+pub const KICK_PARAM_NOISE_AMOUNT: u32 = 11;
+/// Kick parameter: noise lowpass cutoff (0-1 → 20-10000 Hz)
+pub const KICK_PARAM_NOISE_CUTOFF: u32 = 12;
+/// Kick parameter: noise lowpass resonance (0-1 → 0.0-5.0)
+pub const KICK_PARAM_NOISE_RESONANCE: u32 = 13;
+/// Kick parameter: overdrive/saturation amount (0-1, 0 = bypass)
+pub const KICK_PARAM_OVERDRIVE: u32 = 14;
+/// Kick parameter: feedback waveshaper amount (0-1)
+pub const KICK_PARAM_FEEDBACK_AMOUNT: u32 = 15;
+/// Kick parameter: feedback filter cutoff (0-1 → 200-4000 Hz)
+pub const KICK_PARAM_FEEDBACK_CUTOFF: u32 = 16;
+/// Kick parameter: amplitude envelope decay (0-1 → 0.0-4.0 seconds)
+pub const KICK_PARAM_AMP_DECAY: u32 = 17;
+/// Kick parameter: amplitude decay curve (0-1 → 0.1-10.0; <0.5 = natural decay)
+pub const KICK_PARAM_AMP_DECAY_CURVE: u32 = 18;
 
 // =============================================================================
 // Hi-hat parameter indices (must match Swift HiHatParam enum)
@@ -2648,6 +2774,10 @@ pub const HIHAT_PARAM_TONE: u32 = 3;
 pub const HIHAT_PARAM_VOLUME: u32 = 4;
 /// Hi-hat parameter: tuning offset (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
 pub const HIHAT_PARAM_TUNING: u32 = 5;
+/// Hi-hat parameter: noise color (discrete, rounded: 0 = white, 1 = pink)
+pub const HIHAT_PARAM_NOISE_COLOR: u32 = 6;
+/// Hi-hat parameter: filter slope (discrete, rounded: 0 = 12 dB/oct, 1 = 24 dB/oct)
+pub const HIHAT_PARAM_FILTER_SLOPE: u32 = 7;
 
 // =============================================================================
 // Snare drum parameter indices (must match Swift SnareParam enum)
@@ -3321,13 +3451,11 @@ pub unsafe extern "C" fn gooey_engine_set_channel_instrument_type(
     voice.instrument = new_instrument;
     voice.blender = ChannelBlender::default_for_type(instrument_type);
     voice.blend_corner_presets = ChannelBlender::default_corner_preset_ids(instrument_type);
+    // Param indices mean different things per instrument type.
+    voice.param_locks = [None; CHANNEL_PARAM_LOCK_CAPACITY];
 
     // If blend is enabled, re-apply position with the new blender
-    if voice.blend_enabled {
-        let x = voice.blend_x;
-        let y = voice.blend_y;
-        voice.blender.blend_and_apply(&mut voice.instrument, x, y);
-    }
+    voice.restore_blend();
     // channel gain, mute, solo, sequencer pattern all preserved on the voice
 }
 
@@ -3368,6 +3496,9 @@ pub unsafe extern "C" fn gooey_engine_get_channel_instrument_type(
 /// For hihat: param 0=pitch, 1=decay, etc. (same as `gooey_engine_set_hihat_param`)
 /// For tom: param 0=tune, 1=bend, etc. (same as `gooey_engine_set_tom_param`)
 ///
+/// Values set here are overwritten by the next preset blend unless the
+/// parameter is locked with `gooey_engine_set_channel_param_lock`.
+///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
 /// * `channel` - Channel index (0-3)
@@ -3390,6 +3521,131 @@ pub unsafe extern "C" fn gooey_engine_set_channel_param(
     if let Some(voice) = engine.voice_mut(channel as usize) {
         voice.instrument.set_param(param, value);
     }
+}
+
+/// Read a parameter on a channel's instrument, in the same normalized form
+/// used by `gooey_engine_set_channel_param`.
+///
+/// Returns the locked value if the parameter is locked, otherwise the current
+/// target (e.g. the blended value). Unlike `gooey_engine_get_kick_param` and
+/// friends, this reaches any channel, not just the first of a type.
+///
+/// # Returns
+/// The parameter value, or `NaN` if `engine` is null, `channel` is out of
+/// range, or `param` is not valid for the channel's instrument type.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_channel_param(
+    engine: *const GooeyEngine,
+    channel: u32,
+    param: u32,
+) -> f32 {
+    let Some(voice) = engine.as_ref().and_then(|e| e.voice(channel as usize)) else {
+        return f32::NAN;
+    };
+    voice
+        .param_locks
+        .get(param as usize)
+        .copied()
+        .flatten()
+        .unwrap_or_else(|| voice.instrument.get_param(param))
+}
+
+/// Lock a channel parameter to `value` so preset blending cannot overwrite it.
+///
+/// The value is applied immediately (smoothed, like
+/// `gooey_engine_set_channel_param`) and re-applied after every blend: XY
+/// moves, per-step and channel blends on sequencer triggers, and bass preset
+/// loads. LFO modulation still applies on top of a locked value. Changing the
+/// channel's instrument type clears its locks. Invalid params are ignored.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `channel` - Channel index
+/// * `param` - Parameter index (meaning depends on instrument type)
+/// * `value` - Parameter value (0-1 normalized)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_channel_param_lock(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    param: u32,
+    value: f32,
+) {
+    let Some(voice) = engine.as_mut().and_then(|e| e.voice_mut(channel as usize)) else {
+        return;
+    };
+    if !voice.instrument.get_param(param).is_finite() {
+        return;
+    }
+    let Some(lock) = voice.param_locks.get_mut(param as usize) else {
+        return;
+    };
+    *lock = Some(value);
+    voice.instrument.set_param(param, value);
+}
+
+/// Remove a channel parameter lock and restore the parameter to the current
+/// blended value (other locks on the channel are respected). With blend
+/// disabled the parameter keeps its current value.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clear_channel_param_lock(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    param: u32,
+) {
+    let Some(voice) = engine.as_mut().and_then(|e| e.voice_mut(channel as usize)) else {
+        return;
+    };
+    let Some(lock) = voice.param_locks.get_mut(param as usize) else {
+        return;
+    };
+    if lock.take().is_some() {
+        voice.restore_blend();
+    }
+}
+
+/// Remove every parameter lock on a channel and re-apply its blend.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clear_channel_param_locks(
+    engine: *mut GooeyEngine,
+    channel: u32,
+) {
+    let Some(voice) = engine.as_mut().and_then(|e| e.voice_mut(channel as usize)) else {
+        return;
+    };
+    if voice.param_locks.iter().any(Option::is_some) {
+        voice.param_locks = [None; CHANNEL_PARAM_LOCK_CAPACITY];
+        voice.restore_blend();
+    }
+}
+
+/// Returns whether a channel parameter is locked. `false` for a null engine
+/// or out-of-range channel/param.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_channel_param_is_locked(
+    engine: *const GooeyEngine,
+    channel: u32,
+    param: u32,
+) -> bool {
+    engine
+        .as_ref()
+        .and_then(|e| e.voice(channel as usize))
+        .and_then(|v| v.param_locks.get(param as usize))
+        .is_some_and(Option::is_some)
 }
 
 /// Set the tuning offset for a channel (0.0 = −12 semitones, 0.5 = neutral, 1.0 = +12 semitones).
@@ -3598,13 +3854,26 @@ pub unsafe extern "C" fn gooey_engine_trigger_kick(engine: *mut GooeyEngine) {
 /// * `value` - Parameter value (range depends on parameter)
 ///
 /// # Parameter indices and ranges
-/// - 0 (FREQUENCY): 30-80 Hz
-/// - 1 (PUNCH): 0-1
-/// - 2 (SUB): 0-1
-/// - 3 (CLICK): 0-1
-/// - 4 (DECAY): 0.01-5.0 seconds
-/// - 5 (PITCH_ENVELOPE): 0-1
-/// - 6 (VOLUME): 0-1
+/// All values are normalized 0-1; the mapped range is noted in parentheses.
+/// - 0 (FREQUENCY): 30-120 Hz
+/// - 1 (PUNCH)
+/// - 2 (SUB)
+/// - 3 (CLICK)
+/// - 4 (DECAY): 0.01-4.0 seconds
+/// - 5 (PITCH_ENVELOPE)
+/// - 6 (VOLUME)
+/// - 7 (TUNING): −12 to +12 semitones, 0.5 = neutral
+/// - 8 (PITCH_ENVELOPE_CURVE): 0.1-4.0
+/// - 9 (PITCH_START_RATIO): 1.0-10.0x
+/// - 10 (PHASE_MOD_AMOUNT)
+/// - 11 (NOISE_AMOUNT)
+/// - 12 (NOISE_CUTOFF): 20-10000 Hz
+/// - 13 (NOISE_RESONANCE): 0.0-5.0
+/// - 14 (OVERDRIVE)
+/// - 15 (FEEDBACK_AMOUNT)
+/// - 16 (FEEDBACK_CUTOFF): 200-4000 Hz
+/// - 17 (AMP_DECAY): 0.0-4.0 seconds
+/// - 18 (AMP_DECAY_CURVE): 0.1-10.0
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -3671,6 +3940,10 @@ pub unsafe extern "C" fn gooey_engine_get_kick_param(
 /// - 1 (DECAY): 0-1 normalized
 /// - 2 (ATTACK): 0-1 normalized
 /// - 3 (TONE): 0-1 normalized
+/// - 4 (VOLUME): 0-1 normalized
+/// - 5 (TUNING): 0-1 (0.5 = neutral)
+/// - 6 (NOISE_COLOR): discrete, rounded (0 = white, 1 = pink)
+/// - 7 (FILTER_SLOPE): discrete, rounded (0 = 12 dB/oct, 1 = 24 dB/oct)
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -3925,9 +4198,14 @@ pub unsafe extern "C" fn gooey_engine_load_bass_preset(engine: *mut GooeyEngine,
     }
     let engine = &mut *engine;
     if let Some(config) = GooeyEngine::bass_preset_by_id(preset_id) {
-        if let Some(ChannelInstrument::Bass(bass)) = engine.instrument_by_type_mut(INSTRUMENT_BASS)
+        if let Some(voice) = engine
+            .voices_iter_mut()
+            .find(|v| v.instrument.instrument_type() == INSTRUMENT_BASS)
         {
-            bass.set_config(config);
+            if let ChannelInstrument::Bass(bass) = &mut voice.instrument {
+                bass.set_config(config);
+            }
+            voice.apply_param_locks();
         }
     }
 }
@@ -5620,13 +5898,13 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_enabled(
 /// Get the number of kick parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_kick_param_count() -> u32 {
-    8
+    KICK_PARAM_AMP_DECAY_CURVE + 1
 }
 
 /// Get the number of hi-hat parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_hihat_param_count() -> u32 {
-    6
+    HIHAT_PARAM_FILTER_SLOPE + 1
 }
 
 /// Get the number of sequencer steps
@@ -6546,7 +6824,7 @@ pub unsafe extern "C" fn gooey_engine_blend_set_position(
     voice.blend_y = y.clamp(0.0, 1.0);
 
     let (x, y) = (voice.blend_x, voice.blend_y);
-    voice.blender.blend_and_apply(&mut voice.instrument, x, y);
+    voice.apply_blend(x, y);
 }
 
 /// Get the current X blend position for an instrument
