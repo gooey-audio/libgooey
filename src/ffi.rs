@@ -13,7 +13,8 @@ use crate::automation::{
 };
 use crate::effects::{
     DelayEffect, DelayTiming, Effect, FeedbackWaveshaper, LowpassFilterEffect, PlateReverbEffect,
-    SoftLimiter, SpringReverbEffect, TiltFilterEffect, TubeCompressor, TubeSaturation, Waveshaper,
+    SoftLimiter, SpringReverbEffect, TiltFilterEffect, TranceGate, TranceGateConfig,
+    TranceGatePattern, TubeCompressor, TubeSaturation, Waveshaper,
 };
 use crate::engine::lfo::{Lfo, MusicalDivision};
 use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
@@ -25,7 +26,9 @@ use crate::instruments::multisample::{
 use crate::instruments::multisample_control::{
     MultiSampleCommand, MultiSampleControl, MULTISAMPLE_INSTRUMENT_COUNT,
 };
-use crate::instruments::poly_synth_control::{PolySynthControl, PolySynthPending};
+use crate::instruments::poly_synth_control::{
+    PolyPresetConfig, PolySynthControl, PolySynthPending,
+};
 use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
     BassConfig, BassSynth, FilterSlope, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum,
@@ -949,10 +952,11 @@ pub struct GooeyEngine {
 
     // Polyphonic synthesizer for chord playback
     poly_synth: PolySynth,
+    poly_gate: TranceGate,
     // Each engine owns editable copies of the five factory sounds. Chord
     // retriggers load these copies, so host edits are never replaced by a
     // freshly constructed factory config.
-    poly_presets: [PolySynthConfig; POLY_PRESET_COUNT as usize],
+    poly_presets: [PolyPresetConfig; POLY_PRESET_COUNT as usize],
     poly_current_preset: u32,
     /// Host-side projected preset bank and coalesced render-boundary handoff.
     poly_control: PolySynthControl,
@@ -1274,6 +1278,7 @@ impl GooeyEngine {
             sequencer_triggers_enabled: AtomicBool::new(true),
             // Polyphonic synthesizer for chord playback
             poly_synth: PolySynth::new(sample_rate),
+            poly_gate: TranceGate::new(sample_rate),
             poly_presets,
             poly_current_preset: POLY_PRESET_DEFAULT,
             poly_control,
@@ -1370,7 +1375,8 @@ impl GooeyEngine {
             if let Some(config) = pending.take() {
                 self.poly_presets[index] = config;
                 if self.poly_current_preset == index as u32 {
-                    self.poly_synth.set_config(config);
+                    self.poly_synth.set_config(config.synth);
+                    let _ = self.poly_gate.set_config(config.gate);
                 }
             }
         }
@@ -1849,10 +1855,16 @@ impl GooeyEngine {
                 voice.record_peak(ch_out.abs());
             }
 
-            // The poly synth now owns a native stereo image (two oscillators
-            // spread by its width control). Feed that image into the graph
-            // unchanged; the track strip can still balance it later.
+            // The poly synth owns a native stereo image (two oscillators spread
+            // by its width control). Gate both channels equally before the graph
+            // so track effects keep ringing through closed source steps.
             let poly_frame = self.poly_synth.tick_frame(time);
+            let poly_frame = self.poly_gate.process_stereo(
+                poly_frame,
+                transport_beat,
+                self.bpm,
+                transport_running,
+            );
             let melody_frame = self.melody.tick_frame(time);
             // Granulator remains mono and enters through the equal-power seam.
             let gran_frame = StereoFrame::panned(self.granulator.tick(time), 0.5);
@@ -5225,7 +5237,8 @@ impl GooeyEngine {
             return false;
         };
         self.poly_current_preset = preset;
-        self.poly_synth.set_config(self.poly_presets[index]);
+        self.poly_synth.set_config(self.poly_presets[index].synth);
+        let _ = self.poly_gate.set_config(self.poly_presets[index].gate);
         self.poly_control.publish_active_from_audio(preset);
         true
     }
@@ -7054,6 +7067,51 @@ pub const POLY_PARAM_SATURATION: u32 = crate::instruments::POLY_PARAM_SATURATION
 pub const POLY_PARAM_VOLUME: u32 = crate::instruments::POLY_PARAM_VOLUME;
 pub const POLY_PARAM_COUNT: u32 = crate::instruments::POLY_PARAM_COUNT;
 
+/// Trance gate bypassed.
+pub const POLY_GATE_PATTERN_OFF: u32 = 0;
+/// One sixteenth-note pulse at the start of every eighth note.
+pub const POLY_GATE_PATTERN_STRAIGHT_EIGHTHS: u32 = 1;
+/// One sixteenth-note pulse on each offbeat eighth note.
+pub const POLY_GATE_PATTERN_OFFBEAT_EIGHTHS: u32 = 2;
+/// Repeating two-open, two-closed pattern.
+pub const POLY_GATE_PATTERN_CHOPPER: u32 = 3;
+/// Repeating three-open, one-closed pattern.
+pub const POLY_GATE_PATTERN_TRANCE: u32 = 4;
+/// Syncopated `1011_0100_1011_0100` pattern.
+pub const POLY_GATE_PATTERN_SYNCOPATED: u32 = 5;
+/// Number of curated gate patterns, including Off.
+pub const POLY_GATE_PATTERN_COUNT: u32 = 6;
+
+/// Per-preset transport-synchronized poly gate controls.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GooeyPolyGateConfig {
+    pub pattern: u32,
+    pub depth: f32,
+    pub smoothing: f32,
+}
+
+impl GooeyPolyGateConfig {
+    fn into_config(self) -> Option<TranceGateConfig> {
+        TranceGateConfig {
+            pattern: TranceGatePattern::from_id(self.pattern)?,
+            depth: self.depth,
+            smoothing: self.smoothing,
+        }
+        .validated()
+    }
+}
+
+impl From<TranceGateConfig> for GooeyPolyGateConfig {
+    fn from(config: TranceGateConfig) -> Self {
+        Self {
+            pattern: config.pattern.id(),
+            depth: config.depth,
+            smoothing: config.smoothing,
+        }
+    }
+}
+
 pub const POLY_MOD_SOURCE_VELOCITY: u32 = PolyModSource::Velocity as u32;
 pub const POLY_MOD_SOURCE_KEY_POSITION: u32 = PolyModSource::KeyPosition as u32;
 pub const POLY_MOD_ROUTE_COUNT: u32 = crate::instruments::POLY_MOD_ROUTE_COUNT as u32;
@@ -7169,24 +7227,24 @@ fn resolve_chord(chord_set: u32, root: u32, scale_type: u32, degree: u32) -> Opt
     Some(set.chord(&key, degree as usize))
 }
 
-fn factory_poly_preset_config(id: u32) -> Option<PolySynthConfig> {
+fn factory_poly_preset_config(id: u32) -> Option<PolyPresetConfig> {
     match id {
-        POLY_PRESET_DEFAULT => Some(PolySynthConfig::default()),
-        POLY_PRESET_PAD => Some(PolySynthConfig::pad()),
-        POLY_PRESET_PLUCK => Some(PolySynthConfig::pluck()),
-        POLY_PRESET_KEYS => Some(PolySynthConfig::keys()),
-        POLY_PRESET_STRINGS => Some(PolySynthConfig::strings()),
+        POLY_PRESET_DEFAULT => Some(PolyPresetConfig::new(PolySynthConfig::default())),
+        POLY_PRESET_PAD => Some(PolyPresetConfig::new(PolySynthConfig::pad())),
+        POLY_PRESET_PLUCK => Some(PolyPresetConfig::new(PolySynthConfig::pluck())),
+        POLY_PRESET_KEYS => Some(PolyPresetConfig::new(PolySynthConfig::keys())),
+        POLY_PRESET_STRINGS => Some(PolyPresetConfig::new(PolySynthConfig::strings())),
         _ => None,
     }
 }
 
-fn factory_poly_presets() -> [PolySynthConfig; POLY_PRESET_COUNT as usize] {
+fn factory_poly_presets() -> [PolyPresetConfig; POLY_PRESET_COUNT as usize] {
     [
-        PolySynthConfig::default(),
-        PolySynthConfig::pad(),
-        PolySynthConfig::pluck(),
-        PolySynthConfig::keys(),
-        PolySynthConfig::strings(),
+        PolyPresetConfig::new(PolySynthConfig::default()),
+        PolyPresetConfig::new(PolySynthConfig::pad()),
+        PolyPresetConfig::new(PolySynthConfig::pluck()),
+        PolyPresetConfig::new(PolySynthConfig::keys()),
+        PolyPresetConfig::new(PolySynthConfig::strings()),
     ]
 }
 
@@ -7783,6 +7841,48 @@ pub unsafe extern "C" fn gooey_engine_poly_get_param(
         .unwrap_or(f32::NAN)
 }
 
+/// Set the gate configuration on the active editable poly preset.
+///
+/// Returns false for a null engine, unknown pattern, or non-finite value. Finite
+/// depth and smoothing values are clamped to 0..1.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_set_gate(
+    engine: *mut GooeyEngine,
+    config: GooeyPolyGateConfig,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let Some(config) = config.into_config() else {
+        return false;
+    };
+    engine
+        .poly_control
+        .set_gate(engine.poly_control.active_preset(), config)
+}
+
+/// Copy the active editable preset's gate configuration into `out_config`.
+///
+/// # Safety
+/// `engine` and `out_config` must be valid pointers, or may be null to fail.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_get_gate(
+    engine: *const GooeyEngine,
+    out_config: *mut GooeyPolyGateConfig,
+) -> bool {
+    let (Some(engine), Some(out_config)) = (engine.as_ref(), out_config.as_mut()) else {
+        return false;
+    };
+    let Some(config) = engine.poly_control.active_gate() else {
+        return false;
+    };
+    *out_config = config.into();
+    true
+}
+
 // =============================================================================
 // Chord-aware live melody
 // =============================================================================
@@ -7947,7 +8047,47 @@ pub unsafe extern "C" fn gooey_engine_poly_get_preset_param(
     engine.poly_control.param(preset, param).unwrap_or(f32::NAN)
 }
 
-/// Restore one editable preset to its factory parameters and routes.
+/// Set the gate configuration on any editable poly preset. Editing the active
+/// preset updates the render-owned gate at the next buffer boundary.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_set_preset_gate(
+    engine: *mut GooeyEngine,
+    preset: u32,
+    config: GooeyPolyGateConfig,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let Some(config) = config.into_config() else {
+        return false;
+    };
+    engine.poly_control.set_gate(preset, config)
+}
+
+/// Copy one editable preset's gate configuration into `out_config`.
+///
+/// # Safety
+/// `engine` and `out_config` must be valid pointers, or may be null to fail.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_poly_get_preset_gate(
+    engine: *const GooeyEngine,
+    preset: u32,
+    out_config: *mut GooeyPolyGateConfig,
+) -> bool {
+    let (Some(engine), Some(out_config)) = (engine.as_ref(), out_config.as_mut()) else {
+        return false;
+    };
+    let Some(config) = engine.poly_control.gate(preset) else {
+        return false;
+    };
+    *out_config = config.into();
+    true
+}
+
+/// Restore one editable preset to its factory parameters, routes, and gate.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
