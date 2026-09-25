@@ -9,7 +9,10 @@ use crossterm::{
 use gooey::effects::{Effect, EntityDynamics, SoftLimiter};
 use gooey::engine::{Engine, EngineOutput, Instrument};
 use gooey::frame::StereoFrame;
-use gooey::instruments::{ResoKick, ResoKickConfig, ResonatorVoice, ResonatorVoiceConfig};
+use gooey::instruments::{
+    ResoKick, ResoKickConfig, ResonatorVoice, ResonatorVoiceConfig, UltraPercBodyMode,
+    UltraPercConfig, UltraPercNoiseMode, UltraPercVoice,
+};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
@@ -119,11 +122,28 @@ impl Instrument for SharedResonatorVoice {
     }
 }
 
+struct SharedUltraPercVoice(Arc<Mutex<UltraPercVoice>>);
+
+impl Instrument for SharedUltraPercVoice {
+    fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
+        self.0.lock().unwrap().trigger_with_velocity(time, velocity);
+    }
+
+    fn tick(&mut self, current_time: f64) -> f32 {
+        self.0.lock().unwrap().tick(current_time)
+    }
+
+    fn is_active(&self) -> bool {
+        self.0.lock().unwrap().is_active()
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum LabPage {
     Legacy,
     Macros,
     Advanced,
+    UltraPerc,
 }
 
 const GENERIC_MACROS: [&str; 9] = [
@@ -148,6 +168,111 @@ const ADVANCED_NAMES: [&str; 8] = [
     "mode1->mode2",
     "noise level",
 ];
+
+const ULTRA_PERC_NAMES: [&str; 14] = [
+    "master tune",
+    "detune down",
+    "length",
+    "body bias",
+    "FM decay",
+    "bipolar FM depth",
+    "body trigger delay",
+    "harmonics / fold",
+    "noise filter",
+    "noise decay",
+    "noise bias",
+    "volume",
+    "body spectral mode",
+    "noise routing mode",
+];
+
+fn ultra_value(voice: &UltraPercVoice, index: usize) -> f32 {
+    if index < 12 {
+        voice.parameter_normalized(index).unwrap_or(0.0)
+    } else {
+        let config = voice.config_targets();
+        match (index, config.body_mode, config.noise_mode) {
+            (12, UltraPercBodyMode::Low, _) => 0.0,
+            (12, UltraPercBodyMode::Mid, _) => 0.5,
+            (12, UltraPercBodyMode::High, _) => 1.0,
+            (13, _, UltraPercNoiseMode::Lowpass) => 0.0,
+            (13, _, UltraPercNoiseMode::Highpass) => 0.5,
+            (13, _, UltraPercNoiseMode::Body) => 1.0,
+            _ => 0.0,
+        }
+    }
+}
+
+fn set_ultra_value(voice: &mut UltraPercVoice, index: usize, value: f32) {
+    if index < 12 {
+        voice.set_parameter_normalized(index, value);
+    } else if index == 12 {
+        voice.set_body_mode(if value < 0.25 {
+            UltraPercBodyMode::Low
+        } else if value < 0.75 {
+            UltraPercBodyMode::Mid
+        } else {
+            UltraPercBodyMode::High
+        });
+    } else {
+        voice.set_noise_mode(if value < 0.25 {
+            UltraPercNoiseMode::Lowpass
+        } else if value < 0.75 {
+            UltraPercNoiseMode::Highpass
+        } else {
+            UltraPercNoiseMode::Body
+        });
+    }
+}
+
+fn ultra_detail(voice: &UltraPercVoice, index: usize) -> String {
+    let config = voice.config_targets();
+    match index {
+        0 => format!("{:>7.1} Hz", config.master_tune_hz),
+        1 => format!("{:>7.2} oct", config.detune_octaves),
+        2 => format!("{:>7.3} s", config.length_seconds),
+        3 => format!("{:>+7.2}", config.body_bias),
+        4 => format!("{:>7.3} s", config.fm_decay_seconds),
+        5 => format!("{:>+7.2} oct", config.fm_depth_octaves),
+        6 => format!("{:>7.1} ms", config.trigger_delay_seconds * 1_000.0),
+        7 => format!("{:>7.0}%", config.harmonics * 100.0),
+        8 => format!("{:>7.0} Hz", config.noise_filter_hz),
+        9 => format!("{:>7.3} s", config.noise_decay_seconds),
+        10 => format!("{:>+7.2}", config.noise_bias),
+        11 => format!("{:>7.2} x", config.volume),
+        12 => format!("{:>10?}", config.body_mode),
+        13 => format!("{:>10?}", config.noise_mode),
+        _ => String::new(),
+    }
+}
+
+fn render_ultra_display(voice: &UltraPercVoice, selected: usize, preset_name: &str, velocity: f32) {
+    print!("\x1b[2J\x1b[H\x1b[?7l");
+    print!("=== Resonator Voice Lab / ULTRA-PERC-INSPIRED ENGINE ===\r\n");
+    print!("E=compare resonator  TAB=page  SPACE=hit  Q=quit  arrows/[]=adjust\r\n");
+    print!("7=kick 8=tom 9=snare 0=clap -=metallic\r\n");
+    print!(
+        "Preset: {preset_name} | Velocity: {:.0}%\r\n\r\n",
+        velocity * 100.0
+    );
+    for (index, name) in ULTRA_PERC_NAMES.iter().enumerate() {
+        let value = ultra_value(voice, index);
+        let indicator = if index == selected { ">" } else { " " };
+        print!(
+            "{} {:<22} [{}] {:>4.2}  {}\r\n",
+            indicator,
+            name,
+            make_bar(value, 12),
+            value,
+            ultra_detail(voice, index)
+        );
+    }
+    print!(
+        "\r\nSignal: delayed strike → serial twin cores → LO/MID/HI → wavefolder → body VCA\r\n"
+    );
+    print!("        noise → LP/HP direct mix, or LP → body cores; separate noise envelope\r\n");
+    io::stdout().flush().unwrap();
+}
 
 fn generic_macro_value(voice: &ResonatorVoice, index: usize) -> f32 {
     match index {
@@ -238,8 +363,8 @@ fn render_generic_display(
         "ADVANCED"
     };
     print!("=== Resonator Voice Lab / {page_name} ===\r\n");
-    print!("TAB=page  SPACE=hit  Q=quit  arrows/[]=adjust\r\n");
-    print!("1-6=legacy kicks  7=kick 8=tom 9=snare 0=hybrid -=drone\r\n");
+    print!("E=compare Ultra-Perc-inspired engine  TAB=page  SPACE=hit  Q=quit\r\n");
+    print!("arrows/[]=adjust  1-6=legacy  7=kick 8=tom 9=snare 0=clap/hybrid -=metallic\r\n");
     print!(
         "Preset: {preset_name} | Velocity: {:.0}%\r\n\r\n",
         velocity * 100.0
@@ -375,7 +500,7 @@ fn render_display(
     print!("\x1b[2J\x1b[H\x1b[?7l");
     print!("=== Reso Kick Lab ===\r\n");
     print!("SPACE=hit  Q=quit  ↑↓=select  ←→=adjust  []=fine  TAB=page\r\n");
-    print!("V=velocity  1-6=legacy presets  7-9/0/-=generic patches\r\n");
+    print!("V=velocity  E=Ultra-Perc engine  1-6=legacy  7-9/0/-=engine presets\r\n");
     print!("Preset: {preset_name}\r\n\r\n");
 
     for (index, info) in PARAM_INFO.iter().enumerate() {
@@ -420,6 +545,10 @@ fn main() -> anyhow::Result<()> {
         sample_rate,
         generic_config,
     )));
+    let ultra = Arc::new(Mutex::new(UltraPercVoice::with_config(
+        sample_rate,
+        UltraPercConfig::kick(),
+    )));
     let dynamics = Arc::new(EntityDynamics::new(sample_rate));
     dynamics.set_bass_drive(0.55);
     dynamics.set_gain_dist_db(6.0);
@@ -431,6 +560,10 @@ fn main() -> anyhow::Result<()> {
     engine.add_instrument(
         "resonator_voice",
         Box::new(SharedResonatorVoice(generic.clone())),
+    );
+    engine.add_instrument(
+        "ultra_perc_voice",
+        Box::new(SharedUltraPercVoice(ultra.clone())),
     );
     engine.clear_global_effects();
     engine.add_global_effect(Box::new(SharedEntityDynamics(dynamics.clone())));
@@ -466,15 +599,24 @@ fn main() -> anyhow::Result<()> {
                     preset_name,
                 );
             } else {
-                let voice = generic.lock().unwrap();
-                render_generic_display(
-                    &voice,
-                    &generic_config,
-                    page,
-                    selected,
-                    preset_name,
-                    velocities[velocity_index],
-                );
+                if page == LabPage::UltraPerc {
+                    render_ultra_display(
+                        &ultra.lock().unwrap(),
+                        selected,
+                        preset_name,
+                        velocities[velocity_index],
+                    );
+                } else {
+                    let voice = generic.lock().unwrap();
+                    render_generic_display(
+                        &voice,
+                        &generic_config,
+                        page,
+                        selected,
+                        preset_name,
+                        velocities[velocity_index],
+                    );
+                }
             }
             needs_redraw = false;
         }
@@ -491,6 +633,7 @@ fn main() -> anyhow::Result<()> {
                             LabPage::Legacy => PARAM_INFO.len(),
                             LabPage::Macros => GENERIC_MACROS.len(),
                             LabPage::Advanced => ADVANCED_NAMES.len(),
+                            LabPage::UltraPerc => ULTRA_PERC_NAMES.len(),
                         };
                         selected = (selected + 1).min(len - 1);
                         needs_redraw = true;
@@ -529,15 +672,20 @@ fn main() -> anyhow::Result<()> {
                                     value,
                                 );
                             }
+                            LabPage::UltraPerc => {
+                                let mut voice = ultra.lock().unwrap();
+                                let value = (ultra_value(&voice, selected) + delta).clamp(0.0, 1.0);
+                                set_ultra_value(&mut voice, selected, value);
+                            }
                         }
                         preset_name = "Custom";
                         needs_redraw = true;
                     }
                     KeyCode::Char(' ') => {
-                        let instrument = if page == LabPage::Legacy {
-                            "reso_kick"
-                        } else {
-                            "resonator_voice"
+                        let instrument = match page {
+                            LabPage::Legacy => "reso_kick",
+                            LabPage::UltraPerc => "ultra_perc_voice",
+                            LabPage::Macros | LabPage::Advanced => "resonator_voice",
                         };
                         audio_engine
                             .lock()
@@ -563,27 +711,51 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     KeyCode::Char(number @ '7'..='9') => {
-                        let (name, config) = match number {
-                            '7' => ("Resonator Kick", ResonatorVoiceConfig::kick()),
-                            '8' => ("Resonator Tom", ResonatorVoiceConfig::tom()),
-                            _ => ("Resonator Snare", ResonatorVoiceConfig::snare()),
+                        let (name, config, ultra_config) = match number {
+                            '7' => (
+                                "Kick",
+                                ResonatorVoiceConfig::kick(),
+                                UltraPercConfig::kick(),
+                            ),
+                            '8' => ("Tom", ResonatorVoiceConfig::tom(), UltraPercConfig::tom()),
+                            _ => (
+                                "Snare",
+                                ResonatorVoiceConfig::snare(),
+                                UltraPercConfig::snare(),
+                            ),
                         };
                         generic_config = config;
                         *generic.lock().unwrap() = ResonatorVoice::with_config(sample_rate, config);
-                        page = LabPage::Macros;
+                        *ultra.lock().unwrap() =
+                            UltraPercVoice::with_config(sample_rate, ultra_config);
+                        if page == LabPage::Legacy {
+                            page = LabPage::Macros;
+                        }
                         selected = 0;
                         preset_name = name;
                         needs_redraw = true;
                     }
                     KeyCode::Char('0') | KeyCode::Char('-') => {
-                        let (name, config) = if code == KeyCode::Char('0') {
-                            ("Hybrid", ResonatorVoiceConfig::hybrid())
+                        let (name, config, ultra_config) = if code == KeyCode::Char('0') {
+                            (
+                                "Clap / Hybrid",
+                                ResonatorVoiceConfig::hybrid(),
+                                UltraPercConfig::clap(),
+                            )
                         } else {
-                            ("Metallic Drone", ResonatorVoiceConfig::metallic_drone())
+                            (
+                                "Metallic",
+                                ResonatorVoiceConfig::metallic_drone(),
+                                UltraPercConfig::metallic(),
+                            )
                         };
                         generic_config = config;
                         *generic.lock().unwrap() = ResonatorVoice::with_config(sample_rate, config);
-                        page = LabPage::Macros;
+                        *ultra.lock().unwrap() =
+                            UltraPercVoice::with_config(sample_rate, ultra_config);
+                        if page == LabPage::Legacy {
+                            page = LabPage::Macros;
+                        }
                         selected = 0;
                         preset_name = name;
                         needs_redraw = true;
@@ -592,7 +764,17 @@ fn main() -> anyhow::Result<()> {
                         page = match page {
                             LabPage::Legacy => LabPage::Macros,
                             LabPage::Macros => LabPage::Advanced,
-                            LabPage::Advanced => LabPage::Legacy,
+                            LabPage::Advanced => LabPage::UltraPerc,
+                            LabPage::UltraPerc => LabPage::Legacy,
+                        };
+                        selected = 0;
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        page = if page == LabPage::UltraPerc {
+                            LabPage::Macros
+                        } else {
+                            LabPage::UltraPerc
                         };
                         selected = 0;
                         needs_redraw = true;

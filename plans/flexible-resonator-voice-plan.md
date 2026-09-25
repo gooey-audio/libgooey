@@ -43,7 +43,10 @@ The existing `ResoKick` proves that a nonlinear resonator can make compelling ki
   Rationale: Cable thickness and brightness directly communicate routing gain, while a retained-mode GUI supplies readable text, labeled sliders, tooltips, scrolling inspectors, and accessible hit targets that the minimal renderer did not.
   Date/Author: 2026-09-25 / Codex
 - Decision: Use the Entity Ultra-Perc's twin-core, separately excited body/noise architecture as interface vocabulary, while labeling only signal paths the software actually implements.
-  Rationale: The hardware is a useful percussion-synthesis reference, especially its twin resonant core, separate body/noise dynamics, frequency-selective noise, and harmonic shaping. The lab must not imply that Gooey implements its analog wavefolder, trigger delay, external-input filter, or duck output.
+  Rationale: The hardware is a useful percussion-synthesis reference, especially its twin resonant core, separate body/noise dynamics, frequency-selective noise, and harmonic shaping. The generic `ResonatorVoice` graph must not imply that it contains the Ultra-Perc-specific wavefolder, trigger delay, external-input filter, or duck output.
+  Date/Author: 2026-09-25 / Codex
+- Decision: Add a separate `UltraPercVoice` engine instead of expressing the Ultra-Perc signal flow as a `ResonatorVoice` preset.
+  Rationale: The manufacturer flow chart places two resonant cores in a fixed serial body path followed by spectral mode selection, wavefolding, and a body VCA, with LP/HP/BODY noise routing, an independent noise envelope, bipolar body FM, and body-only trigger delay. Those structural choices differ from the generic voice's parallel/feed-forward matrix; kick, tom, snare, clap, and metallic sounds remain configurations of either engine.
   Date/Author: 2026-09-25 / Codex
 - Decision: Drive four independent `Engine` sequencers and four resonator voices from the beat grid.
   Rationale: A useful beat needs simultaneous kick, snare, tom, and hybrid roles, and the existing engine sequencer keeps triggers sample-accurate while the GUI thread only edits patterns and transport state.
@@ -55,7 +58,7 @@ The crate now exports a two-mode resonator instrument with independent transient
 
 ## Context and Orientation
 
-`src/filters/resonator.rs` supplies one bounded two-pole ringing mode. `src/gen/exciter.rs` supplies a short deterministic transient. `src/instruments/reso_kick.rs` combines two resonators with hard-coded kick-oriented routing. The new `src/instruments/resonator_voice.rs` owns two resonators, two oversampled nonlinear stages, the short transient, a separate deterministic filtered-noise tail, parameter smoothers, and a feed-forward routing matrix. `tests/resonator_voice.rs` proves the new graph behavior. `examples/reso_kick.rs` is the interactive native terminal audition tool, and `examples/resonator_voice_gui.rs` is the `eframe`/`egui` graph and four-track beat lab.
+`src/filters/resonator.rs` supplies one bounded two-pole ringing mode. `src/gen/exciter.rs` supplies a short deterministic transient. `src/instruments/reso_kick.rs` combines two resonators with hard-coded kick-oriented routing. `src/instruments/resonator_voice.rs` owns two resonators, two oversampled nonlinear stages, the short transient, a separate deterministic filtered-noise tail, parameter smoothers, and a feed-forward routing matrix. `src/instruments/ultra_perc.rs` is a separate digital interpretation of the manufacturer-documented serial twin-core Ultra-Perc topology. `tests/resonator_voice.rs` and `tests/ultra_perc.rs` prove the two engines' behavior. `examples/reso_kick.rs` is the interactive native terminal comparison tool, and `examples/resonator_voice_gui.rs` is the `eframe`/`egui` graph and four-track beat lab.
 
 A resonant mode is a filter that stores energy and rings at a chosen frequency. T60 is the time for that ring to fall by 60 decibels. A tap selects either the low-pass or band-pass output of a resonator. Feed-forward routing means signals only travel toward the output; the only recirculation is each resonator's already-bounded internal feedback.
 
