@@ -6190,6 +6190,62 @@ pub unsafe extern "C" fn gooey_engine_sampler_get_step(
     true
 }
 
+/// Set a rack's shared attack-hold-release amplitude envelope, in seconds.
+///
+/// Every manual, sequenced, and recorded hit on the rack is shaped by this
+/// envelope, bounding unexpectedly long samples. Rejects an invalid rack and
+/// any negative, NaN, or infinite value, leaving the previous configuration
+/// unchanged. Active voices keep playing and adopt the new rates continuously.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_set_amp_envelope(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    attack_seconds: f32,
+    hold_seconds: f32,
+    release_seconds: f32,
+) -> bool {
+    engine
+        .as_mut()
+        .and_then(|engine| engine.samplers.get_mut(rack as usize))
+        .and_then(Option::as_mut)
+        .is_some_and(|rack| rack.set_amp_envelope(attack_seconds, hold_seconds, release_seconds))
+}
+
+/// Read a rack's shared amplitude envelope into the output pointers, in
+/// seconds. Returns false for an invalid rack or any null output pointer,
+/// leaving the outputs untouched.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`. Each
+/// non-null output pointer must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sampler_get_amp_envelope(
+    engine: *const GooeyEngine,
+    rack: u32,
+    out_attack_seconds: *mut f32,
+    out_hold_seconds: *mut f32,
+    out_release_seconds: *mut f32,
+) -> bool {
+    if out_attack_seconds.is_null() || out_hold_seconds.is_null() || out_release_seconds.is_null() {
+        return false;
+    }
+    let Some(config) = engine
+        .as_ref()
+        .and_then(|engine| engine.samplers.get(rack as usize))
+        .and_then(Option::as_ref)
+        .map(|rack| rack.amp_envelope())
+    else {
+        return false;
+    };
+    *out_attack_seconds = config.attack_seconds();
+    *out_hold_seconds = config.hold_seconds();
+    *out_release_seconds = config.release_seconds();
+    true
+}
+
 /// Restore the default graph layout: Drums, Bass, Synth, Loops.
 ///
 /// # Safety

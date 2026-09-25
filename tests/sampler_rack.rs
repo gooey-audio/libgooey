@@ -189,6 +189,186 @@ fn recorded_manual_hit_replays_on_the_next_loop() {
 }
 
 #[test]
+fn amp_envelope_round_trips_and_defaults_to_one_second_hold() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let rack = gooey_engine_sampler_register(engine) as u32;
+
+        // Defaults: 1 ms attack, 1 s hold, 50 ms release.
+        let (mut a, mut h, mut r) = (-1.0_f32, -1.0_f32, -1.0_f32);
+        assert!(gooey_engine_sampler_get_amp_envelope(
+            engine, rack, &mut a, &mut h, &mut r
+        ));
+        assert!((a - 0.001).abs() < 1e-6);
+        assert!((h - 1.0).abs() < 1e-6);
+        assert!((r - 0.05).abs() < 1e-6);
+
+        // A custom configuration round-trips exactly.
+        assert!(gooey_engine_sampler_set_amp_envelope(
+            engine, rack, 0.01, 2.5, 0.2
+        ));
+        assert!(gooey_engine_sampler_get_amp_envelope(
+            engine, rack, &mut a, &mut h, &mut r
+        ));
+        assert!((a - 0.01).abs() < 1e-6 && (h - 2.5).abs() < 1e-6 && (r - 0.2).abs() < 1e-6);
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn amp_envelope_rejects_invalid_input_without_mutation() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let rack = gooey_engine_sampler_register(engine) as u32;
+        assert!(gooey_engine_sampler_set_amp_envelope(
+            engine, rack, 0.01, 0.5, 0.1
+        ));
+
+        for (a, h, r) in [
+            (-0.01, 0.5, 0.1),
+            (0.01, -0.5, 0.1),
+            (0.01, 0.5, -0.1),
+            (f32::NAN, 0.5, 0.1),
+            (0.01, f32::INFINITY, 0.1),
+        ] {
+            assert!(!gooey_engine_sampler_set_amp_envelope(
+                engine, rack, a, h, r
+            ));
+        }
+        // An invalid rack index is also rejected.
+        assert!(!gooey_engine_sampler_set_amp_envelope(
+            engine,
+            SAMPLER_RACK_MAX + 1,
+            0.01,
+            0.5,
+            0.1
+        ));
+
+        // The last valid configuration survived every rejected update.
+        let (mut a, mut h, mut r) = (0.0_f32, 0.0_f32, 0.0_f32);
+        assert!(gooey_engine_sampler_get_amp_envelope(
+            engine, rack, &mut a, &mut h, &mut r
+        ));
+        assert!((a - 0.01).abs() < 1e-6 && (h - 0.5).abs() < 1e-6 && (r - 0.1).abs() < 1e-6);
+
+        // Null output pointers fail the getter.
+        assert!(!gooey_engine_sampler_get_amp_envelope(
+            engine,
+            rack,
+            std::ptr::null_mut(),
+            &mut h,
+            &mut r
+        ));
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn default_hold_caps_a_long_sample_but_a_longer_hold_extends_it() {
+    unsafe {
+        // A 3-second DC pad — far longer than the default ~1.051 s envelope.
+        let frames = (SR * 3.0) as usize;
+        let pcm = vec![0.5_f32; frames];
+
+        // Default envelope: the tail past ~1.051 s must be silent (capped).
+        let engine = gooey_engine_new(SR);
+        let rack = gooey_engine_sampler_register(engine) as u32;
+        let source = gooey_engine_sampler_get_source_id(engine, rack);
+        assert!(gooey_engine_mixer_route_source(engine, source, 3));
+        assert!(gooey_engine_sampler_set_slot_buffer(
+            engine,
+            rack,
+            0,
+            pcm.as_ptr(),
+            frames as u32,
+            1,
+            SR
+        ));
+        assert!(gooey_engine_sampler_trigger(engine, rack, 0, 1.0));
+        let _ = render(engine, (SR * 1.3) as usize); // render through the cap
+        assert!(
+            peak(&render(engine, 4_096)) < 1e-4,
+            "default hold must cap a long sample"
+        );
+        gooey_engine_free(engine);
+
+        // A 2.5 s hold keeps the same pad sounding well past 1.3 s.
+        let engine = gooey_engine_new(SR);
+        let rack = gooey_engine_sampler_register(engine) as u32;
+        let source = gooey_engine_sampler_get_source_id(engine, rack);
+        assert!(gooey_engine_mixer_route_source(engine, source, 3));
+        assert!(gooey_engine_sampler_set_slot_buffer(
+            engine,
+            rack,
+            0,
+            pcm.as_ptr(),
+            frames as u32,
+            1,
+            SR
+        ));
+        assert!(gooey_engine_sampler_set_amp_envelope(
+            engine, rack, 0.001, 2.5, 0.05
+        ));
+        assert!(gooey_engine_sampler_trigger(engine, rack, 0, 1.0));
+        let _ = render(engine, (SR * 1.3) as usize);
+        assert!(
+            peak(&render(engine, 4_096)) > 0.01,
+            "a longer hold must keep the pad sounding"
+        );
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn shortening_hold_on_an_active_hit_releases_without_a_click() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let rack = gooey_engine_sampler_register(engine) as u32;
+        let source = gooey_engine_sampler_get_source_id(engine, rack);
+        assert!(gooey_engine_mixer_route_source(engine, source, 3));
+        let frames = (SR * 3.0) as usize;
+        let pcm = vec![0.5_f32; frames];
+        assert!(gooey_engine_sampler_set_slot_buffer(
+            engine,
+            rack,
+            0,
+            pcm.as_ptr(),
+            frames as u32,
+            1,
+            SR
+        ));
+        // Long hold, then trigger and settle into the sustained portion.
+        assert!(gooey_engine_sampler_set_amp_envelope(
+            engine, rack, 0.001, 5.0, 0.1
+        ));
+        assert!(gooey_engine_sampler_trigger(engine, rack, 0, 1.0));
+        let _ = render(engine, 8_192);
+
+        // Shorten the hold while the hit sounds — this begins release now.
+        assert!(gooey_engine_sampler_set_amp_envelope(
+            engine, rack, 0.001, 0.0, 0.1
+        ));
+        let tail = render(engine, (SR * 0.2) as usize);
+        let max_step = tail
+            .chunks(2)
+            .map(|f| f[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_step < 0.05, "release must not click: {max_step}");
+        // And the release actually completes to silence.
+        assert!(
+            peak(&render(engine, 4_096)) < 1e-4,
+            "release reaches silence"
+        );
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
 fn sampler_sequence_starts_when_host_time_arm_fires() {
     unsafe {
         let engine = gooey_engine_new(SR);

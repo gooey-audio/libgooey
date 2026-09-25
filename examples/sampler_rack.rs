@@ -40,11 +40,14 @@ impl Drop for FfiEngine {
 
 #[cfg(feature = "native")]
 fn pad(sample_rate: f32, hz: f32) -> Vec<f32> {
-    let frames = (sample_rate * 0.22) as usize;
+    // Long, gently decaying tones (~2.5 s) so the rack's amplitude envelope is
+    // what audibly bounds each hit — shortening hold/release reshapes a pad
+    // that would otherwise ring on well past a second.
+    let frames = (sample_rate * 2.5) as usize;
     (0..frames)
         .map(|i| {
             let t = i as f32 / sample_rate;
-            let envelope = (1.0 - i as f32 / frames as f32).powi(2);
+            let envelope = 1.0 - i as f32 / frames as f32;
             (t * hz * std::f32::consts::TAU).sin() * envelope * 0.7
         })
         .collect()
@@ -158,7 +161,37 @@ fn build_stream(
 }
 
 #[cfg(feature = "native")]
-fn draw(engine: *mut GooeyEngine, running: bool) -> io::Result<()> {
+fn envelope(engine: *mut GooeyEngine, rack: u32) -> (f32, f32, f32) {
+    let (mut attack, mut hold, mut release) = (0.0, 0.0, 0.0);
+    unsafe {
+        gooey_engine_sampler_get_amp_envelope(engine, rack, &mut attack, &mut hold, &mut release);
+    }
+    (attack, hold, release)
+}
+
+/// Nudge one field of the shared A/H/R envelope while hits are sounding.
+#[cfg(feature = "native")]
+fn adjust_envelope(
+    engine: *mut GooeyEngine,
+    rack: u32,
+    d_attack: f32,
+    d_hold: f32,
+    d_release: f32,
+) {
+    let (attack, hold, release) = envelope(engine, rack);
+    unsafe {
+        gooey_engine_sampler_set_amp_envelope(
+            engine,
+            rack,
+            (attack + d_attack).max(0.0),
+            (hold + d_hold).max(0.0),
+            (release + d_release).max(0.0),
+        );
+    }
+}
+
+#[cfg(feature = "native")]
+fn draw(engine: *mut GooeyEngine, rack: u32, running: bool) -> io::Result<()> {
     unsafe {
         execute!(io::stdout(), cursor::MoveTo(0, 0), Clear(ClearType::All))?;
         println!("=== Sampler Rack ===");
@@ -176,7 +209,13 @@ fn draw(engine: *mut GooeyEngine, running: bool) -> io::Result<()> {
                 "OFF (transport still runs)"
             }
         );
+        let (attack, hold, release) = envelope(engine, rack);
+        println!(
+            "Amp envelope:  attack {:.3}s  hold {:.3}s  release {:.3}s",
+            attack, hold, release
+        );
         println!("\n1–4 trigger pads  |  r record arm  |  c clear recording");
+        println!("a/A attack -/+  |  h/H hold -/+  |  e/E release -/+");
         println!("s toggle sequence hits  |  space play/stop  |  q quit");
         io::stdout().flush()
     }
@@ -200,7 +239,7 @@ fn main() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut running = true;
     loop {
-        draw(engine.lock().unwrap().0, running)?;
+        draw(engine.lock().unwrap().0, rack, running)?;
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
@@ -237,6 +276,12 @@ fn main() -> anyhow::Result<()> {
                             1.0,
                         );
                     }
+                    KeyCode::Char('a') => adjust_envelope(guard.0, rack, -0.005, 0.0, 0.0),
+                    KeyCode::Char('A') => adjust_envelope(guard.0, rack, 0.005, 0.0, 0.0),
+                    KeyCode::Char('h') => adjust_envelope(guard.0, rack, 0.0, -0.1, 0.0),
+                    KeyCode::Char('H') => adjust_envelope(guard.0, rack, 0.0, 0.1, 0.0),
+                    KeyCode::Char('e') => adjust_envelope(guard.0, rack, 0.0, 0.0, -0.01),
+                    KeyCode::Char('E') => adjust_envelope(guard.0, rack, 0.0, 0.0, 0.01),
                     _ => {}
                 }
             }
