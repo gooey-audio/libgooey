@@ -579,6 +579,16 @@ impl crate::engine::Instrument for TomDrum {
         self.trigger_with_velocity_internal(time, velocity);
     }
 
+    fn trigger_with_velocity_reverse(&mut self, time: f32, velocity: f32, reverse: bool) {
+        self.trigger_with_velocity_internal(time, velocity);
+        if reverse {
+            self.pitch_envelope.set_reverse(true);
+            self.amplitude_envelope.set_reverse(true);
+            self.tonal_oscillator.envelope.set_reverse(true);
+            self.punch_oscillator.envelope.set_reverse(true);
+        }
+    }
+
     fn tick(&mut self, current_time: f32) -> f32 {
         self.tick(current_time)
     }

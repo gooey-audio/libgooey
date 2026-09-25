@@ -30,6 +30,14 @@ pub trait Instrument: Send {
     /// * `velocity` - Trigger velocity from 0.0 (softest) to 1.0 (hardest)
     fn trigger_with_velocity(&mut self, time: f32, velocity: f32);
 
+    /// Trigger the instrument with velocity and reverse flag.
+    /// When reverse is true, envelopes play backwards (silence → peak).
+    /// Default implementation ignores reverse for backward compatibility.
+    fn trigger_with_velocity_reverse(&mut self, time: f32, velocity: f32, reverse: bool) {
+        let _ = reverse;
+        self.trigger_with_velocity(time, velocity);
+    }
+
     /// Trigger the instrument at full velocity (convenience method)
     fn trigger(&mut self, time: f32) {
         self.trigger_with_velocity(time, 1.0);

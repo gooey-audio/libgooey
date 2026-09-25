@@ -22,6 +22,7 @@ impl SequencerBlendSetting {
 pub struct SequencerStepSettings {
     pub velocity: Option<f32>,
     pub blend: Option<SequencerBlendSetting>,
+    pub reverse: Option<bool>,
 }
 
 /// Represents a single sequencer step with enabled state, velocity, and optional blend setting
@@ -33,6 +34,8 @@ pub struct SequencerStep {
     pub velocity: f32,
     /// Optional absolute blend setting for this step
     pub blend: Option<SequencerBlendSetting>,
+    /// Whether this step plays in reverse (envelopes run backwards)
+    pub reverse: bool,
 }
 
 impl Default for SequencerStep {
@@ -41,6 +44,7 @@ impl Default for SequencerStep {
             enabled: true,
             velocity: 1.0,
             blend: None,
+            reverse: false,
         }
     }
 }
@@ -52,6 +56,7 @@ impl SequencerStep {
             enabled,
             velocity: 1.0,
             blend: None,
+            reverse: false,
         }
     }
 
@@ -61,6 +66,7 @@ impl SequencerStep {
             enabled,
             velocity: velocity.clamp(0.0, 1.0),
             blend: None,
+            reverse: false,
         }
     }
 
@@ -74,6 +80,7 @@ impl SequencerStep {
             enabled,
             velocity: velocity.clamp(0.0, 1.0),
             blend,
+            reverse: false,
         }
     }
 }
@@ -90,6 +97,7 @@ pub struct SequencerTrigger<'a> {
     pub instrument_name: &'a str,
     pub velocity: f32,
     pub blend: Option<SequencerBlendSetting>,
+    pub reverse: bool,
 }
 
 /// A sample-accurate step sequencer with per-step velocity and optional blend settings
@@ -164,6 +172,43 @@ mod tests {
             sequencer.get_step_blend(2),
             Some(SequencerBlendSetting::new(0.4, 0.9))
         );
+    }
+
+    #[test]
+    fn test_step_reverse_set_get() {
+        let mut sequencer = Sequencer::new(120.0, 44100.0, 4, "kick");
+        assert!(!sequencer.get_step_reverse(0));
+
+        sequencer.set_step_reverse(0, true);
+        assert!(sequencer.get_step_reverse(0));
+        assert!(!sequencer.get_step_reverse(1));
+
+        sequencer.set_step_reverse(0, false);
+        assert!(!sequencer.get_step_reverse(0));
+    }
+
+    #[test]
+    fn test_step_with_velocity_preserves_reverse() {
+        let mut sequencer = Sequencer::new(120.0, 44100.0, 4, "kick");
+        sequencer.set_step_reverse(1, true);
+        sequencer.set_step_with_velocity(1, true, 0.4);
+
+        assert!(sequencer.get_step_reverse(1), "Reverse should be preserved after set_step_with_velocity");
+    }
+
+    #[test]
+    fn test_step_settings_preserves_reverse() {
+        let mut sequencer = Sequencer::new(120.0, 44100.0, 4, "kick");
+        sequencer.set_step_reverse(2, true);
+
+        sequencer.set_step_with_settings(2, true, SequencerStepSettings::default());
+        assert!(sequencer.get_step_reverse(2), "Reverse should be preserved when settings.reverse is None");
+
+        sequencer.set_step_with_settings(2, true, SequencerStepSettings {
+            reverse: Some(false),
+            ..Default::default()
+        });
+        assert!(!sequencer.get_step_reverse(2), "Reverse should be updated when settings.reverse is Some");
     }
 
     #[test]
@@ -507,11 +552,13 @@ impl Sequencer {
         }
     }
 
-    /// Set both enabled state and velocity for a step (preserves any blend setting)
+    /// Set both enabled state and velocity for a step (preserves blend and reverse settings)
     pub fn set_step_with_velocity(&mut self, step: usize, enabled: bool, velocity: f32) {
         if step < self.pattern.len() {
             let blend = self.pattern[step].blend;
+            let reverse = self.pattern[step].reverse;
             self.pattern[step] = SequencerStep::with_velocity_and_blend(enabled, velocity, blend);
+            self.pattern[step].reverse = reverse;
         }
     }
 
@@ -530,6 +577,9 @@ impl Sequencer {
             }
             if let Some(blend) = settings.blend {
                 self.pattern[step].blend = Some(blend);
+            }
+            if let Some(reverse) = settings.reverse {
+                self.pattern[step].reverse = reverse;
             }
         }
     }
@@ -576,6 +626,18 @@ impl Sequencer {
     /// Get a step's blend setting
     pub fn get_step_blend(&self, step: usize) -> Option<SequencerBlendSetting> {
         self.pattern.get(step).and_then(|s| s.blend)
+    }
+
+    /// Set a step's reverse flag
+    pub fn set_step_reverse(&mut self, step: usize, reverse: bool) {
+        if step < self.pattern.len() {
+            self.pattern[step].reverse = reverse;
+        }
+    }
+
+    /// Get a step's reverse flag
+    pub fn get_step_reverse(&self, step: usize) -> bool {
+        self.pattern.get(step).map(|s| s.reverse).unwrap_or(false)
     }
 
     /// Get the pattern with velocity information
@@ -673,6 +735,7 @@ impl Sequencer {
                     instrument_name: self.instrument_name.as_str(),
                     velocity: step.velocity,
                     blend: step.blend,
+                    reverse: step.reverse,
                 });
             }
 

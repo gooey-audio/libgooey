@@ -733,6 +733,16 @@ impl crate::engine::Instrument for HiHat {
         HiHat::trigger_with_velocity(self, time, velocity);
     }
 
+    fn trigger_with_velocity_reverse(&mut self, time: f32, velocity: f32, reverse: bool) {
+        HiHat::trigger_with_velocity(self, time, velocity);
+        if reverse {
+            self.amplitude_envelope.set_reverse(true);
+            self.filter_envelope.set_reverse(true);
+            self.noise_oscillator.envelope.set_reverse(true);
+            self.brightness_oscillator.envelope.set_reverse(true);
+        }
+    }
+
     fn tick(&mut self, current_time: f32) -> f32 {
         self.tick(current_time)
     }

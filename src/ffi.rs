@@ -381,44 +381,46 @@ impl GooeyEngine {
             let kick_trigger = self
                 .kick_sequencer
                 .tick_with_settings()
-                .map(|trigger| (trigger.velocity, trigger.blend));
+                .map(|trigger| (trigger.velocity, trigger.blend, trigger.reverse));
             let snare_trigger = self
                 .snare_sequencer
                 .tick_with_settings()
-                .map(|trigger| (trigger.velocity, trigger.blend));
+                .map(|trigger| (trigger.velocity, trigger.blend, trigger.reverse));
             let hihat_trigger = self
                 .hihat_sequencer
                 .tick_with_settings()
-                .map(|trigger| (trigger.velocity, trigger.blend));
+                .map(|trigger| (trigger.velocity, trigger.blend, trigger.reverse));
             let tom_trigger = self
                 .tom_sequencer
                 .tick_with_settings()
-                .map(|trigger| (trigger.velocity, trigger.blend));
+                .map(|trigger| (trigger.velocity, trigger.blend, trigger.reverse));
 
             // Apply triggers with velocity after all sequencers have been ticked.
             // When sequencer triggers are disabled, skip instrument triggers and MIDI events
             // so external host MIDI can drive the instruments instead.
             if self.sequencer_triggers_enabled {
-                if let Some((velocity, blend)) = kick_trigger {
+                if let Some((velocity, blend, reverse)) = kick_trigger {
                     self.apply_sequencer_blend_setting(INSTRUMENT_KICK, blend);
-                    self.kick.trigger_with_velocity(self.current_time, velocity);
+                    self.kick
+                        .trigger_with_velocity_reverse(self.current_time, velocity, reverse);
                     self.push_midi_event(INSTRUMENT_KICK, velocity, sample_offset);
                 }
-                if let Some((velocity, blend)) = snare_trigger {
+                if let Some((velocity, blend, reverse)) = snare_trigger {
                     self.apply_sequencer_blend_setting(INSTRUMENT_SNARE, blend);
                     self.snare
-                        .trigger_with_velocity(self.current_time, velocity);
+                        .trigger_with_velocity_reverse(self.current_time, velocity, reverse);
                     self.push_midi_event(INSTRUMENT_SNARE, velocity, sample_offset);
                 }
-                if let Some((velocity, blend)) = hihat_trigger {
+                if let Some((velocity, blend, reverse)) = hihat_trigger {
                     self.apply_sequencer_blend_setting(INSTRUMENT_HIHAT, blend);
                     self.hihat
-                        .trigger_with_velocity(self.current_time, velocity);
+                        .trigger_with_velocity_reverse(self.current_time, velocity, reverse);
                     self.push_midi_event(INSTRUMENT_HIHAT, velocity, sample_offset);
                 }
-                if let Some((velocity, blend)) = tom_trigger {
+                if let Some((velocity, blend, reverse)) = tom_trigger {
                     self.apply_sequencer_blend_setting(INSTRUMENT_TOM, blend);
-                    self.tom.trigger_with_velocity(self.current_time, velocity);
+                    self.tom
+                        .trigger_with_velocity_reverse(self.current_time, velocity, reverse);
                     self.push_midi_event(INSTRUMENT_TOM, velocity, sample_offset);
                 }
             }
@@ -1985,6 +1987,7 @@ pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_settings(
             } else {
                 None
             },
+            reverse: None,
         };
         sequencer.set_step_with_settings(step as usize, enabled, settings);
     }
@@ -2294,6 +2297,51 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_enabled(
     let engine = &*engine;
     if let Some(sequencer) = engine.sequencer_for_instrument_ref(instrument) {
         return sequencer.get_step_enabled(step as usize);
+    }
+    false
+}
+
+/// Set the reverse flag for a specific step in an instrument's sequencer.
+///
+/// When reverse is true, the instrument hit plays with reversed envelopes
+/// (silence → swell → peak) instead of the normal (peak → decay → silence).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_set_instrument_step_reverse(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+    reverse: bool,
+) {
+    if engine.is_null() {
+        return;
+    }
+
+    let engine = &mut *engine;
+    if let Some(sequencer) = engine.sequencer_for_instrument(instrument) {
+        sequencer.set_step_reverse(step as usize, reverse);
+    }
+}
+
+/// Get the reverse flag for a specific step in an instrument's sequencer.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_reverse(
+    engine: *mut GooeyEngine,
+    instrument: u32,
+    step: u32,
+) -> bool {
+    if engine.is_null() {
+        return false;
+    }
+
+    let engine = &*engine;
+    if let Some(sequencer) = engine.sequencer_for_instrument_ref(instrument) {
+        return sequencer.get_step_reverse(step as usize);
     }
     false
 }

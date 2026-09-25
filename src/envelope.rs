@@ -76,6 +76,7 @@ pub struct Envelope {
     pub is_active: bool,
     pub trigger_time: f32,               // when the envelope was triggered
     pub release_time_start: Option<f32>, // when release was triggered
+    pub reverse: bool,                   // when true, envelope plays backwards (silence → peak)
 }
 
 impl Envelope {
@@ -96,6 +97,7 @@ impl Envelope {
             is_active: false,
             trigger_time: 0.0,
             release_time_start: None,
+            reverse: false,
         }
     }
 
@@ -138,11 +140,17 @@ impl Envelope {
         self.release_time = release_time;
     }
 
+    /// Set whether the envelope plays in reverse (silence → peak)
+    pub fn set_reverse(&mut self, reverse: bool) {
+        self.reverse = reverse;
+    }
+
     pub fn trigger(&mut self, time: f32) {
         self.is_active = true;
         self.trigger_time = time;
         self.current_time = 0.0;
         self.release_time_start = None;
+        self.reverse = false;
     }
 
     pub fn release(&mut self, time: f32) {
@@ -156,8 +164,22 @@ impl Envelope {
             return 0.0;
         }
 
-        let elapsed = current_time - self.trigger_time;
-        self.current_time = elapsed;
+        let real_elapsed = current_time - self.trigger_time;
+        self.current_time = real_elapsed;
+
+        // Reverse mode: play envelope backwards (silence → peak)
+        if self.reverse {
+            let total_duration = self.attack_time + self.decay_time;
+            if real_elapsed >= total_duration {
+                self.is_active = false;
+                return 1.0; // End at peak
+            }
+            // Reverse the time: feed (total_duration - elapsed) into the forward envelope
+            let elapsed = total_duration - real_elapsed;
+            return self.forward_amplitude(elapsed);
+        }
+
+        let elapsed = real_elapsed;
 
         // Check if we're in release phase
         if let Some(release_start) = self.release_time_start {
@@ -188,25 +210,90 @@ impl Envelope {
                 0.0
             }
         } else {
-            // Normal ADSR without release triggered
-            if elapsed < self.attack_time {
-                // Attack phase - apply attack curve
-                let attack_progress = elapsed / self.attack_time;
-                self.attack_curve.apply(attack_progress)
-            } else if elapsed < self.attack_time + self.decay_time {
-                // Decay phase
-                let decay_elapsed = elapsed - self.attack_time;
-                let decay_progress = decay_elapsed / self.decay_time;
-                let curved_progress = self.decay_curve.apply(decay_progress);
-                1.0 - (1.0 - self.sustain_level) * curved_progress
-            } else {
-                // Sustain phase (holds until release is triggered)
-                // For drums with 0.0 sustain, automatically trigger release
-                if self.sustain_level == 0.0 && self.release_time_start.is_none() {
-                    self.release_time_start = Some(current_time);
-                }
-                self.sustain_level
-            }
+            self.forward_amplitude(elapsed)
         }
+    }
+
+    /// Calculate forward envelope amplitude for a given elapsed time.
+    /// Used by both normal and reverse modes.
+    fn forward_amplitude(&mut self, elapsed: f32) -> f32 {
+        if elapsed < self.attack_time {
+            // Attack phase - apply attack curve
+            let attack_progress = elapsed / self.attack_time;
+            self.attack_curve.apply(attack_progress)
+        } else if elapsed < self.attack_time + self.decay_time {
+            // Decay phase
+            let decay_elapsed = elapsed - self.attack_time;
+            let decay_progress = decay_elapsed / self.decay_time;
+            let curved_progress = self.decay_curve.apply(decay_progress);
+            1.0 - (1.0 - self.sustain_level) * curved_progress
+        } else {
+            // Sustain phase (holds until release is triggered)
+            // For drums with 0.0 sustain, automatically trigger release
+            if self.sustain_level == 0.0 && self.release_time_start.is_none() {
+                self.release_time_start = Some(self.trigger_time + elapsed);
+            }
+            self.sustain_level
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reverse_envelope_starts_near_zero() {
+        let config = ADSRConfig::new(0.01, 0.3, 0.0, 0.01);
+        let mut env = Envelope::with_config(config);
+        env.trigger(0.0);
+        env.set_reverse(true);
+
+        // At the very start of reverse, the forward envelope is near its end (silence)
+        let amp = env.get_amplitude(0.0);
+        assert!(amp < 0.01, "Reverse envelope should start near 0, got {}", amp);
+    }
+
+    #[test]
+    fn test_reverse_envelope_peaks_near_end() {
+        let config = ADSRConfig::new(0.01, 0.3, 0.0, 0.01);
+        let mut env = Envelope::with_config(config);
+        env.trigger(0.0);
+        env.set_reverse(true);
+
+        // In reverse, the forward peak (at attack_time) maps to
+        // real_elapsed = total_duration - attack_time
+        let total_duration = 0.01 + 0.3;
+        let peak_time = total_duration - 0.01; // decay duration from start
+        let amp = env.get_amplitude(peak_time);
+        assert!(amp > 0.9, "Reverse envelope should peak near the end, got {}", amp);
+    }
+
+    #[test]
+    fn test_reverse_envelope_deactivates_after_duration() {
+        let config = ADSRConfig::new(0.01, 0.3, 0.0, 0.01);
+        let mut env = Envelope::with_config(config);
+        env.trigger(0.0);
+        env.set_reverse(true);
+
+        let total_duration = 0.01 + 0.3;
+        let _ = env.get_amplitude(total_duration + 0.01);
+        assert!(!env.is_active, "Reverse envelope should deactivate after total duration");
+    }
+
+    #[test]
+    fn test_forward_envelope_unchanged() {
+        // Ensure forward mode still works correctly
+        let config = ADSRConfig::new(0.01, 0.3, 0.0, 0.01);
+        let mut env = Envelope::with_config(config);
+        env.trigger(0.0);
+
+        // At start of attack, should be near 0
+        let amp = env.get_amplitude(0.0);
+        assert!(amp < 0.01, "Forward should start near 0, got {}", amp);
+
+        // At end of attack, should be near peak
+        let amp = env.get_amplitude(0.01);
+        assert!(amp > 0.9, "Forward should peak after attack, got {}", amp);
     }
 }

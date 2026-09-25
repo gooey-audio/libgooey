@@ -82,6 +82,7 @@ pub struct MaxCurveEnvelope {
     pub is_active: bool,
     trigger_time: f32,
     initial_value: f32,
+    reverse: bool,
 }
 
 impl MaxCurveEnvelope {
@@ -104,12 +105,23 @@ impl MaxCurveEnvelope {
             is_active: false,
             trigger_time: 0.0,
             initial_value: 0.0,
+            reverse: false,
         }
     }
 
     /// Set the initial value before triggering
     pub fn set_initial_value(&mut self, value: f32) {
         self.initial_value = value;
+    }
+
+    /// Set whether the envelope plays in reverse
+    pub fn set_reverse(&mut self, reverse: bool) {
+        self.reverse = reverse;
+    }
+
+    /// Total duration of all segments in seconds
+    fn total_duration(&self) -> f32 {
+        self.segments.iter().map(|s| s.duration_secs).sum()
     }
 
     /// Trigger the envelope at the given time
@@ -120,6 +132,7 @@ impl MaxCurveEnvelope {
         self.segment_start_time = time;
         self.segment_start_value = self.initial_value;
         self.current_value = self.initial_value;
+        self.reverse = false;
     }
 
     /// Get the current envelope value at the given time
@@ -128,6 +141,15 @@ impl MaxCurveEnvelope {
             return self.current_value;
         }
 
+        if self.reverse {
+            return self.get_value_reverse(current_time);
+        }
+
+        self.get_value_forward(current_time)
+    }
+
+    /// Forward envelope playback
+    fn get_value_forward(&mut self, current_time: f32) -> f32 {
         // Process segments
         loop {
             if self.current_segment >= self.segments.len() {
@@ -164,6 +186,52 @@ impl MaxCurveEnvelope {
 
             return self.current_value;
         }
+    }
+
+    /// Reverse envelope playback: remap time so the envelope plays from end to start
+    fn get_value_reverse(&mut self, current_time: f32) -> f32 {
+        let real_elapsed = current_time - self.trigger_time;
+        let total = self.total_duration();
+
+        if real_elapsed >= total {
+            // Reached the "beginning" of the forward envelope — we're done
+            self.is_active = false;
+            self.current_value = self.initial_value;
+            return self.current_value;
+        }
+
+        // Map to the forward envelope's time, running backwards
+        let reversed_time = total - real_elapsed;
+
+        // Walk segments to find value at reversed_time
+        let mut segment_start = 0.0_f32;
+        let mut start_value = self.initial_value;
+
+        for segment in &self.segments {
+            let segment_end = segment_start + segment.duration_secs;
+
+            if reversed_time < segment_end {
+                let elapsed_in_segment = reversed_time - segment_start;
+                let progress = if segment.duration_secs > 0.0 {
+                    elapsed_in_segment / segment.duration_secs
+                } else {
+                    1.0
+                };
+                let curved_progress = max_curve(progress, segment.curve);
+                let range = segment.target_value - start_value;
+                self.current_value = start_value + range * curved_progress;
+                return self.current_value;
+            }
+
+            start_value = segment.target_value;
+            segment_start = segment_end;
+        }
+
+        // Past all segments — return final target
+        if let Some(last) = self.segments.last() {
+            self.current_value = last.target_value;
+        }
+        self.current_value
     }
 
     /// Check if the envelope has completed all segments
@@ -256,5 +324,34 @@ mod tests {
             (v - 0.5).abs() < 0.1,
             "Should be ~0.5 at midpoint of second segment"
         );
+    }
+
+    #[test]
+    fn test_reverse_envelope_starts_near_end_value() {
+        let mut env = MaxCurveEnvelope::new(vec![
+            (1.0, 10.0, 0.0),  // Linear ramp to 1.0 in 10ms
+            (0.0, 100.0, 0.0), // Linear ramp to 0.0 in 100ms
+        ]);
+        env.trigger(0.0);
+        env.set_reverse(true);
+
+        // At the start of reverse, should be near the forward envelope's end (0.0)
+        let v = env.get_value(0.0);
+        assert!(v < 0.05, "Reverse should start near 0, got {}", v);
+    }
+
+    #[test]
+    fn test_reverse_envelope_ends_near_initial() {
+        let mut env = MaxCurveEnvelope::new(vec![
+            (1.0, 10.0, 0.0),  // Linear ramp to 1.0 in 10ms
+            (0.0, 100.0, 0.0), // Linear ramp to 0.0 in 100ms
+        ]);
+        env.trigger(0.0);
+        env.set_reverse(true);
+
+        let total = 0.01 + 0.1; // 10ms + 100ms
+        // Just before the end, should be near the forward envelope's start (0.0 initial)
+        let _ = env.get_value(total + 0.01);
+        assert!(!env.is_active, "Reverse envelope should deactivate after total duration");
     }
 }

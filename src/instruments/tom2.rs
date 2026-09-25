@@ -394,6 +394,25 @@ impl Tom2 {
         self.update_membrane_params();
     }
 
+    fn trigger_internal(&mut self, time: f32) {
+        self.is_active = true;
+        self.trigger_time = time;
+        self.past_attack = false;
+        self.morph_osc.reset();
+        self.click_osc.trigger();
+        self.tri_phase = 0.0;
+        self.bandpass_filter.reset();
+        self.membrane_resonator.reset();
+        self.main_sound_done = false;
+
+        let decay_ms = Self::decay_to_ms(self.decay);
+        self.envelope = MaxCurveEnvelope::new(vec![
+            (1.0, 1.0, 0.8),
+            (0.0, decay_ms, -0.83),
+        ]);
+        self.envelope.trigger(time);
+    }
+
     /// Get current parameters as a config snapshot
     pub fn config(&self) -> Tom2Config {
         Tom2Config {
@@ -411,25 +430,15 @@ impl Tom2 {
 
 impl Instrument for Tom2 {
     fn trigger_with_velocity(&mut self, time: f32, _velocity: f32) {
-        self.is_active = true;
-        self.trigger_time = time;
-        self.past_attack = false; // Reset attack phase tracking
-        self.morph_osc.reset(); // Reset oscillator phases on trigger
-        self.click_osc.trigger(); // Start click impulse playback
-        self.tri_phase = 0.0; // Reset standalone triangle phase
-        self.bandpass_filter.reset(); // Clear filter state
+        self.trigger_internal(time);
+    }
 
-        // Reset membrane resonator state
-        self.membrane_resonator.reset();
-        self.main_sound_done = false;
-
-        // Rebuild envelope with current decay value (mapped from 0-100 to ms)
-        let decay_ms = Self::decay_to_ms(self.decay);
-        self.envelope = MaxCurveEnvelope::new(vec![
-            (1.0, 1.0, 0.8),        // Attack: value=1.0, time=1ms, curve=0.8
-            (0.0, decay_ms, -0.83), // Decay: value=0.0, time=decay ms, curve=-0.83
-        ]);
-        self.envelope.trigger(time);
+    fn trigger_with_velocity_reverse(&mut self, time: f32, velocity: f32, reverse: bool) {
+        let _ = velocity;
+        self.trigger_internal(time);
+        if reverse {
+            self.envelope.set_reverse(true);
+        }
     }
 
     fn tick(&mut self, current_time: f32) -> f32 {
