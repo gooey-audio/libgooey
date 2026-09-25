@@ -39,9 +39,12 @@ The existing `ResoKick` proves that a nonlinear resonator can make compelling ki
 - Decision: Smooth physical continuous controls and latch exciter shape and output taps on trigger.
   Rationale: Continuous edits should not click; changing the interpretation of an already-ringing voice is intentionally deferred to the next hit.
   Date/Author: 2026-09-22 / Codex
-- Decision: Represent the editor as the fixed audio graph itself instead of another parameter-page UI.
-  Rationale: Cable thickness and brightness can directly communicate routing gain, clicking a component or cable selects the corresponding live control, and the existing GLFW/OpenGL approach keeps the lab consistent with `polysynth_gui` without adding dependencies.
-  Date/Author: 2026-09-22 / Codex
+- Decision: Represent the editor as the fixed audio graph itself using `eframe`/`egui` rather than handwritten GLFW/OpenGL controls.
+  Rationale: Cable thickness and brightness directly communicate routing gain, while a retained-mode GUI supplies readable text, labeled sliders, tooltips, scrolling inspectors, and accessible hit targets that the minimal renderer did not.
+  Date/Author: 2026-09-25 / Codex
+- Decision: Use the Entity Ultra-Perc's twin-core, separately excited body/noise architecture as interface vocabulary, while labeling only signal paths the software actually implements.
+  Rationale: The hardware is a useful percussion-synthesis reference, especially its twin resonant core, separate body/noise dynamics, frequency-selective noise, and harmonic shaping. The lab must not imply that Gooey implements its analog wavefolder, trigger delay, external-input filter, or duck output.
+  Date/Author: 2026-09-25 / Codex
 - Decision: Drive four independent `Engine` sequencers and four resonator voices from the beat grid.
   Rationale: A useful beat needs simultaneous kick, snare, tom, and hybrid roles, and the existing engine sequencer keeps triggers sample-accurate while the GUI thread only edits patterns and transport state.
   Date/Author: 2026-09-22 / Codex
@@ -52,7 +55,7 @@ The crate now exports a two-mode resonator instrument with independent transient
 
 ## Context and Orientation
 
-`src/filters/resonator.rs` supplies one bounded two-pole ringing mode. `src/gen/exciter.rs` supplies a short deterministic transient. `src/instruments/reso_kick.rs` combines two resonators with hard-coded kick-oriented routing. The new `src/instruments/resonator_voice.rs` owns two resonators, two oversampled nonlinear stages, the short transient, a separate deterministic filtered-noise tail, parameter smoothers, and a feed-forward routing matrix. `tests/resonator_voice.rs` proves the new graph behavior. `examples/reso_kick.rs` is the interactive native terminal audition tool.
+`src/filters/resonator.rs` supplies one bounded two-pole ringing mode. `src/gen/exciter.rs` supplies a short deterministic transient. `src/instruments/reso_kick.rs` combines two resonators with hard-coded kick-oriented routing. The new `src/instruments/resonator_voice.rs` owns two resonators, two oversampled nonlinear stages, the short transient, a separate deterministic filtered-noise tail, parameter smoothers, and a feed-forward routing matrix. `tests/resonator_voice.rs` proves the new graph behavior. `examples/reso_kick.rs` is the interactive native terminal audition tool, and `examples/resonator_voice_gui.rs` is the `eframe`/`egui` graph and four-track beat lab.
 
 A resonant mode is a filter that stores energy and rings at a chosen frequency. T60 is the time for that ring to fall by 60 decibels. A tap selects either the low-pass or band-pass output of a resonator. Feed-forward routing means signals only travel toward the output; the only recirculation is each resonator's already-bounded internal feedback.
 
@@ -110,6 +113,6 @@ No active Nexus task matched this repository when planning began, so there is no
 
 ## Interfaces and Dependencies
 
-`gooey::instruments` exports `ResonatorVoice`, `ResonatorVoiceParams`, `ResonatorVoiceConfig`, `ResonatorModeConfig`, `ResonatorExciterConfig`, `ResonatorNoiseConfig`, `ResonatorRoutingConfig`, `ResonatorMacroConfig`, `ResonatorExciterShape`, and `ResonatorOutputTap`. `ResonatorVoice` implements the existing `Instrument` and `Modulatable` traits. The implementation uses only existing crate facilities: `Resonator`, `Exciter`, `StateVariableFilterTpt`, `Oversampler`, `SmoothedParam`, and `XorShift32`. It adds no C ABI, DSL syntax, dependency, heap allocation in the audio graph, or variable-size mode bank.
+`gooey::instruments` exports `ResonatorVoice`, `ResonatorVoiceParams`, `ResonatorVoiceConfig`, `ResonatorModeConfig`, `ResonatorExciterConfig`, `ResonatorNoiseConfig`, `ResonatorRoutingConfig`, `ResonatorMacroConfig`, `ResonatorExciterShape`, and `ResonatorOutputTap`. `ResonatorVoice` implements the existing `Instrument` and `Modulatable` traits. The audio implementation uses existing crate facilities: `Resonator`, `Exciter`, `StateVariableFilterTpt`, `Oversampler`, `SmoothedParam`, and `XorShift32`. The optional `visualization` feature now includes `eframe` with its Glow renderer for the native graph lab. The audio graph still adds no C ABI, DSL syntax, heap allocation, or variable-size mode bank.
 
-Revision note (2026-09-22): Created the implementation plan after the initial architecture and test surface were established; recorded the compatibility constraint that prevents replacing the public legacy parameter object directly. Updated after implementation with the noise-only lifecycle fix, final validation, deterministic legacy fixtures, the pre-existing Clippy result, and the follow-up native graph editor.
+Revision note (2026-09-22): Created the implementation plan after the initial architecture and test surface were established; recorded the compatibility constraint that prevents replacing the public legacy parameter object directly. Updated after implementation with the noise-only lifecycle fix, final validation, deterministic legacy fixtures, the pre-existing Clippy result, and the follow-up native graph editor. Revised 2026-09-25 after replacing the minimal GLFW editor with a labeled `eframe`/`egui` lab and incorporating the Entity Ultra-Perc reference into the topology presentation.
