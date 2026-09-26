@@ -20,7 +20,7 @@ pub(crate) mod sampler_control;
 pub mod snare;
 pub mod tom;
 pub mod tom2;
-pub mod ultra_perc;
+pub mod twin_core_perc;
 
 pub use self::bass::*;
 pub use self::fm_snap::*;
@@ -41,7 +41,7 @@ pub use self::sampler::*;
 pub use self::snare::*;
 pub use self::tom::*;
 pub use self::tom2::*;
-pub use self::ultra_perc::*;
+pub use self::twin_core_perc::*;
 
 pub type HiHat = HiHat2;
 pub type HiHatConfig = HiHat2Config;

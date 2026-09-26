@@ -21,14 +21,14 @@ fn finite(value: f32, fallback: f32) -> f32 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UltraPercBodyMode {
+pub enum TwinCorePercBodyMode {
     Low,
     Mid,
     High,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UltraPercNoiseMode {
+pub enum TwinCorePercNoiseMode {
     Lowpass,
     Highpass,
     /// Send low-passed noise into the resonant body instead of the direct mix.
@@ -36,7 +36,7 @@ pub enum UltraPercNoiseMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct UltraPercConfig {
+pub struct TwinCorePercConfig {
     pub master_tune_hz: f32,
     /// Downward offset of core two from core one, matching the panel behavior.
     pub detune_octaves: f32,
@@ -45,9 +45,9 @@ pub struct UltraPercConfig {
     pub fm_decay_seconds: f32,
     pub fm_depth_octaves: f32,
     pub trigger_delay_seconds: f32,
-    pub body_mode: UltraPercBodyMode,
+    pub body_mode: TwinCorePercBodyMode,
     pub harmonics: f32,
-    pub noise_mode: UltraPercNoiseMode,
+    pub noise_mode: TwinCorePercNoiseMode,
     pub noise_filter_hz: f32,
     pub noise_decay_seconds: f32,
     pub noise_bias: f32,
@@ -55,13 +55,13 @@ pub struct UltraPercConfig {
     pub seed: u32,
 }
 
-impl Default for UltraPercConfig {
+impl Default for TwinCorePercConfig {
     fn default() -> Self {
         Self::kick()
     }
 }
 
-impl UltraPercConfig {
+impl TwinCorePercConfig {
     pub fn kick() -> Self {
         Self {
             master_tune_hz: 52.0,
@@ -71,9 +71,9 @@ impl UltraPercConfig {
             fm_decay_seconds: 0.055,
             fm_depth_octaves: 3.2,
             trigger_delay_seconds: 0.0,
-            body_mode: UltraPercBodyMode::Low,
+            body_mode: TwinCorePercBodyMode::Low,
             harmonics: 0.14,
-            noise_mode: UltraPercNoiseMode::Lowpass,
+            noise_mode: TwinCorePercNoiseMode::Lowpass,
             noise_filter_hz: 1_800.0,
             noise_decay_seconds: 0.018,
             noise_bias: -0.75,
@@ -90,7 +90,7 @@ impl UltraPercConfig {
             body_bias: 0.05,
             fm_decay_seconds: 0.11,
             fm_depth_octaves: 0.8,
-            body_mode: UltraPercBodyMode::Mid,
+            body_mode: TwinCorePercBodyMode::Mid,
             harmonics: 0.08,
             noise_bias: -1.0,
             volume: 0.7,
@@ -106,9 +106,9 @@ impl UltraPercConfig {
             body_bias: -0.05,
             fm_decay_seconds: 0.025,
             fm_depth_octaves: 0.35,
-            body_mode: UltraPercBodyMode::Mid,
+            body_mode: TwinCorePercBodyMode::Mid,
             harmonics: 0.46,
-            noise_mode: UltraPercNoiseMode::Highpass,
+            noise_mode: TwinCorePercNoiseMode::Highpass,
             noise_filter_hz: 3_800.0,
             noise_decay_seconds: 0.34,
             noise_bias: 0.2,
@@ -126,9 +126,9 @@ impl UltraPercConfig {
             fm_decay_seconds: 0.012,
             fm_depth_octaves: -0.4,
             trigger_delay_seconds: 0.018,
-            body_mode: UltraPercBodyMode::High,
+            body_mode: TwinCorePercBodyMode::High,
             harmonics: 0.58,
-            noise_mode: UltraPercNoiseMode::Body,
+            noise_mode: TwinCorePercNoiseMode::Body,
             noise_filter_hz: 2_600.0,
             noise_decay_seconds: 0.28,
             noise_bias: 0.35,
@@ -145,9 +145,9 @@ impl UltraPercConfig {
             body_bias: 0.35,
             fm_decay_seconds: 0.7,
             fm_depth_octaves: -1.4,
-            body_mode: UltraPercBodyMode::High,
+            body_mode: TwinCorePercBodyMode::High,
             harmonics: 0.78,
-            noise_mode: UltraPercNoiseMode::Body,
+            noise_mode: TwinCorePercNoiseMode::Body,
             noise_filter_hz: 6_500.0,
             noise_decay_seconds: 0.8,
             noise_bias: -0.2,
@@ -157,7 +157,7 @@ impl UltraPercConfig {
     }
 }
 
-pub struct UltraPercVoice {
+pub struct TwinCorePercVoice {
     sample_rate: f32,
     cores: [Resonator; 2],
     exciter: Exciter,
@@ -165,10 +165,10 @@ pub struct UltraPercVoice {
     noise_rng: XorShift32,
     folder: Oversampler,
     params: [SmoothedParam; 12],
-    pending_body_mode: UltraPercBodyMode,
-    active_body_mode: UltraPercBodyMode,
-    pending_noise_mode: UltraPercNoiseMode,
-    active_noise_mode: UltraPercNoiseMode,
+    pending_body_mode: TwinCorePercBodyMode,
+    active_body_mode: TwinCorePercBodyMode,
+    pending_noise_mode: TwinCorePercNoiseMode,
+    active_noise_mode: TwinCorePercNoiseMode,
     seed: u32,
     velocity: f32,
     noise_velocity: f32,
@@ -181,12 +181,12 @@ pub struct UltraPercVoice {
     ring_limit_secs: Option<f32>,
 }
 
-impl UltraPercVoice {
+impl TwinCorePercVoice {
     pub fn new(sample_rate: f32) -> Self {
-        Self::with_config(sample_rate, UltraPercConfig::default())
+        Self::with_config(sample_rate, TwinCorePercConfig::default())
     }
 
-    pub fn with_config(sample_rate: f32, config: UltraPercConfig) -> Self {
+    pub fn with_config(sample_rate: f32, config: TwinCorePercConfig) -> Self {
         let sr = sample_rate.max(1.0);
         let mut exciter = Exciter::new(sr);
         exciter.set_kind(ExciterKind::Pulse);
@@ -229,8 +229,8 @@ impl UltraPercVoice {
         }
     }
 
-    pub fn config_targets(&self) -> UltraPercConfig {
-        UltraPercConfig {
+    pub fn config_targets(&self) -> TwinCorePercConfig {
+        TwinCorePercConfig {
             master_tune_hz: self.params[0].target(),
             detune_octaves: self.params[1].target(),
             length_seconds: self.params[2].target(),
@@ -249,7 +249,7 @@ impl UltraPercVoice {
         }
     }
 
-    pub fn set_config(&mut self, config: UltraPercConfig) {
+    pub fn set_config(&mut self, config: TwinCorePercConfig) {
         let values = [
             config.master_tune_hz,
             config.detune_octaves,
@@ -283,16 +283,21 @@ impl UltraPercVoice {
         }
     }
 
-    pub fn set_body_mode(&mut self, mode: UltraPercBodyMode) {
+    pub fn set_body_mode(&mut self, mode: TwinCorePercBodyMode) {
         self.pending_body_mode = mode;
     }
 
-    pub fn set_noise_mode(&mut self, mode: UltraPercNoiseMode) {
+    pub fn set_noise_mode(&mut self, mode: TwinCorePercNoiseMode) {
         self.pending_noise_mode = mode;
     }
 
     pub fn set_ring_limit_secs(&mut self, limit: Option<f32>) {
         self.ring_limit_secs = limit.map(|v| finite(v, 0.001).max(0.001));
+    }
+
+    pub fn set_seed(&mut self, seed: u32) {
+        self.seed = seed;
+        self.noise_rng = XorShift32::new(seed);
     }
 
     /// Trigger only the independent noise envelope, analogous to N-TRIG.
@@ -335,7 +340,7 @@ impl UltraPercVoice {
     }
 }
 
-impl Instrument for UltraPercVoice {
+impl Instrument for TwinCorePercVoice {
     fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         let velocity = finite(velocity, 0.0).clamp(0.0, 1.0);
         if velocity == 0.0 {
@@ -394,8 +399,8 @@ impl Instrument for UltraPercVoice {
         let (noise_low, _, noise_high) =
             self.noise_filter.process_all(self.noise_rng.next_bipolar());
         let noise = match self.active_noise_mode {
-            UltraPercNoiseMode::Lowpass | UltraPercNoiseMode::Body => noise_low,
-            UltraPercNoiseMode::Highpass => noise_high,
+            TwinCorePercNoiseMode::Lowpass | TwinCorePercNoiseMode::Body => noise_low,
+            TwinCorePercNoiseMode::Highpass => noise_high,
         } * noise_env
             * noise_gain
             * self.noise_velocity.sqrt();
@@ -405,7 +410,7 @@ impl Instrument for UltraPercVoice {
         } else {
             0.0
         };
-        let body_noise = if self.active_noise_mode == UltraPercNoiseMode::Body {
+        let body_noise = if self.active_noise_mode == TwinCorePercNoiseMode::Body {
             noise * 0.7
         } else {
             0.0
@@ -413,11 +418,11 @@ impl Instrument for UltraPercVoice {
         let core1 = self.cores[0].process(transient + body_noise);
         let core2 = self.cores[1].process(core1);
         let spectral = match self.active_body_mode {
-            UltraPercBodyMode::Low => core2,
-            UltraPercBodyMode::Mid => {
+            TwinCorePercBodyMode::Low => core2,
+            TwinCorePercBodyMode::Mid => {
                 0.55 * self.cores[0].bandpass() + 0.75 * self.cores[1].bandpass()
             }
-            UltraPercBodyMode::High => self.cores[1].bandpass() - 0.45 * core2,
+            TwinCorePercBodyMode::High => self.cores[1].bandpass() - 0.45 * core2,
         };
         let harmonics = values[7];
         let folded = self
@@ -430,7 +435,7 @@ impl Instrument for UltraPercVoice {
         } else {
             0.0
         };
-        let direct_noise = if self.active_noise_mode == UltraPercNoiseMode::Body {
+        let direct_noise = if self.active_noise_mode == TwinCorePercNoiseMode::Body {
             0.0
         } else {
             noise
@@ -464,7 +469,7 @@ impl Instrument for UltraPercVoice {
     }
 }
 
-impl Modulatable for UltraPercVoice {
+impl Modulatable for TwinCorePercVoice {
     fn modulatable_parameters(&self) -> Vec<&'static str> {
         vec![
             "tune",
@@ -491,7 +496,7 @@ impl Modulatable for UltraPercVoice {
             self.set_parameter_normalized(index, value);
             Ok(())
         } else {
-            Err(format!("Unknown UltraPercVoice parameter: {parameter}"))
+            Err(format!("Unknown TwinCorePercVoice parameter: {parameter}"))
         }
     }
 

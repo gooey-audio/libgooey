@@ -10,8 +10,8 @@ use gooey::effects::{Effect, EntityDynamics, SoftLimiter};
 use gooey::engine::{Engine, EngineOutput, Instrument};
 use gooey::frame::StereoFrame;
 use gooey::instruments::{
-    ResoKick, ResoKickConfig, ResonatorVoice, ResonatorVoiceConfig, UltraPercBodyMode,
-    UltraPercConfig, UltraPercNoiseMode, UltraPercVoice,
+    ResoKick, ResoKickConfig, ResonatorVoice, ResonatorVoiceConfig, TwinCorePercBodyMode,
+    TwinCorePercConfig, TwinCorePercNoiseMode, TwinCorePercVoice,
 };
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
@@ -122,9 +122,9 @@ impl Instrument for SharedResonatorVoice {
     }
 }
 
-struct SharedUltraPercVoice(Arc<Mutex<UltraPercVoice>>);
+struct SharedTwinCorePercVoice(Arc<Mutex<TwinCorePercVoice>>);
 
-impl Instrument for SharedUltraPercVoice {
+impl Instrument for SharedTwinCorePercVoice {
     fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         self.0.lock().unwrap().trigger_with_velocity(time, velocity);
     }
@@ -143,7 +143,7 @@ enum LabPage {
     Legacy,
     Macros,
     Advanced,
-    UltraPerc,
+    TwinCorePerc,
 }
 
 const GENERIC_MACROS: [&str; 9] = [
@@ -169,7 +169,7 @@ const ADVANCED_NAMES: [&str; 8] = [
     "noise level",
 ];
 
-const ULTRA_PERC_NAMES: [&str; 14] = [
+const TWIN_CORE_PERC_NAMES: [&str; 14] = [
     "master tune",
     "detune down",
     "length",
@@ -186,46 +186,46 @@ const ULTRA_PERC_NAMES: [&str; 14] = [
     "noise routing mode",
 ];
 
-fn ultra_value(voice: &UltraPercVoice, index: usize) -> f32 {
+fn twin_core_value(voice: &TwinCorePercVoice, index: usize) -> f32 {
     if index < 12 {
         voice.parameter_normalized(index).unwrap_or(0.0)
     } else {
         let config = voice.config_targets();
         match (index, config.body_mode, config.noise_mode) {
-            (12, UltraPercBodyMode::Low, _) => 0.0,
-            (12, UltraPercBodyMode::Mid, _) => 0.5,
-            (12, UltraPercBodyMode::High, _) => 1.0,
-            (13, _, UltraPercNoiseMode::Lowpass) => 0.0,
-            (13, _, UltraPercNoiseMode::Highpass) => 0.5,
-            (13, _, UltraPercNoiseMode::Body) => 1.0,
+            (12, TwinCorePercBodyMode::Low, _) => 0.0,
+            (12, TwinCorePercBodyMode::Mid, _) => 0.5,
+            (12, TwinCorePercBodyMode::High, _) => 1.0,
+            (13, _, TwinCorePercNoiseMode::Lowpass) => 0.0,
+            (13, _, TwinCorePercNoiseMode::Highpass) => 0.5,
+            (13, _, TwinCorePercNoiseMode::Body) => 1.0,
             _ => 0.0,
         }
     }
 }
 
-fn set_ultra_value(voice: &mut UltraPercVoice, index: usize, value: f32) {
+fn set_twin_core_value(voice: &mut TwinCorePercVoice, index: usize, value: f32) {
     if index < 12 {
         voice.set_parameter_normalized(index, value);
     } else if index == 12 {
         voice.set_body_mode(if value < 0.25 {
-            UltraPercBodyMode::Low
+            TwinCorePercBodyMode::Low
         } else if value < 0.75 {
-            UltraPercBodyMode::Mid
+            TwinCorePercBodyMode::Mid
         } else {
-            UltraPercBodyMode::High
+            TwinCorePercBodyMode::High
         });
     } else {
         voice.set_noise_mode(if value < 0.25 {
-            UltraPercNoiseMode::Lowpass
+            TwinCorePercNoiseMode::Lowpass
         } else if value < 0.75 {
-            UltraPercNoiseMode::Highpass
+            TwinCorePercNoiseMode::Highpass
         } else {
-            UltraPercNoiseMode::Body
+            TwinCorePercNoiseMode::Body
         });
     }
 }
 
-fn ultra_detail(voice: &UltraPercVoice, index: usize) -> String {
+fn twin_core_detail(voice: &TwinCorePercVoice, index: usize) -> String {
     let config = voice.config_targets();
     match index {
         0 => format!("{:>7.1} Hz", config.master_tune_hz),
@@ -246,17 +246,22 @@ fn ultra_detail(voice: &UltraPercVoice, index: usize) -> String {
     }
 }
 
-fn render_ultra_display(voice: &UltraPercVoice, selected: usize, preset_name: &str, velocity: f32) {
+fn render_twin_core_display(
+    voice: &TwinCorePercVoice,
+    selected: usize,
+    preset_name: &str,
+    velocity: f32,
+) {
     print!("\x1b[2J\x1b[H\x1b[?7l");
-    print!("=== Resonator Voice Lab / ULTRA-PERC-INSPIRED ENGINE ===\r\n");
+    print!("=== Resonator Voice Lab / TWIN-CORE PERCUSSION ENGINE ===\r\n");
     print!("E=compare resonator  TAB=page  SPACE=hit  Q=quit  arrows/[]=adjust\r\n");
     print!("7=kick 8=tom 9=snare 0=clap -=metallic\r\n");
     print!(
         "Preset: {preset_name} | Velocity: {:.0}%\r\n\r\n",
         velocity * 100.0
     );
-    for (index, name) in ULTRA_PERC_NAMES.iter().enumerate() {
-        let value = ultra_value(voice, index);
+    for (index, name) in TWIN_CORE_PERC_NAMES.iter().enumerate() {
+        let value = twin_core_value(voice, index);
         let indicator = if index == selected { ">" } else { " " };
         print!(
             "{} {:<22} [{}] {:>4.2}  {}\r\n",
@@ -264,7 +269,7 @@ fn render_ultra_display(voice: &UltraPercVoice, selected: usize, preset_name: &s
             name,
             make_bar(value, 12),
             value,
-            ultra_detail(voice, index)
+            twin_core_detail(voice, index)
         );
     }
     print!(
@@ -363,7 +368,7 @@ fn render_generic_display(
         "ADVANCED"
     };
     print!("=== Resonator Voice Lab / {page_name} ===\r\n");
-    print!("E=compare Ultra-Perc-inspired engine  TAB=page  SPACE=hit  Q=quit\r\n");
+    print!("E=compare twin-core percussion engine  TAB=page  SPACE=hit  Q=quit\r\n");
     print!("arrows/[]=adjust  1-6=legacy  7=kick 8=tom 9=snare 0=clap/hybrid -=metallic\r\n");
     print!(
         "Preset: {preset_name} | Velocity: {:.0}%\r\n\r\n",
@@ -500,7 +505,7 @@ fn render_display(
     print!("\x1b[2J\x1b[H\x1b[?7l");
     print!("=== Reso Kick Lab ===\r\n");
     print!("SPACE=hit  Q=quit  ↑↓=select  ←→=adjust  []=fine  TAB=page\r\n");
-    print!("V=velocity  E=Ultra-Perc engine  1-6=legacy  7-9/0/-=engine presets\r\n");
+    print!("V=velocity  E=twin-core engine  1-6=legacy  7-9/0/-=engine presets\r\n");
     print!("Preset: {preset_name}\r\n\r\n");
 
     for (index, info) in PARAM_INFO.iter().enumerate() {
@@ -545,9 +550,9 @@ fn main() -> anyhow::Result<()> {
         sample_rate,
         generic_config,
     )));
-    let ultra = Arc::new(Mutex::new(UltraPercVoice::with_config(
+    let twin_core = Arc::new(Mutex::new(TwinCorePercVoice::with_config(
         sample_rate,
-        UltraPercConfig::kick(),
+        TwinCorePercConfig::kick(),
     )));
     let dynamics = Arc::new(EntityDynamics::new(sample_rate));
     dynamics.set_bass_drive(0.55);
@@ -562,8 +567,8 @@ fn main() -> anyhow::Result<()> {
         Box::new(SharedResonatorVoice(generic.clone())),
     );
     engine.add_instrument(
-        "ultra_perc_voice",
-        Box::new(SharedUltraPercVoice(ultra.clone())),
+        "twin_core_perc_voice",
+        Box::new(SharedTwinCorePercVoice(twin_core.clone())),
     );
     engine.clear_global_effects();
     engine.add_global_effect(Box::new(SharedEntityDynamics(dynamics.clone())));
@@ -599,9 +604,9 @@ fn main() -> anyhow::Result<()> {
                     preset_name,
                 );
             } else {
-                if page == LabPage::UltraPerc {
-                    render_ultra_display(
-                        &ultra.lock().unwrap(),
+                if page == LabPage::TwinCorePerc {
+                    render_twin_core_display(
+                        &twin_core.lock().unwrap(),
                         selected,
                         preset_name,
                         velocities[velocity_index],
@@ -633,7 +638,7 @@ fn main() -> anyhow::Result<()> {
                             LabPage::Legacy => PARAM_INFO.len(),
                             LabPage::Macros => GENERIC_MACROS.len(),
                             LabPage::Advanced => ADVANCED_NAMES.len(),
-                            LabPage::UltraPerc => ULTRA_PERC_NAMES.len(),
+                            LabPage::TwinCorePerc => TWIN_CORE_PERC_NAMES.len(),
                         };
                         selected = (selected + 1).min(len - 1);
                         needs_redraw = true;
@@ -672,10 +677,11 @@ fn main() -> anyhow::Result<()> {
                                     value,
                                 );
                             }
-                            LabPage::UltraPerc => {
-                                let mut voice = ultra.lock().unwrap();
-                                let value = (ultra_value(&voice, selected) + delta).clamp(0.0, 1.0);
-                                set_ultra_value(&mut voice, selected, value);
+                            LabPage::TwinCorePerc => {
+                                let mut voice = twin_core.lock().unwrap();
+                                let value =
+                                    (twin_core_value(&voice, selected) + delta).clamp(0.0, 1.0);
+                                set_twin_core_value(&mut voice, selected, value);
                             }
                         }
                         preset_name = "Custom";
@@ -684,7 +690,7 @@ fn main() -> anyhow::Result<()> {
                     KeyCode::Char(' ') => {
                         let instrument = match page {
                             LabPage::Legacy => "reso_kick",
-                            LabPage::UltraPerc => "ultra_perc_voice",
+                            LabPage::TwinCorePerc => "twin_core_perc_voice",
                             LabPage::Macros | LabPage::Advanced => "resonator_voice",
                         };
                         audio_engine
@@ -711,23 +717,27 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     KeyCode::Char(number @ '7'..='9') => {
-                        let (name, config, ultra_config) = match number {
+                        let (name, config, twin_core_config) = match number {
                             '7' => (
                                 "Kick",
                                 ResonatorVoiceConfig::kick(),
-                                UltraPercConfig::kick(),
+                                TwinCorePercConfig::kick(),
                             ),
-                            '8' => ("Tom", ResonatorVoiceConfig::tom(), UltraPercConfig::tom()),
+                            '8' => (
+                                "Tom",
+                                ResonatorVoiceConfig::tom(),
+                                TwinCorePercConfig::tom(),
+                            ),
                             _ => (
                                 "Snare",
                                 ResonatorVoiceConfig::snare(),
-                                UltraPercConfig::snare(),
+                                TwinCorePercConfig::snare(),
                             ),
                         };
                         generic_config = config;
                         *generic.lock().unwrap() = ResonatorVoice::with_config(sample_rate, config);
-                        *ultra.lock().unwrap() =
-                            UltraPercVoice::with_config(sample_rate, ultra_config);
+                        *twin_core.lock().unwrap() =
+                            TwinCorePercVoice::with_config(sample_rate, twin_core_config);
                         if page == LabPage::Legacy {
                             page = LabPage::Macros;
                         }
@@ -736,23 +746,23 @@ fn main() -> anyhow::Result<()> {
                         needs_redraw = true;
                     }
                     KeyCode::Char('0') | KeyCode::Char('-') => {
-                        let (name, config, ultra_config) = if code == KeyCode::Char('0') {
+                        let (name, config, twin_core_config) = if code == KeyCode::Char('0') {
                             (
                                 "Clap / Hybrid",
                                 ResonatorVoiceConfig::hybrid(),
-                                UltraPercConfig::clap(),
+                                TwinCorePercConfig::clap(),
                             )
                         } else {
                             (
                                 "Metallic",
                                 ResonatorVoiceConfig::metallic_drone(),
-                                UltraPercConfig::metallic(),
+                                TwinCorePercConfig::metallic(),
                             )
                         };
                         generic_config = config;
                         *generic.lock().unwrap() = ResonatorVoice::with_config(sample_rate, config);
-                        *ultra.lock().unwrap() =
-                            UltraPercVoice::with_config(sample_rate, ultra_config);
+                        *twin_core.lock().unwrap() =
+                            TwinCorePercVoice::with_config(sample_rate, twin_core_config);
                         if page == LabPage::Legacy {
                             page = LabPage::Macros;
                         }
@@ -764,17 +774,17 @@ fn main() -> anyhow::Result<()> {
                         page = match page {
                             LabPage::Legacy => LabPage::Macros,
                             LabPage::Macros => LabPage::Advanced,
-                            LabPage::Advanced => LabPage::UltraPerc,
-                            LabPage::UltraPerc => LabPage::Legacy,
+                            LabPage::Advanced => LabPage::TwinCorePerc,
+                            LabPage::TwinCorePerc => LabPage::Legacy,
                         };
                         selected = 0;
                         needs_redraw = true;
                     }
                     KeyCode::Char('e') | KeyCode::Char('E') => {
-                        page = if page == LabPage::UltraPerc {
+                        page = if page == LabPage::TwinCorePerc {
                             LabPage::Macros
                         } else {
-                            LabPage::UltraPerc
+                            LabPage::TwinCorePerc
                         };
                         selected = 0;
                         needs_redraw = true;

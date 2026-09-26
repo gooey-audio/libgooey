@@ -1,10 +1,10 @@
 use gooey::engine::{Instrument, Modulatable};
-use gooey::instruments::{UltraPercConfig, UltraPercNoiseMode, UltraPercVoice};
+use gooey::instruments::{TwinCorePercConfig, TwinCorePercNoiseMode, TwinCorePercVoice};
 
 const SAMPLE_RATE: f32 = 48_000.0;
 
-fn render(config: UltraPercConfig, seconds: f32) -> Vec<f32> {
-    let mut voice = UltraPercVoice::with_config(SAMPLE_RATE, config);
+fn render(config: TwinCorePercConfig, seconds: f32) -> Vec<f32> {
+    let mut voice = TwinCorePercVoice::with_config(SAMPLE_RATE, config);
     voice.trigger_with_velocity(0.0, 0.8);
     (0..(seconds * SAMPLE_RATE) as usize)
         .map(|index| voice.tick(index as f64 / SAMPLE_RATE as f64))
@@ -18,11 +18,11 @@ fn energy(samples: &[f32]) -> f32 {
 #[test]
 fn factory_presets_are_finite_audible_and_distinct() {
     let presets = [
-        UltraPercConfig::kick(),
-        UltraPercConfig::tom(),
-        UltraPercConfig::snare(),
-        UltraPercConfig::clap(),
-        UltraPercConfig::metallic(),
+        TwinCorePercConfig::kick(),
+        TwinCorePercConfig::tom(),
+        TwinCorePercConfig::snare(),
+        TwinCorePercConfig::clap(),
+        TwinCorePercConfig::metallic(),
     ];
     let renders: Vec<_> = presets
         .into_iter()
@@ -45,7 +45,7 @@ fn factory_presets_are_finite_audible_and_distinct() {
 
 #[test]
 fn trigger_delay_moves_only_the_body_onset() {
-    let mut config = UltraPercConfig::kick();
+    let mut config = TwinCorePercConfig::kick();
     config.trigger_delay_seconds = 0.04;
     config.noise_bias = 0.4;
     config.noise_decay_seconds = 0.1;
@@ -62,10 +62,10 @@ fn trigger_delay_moves_only_the_body_onset() {
 
 #[test]
 fn body_noise_routing_differs_from_direct_noise() {
-    let mut direct = UltraPercConfig::snare();
-    direct.noise_mode = UltraPercNoiseMode::Lowpass;
+    let mut direct = TwinCorePercConfig::snare();
+    direct.noise_mode = TwinCorePercNoiseMode::Lowpass;
     let mut routed = direct;
-    routed.noise_mode = UltraPercNoiseMode::Body;
+    routed.noise_mode = TwinCorePercNoiseMode::Body;
     let direct = render(direct, 0.5);
     let routed = render(routed, 0.5);
     let difference: f32 = direct
@@ -78,9 +78,9 @@ fn body_noise_routing_differs_from_direct_noise() {
 
 #[test]
 fn independent_noise_trigger_does_not_require_a_body_trigger() {
-    let mut config = UltraPercConfig::snare();
-    config.noise_mode = UltraPercNoiseMode::Highpass;
-    let mut voice = UltraPercVoice::with_config(SAMPLE_RATE, config);
+    let mut config = TwinCorePercConfig::snare();
+    config.noise_mode = TwinCorePercNoiseMode::Highpass;
+    let mut voice = TwinCorePercVoice::with_config(SAMPLE_RATE, config);
     voice.trigger_noise_with_velocity(0.0, 0.7);
     let samples: Vec<_> = (0..4_800)
         .map(|index| voice.tick(index as f64 / SAMPLE_RATE as f64))
@@ -91,10 +91,10 @@ fn independent_noise_trigger_does_not_require_a_body_trigger() {
 
 #[test]
 fn seed_and_modulation_are_deterministic_and_sanitized() {
-    let config = UltraPercConfig::snare();
+    let config = TwinCorePercConfig::snare();
     assert_eq!(render(config, 0.2), render(config, 0.2));
 
-    let mut voice = UltraPercVoice::with_config(SAMPLE_RATE, config);
+    let mut voice = TwinCorePercVoice::with_config(SAMPLE_RATE, config);
     assert_eq!(voice.parameter_range("harmonics"), Some((0.0, 1.0)));
     voice.apply_modulation("harmonics", f32::NAN).unwrap();
     voice.trigger_with_velocity(0.0, 1.0);
@@ -106,7 +106,7 @@ fn seed_and_modulation_are_deterministic_and_sanitized() {
 
 #[test]
 fn ring_limit_stops_long_metallic_patch() {
-    let mut voice = UltraPercVoice::with_config(SAMPLE_RATE, UltraPercConfig::metallic());
+    let mut voice = TwinCorePercVoice::with_config(SAMPLE_RATE, TwinCorePercConfig::metallic());
     voice.set_ring_limit_secs(Some(0.05));
     voice.trigger_with_velocity(0.0, 1.0);
     for index in 0..3_000 {
