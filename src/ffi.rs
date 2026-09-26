@@ -29,8 +29,10 @@ use crate::instruments::poly_synth_control::{PolySynthControl, PolySynthPending}
 use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
     BassConfig, BassSynth, FilterSlope, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum,
-    MelodyVoice, NoiseColor, PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer,
-    SamplerBuffer, SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config,
+    MelodyVoice, NoiseColor, PercussionEngine, PercussionEngineKind, PercussionPreset,
+    PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer, SamplerBuffer,
+    SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config, TwinCorePercBodyMode,
+    TwinCorePercConfig, TwinCorePercNoiseMode, TwinCorePercVoice,
 };
 use crate::live_control::{
     DrumCell, EngineLifecycle, LiveCommand, LiveControlShared, DRUM_LANE_COUNT, DRUM_STEP_COUNT,
@@ -83,6 +85,30 @@ pub const LFO_TIMING_SIXTEENTH: u32 = 6;
 pub const LFO_TIMING_THIRTY_SECOND: u32 = 7;
 /// Invalid LFO value (returned on error or when LFO is in Hz mode)
 pub const LFO_INVALID: u32 = 0xFFFFFFFF;
+
+// =============================================================================
+// Twin-core percussion standalone voice constants
+// =============================================================================
+
+pub const TWIN_CORE_PERC_PARAM_COUNT: u32 = 12;
+pub const TWIN_CORE_PERC_PRESET_KICK: u32 = 0;
+pub const TWIN_CORE_PERC_PRESET_TOM: u32 = 1;
+pub const TWIN_CORE_PERC_PRESET_SNARE: u32 = 2;
+pub const TWIN_CORE_PERC_PRESET_CLAP: u32 = 3;
+pub const TWIN_CORE_PERC_PRESET_METALLIC: u32 = 4;
+pub const TWIN_CORE_PERC_BODY_LOW: u32 = 0;
+pub const TWIN_CORE_PERC_BODY_MID: u32 = 1;
+pub const TWIN_CORE_PERC_BODY_HIGH: u32 = 2;
+pub const TWIN_CORE_PERC_NOISE_LOWPASS: u32 = 0;
+pub const TWIN_CORE_PERC_NOISE_HIGHPASS: u32 = 1;
+pub const TWIN_CORE_PERC_NOISE_BODY: u32 = 2;
+pub const PERCUSSION_ENGINE_ROUTING_MATRIX: u32 = 0;
+pub const PERCUSSION_ENGINE_TWIN_CORE: u32 = 1;
+pub const PERCUSSION_PRESET_KICK: u32 = 0;
+pub const PERCUSSION_PRESET_TOM: u32 = 1;
+pub const PERCUSSION_PRESET_SNARE: u32 = 2;
+pub const PERCUSSION_PRESET_CLAP_HYBRID: u32 = 3;
+pub const PERCUSSION_PRESET_METALLIC: u32 = 4;
 
 /// LFO route configuration
 #[derive(Clone)]
@@ -11722,6 +11748,533 @@ pub unsafe extern "C" fn gooey_engine_loop_render_to_wav(
         }
     }
     writer.finalize().is_ok()
+}
+
+// =============================================================================
+// Selectable percussion engine
+// =============================================================================
+
+/// Opaque host-facing percussion voice with a selectable synthesis topology.
+#[repr(C)]
+pub struct GooeyPercussionEngine {
+    voice: PercussionEngine,
+    sample_rate: f32,
+    time: f64,
+}
+
+fn percussion_engine_kind(kind: u32) -> Option<PercussionEngineKind> {
+    match kind {
+        PERCUSSION_ENGINE_ROUTING_MATRIX => Some(PercussionEngineKind::RoutingMatrix),
+        PERCUSSION_ENGINE_TWIN_CORE => Some(PercussionEngineKind::TwinCore),
+        _ => None,
+    }
+}
+
+fn percussion_preset(preset: u32) -> Option<PercussionPreset> {
+    match preset {
+        PERCUSSION_PRESET_KICK => Some(PercussionPreset::Kick),
+        PERCUSSION_PRESET_TOM => Some(PercussionPreset::Tom),
+        PERCUSSION_PRESET_SNARE => Some(PercussionPreset::Snare),
+        PERCUSSION_PRESET_CLAP_HYBRID => Some(PercussionPreset::ClapHybrid),
+        PERCUSSION_PRESET_METALLIC => Some(PercussionPreset::Metallic),
+        _ => None,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gooey_percussion_engine_new(
+    sample_rate: f32,
+    kind: u32,
+) -> *mut GooeyPercussionEngine {
+    let Some(kind) = percussion_engine_kind(kind) else {
+        return std::ptr::null_mut();
+    };
+    let sample_rate = if sample_rate.is_finite() && sample_rate > 0.0 {
+        sample_rate
+    } else {
+        44_100.0
+    };
+    Box::into_raw(Box::new(GooeyPercussionEngine {
+        voice: PercussionEngine::with_selection(sample_rate, kind, PercussionPreset::Kick),
+        sample_rate,
+        time: 0.0,
+    }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_destroy(voice: *mut GooeyPercussionEngine) {
+    if !voice.is_null() {
+        drop(Box::from_raw(voice));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_select(
+    voice: *mut GooeyPercussionEngine,
+    kind: u32,
+) -> bool {
+    let (Some(voice), Some(kind)) = (voice.as_mut(), percussion_engine_kind(kind)) else {
+        return false;
+    };
+    voice.voice.select_engine(kind);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_get_selected(
+    voice: *const GooeyPercussionEngine,
+) -> u32 {
+    voice
+        .as_ref()
+        .map_or(u32::MAX, |voice| voice.voice.kind() as u32)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_set_preset(
+    voice: *mut GooeyPercussionEngine,
+    preset: u32,
+) -> bool {
+    let (Some(voice), Some(preset)) = (voice.as_mut(), percussion_preset(preset)) else {
+        return false;
+    };
+    voice.voice.select_preset(preset);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_get_preset(
+    voice: *const GooeyPercussionEngine,
+) -> u32 {
+    voice
+        .as_ref()
+        .map_or(u32::MAX, |voice| voice.voice.preset() as u32)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_parameter_count(
+    voice: *const GooeyPercussionEngine,
+) -> u32 {
+    voice
+        .as_ref()
+        .map_or(0, |voice| voice.voice.parameter_count() as u32)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_parameter_name(
+    voice: *const GooeyPercussionEngine,
+    parameter: u32,
+) -> *const c_char {
+    const ROUTING_NAMES: [&[u8]; 9] = [
+        b"pitch\0",
+        b"pitch_sweep\0",
+        b"sweep_time\0",
+        b"decay\0",
+        b"body_character\0",
+        b"noise\0",
+        b"coupling\0",
+        b"drive\0",
+        b"volume\0",
+    ];
+    const TWIN_NAMES: [&[u8]; 12] = [
+        b"tune\0",
+        b"detune\0",
+        b"length\0",
+        b"body_bias\0",
+        b"fm_decay\0",
+        b"fm_depth\0",
+        b"trigger_delay\0",
+        b"harmonics\0",
+        b"noise_filter\0",
+        b"noise_decay\0",
+        b"noise_bias\0",
+        b"volume\0",
+    ];
+    let Some(voice) = voice.as_ref() else {
+        return std::ptr::null();
+    };
+    let names = match voice.voice.kind() {
+        PercussionEngineKind::RoutingMatrix => ROUTING_NAMES.as_slice(),
+        PercussionEngineKind::TwinCore => TWIN_NAMES.as_slice(),
+    };
+    names
+        .get(parameter as usize)
+        .map_or(std::ptr::null(), |name| name.as_ptr().cast())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_set_parameter(
+    voice: *mut GooeyPercussionEngine,
+    parameter: u32,
+    value: f32,
+) -> bool {
+    voice.as_mut().is_some_and(|voice| {
+        voice
+            .voice
+            .set_parameter_normalized(parameter as usize, value)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_get_parameter(
+    voice: *const GooeyPercussionEngine,
+    parameter: u32,
+) -> f32 {
+    voice
+        .as_ref()
+        .and_then(|voice| voice.voice.parameter_normalized(parameter as usize))
+        .unwrap_or(f32::NAN)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_trigger(
+    voice: *mut GooeyPercussionEngine,
+    velocity: f32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.trigger_with_velocity(voice.time, velocity);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_render(
+    voice: *mut GooeyPercussionEngine,
+    output: *mut f32,
+    frame_count: u32,
+) -> bool {
+    if output.is_null() {
+        return false;
+    }
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    let output = slice::from_raw_parts_mut(output, frame_count as usize);
+    let step = 1.0 / voice.sample_rate as f64;
+    for sample in output {
+        *sample = voice.voice.tick(voice.time);
+        voice.time += step;
+    }
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_reset(voice: *mut GooeyPercussionEngine) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.reset();
+    voice.time = 0.0;
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_set_midi_note(
+    voice: *mut GooeyPercussionEngine,
+    note: u8,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.set_midi_note(note.min(127));
+    true
+}
+
+// =============================================================================
+// Standalone twin-core percussion voice (engine-specific advanced controls)
+// =============================================================================
+
+/// Opaque standalone handle for hosts that do not use `GooeyEngine`.
+#[repr(C)]
+pub struct GooeyTwinCorePercVoice {
+    voice: TwinCorePercVoice,
+    sample_rate: f32,
+    time: f64,
+}
+
+fn twin_core_perc_preset(preset: u32) -> Option<TwinCorePercConfig> {
+    match preset {
+        TWIN_CORE_PERC_PRESET_KICK => Some(TwinCorePercConfig::kick()),
+        TWIN_CORE_PERC_PRESET_TOM => Some(TwinCorePercConfig::tom()),
+        TWIN_CORE_PERC_PRESET_SNARE => Some(TwinCorePercConfig::snare()),
+        TWIN_CORE_PERC_PRESET_CLAP => Some(TwinCorePercConfig::clap()),
+        TWIN_CORE_PERC_PRESET_METALLIC => Some(TwinCorePercConfig::metallic()),
+        _ => None,
+    }
+}
+
+/// Allocate a standalone twin-core percussion voice. Destroy it with
+/// `gooey_twin_core_perc_destroy`.
+#[no_mangle]
+pub extern "C" fn gooey_twin_core_perc_new(sample_rate: f32) -> *mut GooeyTwinCorePercVoice {
+    let sample_rate = if sample_rate.is_finite() && sample_rate > 0.0 {
+        sample_rate
+    } else {
+        44_100.0
+    };
+    Box::into_raw(Box::new(GooeyTwinCorePercVoice {
+        voice: TwinCorePercVoice::new(sample_rate),
+        sample_rate,
+        time: 0.0,
+    }))
+}
+
+/// # Safety
+/// `voice` must be null or a pointer returned by `gooey_twin_core_perc_new`
+/// that has not already been destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_destroy(voice: *mut GooeyTwinCorePercVoice) {
+    if !voice.is_null() {
+        drop(Box::from_raw(voice));
+    }
+}
+
+/// Replace the voice with a factory preset. Returns false for an invalid handle
+/// or preset ID.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_set_preset(
+    voice: *mut GooeyTwinCorePercVoice,
+    preset: u32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    let Some(config) = twin_core_perc_preset(preset) else {
+        return false;
+    };
+    voice.voice = TwinCorePercVoice::with_config(voice.sample_rate, config);
+    true
+}
+
+/// Trigger both the body and noise envelopes at the current render time.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_trigger(
+    voice: *mut GooeyTwinCorePercVoice,
+    velocity: f32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.trigger_with_velocity(voice.time, velocity);
+    true
+}
+
+/// Trigger only the independent noise envelope at the current render time.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_trigger_noise(
+    voice: *mut GooeyTwinCorePercVoice,
+    velocity: f32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice
+        .voice
+        .trigger_noise_with_velocity(voice.time, velocity);
+    true
+}
+
+/// Render mono samples into a caller-owned buffer and advance the voice clock.
+///
+/// # Safety
+/// `output` must point to at least `frame_count` writable `f32` values and must
+/// not overlap `voice`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_render(
+    voice: *mut GooeyTwinCorePercVoice,
+    output: *mut f32,
+    frame_count: u32,
+) -> bool {
+    if output.is_null() {
+        return false;
+    }
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    let output = slice::from_raw_parts_mut(output, frame_count as usize);
+    let time_step = 1.0 / voice.sample_rate as f64;
+    for sample in output {
+        *sample = voice.voice.tick(voice.time);
+        voice.time += time_step;
+    }
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_reset(voice: *mut GooeyTwinCorePercVoice) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.reset();
+    voice.time = 0.0;
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_is_active(
+    voice: *const GooeyTwinCorePercVoice,
+) -> bool {
+    voice.as_ref().is_some_and(|voice| voice.voice.is_active())
+}
+
+/// Set one of the 12 continuous controls using a normalized 0–1 value.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_set_parameter(
+    voice: *mut GooeyTwinCorePercVoice,
+    parameter: u32,
+    value: f32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    if parameter >= TWIN_CORE_PERC_PARAM_COUNT || !value.is_finite() {
+        return false;
+    }
+    voice
+        .voice
+        .set_parameter_normalized(parameter as usize, value);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_get_parameter(
+    voice: *const GooeyTwinCorePercVoice,
+    parameter: u32,
+) -> f32 {
+    voice
+        .as_ref()
+        .and_then(|voice| voice.voice.parameter_normalized(parameter as usize))
+        .unwrap_or(f32::NAN)
+}
+
+/// Return a static, null-terminated parameter name, or null for an invalid ID.
+#[no_mangle]
+pub extern "C" fn gooey_twin_core_perc_parameter_name(parameter: u32) -> *const c_char {
+    const NAMES: [&[u8]; 12] = [
+        b"tune\0",
+        b"detune\0",
+        b"length\0",
+        b"body_bias\0",
+        b"fm_decay\0",
+        b"fm_depth\0",
+        b"trigger_delay\0",
+        b"harmonics\0",
+        b"noise_filter\0",
+        b"noise_decay\0",
+        b"noise_bias\0",
+        b"volume\0",
+    ];
+    NAMES
+        .get(parameter as usize)
+        .map_or(std::ptr::null(), |name| name.as_ptr().cast())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_set_body_mode(
+    voice: *mut GooeyTwinCorePercVoice,
+    mode: u32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    let mode = match mode {
+        TWIN_CORE_PERC_BODY_LOW => TwinCorePercBodyMode::Low,
+        TWIN_CORE_PERC_BODY_MID => TwinCorePercBodyMode::Mid,
+        TWIN_CORE_PERC_BODY_HIGH => TwinCorePercBodyMode::High,
+        _ => return false,
+    };
+    voice.voice.set_body_mode(mode);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_get_body_mode(
+    voice: *const GooeyTwinCorePercVoice,
+) -> u32 {
+    match voice
+        .as_ref()
+        .map(|voice| voice.voice.config_targets().body_mode)
+    {
+        Some(TwinCorePercBodyMode::Low) => TWIN_CORE_PERC_BODY_LOW,
+        Some(TwinCorePercBodyMode::Mid) => TWIN_CORE_PERC_BODY_MID,
+        Some(TwinCorePercBodyMode::High) => TWIN_CORE_PERC_BODY_HIGH,
+        None => u32::MAX,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_set_noise_mode(
+    voice: *mut GooeyTwinCorePercVoice,
+    mode: u32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    let mode = match mode {
+        TWIN_CORE_PERC_NOISE_LOWPASS => TwinCorePercNoiseMode::Lowpass,
+        TWIN_CORE_PERC_NOISE_HIGHPASS => TwinCorePercNoiseMode::Highpass,
+        TWIN_CORE_PERC_NOISE_BODY => TwinCorePercNoiseMode::Body,
+        _ => return false,
+    };
+    voice.voice.set_noise_mode(mode);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_get_noise_mode(
+    voice: *const GooeyTwinCorePercVoice,
+) -> u32 {
+    match voice
+        .as_ref()
+        .map(|voice| voice.voice.config_targets().noise_mode)
+    {
+        Some(TwinCorePercNoiseMode::Lowpass) => TWIN_CORE_PERC_NOISE_LOWPASS,
+        Some(TwinCorePercNoiseMode::Highpass) => TWIN_CORE_PERC_NOISE_HIGHPASS,
+        Some(TwinCorePercNoiseMode::Body) => TWIN_CORE_PERC_NOISE_BODY,
+        None => u32::MAX,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_set_seed(
+    voice: *mut GooeyTwinCorePercVoice,
+    seed: u32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.set_seed(seed);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_set_midi_note(
+    voice: *mut GooeyTwinCorePercVoice,
+    note: u8,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.set_midi_note(note.min(127));
+    true
+}
+
+/// Set a safety ring limit in seconds. A non-positive value disables it.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_set_ring_limit(
+    voice: *mut GooeyTwinCorePercVoice,
+    seconds: f32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    let limit = if seconds.is_finite() && seconds > 0.0 {
+        Some(seconds)
+    } else {
+        None
+    };
+    voice.voice.set_ring_limit_secs(limit);
+    true
 }
 
 // =============================================================================

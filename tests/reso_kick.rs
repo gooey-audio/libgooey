@@ -29,6 +29,97 @@ fn first_difference_rms(samples: &[f32]) -> f64 {
     (differences.map(|sample| sample * sample).sum::<f64>() / count as f64).sqrt()
 }
 
+#[test]
+fn legacy_presets_keep_their_deterministic_render() {
+    let presets = [
+        ResoKickConfig::classic808(),
+        ResoKickConfig::punch909(),
+        ResoKickConfig::soft_bounce(),
+        ResoKickConfig::tom(),
+        ResoKickConfig::laser(),
+        ResoKickConfig::sub_drone(),
+    ];
+    // Raw f32-bit hashes are not portable across architectures because libm
+    // implementations may round intermediate transcendental results differently.
+    // These samples cover the attack, body, and tail while allowing only the
+    // explicitly documented maximum cross-platform error of 1e-7.
+    const SAMPLE_INDICES: [usize; 8] = [1, 8, 64, 257, 1_024, 4_096, 12_000, 23_999];
+    const EXPECTED: [[f32; 8]; 6] = [
+        [
+            3.655425e-5,
+            0.030273503,
+            0.6922764,
+            -0.8284299,
+            -0.66958857,
+            0.25257415,
+            -0.12698698,
+            -0.11504954,
+        ],
+        [
+            0.00021404584,
+            0.22682175,
+            0.6059649,
+            0.5998171,
+            -0.6060858,
+            -0.4617524,
+            -0.022315413,
+            0.0005306672,
+        ],
+        [
+            2.8332466e-5,
+            0.021878693,
+            0.51704097,
+            0.1352375,
+            -0.09335334,
+            -0.50820714,
+            0.124641374,
+            -0.015998457,
+        ],
+        [
+            9.1014146e-5,
+            0.08351501,
+            0.64778435,
+            0.4205897,
+            0.63300973,
+            -0.6283577,
+            0.33210063,
+            -0.26136887,
+        ],
+        [
+            5.0452018e-5,
+            0.06528428,
+            -0.10985839,
+            -0.5286398,
+            -0.0903473,
+            0.57981676,
+            -0.09935882,
+            0.3061434,
+        ],
+        [
+            3.6695998e-5,
+            0.025908226,
+            0.3933043,
+            0.29188013,
+            -0.20135984,
+            -0.110243924,
+            -0.5727104,
+            -0.4914294,
+        ],
+    ];
+
+    for (preset_index, (preset, expected)) in presets.into_iter().zip(EXPECTED).enumerate() {
+        let samples = render(preset, 0.75, 0.5);
+        for (sample_index, expected_sample) in SAMPLE_INDICES.into_iter().zip(expected) {
+            let actual = samples[sample_index];
+            let error = (actual - expected_sample).abs();
+            assert!(
+                error <= 1.0e-7,
+                "preset={preset_index}, sample={sample_index}, expected={expected_sample}, actual={actual}, error={error}"
+            );
+        }
+    }
+}
+
 fn positive_crossing_rate(samples: &[f32]) -> f32 {
     let crossings = samples
         .windows(2)

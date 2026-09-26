@@ -11,14 +11,17 @@ pub(crate) mod multisample_control;
 pub mod multisample_pack;
 #[cfg(feature = "bounce")]
 pub mod multisample_prep;
+pub mod percussion_engine;
 pub mod poly_synth;
 pub(crate) mod poly_synth_control;
 pub mod reso_kick;
+pub mod resonator_voice;
 pub mod sampler;
 pub(crate) mod sampler_control;
 pub mod snare;
 pub mod tom;
 pub mod tom2;
+pub mod twin_core_perc;
 
 pub use self::bass::*;
 pub use self::fm_snap::*;
@@ -32,12 +35,15 @@ pub use self::multisample::*;
 pub use self::multisample_pack::*;
 #[cfg(feature = "bounce")]
 pub use self::multisample_prep::*;
+pub use self::percussion_engine::*;
 pub use self::poly_synth::*;
 pub use self::reso_kick::*;
+pub use self::resonator_voice::*;
 pub use self::sampler::*;
 pub use self::snare::*;
 pub use self::tom::*;
 pub use self::tom2::*;
+pub use self::twin_core_perc::*;
 
 pub type HiHat = HiHat2;
 pub type HiHatConfig = HiHat2Config;
