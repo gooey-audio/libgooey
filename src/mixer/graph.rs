@@ -47,7 +47,8 @@ pub const PIANO_SOURCE_COUNT: usize = 2;
 /// Dedicated chord-aware melody synth. Appended after every existing source so
 /// the published sampler and piano IDs remain stable.
 pub const SOURCE_MELODY: u32 = SOURCE_PIANO_BASE + PIANO_SOURCE_COUNT as u32;
-const SOURCE_CAPACITY: usize = SOURCE_COUNT + SAMPLER_SOURCE_COUNT + PIANO_SOURCE_COUNT + 1;
+pub(crate) const SOURCE_CAPACITY: usize =
+    SOURCE_COUNT + SAMPLER_SOURCE_COUNT + PIANO_SOURCE_COUNT + 1;
 
 /// Maximum track gain (allows up to +6 dB of makeup on a submix).
 const MAX_TRACK_GAIN: f32 = 2.0;
@@ -69,6 +70,16 @@ pub struct Track {
     peak: AtomicU32,
     /// Track-level effect rack (reused from the loop-channel effect model).
     rack: EffectChain,
+    /// Old rack retained during a short replacement crossfade. The completed
+    /// chain is moved to the live-control retirement queue off this track; it
+    /// is never dropped by the render thread.
+    rack_transition: Option<RackTransition>,
+}
+
+struct RackTransition {
+    old: EffectChain,
+    remaining_samples: usize,
+    total_samples: usize,
 }
 
 impl Track {
@@ -82,6 +93,7 @@ impl Track {
             soloed: AtomicBool::new(false),
             peak: AtomicU32::new(0.0_f32.to_bits()),
             rack: EffectChain::new(),
+            rack_transition: None,
         }
     }
 
@@ -99,6 +111,9 @@ pub struct MixerGraph {
     /// `routes[source_kind]` = target track index (or `None` = source is muted).
     routes: [Option<usize>; SOURCE_CAPACITY],
     active_sources: [bool; SOURCE_CAPACITY],
+    /// Linear gain before a source enters its routed track. Each source owns a
+    /// distinct smoother so calibrating one source cannot change a sibling.
+    source_trims: [SmoothedParam; SOURCE_CAPACITY],
     /// Per-track accumulator, always `tracks.len()` long. Resized only when the
     /// layout changes (config time); cleared and summed each sample.
     scratch: Vec<StereoFrame>,
@@ -114,6 +129,9 @@ impl MixerGraph {
             routes: [None; SOURCE_CAPACITY],
             active_sources: std::array::from_fn(|index| {
                 index < SOURCE_COUNT || index == SOURCE_MELODY as usize
+            }),
+            source_trims: std::array::from_fn(|_| {
+                SmoothedParam::new(1.0, 0.0, 2.0, sample_rate, 15.0)
             }),
             scratch: Vec::new(),
             sample_rate,
@@ -159,6 +177,10 @@ impl MixerGraph {
         self.tracks.len()
     }
 
+    pub(crate) fn source_is_active_for_control(&self, source_kind: u32) -> bool {
+        self.source_is_active(source_kind)
+    }
+
     /// Borrow a track's name (valid until the track is renamed/removed or the
     /// graph is reset). `None` for an out-of-range index.
     pub fn track_name(&self, track: usize) -> Option<&CStr> {
@@ -186,6 +208,12 @@ impl MixerGraph {
     pub fn set_track_gain(&mut self, track: usize, gain: f32) {
         if let Some(t) = self.tracks.get_mut(track) {
             t.gain.set_target(gain.clamp(0.0, MAX_TRACK_GAIN));
+        }
+    }
+
+    pub(crate) fn set_source_trim(&mut self, source: u32, trim: f32) {
+        if self.source_is_active(source) {
+            self.source_trims[source as usize].set_target(trim);
         }
     }
 
@@ -320,6 +348,51 @@ impl MixerGraph {
             .and_then(|t| t.rack.effect_type_at(slot))
     }
 
+    /// Install a fully prepared rack and begin a short old-to-new crossfade.
+    /// Live control guarantees there is no transition already active.
+    pub(crate) fn replace_rack(&mut self, track: usize, rack: EffectChain) -> bool {
+        let Some(track) = self.tracks.get_mut(track) else {
+            return false;
+        };
+        if track.rack_transition.is_some() {
+            return false;
+        }
+        rack.set_bpm(self.bpm);
+        let old = std::mem::replace(&mut track.rack, rack);
+        let samples = (self.sample_rate * 0.010).round().max(1.0) as usize;
+        track.rack_transition = Some(RackTransition {
+            old,
+            remaining_samples: samples,
+            total_samples: samples,
+        });
+        true
+    }
+
+    /// Move a completed old rack to `retire`. If the return queue is full, put
+    /// it back and retry at a later boundary without destroying it here.
+    pub(crate) fn retire_completed_racks(
+        &mut self,
+        mut retire: impl FnMut(usize, EffectChain) -> Result<(), EffectChain>,
+    ) {
+        for (index, track) in self.tracks.iter_mut().enumerate() {
+            let completed = track
+                .rack_transition
+                .as_ref()
+                .is_some_and(|transition| transition.remaining_samples == 0);
+            if !completed {
+                continue;
+            }
+            let transition = track.rack_transition.take().unwrap();
+            if let Err(old) = retire(index, transition.old) {
+                track.rack_transition = Some(RackTransition {
+                    old,
+                    remaining_samples: 0,
+                    total_samples: transition.total_samples,
+                });
+            }
+        }
+    }
+
     /// Propagate a new tempo to every track's note-synced effects.
     pub fn set_bpm(&mut self, bpm: f32) {
         self.bpm = bpm;
@@ -340,10 +413,13 @@ impl MixerGraph {
     /// Add a source's stereo frame into its routed track's accumulator. No-op if
     /// the source is unrouted.
     pub fn scatter(&mut self, source_kind: u32, frame: StereoFrame) {
-        if let Some(track) = self.route_of(source_kind) {
-            if let Some(slot) = self.scratch.get_mut(track) {
-                *slot += frame;
-            }
+        if !self.source_is_active(source_kind) {
+            return;
+        }
+        let source = source_kind as usize;
+        let frame = frame.scaled(self.source_trims[source].tick());
+        if let Some(track) = self.routes[source] {
+            self.scratch[track] += frame;
         }
     }
 
@@ -370,6 +446,9 @@ impl MixerGraph {
     /// changes from sample zero instead of replaying a real-time fade.
     pub fn snap_strip_params(&mut self) {
         self.update_mute_solo_targets();
+        for trim in &mut self.source_trims {
+            trim.snap();
+        }
         for t in &mut self.tracks {
             t.gain.snap();
             t.pan.snap();
@@ -389,7 +468,20 @@ impl MixerGraph {
             let gain = track.gain.tick() * track.mute_gain.tick();
             let mut f = scratch[i].scaled(gain);
             f = f.balanced(track.pan.tick());
-            f = track.rack.process(f);
+            if let Some(transition) = track.rack_transition.as_mut() {
+                let new_output = track.rack.process(f);
+                if transition.remaining_samples == 0 {
+                    f = new_output;
+                } else {
+                    let old_output = transition.old.process(f);
+                    let progress =
+                        1.0 - transition.remaining_samples as f32 / transition.total_samples as f32;
+                    f = old_output.scaled(1.0 - progress) + new_output.scaled(progress);
+                    transition.remaining_samples -= 1;
+                }
+            } else {
+                f = track.rack.process(f);
+            }
             track.record_peak(f.l.abs().max(f.r.abs()));
             master += f;
         }
@@ -529,5 +621,84 @@ mod tests {
         graph.clear_scratch();
         graph.scatter(SOURCE_DRUMKIT, StereoFrame::mono(1.0));
         assert_eq!(graph.mix_down(), StereoFrame::default());
+    }
+
+    #[test]
+    fn source_trim_defaults_to_unity_and_isolates_piano_on_a_shared_track() {
+        let mut graph = MixerGraph::new(SR, BPM);
+        let chords = graph.add_track(CString::new("Chords").unwrap());
+        assert!(graph.register_source(SOURCE_PIANO_BASE));
+        assert!(graph.route(SOURCE_POLYSYNTH, chords));
+        assert!(graph.route(SOURCE_PIANO_BASE, chords));
+
+        graph.clear_scratch();
+        graph.scatter(SOURCE_POLYSYNTH, StereoFrame::mono(0.1));
+        graph.scatter(SOURCE_PIANO_BASE, StereoFrame::mono(0.1));
+        let unity = graph.mix_down();
+        assert_eq!(unity, StereoFrame::mono(0.2));
+
+        graph.set_source_trim(SOURCE_PIANO_BASE, 1.41062);
+        let mut calibrated = StereoFrame::default();
+        for _ in 0..20_000 {
+            graph.clear_scratch();
+            graph.scatter(SOURCE_POLYSYNTH, StereoFrame::mono(0.1));
+            graph.scatter(SOURCE_PIANO_BASE, StereoFrame::mono(0.1));
+            calibrated = graph.mix_down();
+        }
+        assert!((calibrated.l - 0.241_062).abs() < 1e-5);
+        assert!((calibrated.r - 0.241_062).abs() < 1e-5);
+    }
+
+    #[test]
+    fn offline_strip_snap_includes_source_trim() {
+        let mut graph = MixerGraph::new(SR, BPM);
+        let track = graph.add_track(CString::new("Drums").unwrap());
+        assert!(graph.route(SOURCE_DRUMKIT, track));
+        graph.set_source_trim(SOURCE_DRUMKIT, 0.0);
+        graph.snap_strip_params();
+
+        graph.clear_scratch();
+        graph.scatter(SOURCE_DRUMKIT, StereoFrame::mono(1.0));
+        assert_eq!(graph.mix_down(), StereoFrame::default());
+    }
+
+    #[test]
+    fn completed_rack_transition_is_moved_to_retirement_callback() {
+        let mut graph = MixerGraph::new(SR, BPM);
+        let track = graph.add_track(CString::new("A").unwrap());
+        let mut rack = EffectChain::new();
+        assert_eq!(rack.add(EFFECT_LOWPASS_FILTER, SR, BPM), Some(0));
+        assert!(graph.replace_rack(track, rack));
+        for _ in 0..442 {
+            graph.clear_scratch();
+            graph.scatter(SOURCE_DRUMKIT, StereoFrame::default());
+            let _ = graph.mix_down();
+        }
+        let mut retired = 0;
+        graph.retire_completed_racks(|retired_track, _rack| {
+            assert_eq!(retired_track, track);
+            retired += 1;
+            Ok(())
+        });
+        assert_eq!(retired, 1);
+    }
+
+    #[test]
+    fn rack_replacement_starts_from_the_old_output_without_a_hard_step() {
+        let mut graph = MixerGraph::new(SR, BPM);
+        let track = graph.add_track(CString::new("A").unwrap());
+        assert!(graph.route(SOURCE_DRUMKIT, track));
+        graph.clear_scratch();
+        graph.scatter(SOURCE_DRUMKIT, StereoFrame::mono(0.5));
+        let before = graph.mix_down();
+
+        let mut rack = EffectChain::new();
+        assert_eq!(rack.add(EFFECT_LOWPASS_FILTER, SR, BPM), Some(0));
+        rack.set_param(0, crate::ffi::FILTER_PARAM_CUTOFF, 20.0);
+        assert!(graph.replace_rack(track, rack));
+        graph.clear_scratch();
+        graph.scatter(SOURCE_DRUMKIT, StereoFrame::mono(0.5));
+        let first = graph.mix_down();
+        assert_eq!(first, before);
     }
 }

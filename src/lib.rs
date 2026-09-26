@@ -1,5 +1,6 @@
 //! Shared audio engine logic for native (CPAL) and iOS targets
 
+pub mod automation;
 pub mod dsl;
 pub mod envelope;
 pub mod filters;
@@ -13,6 +14,7 @@ pub mod ffi;
 pub mod frame;
 pub mod gen;
 pub mod instruments;
+pub(crate) mod live_control;
 pub mod mixer;
 pub mod music;
 pub mod performance;

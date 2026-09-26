@@ -122,6 +122,26 @@ impl PolySynthControl {
         self.edit_preset(preset, |config| config.set_param(param, value))
     }
 
+    /// Update the host projection of the active preset without scheduling a
+    /// render-side config apply. Used when something that already writes the
+    /// live synth (a macro) must be reflected by getters and survive later
+    /// whole-config applies from unrelated preset edits.
+    pub(crate) fn set_projected_param(&self, param: u32, value: f32) -> bool {
+        let Some(index) = valid_index(self.active_preset()) else {
+            return false;
+        };
+        let Ok(mut state) = self.shared.state.lock() else {
+            return false;
+        };
+        if !state.projected[index].set_param(param, value) {
+            return false;
+        }
+        if let Some(pending) = state.pending[index].as_mut() {
+            pending.set_param(param, value);
+        }
+        true
+    }
+
     pub(crate) fn set_params(&self, preset: u32, values: &[(u32, f32)]) -> bool {
         self.edit_preset(preset, |config| {
             let mut candidate = *config;

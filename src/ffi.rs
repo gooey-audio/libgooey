@@ -3,6 +3,14 @@
 //! This module exposes the audio engine to C/Swift via C-compatible functions.
 //! Designed for integration with iOS (and other platforms in the future).
 
+use crate::automation::control::{
+    AutomationCommand, AutomationControl, AutomationState, AUTOMATION_QUEUE_CAPACITY,
+};
+use crate::automation::{
+    active_definition, MacroBank, MacroDefinition, MacroMapping, MotionClock, MotionCurve,
+    MotionDefinition, MotionDuration, MotionEndMode, MotionPhase, MotionQuantize, MotionRunner,
+    ParamTarget,
+};
 use crate::effects::{
     DelayEffect, DelayTiming, Effect, FeedbackWaveshaper, LowpassFilterEffect, PlateReverbEffect,
     SoftLimiter, SpringReverbEffect, TiltFilterEffect, TubeCompressor, TubeSaturation, Waveshaper,
@@ -20,15 +28,21 @@ use crate::instruments::multisample_control::{
 use crate::instruments::poly_synth_control::{PolySynthControl, PolySynthPending};
 use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
-    BassConfig, BassSynth, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum, MelodyVoice,
+    BassConfig, BassSynth, FilterSlope, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum,
+    MelodyVoice, NoiseColor, PercussionEngine, PercussionEngineKind, PercussionPreset,
     PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer, SamplerBuffer,
     SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config, TwinCorePercBodyMode,
     TwinCorePercConfig, TwinCorePercNoiseMode, TwinCorePercVoice,
 };
+use crate::live_control::{
+    DrumCell, EngineLifecycle, LiveCommand, LiveControlShared, DRUM_LANE_COUNT, DRUM_STEP_COUNT,
+    LIVE_QUEUE_CAPACITY,
+};
 use crate::metronome::{Metronome, MetronomeDivision, DEFAULT_METRONOME_LEVEL};
+use crate::mixer::graph::SOURCE_CAPACITY;
 use crate::mixer::{
-    ChannelEffect, LaunchQuantization, Mixer, MixerControl, MixerGraph, PitchMode, RetrimTiming,
-    StereoSampleBuffer,
+    ChannelEffect, EffectChain, LaunchQuantization, Mixer, MixerControl, MixerGraph, PitchMode,
+    RetrimTiming, StereoSampleBuffer,
 };
 use crate::music::{
     apply_voicing, available_voicings, Chord, ChordSet, Key, NoteName, ScaleType, VoicingType,
@@ -41,7 +55,8 @@ use crate::performance::{
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 // =============================================================================
 // LFO constants
@@ -87,6 +102,13 @@ pub const TWIN_CORE_PERC_BODY_HIGH: u32 = 2;
 pub const TWIN_CORE_PERC_NOISE_LOWPASS: u32 = 0;
 pub const TWIN_CORE_PERC_NOISE_HIGHPASS: u32 = 1;
 pub const TWIN_CORE_PERC_NOISE_BODY: u32 = 2;
+pub const PERCUSSION_ENGINE_ROUTING_MATRIX: u32 = 0;
+pub const PERCUSSION_ENGINE_TWIN_CORE: u32 = 1;
+pub const PERCUSSION_PRESET_KICK: u32 = 0;
+pub const PERCUSSION_PRESET_TOM: u32 = 1;
+pub const PERCUSSION_PRESET_SNARE: u32 = 2;
+pub const PERCUSSION_PRESET_CLAP_HYBRID: u32 = 3;
+pub const PERCUSSION_PRESET_METALLIC: u32 = 4;
 
 /// LFO route configuration
 #[derive(Clone)]
@@ -115,6 +137,74 @@ pub struct GooeyMidiEvent {
     pub instrument_index: u32,
     pub velocity: f32,
     pub sample_offset: u32,
+}
+
+// =============================================================================
+// Live-control ABI data
+// =============================================================================
+
+/// Version of the additive live-control C ABI.
+pub const GOOEY_LIVE_CONTROL_API_VERSION: u32 = 1;
+/// Maximum accepted commands waiting for one render-buffer boundary.
+pub const GOOEY_LIVE_CONTROL_QUEUE_CAPACITY: u32 = 64;
+/// Fixed number of drum lanes in a submitted snapshot.
+pub const GOOEY_DRUM_LANE_COUNT: u32 = 4;
+/// Fixed number of steps in each drum lane.
+pub const GOOEY_DRUM_STEP_COUNT: u32 = 16;
+/// Maximum effects in one submitted track rack.
+pub const GOOEY_TRACK_RACK_MAX_EFFECTS: u32 = 8;
+
+pub const GOOEY_DRUM_LANE_KICK: u32 = 0;
+pub const GOOEY_DRUM_LANE_SNARE: u32 = 1;
+pub const GOOEY_DRUM_LANE_HIHAT: u32 = 2;
+pub const GOOEY_DRUM_LANE_TOM: u32 = 3;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GooeyDrumStep {
+    pub enabled: u32,
+    pub velocity: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GooeyDrumPattern {
+    // Keep these dimensions literal so cbindgen emits a standalone C POD;
+    // matching public GOOEY_* constants are documented alongside it.
+    pub lanes: [[GooeyDrumStep; 16]; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GooeyEffectParamDescriptor {
+    pub param: u32,
+    pub value: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GooeyEffectDescriptor {
+    pub effect: u32,
+    pub params: *const GooeyEffectParamDescriptor,
+    pub param_count: u32,
+}
+
+/// Opaque, single-producer endpoint for controls that are safe while rendering.
+pub struct GooeyLiveControl {
+    shared: Arc<LiveControlShared>,
+    track_count: usize,
+    active_sources: Vec<bool>,
+    projected_rack_generations: Vec<u64>,
+    projected_rack_layouts: Vec<Vec<u32>>,
+    sample_rate: f32,
+    bpm: f32,
+}
+
+impl Drop for GooeyLiveControl {
+    fn drop(&mut self) {
+        self.shared.reap_retired();
+        self.shared.lifecycle.detach_control();
+    }
 }
 
 // =============================================================================
@@ -211,6 +301,17 @@ impl ChannelInstrument {
                 KICK_PARAM_PITCH_ENVELOPE => k.set_pitch_envelope_amount(value),
                 KICK_PARAM_VOLUME => k.set_volume(value),
                 KICK_PARAM_TUNING => k.set_tuning(value),
+                KICK_PARAM_PITCH_ENVELOPE_CURVE => k.set_pitch_envelope_curve(value),
+                KICK_PARAM_PITCH_START_RATIO => k.set_pitch_start_ratio(value),
+                KICK_PARAM_PHASE_MOD_AMOUNT => k.set_phase_mod_amount(value),
+                KICK_PARAM_NOISE_AMOUNT => k.set_noise_amount(value),
+                KICK_PARAM_NOISE_CUTOFF => k.set_noise_cutoff(value),
+                KICK_PARAM_NOISE_RESONANCE => k.set_noise_resonance(value),
+                KICK_PARAM_OVERDRIVE => k.set_overdrive(value),
+                KICK_PARAM_FEEDBACK_AMOUNT => k.set_feedback(value),
+                KICK_PARAM_FEEDBACK_CUTOFF => k.set_feedback_cutoff(value),
+                KICK_PARAM_AMP_DECAY => k.set_amp_decay(value),
+                KICK_PARAM_AMP_DECAY_CURVE => k.set_amp_decay_curve(value),
                 _ => {}
             },
             Self::Snare(s) => match param {
@@ -243,6 +344,16 @@ impl ChannelInstrument {
                 HIHAT_PARAM_VOLUME => h.set_volume(value),
                 HIHAT_PARAM_TONE => h.set_tone(value),
                 HIHAT_PARAM_TUNING => h.set_tuning(value),
+                HIHAT_PARAM_NOISE_COLOR => h.set_noise_color(if value.round() >= 1.0 {
+                    NoiseColor::Pink
+                } else {
+                    NoiseColor::White
+                }),
+                HIHAT_PARAM_FILTER_SLOPE => h.set_filter_slope(if value.round() >= 1.0 {
+                    FilterSlope::Db24
+                } else {
+                    FilterSlope::Db12
+                }),
                 _ => {}
             },
             Self::Tom(t) => {
@@ -301,6 +412,17 @@ impl ChannelInstrument {
                 KICK_PARAM_PITCH_ENVELOPE => k.params.pitch_envelope_amount.target(),
                 KICK_PARAM_VOLUME => k.params.volume.target(),
                 KICK_PARAM_TUNING => k.params.tuning.target(),
+                KICK_PARAM_PITCH_ENVELOPE_CURVE => k.params.pitch_envelope_curve.target(),
+                KICK_PARAM_PITCH_START_RATIO => k.params.pitch_start_ratio.target(),
+                KICK_PARAM_PHASE_MOD_AMOUNT => k.params.phase_mod_amount.target(),
+                KICK_PARAM_NOISE_AMOUNT => k.params.noise_amount.target(),
+                KICK_PARAM_NOISE_CUTOFF => k.params.noise_cutoff.target(),
+                KICK_PARAM_NOISE_RESONANCE => k.params.noise_resonance.target(),
+                KICK_PARAM_OVERDRIVE => k.params.overdrive.target(),
+                KICK_PARAM_FEEDBACK_AMOUNT => k.params.feedback.target(),
+                KICK_PARAM_FEEDBACK_CUTOFF => k.params.feedback_cutoff.target(),
+                KICK_PARAM_AMP_DECAY => k.params.amp_decay.target(),
+                KICK_PARAM_AMP_DECAY_CURVE => k.params.amp_decay_curve.target(),
                 _ => f32::NAN,
             },
             Self::Snare(s) => match param {
@@ -333,6 +455,14 @@ impl ChannelInstrument {
                 HIHAT_PARAM_VOLUME => h.params.volume.target(),
                 HIHAT_PARAM_TONE => h.params.tone.target(),
                 HIHAT_PARAM_TUNING => h.params.tuning.target(),
+                HIHAT_PARAM_NOISE_COLOR => match h.noise_color {
+                    NoiseColor::White => 0.0,
+                    NoiseColor::Pink => 1.0,
+                },
+                HIHAT_PARAM_FILTER_SLOPE => match h.filter_slope {
+                    FilterSlope::Db12 => 0.0,
+                    FilterSlope::Db24 => 1.0,
+                },
                 _ => f32::NAN,
             },
             Self::Tom(t) => match param {
@@ -349,7 +479,25 @@ impl ChannelInstrument {
                 TOM_PARAM_TUNING => t.tuning(),
                 _ => f32::NAN,
             },
-            Self::Bass(_) => f32::NAN,
+            Self::Bass(b) => match param {
+                BASS_PARAM_FREQUENCY => b.params.frequency.target(),
+                BASS_PARAM_SUB_LEVEL => b.params.sub_level.target(),
+                BASS_PARAM_OSC_LEVEL => b.params.osc_level.target(),
+                BASS_PARAM_DETUNE_LEVEL => b.params.detune_level.target(),
+                BASS_PARAM_DETUNE_AMOUNT => b.params.detune_amount.target(),
+                BASS_PARAM_OSC_SHAPE => b.params.osc_shape.target(),
+                BASS_PARAM_FILTER_CUTOFF => b.params.filter_cutoff.target(),
+                BASS_PARAM_FILTER_RESONANCE => b.params.filter_resonance.target(),
+                BASS_PARAM_FILTER_ENV_AMOUNT => b.params.filter_env_amount.target(),
+                BASS_PARAM_FILTER_ENV_DECAY => b.params.filter_env_decay.target(),
+                BASS_PARAM_FILTER_ENV_CURVE => b.params.filter_env_curve.target(),
+                BASS_PARAM_AMP_DECAY => b.params.amp_decay.target(),
+                BASS_PARAM_AMP_DECAY_CURVE => b.params.amp_decay_curve.target(),
+                BASS_PARAM_OVERDRIVE => b.params.overdrive.target(),
+                BASS_PARAM_VOLUME => b.params.volume.target(),
+                BASS_PARAM_TUNING => b.params.tuning.target(),
+                _ => f32::NAN,
+            },
         }
     }
 
@@ -367,6 +515,19 @@ impl ChannelInstrument {
                 // for live pitch modulation instead.
                 KICK_PARAM_VOLUME => k.params.volume.set_bipolar(value),
                 KICK_PARAM_TUNING => k.params.tuning.set_bipolar(value),
+                // Curve, start ratio and amp decay are latched at trigger, so
+                // modulating them shapes the next hit rather than the current one.
+                KICK_PARAM_PITCH_ENVELOPE_CURVE => k.params.pitch_envelope_curve.set_bipolar(value),
+                KICK_PARAM_PITCH_START_RATIO => k.params.pitch_start_ratio.set_bipolar(value),
+                KICK_PARAM_PHASE_MOD_AMOUNT => k.params.phase_mod_amount.set_bipolar(value),
+                KICK_PARAM_NOISE_AMOUNT => k.params.noise_amount.set_bipolar(value),
+                KICK_PARAM_NOISE_CUTOFF => k.params.noise_cutoff.set_bipolar(value),
+                KICK_PARAM_NOISE_RESONANCE => k.params.noise_resonance.set_bipolar(value),
+                KICK_PARAM_OVERDRIVE => k.params.overdrive.set_bipolar(value),
+                KICK_PARAM_FEEDBACK_AMOUNT => k.params.feedback.set_bipolar(value),
+                KICK_PARAM_FEEDBACK_CUTOFF => k.params.feedback_cutoff.set_bipolar(value),
+                KICK_PARAM_AMP_DECAY => k.params.amp_decay.set_bipolar(value),
+                KICK_PARAM_AMP_DECAY_CURVE => k.params.amp_decay_curve.set_bipolar(value),
                 _ => {}
             },
             Self::Snare(s) => match param {
@@ -616,6 +777,8 @@ impl ChannelBlender {
 /// separate top-level voice, so the addressable voice space
 /// (`NUM_INSTRUMENTS` = 5) is the kit voices plus bass at index 4.
 const KIT_VOICE_COUNT: usize = 4;
+/// Parameter-lock slots per channel; covers the largest instrument param set.
+const CHANNEL_PARAM_LOCK_CAPACITY: usize = 32;
 /// Maximum independently routable sampler racks in one FFI engine.
 pub const SAMPLER_RACK_MAX: u32 = 4;
 /// PCM pads in each sampler rack and steps in its sequencer.
@@ -653,6 +816,10 @@ struct VoiceStrip {
     trigger_velocity: AtomicU32, // f32 bits stored atomically
     /// Saved global frequency for restoring after per-step MIDI note overrides.
     saved_global_freq: Option<f32>,
+    /// Per-parameter locks, indexed by the channel instrument's param index.
+    /// A locked value is re-applied after every preset blend so the XY pad
+    /// and per-step blends cannot overwrite it. LFOs still modulate on top.
+    param_locks: [Option<f32>; CHANNEL_PARAM_LOCK_CAPACITY],
 }
 
 impl VoiceStrip {
@@ -681,6 +848,33 @@ impl VoiceStrip {
             trigger_pending: AtomicBool::new(false),
             trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
             saved_global_freq: None,
+            param_locks: [None; CHANNEL_PARAM_LOCK_CAPACITY],
+        }
+    }
+
+    /// Blend the corner presets at (x,y) into the instrument, then re-apply
+    /// any parameter locks so they win over the blended values.
+    fn apply_blend(&mut self, x: f32, y: f32) {
+        self.blender.blend_and_apply(&mut self.instrument, x, y);
+        self.apply_param_locks();
+    }
+
+    /// Write every locked value back into the instrument. Allocation-free, so
+    /// it is safe on the audio thread.
+    fn apply_param_locks(&mut self) {
+        for (param, lock) in self.param_locks.iter().enumerate() {
+            if let Some(value) = *lock {
+                self.instrument.set_param(param as u32, value);
+            }
+        }
+    }
+
+    /// Re-run the channel's blend (if enabled) so unlocked parameters return
+    /// to their blended values. With blend disabled, values stay where they are.
+    fn restore_blend(&mut self) {
+        if self.blend_enabled {
+            let (x, y) = (self.blend_x, self.blend_y);
+            self.apply_blend(x, y);
         }
     }
 
@@ -704,6 +898,9 @@ struct DrumKit {
 }
 
 pub struct GooeyEngine {
+    /// Installed once, before rendering, by `gooey_engine_live_control_new`.
+    live_control: Option<Arc<LiveControlShared>>,
+
     // Drum voices (kick, snare, hihat, tom) grouped as one submixable kit.
     kit: DrumKit,
 
@@ -859,6 +1056,20 @@ pub struct GooeyEngine {
     // True only while `bounce_to_buffer` drives `render` offline. The metronome
     // consults it so a monitoring aid can never land in an exported file.
     offline_bounce: bool,
+
+    // Macros (one 0-1 control driving many parameters) and motions (one-shot
+    // automation of a macro). Hosts edit through `automation_control`; the
+    // render thread owns `macros` and `motions` and applies queued commands at
+    // buffer boundaries. See `src/automation/`.
+    automation_control: AutomationControl,
+    automation_scratch: std::collections::VecDeque<AutomationCommand>,
+    macros: MacroBank,
+    motions: MotionRunner,
+    /// Frames rendered since the last control-rate automation tick.
+    automation_frames: u32,
+    /// Host-side snapshot taken by `gooey_engine_macro_capture_begin`;
+    /// `None` when no capture is in progress.
+    macro_capture: Option<Vec<(ParamTarget, f32)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1042,6 +1253,7 @@ impl GooeyEngine {
         let chord_control = ChordControl::new();
 
         Self {
+            live_control: None,
             kit,
             bass,
             delay,
@@ -1139,6 +1351,14 @@ impl GooeyEngine {
             // Monitor click, off until the host asks for it.
             metronome: Metronome::new(sample_rate, bpm),
             offline_bounce: false,
+            automation_control: AutomationControl::new(),
+            automation_scratch: std::collections::VecDeque::with_capacity(
+                AUTOMATION_QUEUE_CAPACITY,
+            ),
+            macros: MacroBank::new(),
+            motions: MotionRunner::new(),
+            automation_frames: 0,
+            macro_capture: None,
         }
     }
 
@@ -1238,6 +1458,57 @@ impl GooeyEngine {
         control.reclaim_from_audio(&mut self.sampler_retired);
     }
 
+    /// Apply every command that was fully published before this render
+    /// boundary. Queue capacity is the hard work bound, so an accepted drum
+    /// snapshot always lands atomically at the next boundary.
+    fn apply_live_control_commands(&mut self) {
+        let Some(shared) = self.live_control.as_ref().cloned() else {
+            return;
+        };
+        for _ in 0..LIVE_QUEUE_CAPACITY {
+            let Some(command) = shared.pop_command() else {
+                break;
+            };
+            let generation = command.generation();
+            match command {
+                LiveCommand::SetTrackGain { track, gain, .. } => {
+                    self.graph.set_track_gain(track, gain);
+                }
+                LiveCommand::SetSourceTrim { source, trim, .. } => {
+                    self.graph.set_source_trim(source, trim);
+                }
+                LiveCommand::ReplaceDrumPattern { lanes, .. } => {
+                    for (voice, lane) in self.kit.voices.iter_mut().zip(lanes) {
+                        let pattern = lane.map(|step| (step.enabled, step.velocity));
+                        let replaced = voice.sequencer.replace_live_drum_pattern(&pattern);
+                        debug_assert!(replaced);
+                    }
+                }
+                LiveCommand::ReplaceTrackRack { track, rack, .. } => {
+                    // Layout mutation after control attachment is forbidden, so
+                    // validation on the producer guarantees this succeeds.
+                    assert!(self.graph.replace_rack(track, rack));
+                }
+                LiveCommand::SetTrackEffectParam {
+                    track,
+                    slot,
+                    param,
+                    value,
+                    ..
+                } => self.graph.effect_set_param(track, slot, param, value),
+            }
+            shared.mark_applied(generation);
+        }
+    }
+
+    fn retire_live_control_racks(&mut self) {
+        let Some(shared) = self.live_control.as_ref().cloned() else {
+            return;
+        };
+        self.graph
+            .retire_completed_racks(|track, rack| shared.retire_rack(track, rack));
+    }
+
     /// Resolve any `pending_arm_host_time` against the current
     /// `host_clock_anchor` for a buffer of `frames` samples. Called once at
     /// the top of `render`; the result drives whether (and at which sample
@@ -1326,6 +1597,14 @@ impl GooeyEngine {
     }
 
     fn render(&mut self, buffer: &mut [f32]) {
+        // A zero-frame host call is not an audio render boundary. In
+        // particular, it must not acknowledge live-control commands that have
+        // never been observed by a real callback buffer.
+        if buffer.is_empty() {
+            return;
+        }
+        self.apply_live_control_commands();
+        self.retire_live_control_racks();
         // Clear pending MIDI events from previous render pass
         self.pending_midi_events.clear();
         // Commands are applied at buffer boundaries, including buffers that
@@ -1335,6 +1614,7 @@ impl GooeyEngine {
         self.apply_sampler_control_commands();
         self.apply_piano_control_commands();
         self.apply_chord_control_commands();
+        self.apply_automation_commands();
 
         // Number of stereo frames this buffer holds (two slots per frame).
         let frame_count = buffer.len() / 2;
@@ -1540,6 +1820,13 @@ impl GooeyEngine {
                 self.performance.clear_pending_sampler_hits();
             }
 
+            // Macros and motions run at control rate, before the LFOs so an
+            // LFO routed to the same parameter still wins.
+            self.automation_frames += 1;
+            if self.automation_frames >= AUTOMATION_CONTROL_INTERVAL {
+                self.tick_automation(transport_running, transport_beat);
+            }
+
             // Process LFOs and apply modulation to routed parameters
             for lfo_idx in 0..LFO_COUNT {
                 if self.lfo_enabled[lfo_idx] {
@@ -1742,6 +2029,356 @@ impl GooeyEngine {
         // sample. Silent buffers publish from `apply_control_commands` above.
         self.mixer.publish_control_snapshot();
         self.publish_piano_meters();
+        self.publish_automation_status();
+        self.retire_live_control_racks();
+    }
+
+    /// Set one global effect parameter (see `gooey_engine_set_global_effect_param`).
+    fn set_global_effect_param(&mut self, effect: u32, param: u32, value: f32) {
+        match effect {
+            EFFECT_LOWPASS_FILTER => match param {
+                FILTER_PARAM_CUTOFF => self.lowpass_filter.set_cutoff_freq(value),
+                FILTER_PARAM_RESONANCE => self.lowpass_filter.set_resonance(value),
+                _ => {} // Unknown parameter, ignore
+            },
+            EFFECT_DELAY => match param {
+                DELAY_PARAM_TIMING => {
+                    if let Some(timing) = DelayTiming::from_timing_constant(value as u32) {
+                        self.delay.set_timing(timing);
+                    }
+                }
+                DELAY_PARAM_FEEDBACK => self.delay.set_feedback(value),
+                DELAY_PARAM_MIX => self.delay.set_mix(value),
+                DELAY_PARAM_FILTER_CUTOFF => self.delay.set_filter_cutoff(value),
+                DELAY_PARAM_PINGPONG => self.delay.set_pingpong(value >= 0.5),
+                _ => {} // Unknown parameter, ignore
+            },
+            EFFECT_SATURATION => match param {
+                SATURATION_PARAM_DRIVE => self.saturation.set_drive(value),
+                SATURATION_PARAM_WARMTH => self.saturation.set_warmth(value),
+                SATURATION_PARAM_MIX => self.saturation.set_mix(value),
+                _ => {} // Unknown parameter, ignore
+            },
+            EFFECT_COMPRESSOR => match param {
+                COMPRESSOR_PARAM_THRESHOLD => self.compressor.set_threshold(value),
+                COMPRESSOR_PARAM_RATIO => self.compressor.set_ratio(value),
+                COMPRESSOR_PARAM_ATTACK => self.compressor.set_attack(value),
+                COMPRESSOR_PARAM_RELEASE => self.compressor.set_release(value),
+                COMPRESSOR_PARAM_MIX => self.compressor.set_mix(value),
+                _ => {} // Unknown parameter, ignore
+            },
+            EFFECT_TILT_FILTER => match param {
+                TILT_PARAM_CUTOFF => self.tilt_filter.set_cutoff(value),
+                TILT_PARAM_RESONANCE => self.tilt_filter.set_resonance(value),
+                _ => {} // Unknown parameter, ignore
+            },
+            EFFECT_WAVESHAPER => match param {
+                WAVESHAPER_PARAM_DRIVE => self.waveshaper.set_drive(value),
+                WAVESHAPER_PARAM_MIX => self.waveshaper.set_mix(value),
+                _ => {}
+            },
+            EFFECT_FEEDBACK_WAVESHAPER => match param {
+                FEEDBACK_WAVESHAPER_PARAM_DRIVE => self.feedback_waveshaper.set_drive(value),
+                FEEDBACK_WAVESHAPER_PARAM_FEEDBACK => self.feedback_waveshaper.set_feedback(value),
+                FEEDBACK_WAVESHAPER_PARAM_FILTER_CUTOFF => {
+                    self.feedback_waveshaper.set_filter_cutoff(value)
+                }
+                FEEDBACK_WAVESHAPER_PARAM_MIX => self.feedback_waveshaper.set_mix(value),
+                _ => {}
+            },
+            EFFECT_REVERB => match param {
+                REVERB_PARAM_DECAY => self.reverb.set_decay(value),
+                REVERB_PARAM_MIX => self.reverb.set_mix(value),
+                REVERB_PARAM_DAMPING => self.reverb.set_damping(value),
+                _ => {} // Unknown parameter, ignore
+            },
+            EFFECT_PLATE_REVERB => match param {
+                PLATE_PARAM_DECAY => self.plate_reverb.set_decay(value),
+                PLATE_PARAM_MIX => self.plate_reverb.set_mix(value),
+                PLATE_PARAM_DAMPING => self.plate_reverb.set_damping(value),
+                PLATE_PARAM_PREDELAY => self.plate_reverb.set_predelay(value),
+                PLATE_PARAM_WIDTH => self.plate_reverb.set_width(value),
+                PLATE_PARAM_SIZE => self.plate_reverb.set_size(value),
+                _ => {} // Unknown parameter, ignore
+            },
+            EFFECT_LIMITER => match param {
+                LIMITER_PARAM_THRESHOLD if value.is_finite() => {
+                    self.limiter_threshold.set_target(value)
+                }
+                _ => {} // Unknown parameter, ignore
+            },
+            _ => {} // Unknown effect, ignore
+        }
+    }
+
+    /// Read one global effect parameter, or -1.0 when unknown (see
+    /// `gooey_engine_get_global_effect_param`).
+    fn global_effect_param(&self, effect: u32, param: u32) -> f32 {
+        match effect {
+            EFFECT_LOWPASS_FILTER => match param {
+                FILTER_PARAM_CUTOFF => self.lowpass_filter.get_cutoff_freq(),
+                FILTER_PARAM_RESONANCE => self.lowpass_filter.get_resonance(),
+                _ => -1.0, // Unknown parameter
+            },
+            EFFECT_DELAY => match param {
+                DELAY_PARAM_TIMING => self.delay.get_timing() as f32,
+                DELAY_PARAM_FEEDBACK => self.delay.get_feedback(),
+                DELAY_PARAM_MIX => self.delay.get_mix(),
+                DELAY_PARAM_FILTER_CUTOFF => self.delay.get_filter_cutoff(),
+                DELAY_PARAM_PINGPONG => {
+                    if self.delay.get_pingpong() {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                _ => -1.0, // Unknown parameter
+            },
+            EFFECT_SATURATION => match param {
+                SATURATION_PARAM_DRIVE => self.saturation.get_drive(),
+                SATURATION_PARAM_WARMTH => self.saturation.get_warmth(),
+                SATURATION_PARAM_MIX => self.saturation.get_mix(),
+                _ => -1.0, // Unknown parameter
+            },
+            EFFECT_COMPRESSOR => match param {
+                COMPRESSOR_PARAM_THRESHOLD => self.compressor.get_threshold(),
+                COMPRESSOR_PARAM_RATIO => self.compressor.get_ratio(),
+                COMPRESSOR_PARAM_ATTACK => self.compressor.get_attack(),
+                COMPRESSOR_PARAM_RELEASE => self.compressor.get_release(),
+                COMPRESSOR_PARAM_MIX => self.compressor.get_mix(),
+                _ => -1.0, // Unknown parameter
+            },
+            EFFECT_TILT_FILTER => match param {
+                TILT_PARAM_CUTOFF => self.tilt_filter.get_cutoff(),
+                TILT_PARAM_RESONANCE => self.tilt_filter.get_resonance(),
+                _ => -1.0, // Unknown parameter
+            },
+            EFFECT_REVERB => match param {
+                REVERB_PARAM_DECAY => self.reverb.get_decay(),
+                REVERB_PARAM_MIX => self.reverb.get_mix(),
+                REVERB_PARAM_DAMPING => self.reverb.get_damping(),
+                _ => -1.0, // Unknown parameter
+            },
+            EFFECT_PLATE_REVERB => match param {
+                PLATE_PARAM_DECAY => self.plate_reverb.get_decay(),
+                PLATE_PARAM_MIX => self.plate_reverb.get_mix(),
+                PLATE_PARAM_DAMPING => self.plate_reverb.get_damping(),
+                PLATE_PARAM_PREDELAY => self.plate_reverb.get_predelay(),
+                PLATE_PARAM_WIDTH => self.plate_reverb.get_width(),
+                PLATE_PARAM_SIZE => self.plate_reverb.get_size(),
+                _ => -1.0, // Unknown parameter
+            },
+            EFFECT_LIMITER => match param {
+                LIMITER_PARAM_THRESHOLD => self.limiter_threshold.target(),
+                _ => -1.0, // Unknown parameter
+            },
+            _ => -1.0, // Unknown effect
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Macros and motions
+    // -------------------------------------------------------------------------
+
+    fn motion_clock(&self, transport_running: bool, transport_beat: f64) -> MotionClock {
+        MotionClock {
+            bpm: self.bpm,
+            sample_rate: self.sample_rate,
+            transport_running,
+            transport_beat,
+            transport_generation: self.mixer.transport_generation(),
+        }
+    }
+
+    /// Apply queued macro/motion commands at the buffer boundary.
+    fn apply_automation_commands(&mut self) {
+        self.automation_control
+            .drain_into(&mut self.automation_scratch);
+        if self.automation_scratch.is_empty() {
+            return;
+        }
+        let clock = self.motion_clock(self.mixer.transport_running(), self.mixer.transport_beat());
+        while let Some(command) = self.automation_scratch.pop_front() {
+            match command {
+                AutomationCommand::ReplaceMacro { index, definition } => {
+                    self.macros.replace(index, definition)
+                }
+                AutomationCommand::SetMacroValue { index, value } => {
+                    self.motions.stop_macro(index);
+                    self.macros.set_value(index, value);
+                }
+                AutomationCommand::StartMotion { slot, definition } => {
+                    self.motions
+                        .start(slot, definition, &clock, &mut self.macros)
+                }
+                AutomationCommand::StopMotion { slot } => self.motions.stop(slot),
+                AutomationCommand::StopAll => self.motions.stop_all(),
+            }
+        }
+    }
+
+    /// Advance motions and write every macro whose value changed.
+    fn tick_automation(&mut self, transport_running: bool, transport_beat: f64) {
+        let frames = std::mem::take(&mut self.automation_frames);
+        let clock = self.motion_clock(transport_running, transport_beat);
+        self.motions.advance(frames, &clock, &mut self.macros);
+        for index in 0..crate::automation::MACRO_COUNT {
+            if let Some((definition, value)) = self.macros.take_dirty(index) {
+                for mapping in definition.mappings() {
+                    self.automation_param_write(mapping.target, mapping.value_at(value));
+                }
+            }
+        }
+    }
+
+    fn publish_automation_status(&self) {
+        for index in 0..crate::automation::MACRO_COUNT {
+            self.automation_control
+                .publish_macro_value(index, self.macros.value(index));
+        }
+        for slot in 0..crate::automation::MOTION_SLOT_COUNT {
+            self.automation_control.publish_motion(
+                slot,
+                self.motions.phase(slot),
+                self.motions.progress(slot),
+            );
+        }
+    }
+
+    /// Value range of a macro-mappable parameter, or `None` when the target
+    /// does not exist or is discrete (waveform selectors, filter types, delay
+    /// timing, ping-pong) and therefore cannot be swept.
+    fn automation_param_range(&self, target: ParamTarget) -> Option<(f32, f32)> {
+        let ParamTarget { kind, index, param } = target;
+        match kind {
+            PARAM_TARGET_POLY => (index == 0
+                && param < POLY_PARAM_COUNT
+                && param != POLY_PARAM_OSC_A_WAVEFORM
+                && param != POLY_PARAM_OSC_B_WAVEFORM)
+                .then_some((0.0, 1.0)),
+            PARAM_TARGET_DRUM => {
+                let voice = self.voice(index as usize)?;
+                let continuous = match &voice.instrument {
+                    ChannelInstrument::Kick(_) => param <= KICK_PARAM_AMP_DECAY_CURVE,
+                    ChannelInstrument::Snare(_) => {
+                        param <= SNARE_PARAM_TUNING && param != SNARE_PARAM_FILTER_TYPE
+                    }
+                    ChannelInstrument::HiHat(_) => param <= HIHAT_PARAM_TUNING,
+                    ChannelInstrument::Tom(_) => param <= TOM_PARAM_TUNING,
+                    // Bass is not exposed as a macro target.
+                    ChannelInstrument::Bass(_) => false,
+                };
+                continuous.then_some((0.0, 1.0))
+            }
+            PARAM_TARGET_GLOBAL_EFFECT => match (index, param) {
+                (EFFECT_LOWPASS_FILTER, FILTER_PARAM_CUTOFF) => Some((20.0, 20_000.0)),
+                (EFFECT_LOWPASS_FILTER, FILTER_PARAM_RESONANCE) => Some((0.0, 0.95)),
+                (EFFECT_DELAY, DELAY_PARAM_FEEDBACK) => Some((0.0, 0.95)),
+                (EFFECT_DELAY, DELAY_PARAM_MIX) => Some((0.0, 1.0)),
+                (EFFECT_DELAY, DELAY_PARAM_FILTER_CUTOFF) => Some((20.0, 20_000.0)),
+                (
+                    EFFECT_SATURATION,
+                    SATURATION_PARAM_DRIVE | SATURATION_PARAM_WARMTH | SATURATION_PARAM_MIX,
+                ) => Some((0.0, 1.0)),
+                (EFFECT_COMPRESSOR, COMPRESSOR_PARAM_THRESHOLD) => Some((-60.0, 0.0)),
+                (EFFECT_COMPRESSOR, COMPRESSOR_PARAM_RATIO) => Some((1.0, 20.0)),
+                (EFFECT_COMPRESSOR, COMPRESSOR_PARAM_ATTACK) => Some((0.1, 100.0)),
+                (EFFECT_COMPRESSOR, COMPRESSOR_PARAM_RELEASE) => Some((5.0, 1000.0)),
+                (EFFECT_COMPRESSOR, COMPRESSOR_PARAM_MIX) => Some((0.0, 1.0)),
+                (EFFECT_TILT_FILTER, TILT_PARAM_CUTOFF | TILT_PARAM_RESONANCE) => Some((0.0, 1.0)),
+                (EFFECT_REVERB, REVERB_PARAM_DECAY | REVERB_PARAM_MIX | REVERB_PARAM_DAMPING) => {
+                    Some((0.0, 1.0))
+                }
+                (EFFECT_PLATE_REVERB, PLATE_PARAM_DECAY..=PLATE_PARAM_SIZE) => Some((0.0, 1.0)),
+                (EFFECT_LIMITER, LIMITER_PARAM_THRESHOLD) => Some((0.001, 1.0)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Every macro-mappable parameter, in a stable order. Host thread only.
+    fn automation_targets(&self) -> Vec<ParamTarget> {
+        let poly = (0..POLY_PARAM_COUNT).map(|param| ParamTarget::new(PARAM_TARGET_POLY, 0, param));
+        let drums = (0..NUM_INSTRUMENTS as u32).flat_map(|channel| {
+            (0..32).map(move |param| ParamTarget::new(PARAM_TARGET_DRUM, channel, param))
+        });
+        let effects = (0..EFFECT_COUNT).flat_map(|effect| {
+            (0..8).map(move |param| ParamTarget::new(PARAM_TARGET_GLOBAL_EFFECT, effect, param))
+        });
+        poly.chain(drums)
+            .chain(effects)
+            .filter(|target| self.automation_param_range(*target).is_some())
+            .collect()
+    }
+
+    /// Host-visible value of a mappable parameter (poly reads the projected
+    /// preset, matching `gooey_engine_poly_get_param`).
+    fn automation_param_read(&self, target: ParamTarget) -> Option<f32> {
+        self.automation_param_range(target)?;
+        let value = match target.kind {
+            PARAM_TARGET_POLY => self.poly_control.active_param(target.param)?,
+            PARAM_TARGET_DRUM => self
+                .voice(target.index as usize)?
+                .instrument
+                .get_param(target.param),
+            PARAM_TARGET_GLOBAL_EFFECT => self.global_effect_param(target.index, target.param),
+            _ => return None,
+        };
+        value.is_finite().then_some(value)
+    }
+
+    /// Render-side parameter write used by macros. Re-validates the target
+    /// because a drum channel's instrument can be swapped after mapping.
+    fn automation_param_write(&mut self, target: ParamTarget, value: f32) {
+        let Some((min, max)) = self.automation_param_range(target) else {
+            return;
+        };
+        let value = value.clamp(min, max);
+        match target.kind {
+            PARAM_TARGET_POLY => {
+                self.poly_synth.set_param(target.param, value);
+            }
+            PARAM_TARGET_DRUM => {
+                if let Some(voice) = self.voice_mut(target.index as usize) {
+                    voice.instrument.set_param(target.param, value);
+                }
+            }
+            PARAM_TARGET_GLOBAL_EFFECT => {
+                self.set_global_effect_param(target.index, target.param, value)
+            }
+            _ => {}
+        }
+    }
+
+    /// Host-side parameter write used by capture revert. Poly goes through the
+    /// preset projection so getters and later preset edits stay coherent;
+    /// other targets use the same direct path as the legacy setters.
+    fn automation_param_host_write(&mut self, target: ParamTarget, value: f32) {
+        if target.kind == PARAM_TARGET_POLY {
+            let preset = self.poly_control.active_preset();
+            self.poly_control.set_param(preset, target.param, value);
+        } else {
+            self.automation_param_write(target, value);
+        }
+    }
+
+    /// Mirror a macro position into the poly preset projection, so poly
+    /// getters report macro-driven values and a later unrelated preset edit
+    /// does not snap those parameters back. Host thread only.
+    fn project_poly_macro(&self, index: usize, value: f32) {
+        let Some(definition) = self
+            .automation_control
+            .read(|state| active_definition(&state.macros, index))
+        else {
+            return;
+        };
+        for mapping in definition.mappings() {
+            if mapping.target.kind == PARAM_TARGET_POLY {
+                self.poly_control
+                    .set_projected_param(mapping.target.param, mapping.value_at(value));
+            }
+        }
     }
 
     /// Hand piano metering to the control side once per buffer.
@@ -1781,7 +2418,7 @@ impl GooeyEngine {
         let y = y.clamp(0.0, 1.0);
         let idx = channel as usize;
         if let Some(voice) = self.voice_mut(idx) {
-            voice.blender.blend_and_apply(&mut voice.instrument, x, y);
+            voice.apply_blend(x, y);
         }
     }
 
@@ -2108,7 +2745,7 @@ pub const FEEDBACK_WAVESHAPER_PARAM_MIX: u32 = 3;
 // Kick drum parameter indices (must match Swift KickParam enum)
 // =============================================================================
 
-/// Kick parameter: base frequency (30-80 Hz)
+/// Kick parameter: base frequency (0-1 → 30-120 Hz)
 pub const KICK_PARAM_FREQUENCY: u32 = 0;
 /// Kick parameter: punch/mid presence (0-1)
 pub const KICK_PARAM_PUNCH: u32 = 1;
@@ -2116,7 +2753,7 @@ pub const KICK_PARAM_PUNCH: u32 = 1;
 pub const KICK_PARAM_SUB: u32 = 2;
 /// Kick parameter: click/transient amount (0-1)
 pub const KICK_PARAM_CLICK: u32 = 3;
-/// Kick parameter: decay time (0.01-5.0 seconds)
+/// Kick parameter: decay time (0-1 → 0.01-4.0 seconds)
 pub const KICK_PARAM_DECAY: u32 = 4;
 /// Kick parameter: pitch envelope amount (0-1)
 pub const KICK_PARAM_PITCH_ENVELOPE: u32 = 5;
@@ -2124,6 +2761,28 @@ pub const KICK_PARAM_PITCH_ENVELOPE: u32 = 5;
 pub const KICK_PARAM_VOLUME: u32 = 6;
 /// Kick parameter: tuning offset (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
 pub const KICK_PARAM_TUNING: u32 = 7;
+/// Kick parameter: pitch envelope curve (0-1 → 0.1-4.0; 0 = fast drop, 1 = slow)
+pub const KICK_PARAM_PITCH_ENVELOPE_CURVE: u32 = 8;
+/// Kick parameter: starting pitch multiplier (0-1 → 1.0-10.0x)
+pub const KICK_PARAM_PITCH_START_RATIO: u32 = 9;
+/// Kick parameter: phase modulation depth (0-1, 0 = disabled)
+pub const KICK_PARAM_PHASE_MOD_AMOUNT: u32 = 10;
+/// Kick parameter: pink noise layer amount (0-1)
+pub const KICK_PARAM_NOISE_AMOUNT: u32 = 11;
+/// Kick parameter: noise lowpass cutoff (0-1 → 20-10000 Hz)
+pub const KICK_PARAM_NOISE_CUTOFF: u32 = 12;
+/// Kick parameter: noise lowpass resonance (0-1 → 0.0-5.0)
+pub const KICK_PARAM_NOISE_RESONANCE: u32 = 13;
+/// Kick parameter: overdrive/saturation amount (0-1, 0 = bypass)
+pub const KICK_PARAM_OVERDRIVE: u32 = 14;
+/// Kick parameter: feedback waveshaper amount (0-1)
+pub const KICK_PARAM_FEEDBACK_AMOUNT: u32 = 15;
+/// Kick parameter: feedback filter cutoff (0-1 → 200-4000 Hz)
+pub const KICK_PARAM_FEEDBACK_CUTOFF: u32 = 16;
+/// Kick parameter: amplitude envelope decay (0-1 → 0.0-4.0 seconds)
+pub const KICK_PARAM_AMP_DECAY: u32 = 17;
+/// Kick parameter: amplitude decay curve (0-1 → 0.1-10.0; <0.5 = natural decay)
+pub const KICK_PARAM_AMP_DECAY_CURVE: u32 = 18;
 
 // =============================================================================
 // Hi-hat parameter indices (must match Swift HiHatParam enum)
@@ -2141,6 +2800,10 @@ pub const HIHAT_PARAM_TONE: u32 = 3;
 pub const HIHAT_PARAM_VOLUME: u32 = 4;
 /// Hi-hat parameter: tuning offset (0=−12 semitones, 0.5=neutral, 1=+12 semitones)
 pub const HIHAT_PARAM_TUNING: u32 = 5;
+/// Hi-hat parameter: noise color (discrete, rounded: 0 = white, 1 = pink)
+pub const HIHAT_PARAM_NOISE_COLOR: u32 = 6;
+/// Hi-hat parameter: filter slope (discrete, rounded: 0 = 12 dB/oct, 1 = 24 dB/oct)
+pub const HIHAT_PARAM_FILTER_SLOPE: u32 = 7;
 
 // =============================================================================
 // Snare drum parameter indices (must match Swift SnareParam enum)
@@ -2428,6 +3091,47 @@ pub const BLEND_CORNER_TOP_RIGHT: u32 = 3;
 // Engine lifecycle
 // =============================================================================
 
+/// Allocation prefix kept separate from render-owned mutable DSP state. The C
+/// pointer addresses `engine`, but render/free recover this prefix so shutdown
+/// never has to borrow the live DSP graph merely to inspect lifecycle state.
+#[repr(C)]
+struct GooeyEngineAllocation {
+    lifecycle: Arc<EngineLifecycle>,
+    engine: GooeyEngine,
+}
+
+/// Counts callbacks between FFI entry and acquisition of their per-engine
+/// render guard. It is static, so a callback registers before dereferencing
+/// engine-owned storage; free waits for this short entry window before dropping
+/// the allocation. Hosts must still stop initiating new callbacks before free.
+static ENGINE_RENDER_ENTRANTS: AtomicUsize = AtomicUsize::new(0);
+
+struct EngineRenderEntryGuard;
+
+impl EngineRenderEntryGuard {
+    fn enter() -> Self {
+        ENGINE_RENDER_ENTRANTS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for EngineRenderEntryGuard {
+    fn drop(&mut self) {
+        ENGINE_RENDER_ENTRANTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+unsafe fn engine_allocation(engine: *mut GooeyEngine) -> *mut GooeyEngineAllocation {
+    engine
+        .cast::<u8>()
+        .sub(std::mem::offset_of!(GooeyEngineAllocation, engine))
+        .cast()
+}
+
+unsafe fn clone_engine_lifecycle(engine: *mut GooeyEngine) -> Arc<EngineLifecycle> {
+    Arc::clone(&(*engine_allocation(engine)).lifecycle)
+}
+
 /// Create a new gooey engine
 ///
 /// # Arguments
@@ -2440,8 +3144,14 @@ pub const BLEND_CORNER_TOP_RIGHT: u32 = 3;
 /// The returned pointer must be freed with `gooey_engine_free` to avoid memory leaks.
 #[no_mangle]
 pub extern "C" fn gooey_engine_new(sample_rate: f32) -> *mut GooeyEngine {
-    let engine = Box::new(GooeyEngine::new(sample_rate));
-    Box::into_raw(engine)
+    let allocation = Box::new(GooeyEngineAllocation {
+        lifecycle: EngineLifecycle::new(),
+        engine: GooeyEngine::new(sample_rate),
+    });
+    let allocation = Box::into_raw(allocation);
+    // SAFETY: the Box is now pinned at a stable address and is recovered only
+    // by `gooey_engine_free` using the inverse offset calculation above.
+    unsafe { std::ptr::addr_of_mut!((*allocation).engine) }
 }
 
 /// Free a gooey engine
@@ -2451,9 +3161,16 @@ pub extern "C" fn gooey_engine_new(sample_rate: f32) -> *mut GooeyEngine {
 /// After calling this function, the pointer is invalid and must not be used.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_free(engine: *mut GooeyEngine) {
-    if !engine.is_null() {
-        drop(Box::from_raw(engine));
+    if engine.is_null() {
+        return;
     }
+    let allocation = engine_allocation(engine);
+    let lifecycle = Arc::clone(&(*allocation).lifecycle);
+    lifecycle.begin_shutdown();
+    while ENGINE_RENDER_ENTRANTS.load(Ordering::Acquire) != 0 || lifecycle.has_users() {
+        std::thread::yield_now();
+    }
+    drop(Box::from_raw(allocation));
 }
 
 // =============================================================================
@@ -2491,8 +3208,18 @@ pub unsafe extern "C" fn gooey_engine_render(
         return;
     }
 
-    let engine_ref = &mut *engine;
+    // Register in static storage before the first engine-pointer dereference.
+    // Once `begin_render` succeeds, the per-engine active count protects the
+    // allocation and this short-lived global entry guard can be released.
+    let entry_guard = EngineRenderEntryGuard::enter();
     let buffer_slice = slice::from_raw_parts_mut(buffer, frames as usize * 2);
+    let lifecycle = clone_engine_lifecycle(engine);
+    let Some(_render_guard) = lifecycle.begin_render() else {
+        buffer_slice.fill(0.0);
+        return;
+    };
+    drop(entry_guard);
+    let engine_ref = &mut *engine;
 
     // If engine is already in error state, output silence
     if engine_ref.error_occurred.load(Ordering::Relaxed) {
@@ -2750,13 +3477,11 @@ pub unsafe extern "C" fn gooey_engine_set_channel_instrument_type(
     voice.instrument = new_instrument;
     voice.blender = ChannelBlender::default_for_type(instrument_type);
     voice.blend_corner_presets = ChannelBlender::default_corner_preset_ids(instrument_type);
+    // Param indices mean different things per instrument type.
+    voice.param_locks = [None; CHANNEL_PARAM_LOCK_CAPACITY];
 
     // If blend is enabled, re-apply position with the new blender
-    if voice.blend_enabled {
-        let x = voice.blend_x;
-        let y = voice.blend_y;
-        voice.blender.blend_and_apply(&mut voice.instrument, x, y);
-    }
+    voice.restore_blend();
     // channel gain, mute, solo, sequencer pattern all preserved on the voice
 }
 
@@ -2797,6 +3522,9 @@ pub unsafe extern "C" fn gooey_engine_get_channel_instrument_type(
 /// For hihat: param 0=pitch, 1=decay, etc. (same as `gooey_engine_set_hihat_param`)
 /// For tom: param 0=tune, 1=bend, etc. (same as `gooey_engine_set_tom_param`)
 ///
+/// Values set here are overwritten by the next preset blend unless the
+/// parameter is locked with `gooey_engine_set_channel_param_lock`.
+///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
 /// * `channel` - Channel index (0-3)
@@ -2819,6 +3547,131 @@ pub unsafe extern "C" fn gooey_engine_set_channel_param(
     if let Some(voice) = engine.voice_mut(channel as usize) {
         voice.instrument.set_param(param, value);
     }
+}
+
+/// Read a parameter on a channel's instrument, in the same normalized form
+/// used by `gooey_engine_set_channel_param`.
+///
+/// Returns the locked value if the parameter is locked, otherwise the current
+/// target (e.g. the blended value). Unlike `gooey_engine_get_kick_param` and
+/// friends, this reaches any channel, not just the first of a type.
+///
+/// # Returns
+/// The parameter value, or `NaN` if `engine` is null, `channel` is out of
+/// range, or `param` is not valid for the channel's instrument type.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_channel_param(
+    engine: *const GooeyEngine,
+    channel: u32,
+    param: u32,
+) -> f32 {
+    let Some(voice) = engine.as_ref().and_then(|e| e.voice(channel as usize)) else {
+        return f32::NAN;
+    };
+    voice
+        .param_locks
+        .get(param as usize)
+        .copied()
+        .flatten()
+        .unwrap_or_else(|| voice.instrument.get_param(param))
+}
+
+/// Lock a channel parameter to `value` so preset blending cannot overwrite it.
+///
+/// The value is applied immediately (smoothed, like
+/// `gooey_engine_set_channel_param`) and re-applied after every blend: XY
+/// moves, per-step and channel blends on sequencer triggers, and bass preset
+/// loads. LFO modulation still applies on top of a locked value. Changing the
+/// channel's instrument type clears its locks. Invalid params are ignored.
+///
+/// # Arguments
+/// * `engine` - Pointer to a GooeyEngine
+/// * `channel` - Channel index
+/// * `param` - Parameter index (meaning depends on instrument type)
+/// * `value` - Parameter value (0-1 normalized)
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_channel_param_lock(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    param: u32,
+    value: f32,
+) {
+    let Some(voice) = engine.as_mut().and_then(|e| e.voice_mut(channel as usize)) else {
+        return;
+    };
+    if !voice.instrument.get_param(param).is_finite() {
+        return;
+    }
+    let Some(lock) = voice.param_locks.get_mut(param as usize) else {
+        return;
+    };
+    *lock = Some(value);
+    voice.instrument.set_param(param, value);
+}
+
+/// Remove a channel parameter lock and restore the parameter to the current
+/// blended value (other locks on the channel are respected). With blend
+/// disabled the parameter keeps its current value.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clear_channel_param_lock(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    param: u32,
+) {
+    let Some(voice) = engine.as_mut().and_then(|e| e.voice_mut(channel as usize)) else {
+        return;
+    };
+    let Some(lock) = voice.param_locks.get_mut(param as usize) else {
+        return;
+    };
+    if lock.take().is_some() {
+        voice.restore_blend();
+    }
+}
+
+/// Remove every parameter lock on a channel and re-apply its blend.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clear_channel_param_locks(
+    engine: *mut GooeyEngine,
+    channel: u32,
+) {
+    let Some(voice) = engine.as_mut().and_then(|e| e.voice_mut(channel as usize)) else {
+        return;
+    };
+    if voice.param_locks.iter().any(Option::is_some) {
+        voice.param_locks = [None; CHANNEL_PARAM_LOCK_CAPACITY];
+        voice.restore_blend();
+    }
+}
+
+/// Returns whether a channel parameter is locked. `false` for a null engine
+/// or out-of-range channel/param.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_channel_param_is_locked(
+    engine: *const GooeyEngine,
+    channel: u32,
+    param: u32,
+) -> bool {
+    engine
+        .as_ref()
+        .and_then(|e| e.voice(channel as usize))
+        .and_then(|v| v.param_locks.get(param as usize))
+        .is_some_and(Option::is_some)
 }
 
 /// Set the tuning offset for a channel (0.0 = −12 semitones, 0.5 = neutral, 1.0 = +12 semitones).
@@ -3027,13 +3880,26 @@ pub unsafe extern "C" fn gooey_engine_trigger_kick(engine: *mut GooeyEngine) {
 /// * `value` - Parameter value (range depends on parameter)
 ///
 /// # Parameter indices and ranges
-/// - 0 (FREQUENCY): 30-80 Hz
-/// - 1 (PUNCH): 0-1
-/// - 2 (SUB): 0-1
-/// - 3 (CLICK): 0-1
-/// - 4 (DECAY): 0.01-5.0 seconds
-/// - 5 (PITCH_ENVELOPE): 0-1
-/// - 6 (VOLUME): 0-1
+/// All values are normalized 0-1; the mapped range is noted in parentheses.
+/// - 0 (FREQUENCY): 30-120 Hz
+/// - 1 (PUNCH)
+/// - 2 (SUB)
+/// - 3 (CLICK)
+/// - 4 (DECAY): 0.01-4.0 seconds
+/// - 5 (PITCH_ENVELOPE)
+/// - 6 (VOLUME)
+/// - 7 (TUNING): −12 to +12 semitones, 0.5 = neutral
+/// - 8 (PITCH_ENVELOPE_CURVE): 0.1-4.0
+/// - 9 (PITCH_START_RATIO): 1.0-10.0x
+/// - 10 (PHASE_MOD_AMOUNT)
+/// - 11 (NOISE_AMOUNT)
+/// - 12 (NOISE_CUTOFF): 20-10000 Hz
+/// - 13 (NOISE_RESONANCE): 0.0-5.0
+/// - 14 (OVERDRIVE)
+/// - 15 (FEEDBACK_AMOUNT)
+/// - 16 (FEEDBACK_CUTOFF): 200-4000 Hz
+/// - 17 (AMP_DECAY): 0.0-4.0 seconds
+/// - 18 (AMP_DECAY_CURVE): 0.1-10.0
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -3100,6 +3966,10 @@ pub unsafe extern "C" fn gooey_engine_get_kick_param(
 /// - 1 (DECAY): 0-1 normalized
 /// - 2 (ATTACK): 0-1 normalized
 /// - 3 (TONE): 0-1 normalized
+/// - 4 (VOLUME): 0-1 normalized
+/// - 5 (TUNING): 0-1 (0.5 = neutral)
+/// - 6 (NOISE_COLOR): discrete, rounded (0 = white, 1 = pink)
+/// - 7 (FILTER_SLOPE): discrete, rounded (0 = 12 dB/oct, 1 = 24 dB/oct)
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -3354,9 +4224,14 @@ pub unsafe extern "C" fn gooey_engine_load_bass_preset(engine: *mut GooeyEngine,
     }
     let engine = &mut *engine;
     if let Some(config) = GooeyEngine::bass_preset_by_id(preset_id) {
-        if let Some(ChannelInstrument::Bass(bass)) = engine.instrument_by_type_mut(INSTRUMENT_BASS)
+        if let Some(voice) = engine
+            .voices_iter_mut()
+            .find(|v| v.instrument.instrument_type() == INSTRUMENT_BASS)
         {
-            bass.set_config(config);
+            if let ChannelInstrument::Bass(bass) = &mut voice.instrument {
+                bass.set_config(config);
+            }
+            voice.apply_param_locks();
         }
     }
 }
@@ -3413,82 +4288,7 @@ pub unsafe extern "C" fn gooey_engine_set_global_effect_param(
         return;
     }
 
-    let engine = &mut *engine;
-
-    match effect {
-        EFFECT_LOWPASS_FILTER => match param {
-            FILTER_PARAM_CUTOFF => engine.lowpass_filter.set_cutoff_freq(value),
-            FILTER_PARAM_RESONANCE => engine.lowpass_filter.set_resonance(value),
-            _ => {} // Unknown parameter, ignore
-        },
-        EFFECT_DELAY => match param {
-            DELAY_PARAM_TIMING => {
-                if let Some(timing) = DelayTiming::from_timing_constant(value as u32) {
-                    engine.delay.set_timing(timing);
-                }
-            }
-            DELAY_PARAM_FEEDBACK => engine.delay.set_feedback(value),
-            DELAY_PARAM_MIX => engine.delay.set_mix(value),
-            DELAY_PARAM_FILTER_CUTOFF => engine.delay.set_filter_cutoff(value),
-            DELAY_PARAM_PINGPONG => engine.delay.set_pingpong(value >= 0.5),
-            _ => {} // Unknown parameter, ignore
-        },
-        EFFECT_SATURATION => match param {
-            SATURATION_PARAM_DRIVE => engine.saturation.set_drive(value),
-            SATURATION_PARAM_WARMTH => engine.saturation.set_warmth(value),
-            SATURATION_PARAM_MIX => engine.saturation.set_mix(value),
-            _ => {} // Unknown parameter, ignore
-        },
-        EFFECT_COMPRESSOR => match param {
-            COMPRESSOR_PARAM_THRESHOLD => engine.compressor.set_threshold(value),
-            COMPRESSOR_PARAM_RATIO => engine.compressor.set_ratio(value),
-            COMPRESSOR_PARAM_ATTACK => engine.compressor.set_attack(value),
-            COMPRESSOR_PARAM_RELEASE => engine.compressor.set_release(value),
-            COMPRESSOR_PARAM_MIX => engine.compressor.set_mix(value),
-            _ => {} // Unknown parameter, ignore
-        },
-        EFFECT_TILT_FILTER => match param {
-            TILT_PARAM_CUTOFF => engine.tilt_filter.set_cutoff(value),
-            TILT_PARAM_RESONANCE => engine.tilt_filter.set_resonance(value),
-            _ => {} // Unknown parameter, ignore
-        },
-        EFFECT_WAVESHAPER => match param {
-            WAVESHAPER_PARAM_DRIVE => engine.waveshaper.set_drive(value),
-            WAVESHAPER_PARAM_MIX => engine.waveshaper.set_mix(value),
-            _ => {}
-        },
-        EFFECT_FEEDBACK_WAVESHAPER => match param {
-            FEEDBACK_WAVESHAPER_PARAM_DRIVE => engine.feedback_waveshaper.set_drive(value),
-            FEEDBACK_WAVESHAPER_PARAM_FEEDBACK => engine.feedback_waveshaper.set_feedback(value),
-            FEEDBACK_WAVESHAPER_PARAM_FILTER_CUTOFF => {
-                engine.feedback_waveshaper.set_filter_cutoff(value)
-            }
-            FEEDBACK_WAVESHAPER_PARAM_MIX => engine.feedback_waveshaper.set_mix(value),
-            _ => {}
-        },
-        EFFECT_REVERB => match param {
-            REVERB_PARAM_DECAY => engine.reverb.set_decay(value),
-            REVERB_PARAM_MIX => engine.reverb.set_mix(value),
-            REVERB_PARAM_DAMPING => engine.reverb.set_damping(value),
-            _ => {} // Unknown parameter, ignore
-        },
-        EFFECT_PLATE_REVERB => match param {
-            PLATE_PARAM_DECAY => engine.plate_reverb.set_decay(value),
-            PLATE_PARAM_MIX => engine.plate_reverb.set_mix(value),
-            PLATE_PARAM_DAMPING => engine.plate_reverb.set_damping(value),
-            PLATE_PARAM_PREDELAY => engine.plate_reverb.set_predelay(value),
-            PLATE_PARAM_WIDTH => engine.plate_reverb.set_width(value),
-            PLATE_PARAM_SIZE => engine.plate_reverb.set_size(value),
-            _ => {} // Unknown parameter, ignore
-        },
-        EFFECT_LIMITER => match param {
-            LIMITER_PARAM_THRESHOLD if value.is_finite() => {
-                engine.limiter_threshold.set_target(value)
-            }
-            _ => {} // Unknown parameter, ignore
-        },
-        _ => {} // Unknown effect, ignore
-    }
+    (*engine).set_global_effect_param(effect, param, value);
 }
 
 /// Get a parameter value from a global effect
@@ -3515,68 +4315,7 @@ pub unsafe extern "C" fn gooey_engine_get_global_effect_param(
         return -1.0;
     }
 
-    let engine = &*engine;
-
-    match effect {
-        EFFECT_LOWPASS_FILTER => match param {
-            FILTER_PARAM_CUTOFF => engine.lowpass_filter.get_cutoff_freq(),
-            FILTER_PARAM_RESONANCE => engine.lowpass_filter.get_resonance(),
-            _ => -1.0, // Unknown parameter
-        },
-        EFFECT_DELAY => match param {
-            DELAY_PARAM_TIMING => engine.delay.get_timing() as f32,
-            DELAY_PARAM_FEEDBACK => engine.delay.get_feedback(),
-            DELAY_PARAM_MIX => engine.delay.get_mix(),
-            DELAY_PARAM_FILTER_CUTOFF => engine.delay.get_filter_cutoff(),
-            DELAY_PARAM_PINGPONG => {
-                if engine.delay.get_pingpong() {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-            _ => -1.0, // Unknown parameter
-        },
-        EFFECT_SATURATION => match param {
-            SATURATION_PARAM_DRIVE => engine.saturation.get_drive(),
-            SATURATION_PARAM_WARMTH => engine.saturation.get_warmth(),
-            SATURATION_PARAM_MIX => engine.saturation.get_mix(),
-            _ => -1.0, // Unknown parameter
-        },
-        EFFECT_COMPRESSOR => match param {
-            COMPRESSOR_PARAM_THRESHOLD => engine.compressor.get_threshold(),
-            COMPRESSOR_PARAM_RATIO => engine.compressor.get_ratio(),
-            COMPRESSOR_PARAM_ATTACK => engine.compressor.get_attack(),
-            COMPRESSOR_PARAM_RELEASE => engine.compressor.get_release(),
-            COMPRESSOR_PARAM_MIX => engine.compressor.get_mix(),
-            _ => -1.0, // Unknown parameter
-        },
-        EFFECT_TILT_FILTER => match param {
-            TILT_PARAM_CUTOFF => engine.tilt_filter.get_cutoff(),
-            TILT_PARAM_RESONANCE => engine.tilt_filter.get_resonance(),
-            _ => -1.0, // Unknown parameter
-        },
-        EFFECT_REVERB => match param {
-            REVERB_PARAM_DECAY => engine.reverb.get_decay(),
-            REVERB_PARAM_MIX => engine.reverb.get_mix(),
-            REVERB_PARAM_DAMPING => engine.reverb.get_damping(),
-            _ => -1.0, // Unknown parameter
-        },
-        EFFECT_PLATE_REVERB => match param {
-            PLATE_PARAM_DECAY => engine.plate_reverb.get_decay(),
-            PLATE_PARAM_MIX => engine.plate_reverb.get_mix(),
-            PLATE_PARAM_DAMPING => engine.plate_reverb.get_damping(),
-            PLATE_PARAM_PREDELAY => engine.plate_reverb.get_predelay(),
-            PLATE_PARAM_WIDTH => engine.plate_reverb.get_width(),
-            PLATE_PARAM_SIZE => engine.plate_reverb.get_size(),
-            _ => -1.0, // Unknown parameter
-        },
-        EFFECT_LIMITER => match param {
-            LIMITER_PARAM_THRESHOLD => engine.limiter_threshold.target(),
-            _ => -1.0, // Unknown parameter
-        },
-        _ => -1.0, // Unknown effect
-    }
+    (*engine).global_effect_param(effect, param)
 }
 
 /// Enable or disable a global effect
@@ -5185,13 +5924,13 @@ pub unsafe extern "C" fn gooey_engine_sequencer_get_instrument_step_enabled(
 /// Get the number of kick parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_kick_param_count() -> u32 {
-    8
+    KICK_PARAM_AMP_DECAY_CURVE + 1
 }
 
 /// Get the number of hi-hat parameters
 #[no_mangle]
 pub extern "C" fn gooey_engine_hihat_param_count() -> u32 {
-    6
+    HIHAT_PARAM_FILTER_SLOPE + 1
 }
 
 /// Get the number of sequencer steps
@@ -6111,7 +6850,7 @@ pub unsafe extern "C" fn gooey_engine_blend_set_position(
     voice.blend_y = y.clamp(0.0, 1.0);
 
     let (x, y) = (voice.blend_x, voice.blend_y);
-    voice.blender.blend_and_apply(&mut voice.instrument, x, y);
+    voice.apply_blend(x, y);
 }
 
 /// Get the current X blend position for an instrument
@@ -8811,7 +9550,338 @@ pub unsafe extern "C" fn gooey_engine_piano_load_sfz(
         .queue_set_map(piano as usize, pack.map.build())
 }
 
+fn live_effect_param_is_valid(effect: u32, param: u32, value: f32) -> bool {
+    if !value.is_finite() {
+        return false;
+    }
+    match (effect, param) {
+        (EFFECT_LOWPASS_FILTER, FILTER_PARAM_CUTOFF) => (20.0..=20_000.0).contains(&value),
+        (EFFECT_LOWPASS_FILTER, FILTER_PARAM_RESONANCE) => (0.0..=0.95).contains(&value),
+        (EFFECT_DELAY, DELAY_PARAM_TIMING) => (DELAY_TIMING_WHOLE..=DELAY_TIMING_SIXTEENTH_TRIPLET)
+            .any(|timing| value == timing as f32),
+        (EFFECT_DELAY, DELAY_PARAM_FEEDBACK) => (0.0..=0.95).contains(&value),
+        (EFFECT_DELAY, DELAY_PARAM_MIX) => (0.0..=1.0).contains(&value),
+        (EFFECT_REVERB, REVERB_PARAM_DECAY | REVERB_PARAM_MIX | REVERB_PARAM_DAMPING) => {
+            (0.0..=1.0).contains(&value)
+        }
+        _ => false,
+    }
+}
+
+unsafe fn build_live_rack(
+    effects: *const GooeyEffectDescriptor,
+    effect_count: u32,
+    sample_rate: f32,
+    bpm: f32,
+) -> Option<(EffectChain, Vec<u32>)> {
+    if effect_count > GOOEY_TRACK_RACK_MAX_EFFECTS || (effect_count != 0 && effects.is_null()) {
+        return None;
+    }
+    let descriptors: &[GooeyEffectDescriptor] = if effect_count == 0 {
+        &[]
+    } else {
+        slice::from_raw_parts(effects, effect_count as usize)
+    };
+    let mut rack = EffectChain::new();
+    let mut layout = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        if !matches!(
+            descriptor.effect,
+            EFFECT_LOWPASS_FILTER | EFFECT_DELAY | EFFECT_REVERB
+        ) || descriptor.param_count > 3
+            || (descriptor.param_count != 0 && descriptor.params.is_null())
+        {
+            return None;
+        }
+        let params: &[GooeyEffectParamDescriptor] = if descriptor.param_count == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(descriptor.params, descriptor.param_count as usize)
+        };
+        let mut seen = [false; 5];
+        for parameter in params {
+            let Some(flag) = seen.get_mut(parameter.param as usize) else {
+                return None;
+            };
+            if *flag
+                || !live_effect_param_is_valid(descriptor.effect, parameter.param, parameter.value)
+            {
+                return None;
+            }
+            *flag = true;
+        }
+        let slot = rack.add(descriptor.effect, sample_rate, bpm)?;
+        for parameter in params {
+            rack.set_param(slot, parameter.param, parameter.value);
+        }
+        layout.push(descriptor.effect);
+    }
+    Some((rack, layout))
+}
+
+/// Attach the engine's one single-producer live-control endpoint.
+///
+/// Call only after stopped-render graph creation/routing is complete and before
+/// the first concurrent render. Returns null if a handle was already created or
+/// engine shutdown has begun. The returned handle must be released with
+/// `gooey_live_control_free`; engine destruction waits for that detach.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_live_control_new(
+    engine: *mut GooeyEngine,
+) -> *mut GooeyLiveControl {
+    if engine.is_null() {
+        return std::ptr::null_mut();
+    }
+    let lifecycle = clone_engine_lifecycle(engine);
+    let Some(engine) = engine.as_mut() else {
+        return std::ptr::null_mut();
+    };
+    if engine.live_control.is_some() || !lifecycle.try_attach_control() {
+        return std::ptr::null_mut();
+    }
+    debug_assert_eq!(
+        LIVE_QUEUE_CAPACITY,
+        GOOEY_LIVE_CONTROL_QUEUE_CAPACITY as usize
+    );
+    let shared = LiveControlShared::new(lifecycle, engine.graph.track_count());
+    let projected_rack_layouts = (0..engine.graph.track_count())
+        .map(|track| {
+            (0..engine.graph.effect_count(track))
+                .filter_map(|slot| engine.graph.effect_type_at(track, slot))
+                .collect()
+        })
+        .collect::<Vec<_>>();
+    let control = GooeyLiveControl {
+        shared: Arc::clone(&shared),
+        track_count: engine.graph.track_count(),
+        active_sources: (0..SOURCE_CAPACITY)
+            .map(|source| engine.graph.source_is_active_for_control(source as u32))
+            .collect(),
+        projected_rack_generations: vec![0; engine.graph.track_count()],
+        projected_rack_layouts,
+        sample_rate: engine.sample_rate,
+        bpm: engine.bpm,
+    };
+    engine.live_control = Some(shared);
+    Box::into_raw(Box::new(control))
+}
+
+/// Release a live-control endpoint. Null is accepted.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_free(control: *mut GooeyLiveControl) {
+    if !control.is_null() {
+        drop(Box::from_raw(control));
+    }
+}
+
+fn live_generation(control: &GooeyLiveControl) -> Option<u64> {
+    (!control.shared.queue_is_full())
+        .then(|| control.shared.next_generation())
+        .flatten()
+}
+
+/// Queue a finite track fader target in the inclusive range 0...2.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_set_track_gain(
+    control: *mut GooeyLiveControl,
+    track: u32,
+    gain: f32,
+) -> u64 {
+    let Some(control) = control.as_mut() else {
+        return 0;
+    };
+    control.shared.reap_retired();
+    if track as usize >= control.track_count || !gain.is_finite() || !(0.0..=2.0).contains(&gain) {
+        return 0;
+    }
+    let Some(generation) = live_generation(control) else {
+        return 0;
+    };
+    control
+        .shared
+        .submit(LiveCommand::SetTrackGain {
+            generation,
+            track: track as usize,
+            gain,
+        })
+        .map_or(0, |_| generation)
+}
+
+/// Queue a finite pre-route source trim target in the inclusive range 0...2.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_set_source_trim(
+    control: *mut GooeyLiveControl,
+    source: u32,
+    trim: f32,
+) -> u64 {
+    let Some(control) = control.as_mut() else {
+        return 0;
+    };
+    control.shared.reap_retired();
+    if !control
+        .active_sources
+        .get(source as usize)
+        .copied()
+        .unwrap_or(false)
+        || !trim.is_finite()
+        || !(0.0..=2.0).contains(&trim)
+    {
+        return 0;
+    }
+    let Some(generation) = live_generation(control) else {
+        return 0;
+    };
+    control
+        .shared
+        .submit(LiveCommand::SetSourceTrim {
+            generation,
+            source,
+            trim,
+        })
+        .map_or(0, |_| generation)
+}
+
+/// Copy and queue one complete four-lane by sixteen-step drum snapshot.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_submit_drum_pattern(
+    control: *mut GooeyLiveControl,
+    pattern: *const GooeyDrumPattern,
+) -> u64 {
+    let (Some(control), Some(pattern)) = (control.as_mut(), pattern.as_ref()) else {
+        return 0;
+    };
+    control.shared.reap_retired();
+    let mut lanes = [[DrumCell::default(); DRUM_STEP_COUNT]; DRUM_LANE_COUNT];
+    for (output_lane, input_lane) in lanes.iter_mut().zip(pattern.lanes) {
+        for (output, input) in output_lane.iter_mut().zip(input_lane) {
+            if input.enabled > 1
+                || !input.velocity.is_finite()
+                || !(0.0..=1.0).contains(&input.velocity)
+            {
+                return 0;
+            }
+            *output = DrumCell {
+                enabled: input.enabled == 1,
+                velocity: input.velocity,
+            };
+        }
+    }
+    let Some(generation) = live_generation(control) else {
+        return 0;
+    };
+    control
+        .shared
+        .submit(LiveCommand::ReplaceDrumPattern { generation, lanes })
+        .map_or(0, |_| generation)
+}
+
+/// Prepare and queue an ordered replacement rack. Null plus zero clears it.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_replace_track_rack(
+    control: *mut GooeyLiveControl,
+    track: u32,
+    effects: *const GooeyEffectDescriptor,
+    effect_count: u32,
+) -> u64 {
+    let Some(control) = control.as_mut() else {
+        return 0;
+    };
+    control.shared.reap_retired();
+    let track = track as usize;
+    if track >= control.track_count || control.shared.queue_is_full() {
+        return 0;
+    }
+    if !control.shared.begin_rack_transition(track) {
+        return 0;
+    }
+    let Some((rack, layout)) =
+        build_live_rack(effects, effect_count, control.sample_rate, control.bpm)
+    else {
+        control.shared.cancel_rack_transition(track);
+        return 0;
+    };
+    let Some(generation) = control.shared.next_generation() else {
+        control.shared.cancel_rack_transition(track);
+        return 0;
+    };
+    match control.shared.submit(LiveCommand::ReplaceTrackRack {
+        generation,
+        track,
+        rack,
+    }) {
+        Ok(()) => {
+            control.projected_rack_generations[track] = generation;
+            control.projected_rack_layouts[track] = layout;
+            generation
+        }
+        Err(_) => {
+            control.shared.cancel_rack_transition(track);
+            0
+        }
+    }
+}
+
+/// Queue one scalar edit for the exact rack generation and slot.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_set_track_effect_param(
+    control: *mut GooeyLiveControl,
+    track: u32,
+    slot: u32,
+    rack_generation: u64,
+    param: u32,
+    value: f32,
+) -> u64 {
+    let Some(control) = control.as_mut() else {
+        return 0;
+    };
+    control.shared.reap_retired();
+    let track = track as usize;
+    let slot = slot as usize;
+    if rack_generation == 0
+        || control.projected_rack_generations.get(track).copied() != Some(rack_generation)
+    {
+        return 0;
+    }
+    let Some(effect) = control
+        .projected_rack_layouts
+        .get(track)
+        .and_then(|rack| rack.get(slot))
+        .copied()
+    else {
+        return 0;
+    };
+    if !live_effect_param_is_valid(effect, param, value) {
+        return 0;
+    }
+    let Some(generation) = live_generation(control) else {
+        return 0;
+    };
+    control
+        .shared
+        .submit(LiveCommand::SetTrackEffectParam {
+            generation,
+            track,
+            slot,
+            param,
+            value,
+        })
+        .map_or(0, |_| generation)
+}
+
+/// Return the generation of the last complete command installed by render.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_get_last_applied_generation(
+    control: *const GooeyLiveControl,
+) -> u64 {
+    control
+        .as_ref()
+        .map_or(0, |control| control.shared.last_applied())
+}
+
 /// Restore the default graph layout: Drums, Bass, Synth, Loops.
+///
+/// This stopped-render configuration call must not run concurrently with audio
+/// rendering or after a live-control handle has been attached.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`.
@@ -10681,7 +11751,237 @@ pub unsafe extern "C" fn gooey_engine_loop_render_to_wav(
 }
 
 // =============================================================================
-// Standalone twin-core percussion voice
+// Selectable percussion engine
+// =============================================================================
+
+/// Opaque host-facing percussion voice with a selectable synthesis topology.
+#[repr(C)]
+pub struct GooeyPercussionEngine {
+    voice: PercussionEngine,
+    sample_rate: f32,
+    time: f64,
+}
+
+fn percussion_engine_kind(kind: u32) -> Option<PercussionEngineKind> {
+    match kind {
+        PERCUSSION_ENGINE_ROUTING_MATRIX => Some(PercussionEngineKind::RoutingMatrix),
+        PERCUSSION_ENGINE_TWIN_CORE => Some(PercussionEngineKind::TwinCore),
+        _ => None,
+    }
+}
+
+fn percussion_preset(preset: u32) -> Option<PercussionPreset> {
+    match preset {
+        PERCUSSION_PRESET_KICK => Some(PercussionPreset::Kick),
+        PERCUSSION_PRESET_TOM => Some(PercussionPreset::Tom),
+        PERCUSSION_PRESET_SNARE => Some(PercussionPreset::Snare),
+        PERCUSSION_PRESET_CLAP_HYBRID => Some(PercussionPreset::ClapHybrid),
+        PERCUSSION_PRESET_METALLIC => Some(PercussionPreset::Metallic),
+        _ => None,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gooey_percussion_engine_new(
+    sample_rate: f32,
+    kind: u32,
+) -> *mut GooeyPercussionEngine {
+    let Some(kind) = percussion_engine_kind(kind) else {
+        return std::ptr::null_mut();
+    };
+    let sample_rate = if sample_rate.is_finite() && sample_rate > 0.0 {
+        sample_rate
+    } else {
+        44_100.0
+    };
+    Box::into_raw(Box::new(GooeyPercussionEngine {
+        voice: PercussionEngine::with_selection(sample_rate, kind, PercussionPreset::Kick),
+        sample_rate,
+        time: 0.0,
+    }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_destroy(voice: *mut GooeyPercussionEngine) {
+    if !voice.is_null() {
+        drop(Box::from_raw(voice));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_select(
+    voice: *mut GooeyPercussionEngine,
+    kind: u32,
+) -> bool {
+    let (Some(voice), Some(kind)) = (voice.as_mut(), percussion_engine_kind(kind)) else {
+        return false;
+    };
+    voice.voice.select_engine(kind);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_get_selected(
+    voice: *const GooeyPercussionEngine,
+) -> u32 {
+    voice
+        .as_ref()
+        .map_or(u32::MAX, |voice| voice.voice.kind() as u32)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_set_preset(
+    voice: *mut GooeyPercussionEngine,
+    preset: u32,
+) -> bool {
+    let (Some(voice), Some(preset)) = (voice.as_mut(), percussion_preset(preset)) else {
+        return false;
+    };
+    voice.voice.select_preset(preset);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_get_preset(
+    voice: *const GooeyPercussionEngine,
+) -> u32 {
+    voice
+        .as_ref()
+        .map_or(u32::MAX, |voice| voice.voice.preset() as u32)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_parameter_count(
+    voice: *const GooeyPercussionEngine,
+) -> u32 {
+    voice
+        .as_ref()
+        .map_or(0, |voice| voice.voice.parameter_count() as u32)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_parameter_name(
+    voice: *const GooeyPercussionEngine,
+    parameter: u32,
+) -> *const c_char {
+    const ROUTING_NAMES: [&[u8]; 9] = [
+        b"pitch\0",
+        b"pitch_sweep\0",
+        b"sweep_time\0",
+        b"decay\0",
+        b"body_character\0",
+        b"noise\0",
+        b"coupling\0",
+        b"drive\0",
+        b"volume\0",
+    ];
+    const TWIN_NAMES: [&[u8]; 12] = [
+        b"tune\0",
+        b"detune\0",
+        b"length\0",
+        b"body_bias\0",
+        b"fm_decay\0",
+        b"fm_depth\0",
+        b"trigger_delay\0",
+        b"harmonics\0",
+        b"noise_filter\0",
+        b"noise_decay\0",
+        b"noise_bias\0",
+        b"volume\0",
+    ];
+    let Some(voice) = voice.as_ref() else {
+        return std::ptr::null();
+    };
+    let names = match voice.voice.kind() {
+        PercussionEngineKind::RoutingMatrix => ROUTING_NAMES.as_slice(),
+        PercussionEngineKind::TwinCore => TWIN_NAMES.as_slice(),
+    };
+    names
+        .get(parameter as usize)
+        .map_or(std::ptr::null(), |name| name.as_ptr().cast())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_set_parameter(
+    voice: *mut GooeyPercussionEngine,
+    parameter: u32,
+    value: f32,
+) -> bool {
+    voice.as_mut().is_some_and(|voice| {
+        voice
+            .voice
+            .set_parameter_normalized(parameter as usize, value)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_get_parameter(
+    voice: *const GooeyPercussionEngine,
+    parameter: u32,
+) -> f32 {
+    voice
+        .as_ref()
+        .and_then(|voice| voice.voice.parameter_normalized(parameter as usize))
+        .unwrap_or(f32::NAN)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_trigger(
+    voice: *mut GooeyPercussionEngine,
+    velocity: f32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.trigger_with_velocity(voice.time, velocity);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_render(
+    voice: *mut GooeyPercussionEngine,
+    output: *mut f32,
+    frame_count: u32,
+) -> bool {
+    if output.is_null() {
+        return false;
+    }
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    let output = slice::from_raw_parts_mut(output, frame_count as usize);
+    let step = 1.0 / voice.sample_rate as f64;
+    for sample in output {
+        *sample = voice.voice.tick(voice.time);
+        voice.time += step;
+    }
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_reset(voice: *mut GooeyPercussionEngine) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.reset();
+    voice.time = 0.0;
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_set_midi_note(
+    voice: *mut GooeyPercussionEngine,
+    note: u8,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.set_midi_note(note.min(127));
+    true
+}
+
+// =============================================================================
+// Standalone twin-core percussion voice (engine-specific advanced controls)
 // =============================================================================
 
 /// Opaque standalone handle for hosts that do not use `GooeyEngine`.
@@ -10977,9 +12277,1091 @@ pub unsafe extern "C" fn gooey_twin_core_perc_set_ring_limit(
     true
 }
 
+// =============================================================================
+// Macros and motions
+// =============================================================================
+//
+// A macro is one 0-1 control connected to up to MACRO_MAX_MAPPINGS
+// parameters. Each mapping stores the parameter value at macro 0 ("from") and
+// at macro 1 ("to"). A motion is a one-shot automation of one macro's value:
+// it ramps the macro to a target over a duration along a curve, then holds,
+// returns, or snaps back. See docs/macros-motions-abi.md.
+//
+// Threading: macro/motion definition edits, macro values, trigger/stop, and
+// status getters go through a render-boundary queue and atomics and may be
+// called while rendering. Capture begin/commit/cancel read and write
+// parameters through the legacy setter paths and follow the same
+// host-serialized contract as `gooey_engine_set_*_param`.
+
+/// Number of macros.
+pub const MACRO_COUNT: u32 = 16;
+/// Maximum parameters one macro can drive.
+pub const MACRO_MAX_MAPPINGS: u32 = 16;
+/// Number of motion slots.
+pub const MOTION_SLOT_COUNT: u32 = 32;
+/// Returned by integer getters for an invalid macro, slot, or unconfigured motion.
+pub const AUTOMATION_INVALID: u32 = 0xFFFF_FFFF;
+
+const _: () = assert!(MACRO_COUNT as usize == crate::automation::MACRO_COUNT);
+const _: () = assert!(MACRO_MAX_MAPPINGS as usize == crate::automation::MACRO_MAX_MAPPINGS);
+const _: () = assert!(MOTION_SLOT_COUNT as usize == crate::automation::MOTION_SLOT_COUNT);
+
+/// Parameter target: poly synth. `index` is 0, `param` is a POLY_PARAM_*
+/// constant (waveform selectors excluded). Values are normalized 0-1.
+pub const PARAM_TARGET_POLY: u32 = 0;
+/// Parameter target: drum voice. `index` is the channel (INSTRUMENT_KICK..
+/// INSTRUMENT_TOM by default), `param` is the *_PARAM_* constant for the
+/// channel's current instrument (SNARE_PARAM_FILTER_TYPE excluded; bass
+/// channels are not mappable). Values are normalized 0-1.
+pub const PARAM_TARGET_DRUM: u32 = 1;
+/// Parameter target: global effect. `index` is an EFFECT_* constant, `param`
+/// the effect's *_PARAM_* constant. Values use the same units as
+/// `gooey_engine_set_global_effect_param`. Delay timing/ping-pong and the
+/// waveshapers are not mappable.
+pub const PARAM_TARGET_GLOBAL_EFFECT: u32 = 2;
+
+/// Capture commit: replace the macro's mappings with the captured changes.
+pub const MACRO_CAPTURE_REPLACE: u32 = 0;
+/// Capture commit: add captured changes to the macro. Parameters the macro
+/// already drives keep their "from" value and take the new "to" value.
+pub const MACRO_CAPTURE_MERGE: u32 = 1;
+/// Capture commit error: bad macro/mode, or no capture in progress.
+pub const MACRO_CAPTURE_ERROR_INVALID: i32 = -1;
+/// Capture commit error: the result would exceed MACRO_MAX_MAPPINGS. The
+/// capture stays open so some changes can be undone before retrying.
+pub const MACRO_CAPTURE_ERROR_TOO_MANY: i32 = -2;
+
+/// Motion curve: constant speed.
+pub const MOTION_CURVE_LINEAR: u32 = 0;
+/// Motion curve: slow start, fast finish.
+pub const MOTION_CURVE_EASE_IN: u32 = 1;
+/// Motion curve: fast start, slow finish.
+pub const MOTION_CURVE_EASE_OUT: u32 = 2;
+/// Motion curve: slow start and finish.
+pub const MOTION_CURVE_S_CURVE: u32 = 3;
+
+/// Motion end mode: stay at the target.
+pub const MOTION_END_HOLD: u32 = 0;
+/// Motion end mode: retrace back to the start over the same duration.
+pub const MOTION_END_RETURN: u32 = 1;
+/// Motion end mode: jump back to the start as soon as the target is reached.
+pub const MOTION_END_SNAP_BACK: u32 = 2;
+
+/// Motion duration unit: beats at the engine BPM (follows tempo changes).
+pub const MOTION_DURATION_BEATS: u32 = 0;
+/// Motion duration unit: milliseconds.
+pub const MOTION_DURATION_MS: u32 = 1;
+
+/// Motion start: immediately.
+pub const MOTION_QUANTIZE_NONE: u32 = 0;
+/// Motion start: next beat while the transport runs.
+pub const MOTION_QUANTIZE_BEAT: u32 = 1;
+/// Motion start: next 4-beat bar while the transport runs.
+pub const MOTION_QUANTIZE_BAR: u32 = 2;
+
+/// Motion state: not running.
+pub const MOTION_STATE_IDLE: u32 = 0;
+/// Motion state: waiting for a quantized start.
+pub const MOTION_STATE_PENDING: u32 = 1;
+/// Motion state: ramping toward the target.
+pub const MOTION_STATE_RUNNING: u32 = 2;
+/// Motion state: ramping back to the start (MOTION_END_RETURN).
+pub const MOTION_STATE_RETURNING: u32 = 3;
+
+const _: () = assert!(MotionPhase::Idle as u32 == MOTION_STATE_IDLE);
+const _: () = assert!(MotionPhase::Pending as u32 == MOTION_STATE_PENDING);
+const _: () = assert!(MotionPhase::Forward as u32 == MOTION_STATE_RUNNING);
+const _: () = assert!(MotionPhase::Returning as u32 == MOTION_STATE_RETURNING);
+
+/// Frames between macro/motion updates (~0.7 ms at 48 kHz). Parameter
+/// smoothers interpolate between updates.
+const AUTOMATION_CONTROL_INTERVAL: u32 = 32;
+
+/// Minimum change, relative to a parameter's range, that capture registers.
+const CAPTURE_EPSILON: f32 = 1e-4;
+
+fn macro_slot(index: u32) -> Option<usize> {
+    ((index as usize) < crate::automation::MACRO_COUNT).then_some(index as usize)
+}
+
+fn motion_slot(slot: u32) -> Option<usize> {
+    ((slot as usize) < crate::automation::MOTION_SLOT_COUNT).then_some(slot as usize)
+}
+
+impl GooeyEngine {
+    /// Parameters whose current value differs from the capture snapshot.
+    fn macro_capture_changes(&self) -> Option<Vec<MacroMapping>> {
+        let snapshot = self.macro_capture.as_ref()?;
+        Some(
+            snapshot
+                .iter()
+                .filter_map(|&(target, from)| {
+                    let (min, max) = self.automation_param_range(target)?;
+                    let to = self.automation_param_read(target)?;
+                    ((to - from).abs() > CAPTURE_EPSILON * (max - min)).then_some(MacroMapping {
+                        target,
+                        from,
+                        to,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Edit one configured motion definition under the producer lock.
+    fn edit_motion(&self, slot: u32, edit: impl FnOnce(&mut MotionDefinition) -> bool) -> bool {
+        let Some(slot) = motion_slot(slot) else {
+            return false;
+        };
+        self.automation_control
+            .edit(|state| state.motions[slot].as_mut().is_some_and(edit))
+            .unwrap_or(false)
+    }
+
+    fn motion_definition(&self, slot: u32) -> Option<MotionDefinition> {
+        let slot = motion_slot(slot)?;
+        self.automation_control
+            .read(|state| state.motions[slot])
+            .flatten()
+    }
+
+    fn macro_definition(&self, index: usize) -> Option<MacroDefinition> {
+        self.automation_control.read(|state| state.macros[index])
+    }
+
+    /// Mirror a macro's latest published value into the poly projection.
+    fn project_poly_macro_current(&self, index: usize) {
+        if let Some(value) = self.automation_control.macro_value(index) {
+            self.project_poly_macro(index, value);
+        }
+    }
+
+    /// Replace a macro definition in the projection and queue it for render.
+    fn replace_macro(&self, index: usize, edit: impl FnOnce(&mut MacroDefinition) -> bool) -> bool {
+        self.automation_control
+            .edit(|state: &mut AutomationState| {
+                if !state.has_room(1) {
+                    return false;
+                }
+                let mut definition = state.macros[index];
+                if !edit(&mut definition) {
+                    return false;
+                }
+                state.macros[index] = definition;
+                state.push(AutomationCommand::ReplaceMacro { index, definition })
+            })
+            .unwrap_or(false)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Capture
+// -----------------------------------------------------------------------------
+
+/// Begin capturing a macro. Snapshots every mappable parameter; the user then
+/// adjusts parameters with the normal setters and calls
+/// `gooey_engine_macro_capture_commit`. Calling again restarts the capture.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+/// Host-serialized like `gooey_engine_set_*_param`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_capture_begin(engine: *mut GooeyEngine) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let snapshot = engine
+        .automation_targets()
+        .into_iter()
+        .filter_map(|target| {
+            engine
+                .automation_param_read(target)
+                .map(|value| (target, value))
+        })
+        .collect();
+    engine.macro_capture = Some(snapshot);
+    true
+}
+
+/// Whether a macro capture is in progress.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_is_capturing(engine: *const GooeyEngine) -> bool {
+    engine
+        .as_ref()
+        .is_some_and(|engine| engine.macro_capture.is_some())
+}
+
+/// Number of parameters changed since `gooey_engine_macro_capture_begin`, or
+/// -1 when no capture is in progress.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+/// Host-serialized like `gooey_engine_set_*_param`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_capture_get_change_count(
+    engine: *const GooeyEngine,
+) -> i32 {
+    engine
+        .as_ref()
+        .and_then(GooeyEngine::macro_capture_changes)
+        .map_or(-1, |changes| changes.len() as i32)
+}
+
+/// Register the captured changes into `macro_index` and end the capture.
+///
+/// Each changed parameter becomes a mapping from its pre-capture value (macro
+/// 0) to its current value (macro 1). The changed parameters revert to their
+/// pre-capture values, the macro is set to 0, and motions on it stop.
+///
+/// Returns the macro's mapping count, MACRO_CAPTURE_ERROR_INVALID, or
+/// MACRO_CAPTURE_ERROR_TOO_MANY (capture stays open, nothing changes).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+/// Host-serialized like `gooey_engine_set_*_param`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_capture_commit(
+    engine: *mut GooeyEngine,
+    macro_index: u32,
+    mode: u32,
+) -> i32 {
+    let Some(engine) = engine.as_mut() else {
+        return MACRO_CAPTURE_ERROR_INVALID;
+    };
+    let Some(index) = macro_slot(macro_index) else {
+        return MACRO_CAPTURE_ERROR_INVALID;
+    };
+    if mode != MACRO_CAPTURE_REPLACE && mode != MACRO_CAPTURE_MERGE {
+        return MACRO_CAPTURE_ERROR_INVALID;
+    }
+    let Some(changes) = engine.macro_capture_changes() else {
+        return MACRO_CAPTURE_ERROR_INVALID;
+    };
+
+    let committed = engine.automation_control.edit(|state| {
+        if !state.has_room(2) {
+            return Err(MACRO_CAPTURE_ERROR_INVALID);
+        }
+        let mut definition = if mode == MACRO_CAPTURE_MERGE {
+            state.macros[index]
+        } else {
+            MacroDefinition::default()
+        };
+        for change in &changes {
+            let mapping = match definition.find(change.target) {
+                Some(existing) => MacroMapping {
+                    to: change.to,
+                    ..*existing
+                },
+                None => *change,
+            };
+            if !definition.upsert(mapping) {
+                return Err(MACRO_CAPTURE_ERROR_TOO_MANY);
+            }
+        }
+        state.macros[index] = definition;
+        state.push(AutomationCommand::ReplaceMacro { index, definition });
+        state.push(AutomationCommand::SetMacroValue { index, value: 0.0 });
+        Ok(definition)
+    });
+    let definition = match committed {
+        Some(Ok(definition)) => definition,
+        Some(Err(code)) => return code,
+        None => return MACRO_CAPTURE_ERROR_INVALID,
+    };
+
+    for change in &changes {
+        engine.automation_param_host_write(change.target, change.from);
+    }
+    engine.automation_control.publish_macro_value(index, 0.0);
+    engine.project_poly_macro(index, 0.0);
+    engine.macro_capture = None;
+    definition.len() as i32
+}
+
+/// End a capture without registering it. With `revert`, parameters changed
+/// since the capture began return to their pre-capture values; otherwise the
+/// changes are kept as ordinary edits.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+/// Host-serialized like `gooey_engine_set_*_param`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_capture_cancel(
+    engine: *mut GooeyEngine,
+    revert: bool,
+) -> bool {
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    let Some(changes) = engine.macro_capture_changes() else {
+        return false;
+    };
+    if revert {
+        for change in &changes {
+            engine.automation_param_host_write(change.target, change.from);
+        }
+    }
+    engine.macro_capture = None;
+    true
+}
+
+// -----------------------------------------------------------------------------
+// Macros
+// -----------------------------------------------------------------------------
+
+/// Add a mapping to a macro, or update the mapping for the same parameter.
+/// `from`/`to` are clamped to the parameter's range. Returns false for an
+/// invalid macro, unmappable parameter, non-finite value, full macro, or full
+/// command queue.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_add_mapping(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+    kind: u32,
+    index: u32,
+    param: u32,
+    from: f32,
+    to: f32,
+) -> bool {
+    let Some(engine) = engine.as_ref() else {
+        return false;
+    };
+    let Some(slot) = macro_slot(macro_index) else {
+        return false;
+    };
+    let target = ParamTarget::new(kind, index, param);
+    let Some((min, max)) = engine.automation_param_range(target) else {
+        return false;
+    };
+    if !from.is_finite() || !to.is_finite() {
+        return false;
+    }
+    let mapping = MacroMapping {
+        target,
+        from: from.clamp(min, max),
+        to: to.clamp(min, max),
+    };
+    engine.replace_macro(slot, |definition| definition.upsert(mapping))
+}
+
+/// Remove the mapping for one parameter from a macro.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_remove_mapping(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+    kind: u32,
+    index: u32,
+    param: u32,
+) -> bool {
+    let (Some(engine), Some(slot)) = (engine.as_ref(), macro_slot(macro_index)) else {
+        return false;
+    };
+    let target = ParamTarget::new(kind, index, param);
+    engine.replace_macro(slot, |definition| definition.remove(target))
+}
+
+/// Remove every mapping from a macro. Parameters keep their current values.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_clear(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+) -> bool {
+    let (Some(engine), Some(slot)) = (engine.as_ref(), macro_slot(macro_index)) else {
+        return false;
+    };
+    engine.replace_macro(slot, |definition| {
+        definition.clear();
+        true
+    })
+}
+
+/// Number of mappings in a macro (0 when invalid).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_get_mapping_count(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .zip(macro_slot(macro_index))
+        .and_then(|(engine, slot)| engine.macro_definition(slot))
+        .map_or(0, |definition| definition.len() as u32)
+}
+
+/// Read mapping `mapping_index` of a macro into the out pointers. Any out
+/// pointer may be null. Returns false when the macro or mapping is invalid.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+/// Non-null out pointers must be valid for writes.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_get_mapping(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+    mapping_index: u32,
+    out_kind: *mut u32,
+    out_index: *mut u32,
+    out_param: *mut u32,
+    out_from: *mut f32,
+    out_to: *mut f32,
+) -> bool {
+    let Some(mapping) = engine
+        .as_ref()
+        .zip(macro_slot(macro_index))
+        .and_then(|(engine, slot)| engine.macro_definition(slot))
+        .and_then(|definition| definition.mappings().get(mapping_index as usize).copied())
+    else {
+        return false;
+    };
+    if let Some(out) = out_kind.as_mut() {
+        *out = mapping.target.kind;
+    }
+    if let Some(out) = out_index.as_mut() {
+        *out = mapping.target.index;
+    }
+    if let Some(out) = out_param.as_mut() {
+        *out = mapping.target.param;
+    }
+    if let Some(out) = out_from.as_mut() {
+        *out = mapping.from;
+    }
+    if let Some(out) = out_to.as_mut() {
+        *out = mapping.to;
+    }
+    true
+}
+
+/// Set a macro's position (0-1, clamped) by hand. Stops any motion driving
+/// the macro, like grabbing a fader during automation. Mapped parameters
+/// follow within one control interval.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_set_value(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+    value: f32,
+) -> bool {
+    let (Some(engine), Some(index)) = (engine.as_ref(), macro_slot(macro_index)) else {
+        return false;
+    };
+    if !value.is_finite() {
+        return false;
+    }
+    let value = value.clamp(0.0, 1.0);
+    let queued = engine
+        .automation_control
+        .edit(|state| state.push(AutomationCommand::SetMacroValue { index, value }));
+    if queued != Some(true) {
+        return false;
+    }
+    engine.automation_control.publish_macro_value(index, value);
+    engine.project_poly_macro(index, value);
+    true
+}
+
+/// A macro's live position (animates while a motion runs), or NaN when invalid.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_get_value(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .zip(macro_slot(macro_index))
+        .and_then(|(engine, index)| engine.automation_control.macro_value(index))
+        .unwrap_or(f32::NAN)
+}
+
+// -----------------------------------------------------------------------------
+// Motions
+// -----------------------------------------------------------------------------
+
+/// Point a motion slot at a macro and target value (0-1, clamped). An
+/// unconfigured slot gets defaults: 4 beats, linear, hold, start from the
+/// current value, no quantize. A configured slot keeps its other settings.
+/// Running instances are unaffected until the next trigger.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_configure(
+    engine: *const GooeyEngine,
+    slot: u32,
+    macro_index: u32,
+    target: f32,
+) -> bool {
+    let (Some(engine), Some(slot), Some(macro_index)) =
+        (engine.as_ref(), motion_slot(slot), macro_slot(macro_index))
+    else {
+        return false;
+    };
+    if !target.is_finite() {
+        return false;
+    }
+    let target = target.clamp(0.0, 1.0);
+    engine
+        .automation_control
+        .edit(|state| {
+            let definition = state.motions[slot]
+                .get_or_insert_with(|| MotionDefinition::new(macro_index, target));
+            definition.macro_index = macro_index;
+            definition.target = target;
+        })
+        .is_some()
+}
+
+/// Unconfigure a motion slot and stop it.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_clear(engine: *const GooeyEngine, slot: u32) -> bool {
+    let (Some(engine), Some(slot)) = (engine.as_ref(), motion_slot(slot)) else {
+        return false;
+    };
+    engine
+        .automation_control
+        .edit(|state| {
+            // Leave the slot configured when the stop cannot be queued, so
+            // getters never report a motion gone that is still running.
+            if !state.push(AutomationCommand::StopMotion { slot }) {
+                return false;
+            }
+            state.motions[slot] = None;
+            true
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a motion slot is configured.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_is_configured(
+    engine: *const GooeyEngine,
+    slot: u32,
+) -> bool {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.motion_definition(slot))
+        .is_some()
+}
+
+/// The macro a motion drives, or AUTOMATION_INVALID.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_get_macro(
+    engine: *const GooeyEngine,
+    slot: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.motion_definition(slot))
+        .map_or(AUTOMATION_INVALID, |definition| {
+            definition.macro_index as u32
+        })
+}
+
+/// A motion's target macro value, or NaN when unconfigured.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_get_target(
+    engine: *const GooeyEngine,
+    slot: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.motion_definition(slot))
+        .map_or(f32::NAN, |definition| definition.target)
+}
+
+/// Set an explicit start value (0-1), or pass NaN to start from wherever the
+/// macro is when the motion begins. An explicit start makes a Hold motion
+/// repeatable: each trigger jumps to the start and ramps again.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_set_start(
+    engine: *const GooeyEngine,
+    slot: u32,
+    start: f32,
+) -> bool {
+    let Some(engine) = engine.as_ref() else {
+        return false;
+    };
+    if start.is_infinite() {
+        return false;
+    }
+    let start = (!start.is_nan()).then(|| start.clamp(0.0, 1.0));
+    engine.edit_motion(slot, |definition| {
+        definition.start = start;
+        true
+    })
+}
+
+/// A motion's explicit start value, or NaN when it starts from the current
+/// value or is unconfigured.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_get_start(
+    engine: *const GooeyEngine,
+    slot: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.motion_definition(slot))
+        .and_then(|definition| definition.start)
+        .unwrap_or(f32::NAN)
+}
+
+/// Set a motion's duration (one leg; MOTION_END_RETURN takes twice as long).
+/// `unit` is MOTION_DURATION_BEATS or MOTION_DURATION_MS; `value` must be
+/// finite and non-negative.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_set_duration(
+    engine: *const GooeyEngine,
+    slot: u32,
+    unit: u32,
+    value: f32,
+) -> bool {
+    let Some(engine) = engine.as_ref() else {
+        return false;
+    };
+    if !value.is_finite() || value < 0.0 {
+        return false;
+    }
+    let duration = match unit {
+        MOTION_DURATION_BEATS => MotionDuration::Beats(value),
+        MOTION_DURATION_MS => MotionDuration::Millis(value),
+        _ => return false,
+    };
+    engine.edit_motion(slot, |definition| {
+        definition.duration = duration;
+        true
+    })
+}
+
+/// A motion's duration unit, or AUTOMATION_INVALID.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_get_duration_unit(
+    engine: *const GooeyEngine,
+    slot: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.motion_definition(slot))
+        .map_or(AUTOMATION_INVALID, |definition| match definition.duration {
+            MotionDuration::Beats(_) => MOTION_DURATION_BEATS,
+            MotionDuration::Millis(_) => MOTION_DURATION_MS,
+        })
+}
+
+/// A motion's duration value in its unit, or NaN.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_get_duration_value(
+    engine: *const GooeyEngine,
+    slot: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.motion_definition(slot))
+        .map_or(f32::NAN, |definition| match definition.duration {
+            MotionDuration::Beats(value) | MotionDuration::Millis(value) => value,
+        })
+}
+
+/// Set a motion's curve (MOTION_CURVE_*).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_set_curve(
+    engine: *const GooeyEngine,
+    slot: u32,
+    curve: u32,
+) -> bool {
+    let (Some(engine), Some(curve)) = (engine.as_ref(), MotionCurve::from_u32(curve)) else {
+        return false;
+    };
+    engine.edit_motion(slot, |definition| {
+        definition.curve = curve;
+        true
+    })
+}
+
+/// A motion's curve, or AUTOMATION_INVALID.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_get_curve(
+    engine: *const GooeyEngine,
+    slot: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.motion_definition(slot))
+        .map_or(AUTOMATION_INVALID, |definition| definition.curve.as_u32())
+}
+
+/// Set a motion's end mode (MOTION_END_*).
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_set_end_mode(
+    engine: *const GooeyEngine,
+    slot: u32,
+    end_mode: u32,
+) -> bool {
+    let (Some(engine), Some(end_mode)) = (engine.as_ref(), MotionEndMode::from_u32(end_mode))
+    else {
+        return false;
+    };
+    engine.edit_motion(slot, |definition| {
+        definition.end_mode = end_mode;
+        true
+    })
+}
+
+/// A motion's end mode, or AUTOMATION_INVALID.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_get_end_mode(
+    engine: *const GooeyEngine,
+    slot: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.motion_definition(slot))
+        .map_or(AUTOMATION_INVALID, |definition| {
+            definition.end_mode.as_u32()
+        })
+}
+
+/// Set a motion's start quantization (MOTION_QUANTIZE_*). Quantization only
+/// applies while the transport runs; otherwise the motion starts at once.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_set_quantize(
+    engine: *const GooeyEngine,
+    slot: u32,
+    quantize: u32,
+) -> bool {
+    let (Some(engine), Some(quantize)) = (engine.as_ref(), MotionQuantize::from_u32(quantize))
+    else {
+        return false;
+    };
+    engine.edit_motion(slot, |definition| {
+        definition.quantize = quantize;
+        true
+    })
+}
+
+/// A motion's start quantization, or AUTOMATION_INVALID.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_get_quantize(
+    engine: *const GooeyEngine,
+    slot: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.motion_definition(slot))
+        .map_or(AUTOMATION_INVALID, |definition| {
+            definition.quantize.as_u32()
+        })
+}
+
+/// Start (or restart) a configured motion at the next render buffer. Any
+/// other motion driving the same macro stops. Returns false when the slot is
+/// unconfigured or the command queue is full.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_trigger(
+    engine: *const GooeyEngine,
+    slot: u32,
+) -> bool {
+    let (Some(engine), Some(slot)) = (engine.as_ref(), motion_slot(slot)) else {
+        return false;
+    };
+    let started = engine.automation_control.edit(|state| {
+        let definition = state.motions[slot]?;
+        state
+            .push(AutomationCommand::StartMotion { slot, definition })
+            .then_some(definition)
+    });
+    let Some(Some(definition)) = started else {
+        return false;
+    };
+    // Project where the macro will come to rest so poly getters and later
+    // preset edits agree with the motion's outcome.
+    let resting = match definition.end_mode {
+        MotionEndMode::Hold => Some(definition.target),
+        MotionEndMode::Return | MotionEndMode::SnapBack => definition.start.or_else(|| {
+            engine
+                .automation_control
+                .macro_value(definition.macro_index)
+        }),
+    };
+    if let Some(resting) = resting {
+        engine.project_poly_macro(definition.macro_index, resting);
+    }
+    true
+}
+
+/// Stop a motion where it is. The macro keeps its current value.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_stop(engine: *const GooeyEngine, slot: u32) -> bool {
+    let (Some(engine), Some(slot)) = (engine.as_ref(), motion_slot(slot)) else {
+        return false;
+    };
+    let stopped = engine
+        .automation_control
+        .edit(|state| {
+            state
+                .push(AutomationCommand::StopMotion { slot })
+                .then(|| state.motions[slot].map(|definition| definition.macro_index))
+        })
+        .flatten();
+    let Some(macro_index) = stopped else {
+        return false;
+    };
+    if let Some(index) = macro_index {
+        engine.project_poly_macro_current(index);
+    }
+    true
+}
+
+/// Stop every motion. Macros keep their current values.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_stop_all(engine: *const GooeyEngine) -> bool {
+    let Some(engine) = engine.as_ref() else {
+        return false;
+    };
+    let stopped = engine
+        .automation_control
+        .edit(|state| state.push(AutomationCommand::StopAll))
+        .unwrap_or(false);
+    if stopped {
+        for index in 0..crate::automation::MACRO_COUNT {
+            engine.project_poly_macro_current(index);
+        }
+    }
+    stopped
+}
+
+/// A motion's state (MOTION_STATE_*) as of the last rendered buffer, or
+/// AUTOMATION_INVALID for an invalid slot.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_get_state(
+    engine: *const GooeyEngine,
+    slot: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .zip(motion_slot(slot))
+        .and_then(|(engine, slot)| engine.automation_control.motion_phase(slot))
+        .unwrap_or(AUTOMATION_INVALID)
+}
+
+/// A motion's overall progress 0-1 as of the last rendered buffer (with
+/// MOTION_END_RETURN the outbound leg is 0-0.5), or NaN for an invalid slot.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_motion_get_progress(
+    engine: *const GooeyEngine,
+    slot: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .zip(motion_slot(slot))
+        .and_then(|(engine, slot)| engine.automation_control.motion_progress(slot))
+        .unwrap_or(f32::NAN)
+}
+
+#[cfg(test)]
+mod automation_tests {
+    use super::*;
+
+    fn render(engine: &mut GooeyEngine, seconds: f32) {
+        let mut buffer = [0.0_f32; 256 * 2];
+        let mut frames = (seconds * engine.sample_rate) as usize;
+        while frames > 0 {
+            let chunk = frames.min(256);
+            engine.render(&mut buffer[..chunk * 2]);
+            frames -= chunk;
+        }
+    }
+
+    fn live_cutoff(engine: &GooeyEngine) -> f32 {
+        engine
+            .poly_synth
+            .params
+            .target(POLY_PARAM_FILTER_CUTOFF)
+            .unwrap()
+    }
+
+    #[test]
+    fn poly_motion_ramps_live_synth_and_survives_preset_edits() {
+        let mut engine = GooeyEngine::new(48_000.0);
+        let engine_ptr: *mut GooeyEngine = &mut engine;
+        unsafe {
+            assert!(gooey_engine_macro_add_mapping(
+                engine_ptr,
+                0,
+                PARAM_TARGET_POLY,
+                0,
+                POLY_PARAM_FILTER_CUTOFF,
+                0.9,
+                0.1,
+            ));
+            assert!(gooey_engine_motion_configure(engine_ptr, 0, 0, 1.0));
+            assert!(gooey_engine_motion_set_duration(
+                engine_ptr,
+                0,
+                MOTION_DURATION_MS,
+                200.0
+            ));
+            assert!(gooey_engine_motion_trigger(engine_ptr, 0));
+        }
+        render(&mut engine, 0.1);
+        assert!((live_cutoff(&engine) - 0.5).abs() < 0.02);
+
+        // An unrelated preset edit re-applies the whole config at the next
+        // buffer; the running motion reasserts its parameter.
+        unsafe {
+            assert!(gooey_engine_poly_set_param(
+                engine_ptr,
+                POLY_PARAM_VOLUME,
+                0.3
+            ));
+        }
+        render(&mut engine, 0.05);
+        assert!((live_cutoff(&engine) - 0.3).abs() < 0.02);
+
+        render(&mut engine, 0.1);
+        assert!((live_cutoff(&engine) - 0.1).abs() < 1e-6);
+
+        // After the motion, a later preset edit keeps the held value because
+        // the trigger projected it into the preset bank.
+        unsafe {
+            assert!(gooey_engine_poly_set_param(
+                engine_ptr,
+                POLY_PARAM_VOLUME,
+                0.4
+            ));
+        }
+        render(&mut engine, 0.01);
+        assert!((live_cutoff(&engine) - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn manual_macro_value_writes_live_drum_param() {
+        let mut engine = GooeyEngine::new(48_000.0);
+        let engine_ptr: *mut GooeyEngine = &mut engine;
+        unsafe {
+            assert!(gooey_engine_macro_add_mapping(
+                engine_ptr,
+                0,
+                PARAM_TARGET_DRUM,
+                INSTRUMENT_HIHAT,
+                HIHAT_PARAM_TONE,
+                0.0,
+                1.0,
+            ));
+            assert!(gooey_engine_macro_set_value(engine_ptr, 0, 0.25));
+        }
+        render(&mut engine, 0.01);
+        let tone = engine
+            .voice(INSTRUMENT_HIHAT as usize)
+            .unwrap()
+            .instrument
+            .get_param(HIHAT_PARAM_TONE);
+        assert!((tone - 0.25).abs() < 1e-6);
+    }
+}
+
 #[cfg(test)]
 mod output_stage_tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn engine_free_waits_for_a_callback_in_the_entry_window() {
+        let engine = gooey_engine_new(44_100.0);
+        let entry_guard = EngineRenderEntryGuard::enter();
+        let engine_address = engine as usize;
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || unsafe {
+            gooey_engine_free(engine_address as *mut GooeyEngine);
+            done_tx.send(()).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(done_rx.try_recv().is_err());
+        drop(entry_guard);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+    }
 
     #[test]
     fn limiter_bypass_and_threshold_changes_ramp_without_a_hard_step() {

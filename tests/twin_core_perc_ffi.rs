@@ -114,3 +114,51 @@ fn ffi_rejects_null_handles_and_buffers() {
         gooey_twin_core_perc_destroy(voice);
     }
 }
+
+#[test]
+fn selectable_engine_ffi_supports_a_dropdown_and_shared_presets() {
+    unsafe {
+        let voice = gooey_percussion_engine_new(SAMPLE_RATE, PERCUSSION_ENGINE_ROUTING_MATRIX);
+        assert!(!voice.is_null());
+        assert_eq!(
+            gooey_percussion_engine_get_selected(voice),
+            PERCUSSION_ENGINE_ROUTING_MATRIX
+        );
+        assert_eq!(gooey_percussion_engine_parameter_count(voice), 9);
+        assert!(gooey_percussion_engine_set_preset(
+            voice,
+            PERCUSSION_PRESET_SNARE
+        ));
+        assert!(gooey_percussion_engine_trigger(voice, 0.8));
+        let mut matrix = vec![0.0; 9_600];
+        assert!(gooey_percussion_engine_render(
+            voice,
+            matrix.as_mut_ptr(),
+            matrix.len() as u32,
+        ));
+        assert!(energy(&matrix) > 1.0e-5);
+
+        assert!(gooey_percussion_engine_select(
+            voice,
+            PERCUSSION_ENGINE_TWIN_CORE
+        ));
+        assert_eq!(
+            gooey_percussion_engine_get_selected(voice),
+            PERCUSSION_ENGINE_TWIN_CORE
+        );
+        assert_eq!(
+            gooey_percussion_engine_get_preset(voice),
+            PERCUSSION_PRESET_SNARE
+        );
+        assert_eq!(gooey_percussion_engine_parameter_count(voice), 12);
+        assert_eq!(
+            CStr::from_ptr(gooey_percussion_engine_parameter_name(voice, 7))
+                .to_str()
+                .unwrap(),
+            "harmonics"
+        );
+        assert!(gooey_percussion_engine_set_parameter(voice, 7, 0.8));
+        assert!((gooey_percussion_engine_get_parameter(voice, 7) - 0.8).abs() < 1.0e-6);
+        gooey_percussion_engine_destroy(voice);
+    }
+}
