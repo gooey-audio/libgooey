@@ -1,7 +1,7 @@
 //! Nonblocking host-to-render control plane for chord gestures and loop clips.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{
@@ -35,6 +35,8 @@ struct SharedControl {
     next_generation: AtomicU64,
     applied_generation: AtomicU64,
     piano_registered: [AtomicBool; PIANO_COUNT],
+    // An unset override leaves each clip event's authored velocity intact.
+    loop_piano_velocity: AtomicU32,
 }
 
 #[derive(Clone)]
@@ -65,6 +67,7 @@ impl ChordControl {
                 next_generation: AtomicU64::new(1),
                 applied_generation: AtomicU64::new(0),
                 piano_registered: std::array::from_fn(|_| AtomicBool::new(false)),
+                loop_piano_velocity: AtomicU32::new(u32::MAX),
             }),
         }
     }
@@ -73,6 +76,33 @@ impl ChordControl {
         if let Some(value) = self.shared.piano_registered.get(piano) {
             value.store(true, Ordering::Release);
         }
+    }
+
+    pub(crate) fn set_loop_piano_velocity(&self, velocity: f32) -> bool {
+        if !velocity.is_finite() {
+            return false;
+        }
+        self.shared
+            .loop_piano_velocity
+            .store(velocity.clamp(0.0, 1.0).to_bits(), Ordering::Release);
+        true
+    }
+
+    pub(crate) fn loop_piano_velocity(&self) -> Option<f32> {
+        let bits = self.shared.loop_piano_velocity.load(Ordering::Acquire);
+        (bits != u32::MAX).then(|| f32::from_bits(bits))
+    }
+
+    pub(crate) fn with_loop_piano_velocity(
+        &self,
+        mut event: PreparedChordEvent,
+    ) -> PreparedChordEvent {
+        if event.target == CHORD_TARGET_PIANO {
+            if let Some(velocity) = self.loop_piano_velocity() {
+                event.event.velocity = velocity;
+            }
+        }
+        event
     }
 
     pub(crate) fn target_is_valid(&self, event: &PreparedChordEvent) -> bool {
@@ -333,5 +363,21 @@ mod tests {
         let mut scratch = ChordControlScratch::default();
         control.drain_into(&mut scratch);
         assert!(scratch.actions.is_empty());
+    }
+
+    #[test]
+    fn loop_velocity_changes_only_future_piano_actions() {
+        let control = ChordControl::new();
+        let mut piano = event(0, 48);
+        piano.target = CHORD_TARGET_PIANO;
+        let synth = event(48, 48);
+        assert_eq!(control.with_loop_piano_velocity(piano).event.velocity, 0.8);
+        assert!(control.set_loop_piano_velocity(0.2));
+        assert_eq!(control.with_loop_piano_velocity(piano).event.velocity, 0.2);
+        assert_eq!(control.with_loop_piano_velocity(synth).event.velocity, 0.8);
+        assert!(control.set_loop_piano_velocity(0.65));
+        assert_eq!(control.with_loop_piano_velocity(piano).event.velocity, 0.65);
+        assert!(!control.set_loop_piano_velocity(f32::NAN));
+        assert_eq!(control.with_loop_piano_velocity(piano).event.velocity, 0.65);
     }
 }
