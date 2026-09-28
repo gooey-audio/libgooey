@@ -52,7 +52,7 @@ use crate::music::{
 use crate::performance::control::{ChordControl, ChordControlScratch};
 use crate::performance::{
     prepare_chord_event, ChordCommandAction, ChordLoopSnapshot, PerformanceRecorder, PlayerAction,
-    PreparedChordEvent, RecordMode, CHORD_TARGET_PIANO, CHORD_TARGET_POLY,
+    PreparedChordEvent, RecordMode, CHORD_TARGET_PIANO, CHORD_TARGET_POLY, TICKS_PER_QUARTER,
 };
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -1172,6 +1172,8 @@ pub struct GooeyEngine {
     chord_control_scratch: ChordControlScratch,
     chord_retired: Vec<std::sync::Arc<ChordLoopSnapshot>>,
     controlled_chord: Option<ControlledChord>,
+    /// A live pad strike is waiting for its recorded clip event to take over.
+    pending_live_chord_handoff: bool,
     // Config-time registered sample-pad instruments. Empty entries are not graph sources.
     samplers: [Option<SamplerRack>; SAMPLER_RACK_MAX as usize],
     /// Control-side sampler replacement endpoint. Producers never mutate
@@ -1221,6 +1223,7 @@ struct ControlledChord {
     notes: [u8; 6],
     note_count: u8,
     loop_owned: bool,
+    trigger_beat: f64,
 }
 
 /// Host-clock reference for the next render buffer. The audio callback sets
@@ -1479,6 +1482,7 @@ impl GooeyEngine {
             chord_control_scratch: ChordControlScratch::default(),
             chord_retired: Vec::with_capacity(32),
             controlled_chord: None,
+            pending_live_chord_handoff: false,
             samplers: std::array::from_fn(|_| None),
             sampler_control,
             sampler_command_scratch: std::collections::VecDeque::with_capacity(16),
@@ -1547,13 +1551,15 @@ impl GooeyEngine {
         }
     }
 
-    fn apply_chord_control_commands(&mut self) {
+    fn apply_chord_control_commands(&mut self) -> bool {
         let control = self.chord_control.clone();
         let _ = control.reclaim_from_audio(&mut self.chord_retired);
         control.drain_into(&mut self.chord_control_scratch);
+        let mut installed_replace = false;
 
         if self.chord_retired.capacity() - self.chord_retired.len() >= 2 {
             if let Some(edit) = self.chord_control_scratch.edit.take() {
+                let is_replace = matches!(&edit, crate::performance::ChordClipEdit::Replace(_));
                 if let Some(generation) = self.performance.apply_clip_edit(
                     edit,
                     self.mixer.transport_running(),
@@ -1561,6 +1567,7 @@ impl GooeyEngine {
                 ) {
                     self.release_loop_owned_chord();
                     control.mark_applied(generation);
+                    installed_replace = is_replace;
                 }
             }
         }
@@ -1573,7 +1580,11 @@ impl GooeyEngine {
                 ChordCommandAction::ReleaseAll => self.release_controlled_chord(),
             }
         }
+        if installed_replace {
+            self.arm_live_chord_handoff();
+        }
         let _ = control.reclaim_from_audio(&mut self.chord_retired);
+        installed_replace
     }
 
     fn apply_sampler_control_commands(&mut self) {
@@ -1755,7 +1766,7 @@ impl GooeyEngine {
         self.apply_poly_control_commands();
         self.apply_sampler_control_commands();
         self.apply_piano_control_commands();
-        self.apply_chord_control_commands();
+        let immediate_chord_install = self.apply_chord_control_commands();
         self.apply_automation_commands();
 
         // Number of stereo frames this buffer holds (two slots per frame).
@@ -1945,9 +1956,14 @@ impl GooeyEngine {
                 if let Some(generation) = update.installed_generation {
                     self.release_loop_owned_chord();
                     self.chord_control.mark_applied(generation);
+                    self.arm_live_chord_handoff();
                 }
                 if let Some(action) = update.action {
-                    self.apply_performance_action(action);
+                    self.apply_performance_action(
+                        action,
+                        update.installed_generation.is_some()
+                            || (immediate_chord_install && sample_offset == 0),
+                    );
                 }
                 let sampler_hits = self.performance.take_sampler_hits();
                 for hit in sampler_hits {
@@ -5541,6 +5557,7 @@ impl GooeyEngine {
     }
 
     fn release_controlled_chord(&mut self) {
+        self.pending_live_chord_handoff = false;
         let Some(active) = self.controlled_chord.take() else {
             return;
         };
@@ -5615,14 +5632,58 @@ impl GooeyEngine {
             notes: sounding_notes,
             note_count: sounding_count as u8,
             loop_owned,
+            trigger_beat: self.mixer.transport_beat(),
         });
     }
 
-    /// Apply a clip player action to the poly synth without recording.
-    fn apply_performance_action(&mut self, action: PlayerAction) {
+    /// Let a just-recorded event take ownership of its live strike once.
+    fn arm_live_chord_handoff(&mut self) {
+        self.pending_live_chord_handoff = self
+            .controlled_chord
+            .is_some_and(|active| !active.loop_owned);
+    }
+
+    fn live_chord_matches_recorded_onset(
+        &self,
+        active: ControlledChord,
+        event: PreparedChordEvent,
+    ) -> bool {
+        let length = f64::from(self.performance.length_ticks());
+        let live_tick = (active.trigger_beat * f64::from(TICKS_PER_QUARTER)).rem_euclid(length);
+        let distance = (live_tick - f64::from(event.event.start_tick)).abs();
+        // A sixteenth-note recording can round by half a grid step. One
+        // extra tick allows for the delay until the next render buffer.
+        let near_onset =
+            distance.min(length - distance) <= f64::from(TICKS_PER_QUARTER) / 8.0 + 1.0;
+        active.target == event.target
+            && active.target_id == event.target_id
+            && active.note_count as usize == event.notes().len()
+            && active.notes[..active.note_count as usize] == *event.notes()
+            && near_onset
+    }
+
+    fn apply_performance_action(&mut self, action: PlayerAction, install_rescan: bool) {
         self.performance.set_applying_playback(true);
         match action {
-            PlayerAction::Trigger(event) => self.trigger_controlled_chord(event, true),
+            PlayerAction::Trigger(event) => {
+                if self.pending_live_chord_handoff {
+                    if let Some(active) = self.controlled_chord.filter(|active| !active.loop_owned)
+                    {
+                        if self.live_chord_matches_recorded_onset(active, event) {
+                            self.controlled_chord.as_mut().unwrap().loop_owned = true;
+                            self.pending_live_chord_handoff = false;
+                            self.performance.set_applying_playback(false);
+                            return;
+                        }
+                        if install_rescan {
+                            self.performance.set_applying_playback(false);
+                            return;
+                        }
+                    }
+                }
+                self.pending_live_chord_handoff = false;
+                self.trigger_controlled_chord(event, true);
+            }
             PlayerAction::Release => self.release_loop_owned_chord(),
         }
         self.performance.set_applying_playback(false);

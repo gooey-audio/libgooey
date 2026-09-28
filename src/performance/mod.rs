@@ -266,6 +266,8 @@ pub struct PerformanceRecorder {
     transport_running: bool,
     /// Event currently sounding from clip playback (index into `events`), if any.
     playing_index: Option<usize>,
+    /// The last chord is held through the gap after a real loop wrap.
+    carrying_last_chord: bool,
     /// Next tick at which a sorted host snapshot can change state. Normal
     /// sample playback skips event lookup until this boundary is reached.
     next_event_boundary: Option<u32>,
@@ -312,6 +314,7 @@ impl PerformanceRecorder {
             last_transport_generation: 0,
             transport_running: false,
             playing_index: None,
+            carrying_last_chord: false,
             next_event_boundary: None,
             applying_playback: false,
             playback_limit: 0,
@@ -391,6 +394,7 @@ impl PerformanceRecorder {
         self.sampler_events.clear();
         self.open = None;
         self.playing_index = None;
+        self.carrying_last_chord = false;
         self.next_event_boundary = None;
         self.playback_limit = 0;
         self.sampler_playback_limit = 0;
@@ -463,6 +467,7 @@ impl PerformanceRecorder {
         self.length_ticks = snapshot.length_ticks;
         self.playback_limit = snapshot.events.len();
         self.playing_index = None;
+        self.carrying_last_chord = false;
         self.next_event_boundary = None;
         self.last_tick = 0;
         self.last_absolute_tick = None;
@@ -496,6 +501,7 @@ impl PerformanceRecorder {
                 self.events.clear();
                 self.length_ticks = DEFAULT_LENGTH_TICKS;
                 self.playing_index = None;
+                self.carrying_last_chord = false;
                 self.next_event_boundary = None;
                 self.playback_limit = 0;
                 self.last_absolute_tick = None;
@@ -543,6 +549,7 @@ impl PerformanceRecorder {
                 self.recording_active = false;
             }
             let action = self.playing_index.take().map(|_| PlayerAction::Release);
+            self.carrying_last_chord = false;
             self.next_event_boundary = None;
             self.last_sampler_tick = None;
             self.pending_sampler_hits.clear();
@@ -784,9 +791,11 @@ impl PerformanceRecorder {
 
         if playable_end == 0 {
             if self.playing_index.take().is_some() {
+                self.carrying_last_chord = false;
                 self.next_event_boundary = None;
                 return Some(PlayerAction::Release);
             }
+            self.carrying_last_chord = false;
             self.next_event_boundary = None;
             return None;
         }
@@ -802,7 +811,24 @@ impl PerformanceRecorder {
             covering_recorded_event(&self.events[..playable_end], tick, self.length_ticks)
         };
 
-        if best == self.playing_index && !force_rescan {
+        // A final event ending at tick zero has no covering event in the
+        // leading gap. Keep its voice until the first strike, but only after
+        // a real wrap: transport start must preserve the leading silence.
+        if retrigger_same_at_start && best.is_none() && self.active_snapshot.is_some() {
+            if let Some(index) = self.playing_index {
+                let events = self.active_events();
+                let final_event = events[index].event;
+                let first_start = events.first().map(|event| event.event.start_tick);
+                let is_final_event = index + 1 == events.len();
+                if is_final_event && final_event.end_tick(self.length_ticks) == 0 {
+                    self.carrying_last_chord = true;
+                    self.next_event_boundary = first_start;
+                    return None;
+                }
+            }
+        }
+
+        if best == self.playing_index && !force_rescan && !self.carrying_last_chord {
             self.cache_next_event_boundary(best, tick);
             return None;
         }
@@ -812,7 +838,7 @@ impl PerformanceRecorder {
         // or we cross a start boundary.
         if best == self.playing_index {
             // Check if we just landed on a start boundary of that event.
-            if retrigger_same_at_start {
+            if retrigger_same_at_start || self.carrying_last_chord {
                 let Some(i) = best else {
                     self.cache_next_event_boundary(best, tick);
                     return None;
@@ -820,10 +846,12 @@ impl PerformanceRecorder {
                 let event = self.active_events()[i];
                 if event.event.start_tick == tick {
                     self.playing_index = best;
+                    self.carrying_last_chord = false;
                     self.cache_next_event_boundary(best, tick);
                     return Some(PlayerAction::Trigger(event));
                 }
             }
+            self.carrying_last_chord = false;
             self.cache_next_event_boundary(best, tick);
             return None;
         }
@@ -845,6 +873,7 @@ impl PerformanceRecorder {
             }
             (None, None) => None,
         };
+        self.carrying_last_chord = false;
         self.cache_next_event_boundary(best, tick);
         action
     }
@@ -1344,6 +1373,130 @@ mod tests {
             .update_clock_with_transport(wrapped, true, 1, &mut retired)
             .action
             .is_none());
+    }
+
+    #[test]
+    fn final_piano_chord_carries_to_first_strike_after_wrap() {
+        let mut rec = PerformanceRecorder::new();
+        let mut retired = Vec::with_capacity(4);
+        let mut first = host_event(96, 192, 0);
+        first.target = CHORD_TARGET_PIANO;
+        let mut last = host_event(288, 96, 4);
+        last.target = CHORD_TARGET_PIANO;
+        rec.apply_clip_edit(snapshot(1, 384, vec![first, last]), false, &mut retired);
+
+        assert!(rec
+            .update_clock_with_transport(0.0, true, 1, &mut retired)
+            .action
+            .is_none());
+        assert!(matches!(
+            rec.update_clock_with_transport(1.0, true, 1, &mut retired).action,
+            Some(PlayerAction::Trigger(event)) if event.event.degree == 0
+        ));
+        assert!(matches!(
+            rec.update_clock_with_transport(3.0, true, 1, &mut retired).action,
+            Some(PlayerAction::Trigger(event)) if event.event.degree == 4
+        ));
+        assert!(rec
+            .update_clock_with_transport(4.0, true, 1, &mut retired)
+            .action
+            .is_none());
+        assert!(rec
+            .update_clock_with_transport(4.5, true, 1, &mut retired)
+            .action
+            .is_none());
+        assert!(matches!(
+            rec.update_clock_with_transport(5.0, true, 1, &mut retired).action,
+            Some(PlayerAction::Trigger(event)) if event.event.degree == 0
+        ));
+    }
+
+    #[test]
+    fn trailing_rest_releases_before_wrap() {
+        let mut rec = PerformanceRecorder::new();
+        let mut retired = Vec::with_capacity(4);
+        rec.apply_clip_edit(
+            snapshot(1, 384, vec![host_event(96, 192, 0), host_event(288, 48, 4)]),
+            false,
+            &mut retired,
+        );
+        assert!(rec
+            .update_clock_with_transport(0.0, true, 1, &mut retired)
+            .action
+            .is_none());
+        assert!(matches!(
+            rec.update_clock_with_transport(1.0, true, 1, &mut retired)
+                .action,
+            Some(PlayerAction::Trigger(_))
+        ));
+        assert!(matches!(
+            rec.update_clock_with_transport(3.0, true, 1, &mut retired)
+                .action,
+            Some(PlayerAction::Trigger(_))
+        ));
+        assert!(matches!(
+            rec.update_clock_with_transport(3.5, true, 1, &mut retired)
+                .action,
+            Some(PlayerAction::Release)
+        ));
+        assert!(rec
+            .update_clock_with_transport(4.0, true, 1, &mut retired)
+            .action
+            .is_none());
+    }
+
+    #[test]
+    fn first_strike_at_zero_replaces_final_chord_on_wrap() {
+        let mut rec = PerformanceRecorder::new();
+        let mut retired = Vec::with_capacity(4);
+        rec.apply_clip_edit(
+            snapshot(1, 384, vec![host_event(0, 288, 0), host_event(288, 96, 4)]),
+            false,
+            &mut retired,
+        );
+        assert!(matches!(
+            rec.update_clock_with_transport(0.0, true, 1, &mut retired)
+                .action,
+            Some(PlayerAction::Trigger(_))
+        ));
+        assert!(matches!(
+            rec.update_clock_with_transport(3.0, true, 1, &mut retired)
+                .action,
+            Some(PlayerAction::Trigger(_))
+        ));
+        assert!(matches!(
+            rec.update_clock_with_transport(4.0, true, 1, &mut retired).action,
+            Some(PlayerAction::Trigger(event)) if event.event.degree == 0
+        ));
+    }
+
+    #[test]
+    fn single_chord_waits_for_its_start_on_each_pass() {
+        let mut rec = PerformanceRecorder::new();
+        let mut retired = Vec::with_capacity(4);
+        rec.apply_clip_edit(
+            snapshot(1, 384, vec![host_event(96, 288, 0)]),
+            false,
+            &mut retired,
+        );
+        assert!(rec
+            .update_clock_with_transport(0.0, true, 1, &mut retired)
+            .action
+            .is_none());
+        assert!(matches!(
+            rec.update_clock_with_transport(1.0, true, 1, &mut retired)
+                .action,
+            Some(PlayerAction::Trigger(_))
+        ));
+        assert!(rec
+            .update_clock_with_transport(4.0, true, 1, &mut retired)
+            .action
+            .is_none());
+        assert!(matches!(
+            rec.update_clock_with_transport(5.0, true, 1, &mut retired)
+                .action,
+            Some(PlayerAction::Trigger(_))
+        ));
     }
 
     #[test]
