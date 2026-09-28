@@ -56,3 +56,6 @@ jobs:
 
     - name: Run tests with native features
       run: cargo test --features native --verbose
+
+    - name: Verify generated C header
+      run: clang -fsyntax-only -x c include/gooey.h
