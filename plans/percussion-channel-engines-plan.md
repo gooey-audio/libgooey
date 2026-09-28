@@ -12,6 +12,7 @@ A host using `GooeyEngine` currently cannot put the two new percussion voices in
 - [x] (2026-09-28 22:04Z) Added channel types, parameter and preset APIs, tuning, and nonblending behavior.
 - [x] (2026-09-28 22:04Z) Added integration, allocation, and mode-latching tests plus CI header checks.
 - [x] (2026-09-28 22:04Z) Ran default, no-default-feature, and iOS-feature Rust suites; generated header passes clang syntax check.
+- [x] (2026-09-28 22:05Z) Pushed the implementation and opened PR #262 against main for review.
 - [ ] Merge reviewed work, release from main with the next unused patch tag, and verify the iOS archive.
 
 ## Surprises & Discoveries
@@ -75,7 +76,7 @@ Builds and tests can be repeated. The header is generated and ignored, so a fres
 
 ## Artifacts and Notes
 
-Validation on 2026-09-28: `cargo test --no-default-features`, `cargo test --no-default-features --features ios`, and `cargo test --quiet` all exited zero. The new `tests/percussion_channels.rs` ran eight passing cases after adding a Twin Core mode-route check, and `tests/percussion_channel_alloc.rs` ran one passing case. `clang -fsyntax-only -x c include/gooey.h` exited zero with no diagnostics. The existing `tests/performance_recording.rs` emits five unrelated unnecessary-unsafe warnings. Release tag and archive evidence remain pending merge and review.
+Validation on 2026-09-28: `cargo test --no-default-features`, `cargo test --no-default-features --features ios`, and `cargo test --quiet` all exited zero. The new `tests/percussion_channels.rs` ran eight passing cases after adding a Twin Core mode-route check, and `tests/percussion_channel_alloc.rs` ran one passing case. `clang -fsyntax-only -x c include/gooey.h` exited zero with no diagnostics. The existing `tests/performance_recording.rs` emits five unrelated unnecessary-unsafe warnings. PR #262 is open at `https://github.com/gooey-audio/libgooey/pull/262`; release tag and archive evidence remain pending merge and review.
 
 ## Interfaces and Dependencies
 
@@ -85,4 +86,6 @@ Revision note, 2026-09-28: Created this plan from the approved implementation sc
 
 Revision note, 2026-09-28 22:04Z: Recorded completed implementation and validation. Release remains pending review and merge as required by the approved plan.
 
-Revision note, 2026-09-28 22:06Z: Added explicit mode-target LFO coverage and updated the passing test count.
+Revision note, 2026-09-28 22:05Z: Added explicit mode-target LFO coverage and updated the passing test count.
+
+Revision note, 2026-09-28 22:05Z: Recorded the review PR so a future agent can resume release work from this document.
