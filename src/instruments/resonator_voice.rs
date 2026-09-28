@@ -498,6 +498,8 @@ pub struct ResonatorVoice {
     pending_taps: [ResonatorOutputTap; 2],
     active_taps: [ResonatorOutputTap; 2],
     base_frequency: SmoothedParam,
+    /// Channel pitch offset; independent of the preset's pitch macro.
+    channel_tuning: SmoothedParam,
     sweep_seconds: SmoothedParam,
     output_volume: SmoothedParam,
     velocity: f32,
@@ -556,6 +558,7 @@ impl ResonatorVoice {
                 sr,
                 SMOOTH_MS,
             ),
+            channel_tuning: SmoothedParam::new_normalized(0.5, sr),
             sweep_seconds: SmoothedParam::new(config.sweep_seconds, 0.002, 4.0, sr, SMOOTH_MS),
             output_volume: SmoothedParam::new(config.volume, 0.0, 2.0, sr, SMOOTH_MS),
             velocity: 1.0,
@@ -614,6 +617,7 @@ impl ResonatorVoice {
         } else {
             0.5 * base + 0.5 * self.base_frequency.tick()
         };
+        let base = base * 2.0_f32.powf((self.channel_tuning.tick() - 0.5) * 2.0);
         let sweep_seconds = (0.5 * self.sweep_seconds.tick()
             + 0.5 * (0.002 * 1000.0_f32.powf(sweep_time_macro)))
         .max(0.002);
@@ -719,6 +723,15 @@ impl ResonatorVoice {
     pub fn set_base_frequency_hz(&mut self, value: f32) {
         self.base_frequency.set_target(finite(value, 60.0));
         self.midi_note = None;
+    }
+    /// 0.5 is neutral; endpoints shift the base frequency by one octave.
+    pub fn set_channel_tuning(&mut self, value: f32) {
+        if value.is_finite() {
+            self.channel_tuning.set_target(value);
+        }
+    }
+    pub fn channel_tuning(&self) -> f32 {
+        self.channel_tuning.target()
     }
     pub fn set_sweep_seconds(&mut self, value: f32) {
         self.sweep_seconds.set_target(finite(value, 0.1));

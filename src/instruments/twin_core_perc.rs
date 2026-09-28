@@ -165,6 +165,8 @@ pub struct TwinCorePercVoice {
     noise_rng: XorShift32,
     folder: Oversampler,
     params: [SmoothedParam; 12],
+    /// Channel pitch offset; independent of the indexed tune parameter.
+    channel_tuning: SmoothedParam,
     pending_body_mode: TwinCorePercBodyMode,
     active_body_mode: TwinCorePercBodyMode,
     pending_noise_mode: TwinCorePercNoiseMode,
@@ -212,6 +214,7 @@ impl TwinCorePercVoice {
                 SmoothedParam::new(config.noise_bias, -1.0, 1.0, sr, SMOOTH_MS),
                 SmoothedParam::new(config.volume, 0.0, 2.0, sr, SMOOTH_MS),
             ],
+            channel_tuning: SmoothedParam::new_normalized(0.5, sr),
             pending_body_mode: config.body_mode,
             active_body_mode: config.body_mode,
             pending_noise_mode: config.noise_mode,
@@ -274,13 +277,42 @@ impl TwinCorePercVoice {
 
     pub fn parameter_normalized(&self, index: usize) -> Option<f32> {
         let p = self.params.get(index)?;
-        Some((p.target() - p.min) / (p.max - p.min))
+        Some(if Self::exponential_parameter(index) {
+            (p.target() / p.min).ln() / (p.max / p.min).ln()
+        } else {
+            (p.target() - p.min) / (p.max - p.min)
+        })
     }
 
     pub fn set_parameter_normalized(&mut self, index: usize, value: f32) {
         if let Some(param) = self.params.get_mut(index) {
-            param.set_normalized(finite(value, 0.0));
+            if !value.is_finite() {
+                return;
+            }
+            let normalized = value.clamp(0.0, 1.0);
+            if Self::exponential_parameter(index) {
+                param.set_target(param.min * (param.max / param.min).powf(normalized));
+            } else {
+                param.set_normalized(normalized);
+            }
         }
+    }
+
+    /// Tune, length, FM decay, noise filter, and noise decay use logarithmic
+    /// slider spacing while retaining the physical bounds in `params`.
+    fn exponential_parameter(index: usize) -> bool {
+        matches!(index, 0 | 2 | 4 | 8 | 9)
+    }
+
+    /// 0.5 is neutral; endpoints shift the base frequency by one octave.
+    pub fn set_channel_tuning(&mut self, value: f32) {
+        if value.is_finite() {
+            self.channel_tuning.set_target(value);
+        }
+    }
+
+    pub fn channel_tuning(&self) -> f32 {
+        self.channel_tuning.target()
     }
 
     pub fn set_body_mode(&mut self, mode: TwinCorePercBodyMode) {
@@ -386,6 +418,7 @@ impl Instrument for TwinCorePercVoice {
             .midi_note
             .map(|note| 440.0 * 2.0_f32.powf((note as f32 - 69.0) / 12.0))
             .unwrap_or(values[0]);
+        let master = master * 2.0_f32.powf((self.channel_tuning.tick() - 0.5) * 2.0);
         let pitch = (master * 2.0_f32.powf(values[5] * fm_env)).clamp(20.0, self.sample_rate * 0.4);
         let second_pitch = (pitch * 2.0_f32.powf(-values[1])).max(20.0);
         for (core, hz) in self.cores.iter_mut().zip([pitch, second_pitch]) {
@@ -505,5 +538,24 @@ impl Modulatable for TwinCorePercVoice {
             .iter()
             .position(|candidate| *candidate == parameter)
             .map(|_| (0.0, 1.0))
+    }
+}
+
+#[cfg(test)]
+mod channel_mode_tests {
+    use super::*;
+
+    #[test]
+    fn selected_modes_latch_on_the_next_trigger() {
+        let mut voice = TwinCorePercVoice::new(44_100.0);
+        assert_eq!(voice.active_body_mode, TwinCorePercBodyMode::Low);
+        assert_eq!(voice.active_noise_mode, TwinCorePercNoiseMode::Lowpass);
+        voice.set_body_mode(TwinCorePercBodyMode::High);
+        voice.set_noise_mode(TwinCorePercNoiseMode::Body);
+        assert_eq!(voice.active_body_mode, TwinCorePercBodyMode::Low);
+        assert_eq!(voice.active_noise_mode, TwinCorePercNoiseMode::Lowpass);
+        voice.trigger_with_velocity(0.0, 1.0);
+        assert_eq!(voice.active_body_mode, TwinCorePercBodyMode::High);
+        assert_eq!(voice.active_noise_mode, TwinCorePercNoiseMode::Body);
     }
 }

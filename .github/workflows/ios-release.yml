@@ -40,6 +40,9 @@ jobs:
           chmod +x scripts/build-ios.sh
           ./scripts/build-ios.sh
 
+      - name: Verify generated C header
+        run: clang -fsyntax-only -x c include/gooey.h
+
       - name: Verify build outputs
         run: |
           echo "Checking for build artifacts..."
