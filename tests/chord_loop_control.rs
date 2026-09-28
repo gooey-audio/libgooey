@@ -475,12 +475,15 @@ fn piano_events_trigger_on_exact_tick_samples_for_all_nebula_lengths() {
                 );
                 let _ = render(engine, samples_per_tick - 1);
                 assert_eq!(gooey_engine_piano_active_voices(engine, piano), 3);
-                // The release command lands on this wrap sample. Piano voice
-                // metering includes the short envelope tail, so allow it to
-                // finish before observing zero active voices.
+                // The final chord stays active across the wrap until its next
+                // strike, even when the event ends at the loop boundary.
                 let _ = render(engine, 1);
                 let _ = render(engine, 4_096);
-                assert_eq!(gooey_engine_piano_active_voices(engine, piano), 0);
+                assert_eq!(
+                    gooey_engine_piano_active_voices(engine, piano),
+                    3,
+                    "carried chord bpm={bpm} length={length}"
+                );
             }
             gooey_engine_free(engine);
         }

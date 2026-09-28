@@ -10,14 +10,15 @@ PR #260 lets a host change the strike strength of future piano chord-loop notes 
 
 - [x] (2026-09-28 23:54Z) Inspect the PR, main, and merge conflict; confirm one manual conflict in `src/ffi.rs`.
 - [x] (2026-09-28 23:54Z) Fetch both branches and create `.context/pr-260` worktree from the PR head.
-- [ ] Commit this plan, merge current `origin/main`, and resolve the trigger conflict.
-- [ ] Run formatting, focused iOS tests, the default test suite, and the generated C header check.
+- [x] (2026-09-28 23:56Z) Commit this plan, merge current `origin/main`, and resolve the trigger conflict.
+- [x] (2026-09-28 23:56Z) Run formatting, focused iOS tests, the default test suite, and the generated C header check.
 - [ ] Push the merge commit to the existing PR branch and confirm GitHub mergeability and CI.
 
 ## Surprises & Discoveries
 
 - Git's three-way merge combines `src/performance/control.rs` and `tests/chord_loop_control.rs` automatically. Its only manual conflict is the `PlayerAction::Trigger` arm in `GooeyEngine::apply_performance_action` in `src/ffi.rs`.
 - `main` changed the trigger arm after PR #260 branched. It now checks `pending_live_chord_handoff` before deciding whether to call `trigger_controlled_chord`.
+- The merged code passes all requested local checks. The default suite reports 515 unit tests passed; the focused chord-loop integration suite reports 9 passed. The existing `tests/performance_recording.rs` code emits five unnecessary-`unsafe` warnings, but no test failures.
 
 ## Decision Log
 
@@ -26,7 +27,7 @@ PR #260 lets a host change the strike strength of future piano chord-loop notes 
 
 ## Outcomes & Retrospective
 
-Pending implementation and verification.
+The manual conflict has been resolved without removing either behavior. Local formatting, Rust tests, and generated C header validation pass. Remote push and CI confirmation remain.
 
 ## Context and Orientation
 
@@ -74,6 +75,18 @@ The worktree keeps the Conductor workspace branch untouched. If the merge has no
 
 Before implementation, `git merge-tree` reports one manual conflict at `PlayerAction::Trigger` in `src/ffi.rs`. The other two modified PR files merge automatically. No Nexus task linked to PR #260 was found in the available task list.
 
+Local verification completed at 2026-09-28 23:56Z:
+
+    cargo fmt --check                                             passed
+    cargo test --no-default-features --features ios loop_velocity_changes_only_future_piano_actions  1 passed
+    cargo test --no-default-features --features ios --test chord_loop_control  9 passed
+    cargo test                                                    515 unit tests passed; integration suites passed
+    clang -fsyntax-only -x c include/gooey.h                      passed
+
+The generated header includes `bool gooey_engine_chord_loop_set_piano_velocity(const struct GooeyEngine *engine, float velocity);`.
+
 ## Interfaces and Dependencies
 
 Keep the PR's C ABI `gooey_engine_chord_loop_set_piano_velocity(engine: *const GooeyEngine, velocity: f32) -> bool`. It returns false for a null engine or non-finite velocity, clamps finite values to 0–1, and changes only future scheduled piano chord-loop strikes. It must not affect direct chord triggers, synth loop events, the sounding chord, or transport. No new dependency or migration is required.
+
+Revision note (2026-09-28 23:56Z): Updated progress and evidence after resolving the sole merge conflict and completing local validation; remote verification is still pending.

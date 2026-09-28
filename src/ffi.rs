@@ -16,7 +16,9 @@ use crate::effects::{
     SoftLimiter, SpringReverbEffect, TiltFilterEffect, TubeCompressor, TubeSaturation, Waveshaper,
 };
 use crate::engine::lfo::{Lfo, MusicalDivision};
-use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
+use crate::engine::{
+    Instrument, Modulatable, Sequencer, SequencerBlendSetting, SequencerStepSettings,
+};
 use crate::envelope::ADSRConfig;
 use crate::frame::StereoFrame;
 use crate::instruments::multisample::{
@@ -29,8 +31,10 @@ use crate::instruments::poly_synth_control::{PolySynthControl, PolySynthPending}
 use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
     BassConfig, BassSynth, FilterSlope, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum,
-    MelodyVoice, NoiseColor, PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer,
-    SamplerBuffer, SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config,
+    MelodyVoice, NoiseColor, PercussionEngine, PercussionEngineKind, PercussionPreset,
+    PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer, SamplerBuffer,
+    SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config, TwinCorePercBodyMode,
+    TwinCorePercConfig, TwinCorePercNoiseMode, TwinCorePercVoice,
 };
 use crate::live_control::{
     DrumCell, EngineLifecycle, LiveCommand, LiveControlShared, DRUM_LANE_COUNT, DRUM_STEP_COUNT,
@@ -48,7 +52,7 @@ use crate::music::{
 use crate::performance::control::{ChordControl, ChordControlScratch};
 use crate::performance::{
     prepare_chord_event, ChordCommandAction, ChordLoopSnapshot, PerformanceRecorder, PlayerAction,
-    PreparedChordEvent, RecordMode, CHORD_TARGET_PIANO, CHORD_TARGET_POLY,
+    PreparedChordEvent, RecordMode, CHORD_TARGET_PIANO, CHORD_TARGET_POLY, TICKS_PER_QUARTER,
 };
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -84,12 +88,36 @@ pub const LFO_TIMING_THIRTY_SECOND: u32 = 7;
 /// Invalid LFO value (returned on error or when LFO is in Hz mode)
 pub const LFO_INVALID: u32 = 0xFFFFFFFF;
 
+// =============================================================================
+// Twin-core percussion standalone voice constants
+// =============================================================================
+
+pub const TWIN_CORE_PERC_PARAM_COUNT: u32 = 12;
+pub const TWIN_CORE_PERC_PRESET_KICK: u32 = 0;
+pub const TWIN_CORE_PERC_PRESET_TOM: u32 = 1;
+pub const TWIN_CORE_PERC_PRESET_SNARE: u32 = 2;
+pub const TWIN_CORE_PERC_PRESET_CLAP: u32 = 3;
+pub const TWIN_CORE_PERC_PRESET_METALLIC: u32 = 4;
+pub const TWIN_CORE_PERC_BODY_LOW: u32 = 0;
+pub const TWIN_CORE_PERC_BODY_MID: u32 = 1;
+pub const TWIN_CORE_PERC_BODY_HIGH: u32 = 2;
+pub const TWIN_CORE_PERC_NOISE_LOWPASS: u32 = 0;
+pub const TWIN_CORE_PERC_NOISE_HIGHPASS: u32 = 1;
+pub const TWIN_CORE_PERC_NOISE_BODY: u32 = 2;
+pub const PERCUSSION_ENGINE_ROUTING_MATRIX: u32 = 0;
+pub const PERCUSSION_ENGINE_TWIN_CORE: u32 = 1;
+pub const PERCUSSION_PRESET_KICK: u32 = 0;
+pub const PERCUSSION_PRESET_TOM: u32 = 1;
+pub const PERCUSSION_PRESET_SNARE: u32 = 2;
+pub const PERCUSSION_PRESET_CLAP_HYBRID: u32 = 3;
+pub const PERCUSSION_PRESET_METALLIC: u32 = 4;
+
 /// LFO route configuration
 #[derive(Clone)]
 struct LfoRoute {
     /// Unique ID for this route (used for removal)
     id: u32,
-    /// Target instrument (INSTRUMENT_KICK, etc.)
+    /// Target channel slot index (0–4), independent of the selected type.
     instrument: u32,
     /// Target parameter index (KICK_PARAM_FREQUENCY, etc.)
     param: u32,
@@ -193,6 +221,8 @@ enum ChannelInstrument {
     HiHat(HiHat2),
     Tom(Tom2),
     Bass(BassSynth),
+    Resonator(PercussionEngine),
+    TwinCore(PercussionEngine),
 }
 
 impl ChannelInstrument {
@@ -204,6 +234,8 @@ impl ChannelInstrument {
             Self::HiHat(_) => INSTRUMENT_HIHAT,
             Self::Tom(_) => INSTRUMENT_TOM,
             Self::Bass(_) => INSTRUMENT_BASS,
+            Self::Resonator(_) => INSTRUMENT_RESONATOR,
+            Self::TwinCore(_) => INSTRUMENT_TWIN_CORE,
         }
     }
 
@@ -215,6 +247,7 @@ impl ChannelInstrument {
             Self::HiHat(h) => h.trigger_with_velocity(time, velocity),
             Self::Tom(t) => t.trigger_with_velocity(time, velocity),
             Self::Bass(b) => b.trigger_with_velocity(time, velocity),
+            Self::Resonator(p) | Self::TwinCore(p) => p.trigger_with_velocity(time, velocity),
         }
     }
 
@@ -227,6 +260,7 @@ impl ChannelInstrument {
             Self::HiHat(h) => h.snap_params(),
             Self::Tom(_) => {} // Tom2 uses plain f32, already immediate
             Self::Bass(b) => b.snap_params(),
+            Self::Resonator(_) | Self::TwinCore(_) => {}
         }
     }
 
@@ -238,6 +272,7 @@ impl ChannelInstrument {
             Self::HiHat(h) => h.tick(current_time),
             Self::Tom(t) => t.tick(current_time),
             Self::Bass(b) => b.tick(current_time),
+            Self::Resonator(p) | Self::TwinCore(p) => p.tick(current_time),
         }
     }
 
@@ -259,6 +294,51 @@ impl ChannelInstrument {
             Self::HiHat(h) => h.params.tuning.get(),
             Self::Tom(t) => t.tuning(),
             Self::Bass(b) => b.params.tuning.get(),
+            Self::Resonator(p) => p.routing_matrix().map_or(0.5, |v| v.channel_tuning()),
+            Self::TwinCore(p) => p.twin_core().map_or(0.5, |v| v.channel_tuning()),
+        }
+    }
+
+    /// Read the commanded tuning for an instrument swap, even if smoothing is
+    /// still in progress on a legacy voice.
+    fn tuning_target(&self) -> f32 {
+        match self {
+            Self::Kick(k) => k.params.tuning.target(),
+            Self::Snare(s) => s.params.tuning.target(),
+            Self::HiHat(h) => h.params.tuning.target(),
+            Self::Tom(t) => t.tuning(),
+            Self::Bass(b) => b.params.tuning.target(),
+            Self::Resonator(p) => p.routing_matrix().map_or(0.5, |v| v.channel_tuning()),
+            Self::TwinCore(p) => p.twin_core().map_or(0.5, |v| v.channel_tuning()),
+        }
+    }
+
+    fn set_tuning(&mut self, value: f32) {
+        if !value.is_finite() {
+            return;
+        }
+        match self {
+            Self::Resonator(p) => {
+                if let Some(v) = p.routing_matrix_mut() {
+                    v.set_channel_tuning(value);
+                }
+            }
+            Self::TwinCore(p) => {
+                if let Some(v) = p.twin_core_mut() {
+                    v.set_channel_tuning(value);
+                }
+            }
+            _ => {
+                let param = match self.instrument_type() {
+                    INSTRUMENT_KICK => KICK_PARAM_TUNING,
+                    INSTRUMENT_SNARE => SNARE_PARAM_TUNING,
+                    INSTRUMENT_HIHAT => HIHAT_PARAM_TUNING,
+                    INSTRUMENT_TOM => TOM_PARAM_TUNING,
+                    INSTRUMENT_BASS => BASS_PARAM_TUNING,
+                    _ => return,
+                };
+                self.set_param(param, value);
+            }
         }
     }
 
@@ -366,6 +446,34 @@ impl ChannelInstrument {
                 BASS_PARAM_TUNING => b.set_tuning(value),
                 _ => {}
             },
+            Self::Resonator(p) => {
+                if param < RESONATOR_PARAM_COUNT && value.is_finite() {
+                    p.set_parameter_normalized(param as usize, value.clamp(0.0, 1.0));
+                }
+            }
+            Self::TwinCore(p) => {
+                if !value.is_finite() {
+                    return;
+                }
+                if param < TWIN_CORE_PERC_PARAM_COUNT {
+                    p.set_parameter_normalized(param as usize, value.clamp(0.0, 1.0));
+                } else if let Some(voice) = p.twin_core_mut() {
+                    let mode = value.round().clamp(0.0, 2.0) as u32;
+                    match param {
+                        TWIN_CORE_PARAM_BODY_MODE => voice.set_body_mode(match mode {
+                            0 => TwinCorePercBodyMode::Low,
+                            1 => TwinCorePercBodyMode::Mid,
+                            _ => TwinCorePercBodyMode::High,
+                        }),
+                        TWIN_CORE_PARAM_NOISE_MODE => voice.set_noise_mode(match mode {
+                            0 => TwinCorePercNoiseMode::Lowpass,
+                            1 => TwinCorePercNoiseMode::Highpass,
+                            _ => TwinCorePercNoiseMode::Body,
+                        }),
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 
@@ -472,6 +580,26 @@ impl ChannelInstrument {
                 BASS_PARAM_TUNING => b.params.tuning.target(),
                 _ => f32::NAN,
             },
+            Self::Resonator(p) => p.parameter_normalized(param as usize).unwrap_or(f32::NAN),
+            Self::TwinCore(p) => match param {
+                TWIN_CORE_PARAM_BODY_MODE => {
+                    match p.twin_core().map(|v| v.config_targets().body_mode) {
+                        Some(TwinCorePercBodyMode::Low) => 0.0,
+                        Some(TwinCorePercBodyMode::Mid) => 1.0,
+                        Some(TwinCorePercBodyMode::High) => 2.0,
+                        None => f32::NAN,
+                    }
+                }
+                TWIN_CORE_PARAM_NOISE_MODE => {
+                    match p.twin_core().map(|v| v.config_targets().noise_mode) {
+                        Some(TwinCorePercNoiseMode::Lowpass) => 0.0,
+                        Some(TwinCorePercNoiseMode::Highpass) => 1.0,
+                        Some(TwinCorePercNoiseMode::Body) => 2.0,
+                        None => f32::NAN,
+                    }
+                }
+                _ => p.parameter_normalized(param as usize).unwrap_or(f32::NAN),
+            },
         }
     }
 
@@ -571,12 +699,46 @@ impl ChannelInstrument {
                 BASS_PARAM_TUNING => b.params.tuning.set_bipolar(value),
                 _ => {}
             },
+            Self::Resonator(p) => {
+                if let Some(name) = p.parameter_name(param as usize) {
+                    if let Some(voice) = p.routing_matrix_mut() {
+                        let _ = voice.apply_modulation(name, value);
+                    }
+                }
+            }
+            Self::TwinCore(p) => {
+                if param < TWIN_CORE_PERC_PARAM_COUNT {
+                    p.set_parameter_normalized(
+                        param as usize,
+                        (value.clamp(-1.0, 1.0) + 1.0) * 0.5,
+                    );
+                } else if param == TWIN_CORE_PARAM_BODY_MODE || param == TWIN_CORE_PARAM_NOISE_MODE
+                {
+                    let mode = (value.clamp(-1.0, 1.0) + 1.0).round();
+                    if let Some(voice) = p.twin_core_mut() {
+                        if param == TWIN_CORE_PARAM_BODY_MODE {
+                            voice.set_body_mode(match mode as u32 {
+                                0 => TwinCorePercBodyMode::Low,
+                                1 => TwinCorePercBodyMode::Mid,
+                                _ => TwinCorePercBodyMode::High,
+                            });
+                        } else {
+                            voice.set_noise_mode(match mode as u32 {
+                                0 => TwinCorePercNoiseMode::Lowpass,
+                                1 => TwinCorePercNoiseMode::Highpass,
+                                _ => TwinCorePercNoiseMode::Body,
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
 /// A polymorphic preset blender matching the instrument type on a channel.
 enum ChannelBlender {
+    None,
     Kick(PresetBlender<KickConfig>),
     Snare(PresetBlender<SnareConfig>),
     HiHat(PresetBlender<HiHat2Config>),
@@ -600,6 +762,7 @@ impl ChannelBlender {
     /// Set a corner preset by corner index and preset ID.
     fn set_corner_preset(&mut self, corner: u32, preset_id: u32) {
         match self {
+            Self::None => {}
             Self::Kick(b) => {
                 if let Some(config) = GooeyEngine::kick_preset_by_id(preset_id) {
                     match corner {
@@ -661,6 +824,7 @@ impl ChannelBlender {
     /// Create a default blender with standard corner presets for the given instrument type.
     fn default_for_type(instrument_type: u32) -> Self {
         match instrument_type {
+            INSTRUMENT_RESONATOR | INSTRUMENT_TWIN_CORE => Self::None,
             INSTRUMENT_KICK => Self::Kick(PresetBlender::new(
                 KickConfig::tight(),
                 KickConfig::punch(),
@@ -703,6 +867,7 @@ impl ChannelBlender {
     /// Returns the default corner preset IDs for a given instrument type.
     fn default_corner_preset_ids(instrument_type: u32) -> [u32; 4] {
         match instrument_type {
+            INSTRUMENT_RESONATOR | INSTRUMENT_TWIN_CORE => [u32::MAX; 4],
             INSTRUMENT_KICK => [
                 KICK_PRESET_TIGHT,
                 KICK_PRESET_PUNCH,
@@ -829,6 +994,9 @@ impl VoiceStrip {
     /// Blend the corner presets at (x,y) into the instrument, then re-apply
     /// any parameter locks so they win over the blended values.
     fn apply_blend(&mut self, x: f32, y: f32) {
+        if matches!(self.blender, ChannelBlender::None) {
+            return;
+        }
         self.blender.blend_and_apply(&mut self.instrument, x, y);
         self.apply_param_locks();
     }
@@ -1004,6 +1172,8 @@ pub struct GooeyEngine {
     chord_control_scratch: ChordControlScratch,
     chord_retired: Vec<std::sync::Arc<ChordLoopSnapshot>>,
     controlled_chord: Option<ControlledChord>,
+    /// A live pad strike is waiting for its recorded clip event to take over.
+    pending_live_chord_handoff: bool,
     // Config-time registered sample-pad instruments. Empty entries are not graph sources.
     samplers: [Option<SamplerRack>; SAMPLER_RACK_MAX as usize],
     /// Control-side sampler replacement endpoint. Producers never mutate
@@ -1053,6 +1223,7 @@ struct ControlledChord {
     notes: [u8; 6],
     note_count: u8,
     loop_owned: bool,
+    trigger_beat: f64,
 }
 
 /// Host-clock reference for the next render buffer. The audio callback sets
@@ -1311,6 +1482,7 @@ impl GooeyEngine {
             chord_control_scratch: ChordControlScratch::default(),
             chord_retired: Vec::with_capacity(32),
             controlled_chord: None,
+            pending_live_chord_handoff: false,
             samplers: std::array::from_fn(|_| None),
             sampler_control,
             sampler_command_scratch: std::collections::VecDeque::with_capacity(16),
@@ -1379,13 +1551,15 @@ impl GooeyEngine {
         }
     }
 
-    fn apply_chord_control_commands(&mut self) {
+    fn apply_chord_control_commands(&mut self) -> bool {
         let control = self.chord_control.clone();
         let _ = control.reclaim_from_audio(&mut self.chord_retired);
         control.drain_into(&mut self.chord_control_scratch);
+        let mut installed_replace = false;
 
         if self.chord_retired.capacity() - self.chord_retired.len() >= 2 {
             if let Some(edit) = self.chord_control_scratch.edit.take() {
+                let is_replace = matches!(&edit, crate::performance::ChordClipEdit::Replace(_));
                 if let Some(generation) = self.performance.apply_clip_edit(
                     edit,
                     self.mixer.transport_running(),
@@ -1393,6 +1567,7 @@ impl GooeyEngine {
                 ) {
                     self.release_loop_owned_chord();
                     control.mark_applied(generation);
+                    installed_replace = is_replace;
                 }
             }
         }
@@ -1405,7 +1580,11 @@ impl GooeyEngine {
                 ChordCommandAction::ReleaseAll => self.release_controlled_chord(),
             }
         }
+        if installed_replace {
+            self.arm_live_chord_handoff();
+        }
         let _ = control.reclaim_from_audio(&mut self.chord_retired);
+        installed_replace
     }
 
     fn apply_sampler_control_commands(&mut self) {
@@ -1587,7 +1766,7 @@ impl GooeyEngine {
         self.apply_poly_control_commands();
         self.apply_sampler_control_commands();
         self.apply_piano_control_commands();
-        self.apply_chord_control_commands();
+        let immediate_chord_install = self.apply_chord_control_commands();
         self.apply_automation_commands();
 
         // Number of stereo frames this buffer holds (two slots per frame).
@@ -1777,9 +1956,14 @@ impl GooeyEngine {
                 if let Some(generation) = update.installed_generation {
                     self.release_loop_owned_chord();
                     self.chord_control.mark_applied(generation);
+                    self.arm_live_chord_handoff();
                 }
                 if let Some(action) = update.action {
-                    self.apply_performance_action(action);
+                    self.apply_performance_action(
+                        action,
+                        update.installed_generation.is_some()
+                            || (immediate_chord_install && sample_offset == 0),
+                    );
                 }
                 let sampler_hits = self.performance.take_sampler_hits();
                 for hit in sampler_hits {
@@ -2239,6 +2423,8 @@ impl GooeyEngine {
                     }
                     ChannelInstrument::HiHat(_) => param <= HIHAT_PARAM_TUNING,
                     ChannelInstrument::Tom(_) => param <= TOM_PARAM_TUNING,
+                    ChannelInstrument::Resonator(_) => param < RESONATOR_PARAM_COUNT,
+                    ChannelInstrument::TwinCore(_) => param < TWIN_CORE_PARAM_BODY_MODE,
                     // Bass is not exposed as a macro target.
                     ChannelInstrument::Bass(_) => false,
                 };
@@ -2372,6 +2558,12 @@ impl GooeyEngine {
         channel: u32,
         blend: Option<SequencerBlendSetting>,
     ) {
+        if self
+            .voice(channel as usize)
+            .is_some_and(|v| matches!(v.blender, ChannelBlender::None))
+        {
+            return;
+        }
         if let Some(blend_setting) = blend {
             self.apply_blend_position(channel, blend_setting.x, blend_setting.y);
             return;
@@ -2861,10 +3053,71 @@ pub const INSTRUMENT_HIHAT: u32 = 2;
 pub const INSTRUMENT_TOM: u32 = 3;
 /// Instrument ID: bass synth
 pub const INSTRUMENT_BASS: u32 = 4;
-/// Total number of instruments
-pub const INSTRUMENT_COUNT: u32 = 5;
-/// Internal usize version for array indexing
-const NUM_INSTRUMENTS: usize = INSTRUMENT_COUNT as usize;
+/// Instrument ID: routing-matrix resonator percussion.
+pub const INSTRUMENT_RESONATOR: u32 = 5;
+/// Instrument ID: twin-core percussion.
+pub const INSTRUMENT_TWIN_CORE: u32 = 6;
+/// Number of selectable instrument types, not the number of channel slots.
+pub const INSTRUMENT_COUNT: u32 = 7;
+/// The engine retains four drum strips and one bass strip.
+const NUM_INSTRUMENTS: usize = 5;
+
+/// Shared factory percussion preset IDs for both new channel types.
+pub const PERC_PRESET_KICK: u32 = 0;
+pub const PERC_PRESET_TOM: u32 = 1;
+pub const PERC_PRESET_SNARE: u32 = 2;
+pub const PERC_PRESET_CLAP: u32 = 3;
+pub const PERC_PRESET_METALLIC: u32 = 4;
+
+/// Resonator pitch macro (0–1, exponential 20–400 Hz before preset base-frequency blending).
+pub const RESONATOR_PARAM_PITCH: u32 = 0;
+/// Resonator pitch-sweep multiplier (0–1 scales the preset sweep by 0.25–1.75).
+pub const RESONATOR_PARAM_PITCH_SWEEP: u32 = 1;
+/// Resonator sweep time (0–1 maps exponentially to 0.002–2 s, blended with the preset).
+pub const RESONATOR_PARAM_SWEEP_TIME: u32 = 2;
+/// Resonator decay multiplier (0–1 scales preset decay by 0.15–1.85).
+pub const RESONATOR_PARAM_DECAY: u32 = 3;
+/// Resonator body-character balance (0–1).
+pub const RESONATOR_PARAM_BODY_CHARACTER: u32 = 4;
+/// Resonator noise level macro (0–1).
+pub const RESONATOR_PARAM_NOISE: u32 = 5;
+/// Resonator mode coupling (0–1).
+pub const RESONATOR_PARAM_COUPLING: u32 = 6;
+/// Resonator drive multiplier (0–1 scales preset drive by 0.5–3.5).
+pub const RESONATOR_PARAM_DRIVE: u32 = 7;
+/// Resonator output volume macro (0–1, multiplied by preset output volume).
+pub const RESONATOR_PARAM_VOLUME: u32 = 8;
+const RESONATOR_PARAM_COUNT: u32 = 9;
+
+/// Twin Core tune (0–1, exponential 20–2000 Hz).
+pub const TWIN_CORE_PARAM_TUNE: u32 = 0;
+/// Twin Core detune (0–1, linear 0–2.5 octaves down for core two).
+pub const TWIN_CORE_PARAM_DETUNE: u32 = 1;
+/// Twin Core body length (0–1, exponential 0.002–20 s).
+pub const TWIN_CORE_PARAM_LENGTH: u32 = 2;
+/// Twin Core body bias (0–1, linear −1–1).
+pub const TWIN_CORE_PARAM_BODY_BIAS: u32 = 3;
+/// Twin Core FM decay (0–1, exponential 0.002–8 s).
+pub const TWIN_CORE_PARAM_FM_DECAY: u32 = 4;
+/// Twin Core FM depth (0–1, linear −5–5 octaves).
+pub const TWIN_CORE_PARAM_FM_DEPTH: u32 = 5;
+/// Twin Core trigger delay (0–1, linear 0–0.075 s).
+pub const TWIN_CORE_PARAM_TRIGGER_DELAY: u32 = 6;
+/// Twin Core wavefold harmonics (0–1).
+pub const TWIN_CORE_PARAM_HARMONICS: u32 = 7;
+/// Twin Core noise filter (0–1, exponential 20 Hz–0.45 × sample rate).
+pub const TWIN_CORE_PARAM_NOISE_FILTER: u32 = 8;
+/// Twin Core noise decay (0–1, exponential 0.002–20 s).
+pub const TWIN_CORE_PARAM_NOISE_DECAY: u32 = 9;
+/// Twin Core noise bias (0–1, linear −1–1).
+pub const TWIN_CORE_PARAM_NOISE_BIAS: u32 = 10;
+/// Twin Core output volume (0–1, linear 0–2).
+pub const TWIN_CORE_PARAM_VOLUME: u32 = 11;
+/// Twin Core body mode (float 0–2 rounded: low, mid, high; next trigger).
+pub const TWIN_CORE_PARAM_BODY_MODE: u32 = 12;
+/// Twin Core noise mode (float 0–2 rounded: lowpass, highpass, body; next trigger).
+pub const TWIN_CORE_PARAM_NOISE_MODE: u32 = 13;
+const TWIN_CORE_PARAM_COUNT: u32 = 14;
 const DEFAULT_MASTER_GAIN: f32 = 0.25;
 
 /// Number of stereo loop-mixer channels (see `gooey_engine_loop_*`).
@@ -3410,12 +3663,13 @@ pub unsafe extern "C" fn gooey_engine_get_error_message(
 ///
 /// After calling this, the channel produces the new instrument's sound.
 /// Resets synth DSP state for that channel (new instrument starts fresh).
-/// Preserves channel-level state: gain, mute, solo, sequencer pattern, blend position.
+/// Preserves channel-level state: gain, mute, solo, sequencer pattern, blend position,
+/// and tuning. Selecting Resonator or Twin Core disables XY blending.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
-/// * `channel` - Channel index (0-3)
-/// * `instrument_type` - Instrument type (INSTRUMENT_KICK=0, INSTRUMENT_SNARE=1, INSTRUMENT_HIHAT=2, INSTRUMENT_TOM=3)
+/// * `channel` - Channel slot index (0–4)
+/// * `instrument_type` - Selectable instrument type (0–6)
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -3439,20 +3693,36 @@ pub unsafe extern "C" fn gooey_engine_set_channel_instrument_type(
         return;
     }
 
-    let new_instrument = match instrument_type {
+    let tuning = voice.instrument.tuning_target();
+    let mut new_instrument = match instrument_type {
         INSTRUMENT_KICK => ChannelInstrument::Kick(KickDrum::new(sample_rate)),
         INSTRUMENT_SNARE => ChannelInstrument::Snare(SnareDrum::new(sample_rate)),
         INSTRUMENT_HIHAT => ChannelInstrument::HiHat(HiHat2::new(sample_rate)),
         INSTRUMENT_TOM => ChannelInstrument::Tom(Tom2::new(sample_rate)),
         INSTRUMENT_BASS => ChannelInstrument::Bass(BassSynth::new(sample_rate)),
+        INSTRUMENT_RESONATOR => ChannelInstrument::Resonator(PercussionEngine::with_selection(
+            sample_rate,
+            PercussionEngineKind::RoutingMatrix,
+            PercussionPreset::Kick,
+        )),
+        INSTRUMENT_TWIN_CORE => ChannelInstrument::TwinCore(PercussionEngine::with_selection(
+            sample_rate,
+            PercussionEngineKind::TwinCore,
+            PercussionPreset::Kick,
+        )),
         _ => return,
     };
 
+    new_instrument.set_tuning(tuning);
     voice.instrument = new_instrument;
     voice.blender = ChannelBlender::default_for_type(instrument_type);
     voice.blend_corner_presets = ChannelBlender::default_corner_preset_ids(instrument_type);
     // Param indices mean different things per instrument type.
     voice.param_locks = [None; CHANNEL_PARAM_LOCK_CAPACITY];
+    voice.saved_global_freq = None;
+    if matches!(instrument_type, INSTRUMENT_RESONATOR | INSTRUMENT_TWIN_CORE) {
+        voice.blend_enabled = false;
+    }
 
     // If blend is enabled, re-apply position with the new blender
     voice.restore_blend();
@@ -3465,10 +3735,10 @@ pub unsafe extern "C" fn gooey_engine_set_channel_instrument_type(
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
-/// * `channel` - Channel index (0-3)
+/// * `channel` - Channel slot index (0–4)
 ///
 /// # Returns
-/// Instrument type (INSTRUMENT_KICK=0, INSTRUMENT_SNARE=1, INSTRUMENT_HIHAT=2, INSTRUMENT_TOM=3),
+/// Instrument type (0–6),
 /// or 0xFFFFFFFF if invalid.
 ///
 /// # Safety
@@ -3486,6 +3756,51 @@ pub unsafe extern "C" fn gooey_engine_get_channel_instrument_type(
         Some(voice) => voice.instrument.instrument_type(),
         None => 0xFFFFFFFF,
     }
+}
+
+/// Load one of the five factory percussion presets on a Resonator or Twin Core
+/// channel. Clears parameter locks while preserving the strip and its tuning.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_channel_preset(
+    engine: *mut GooeyEngine,
+    channel: u32,
+    preset: u32,
+) -> bool {
+    let Some(preset) = percussion_preset(preset) else {
+        return false;
+    };
+    let Some(voice) = engine.as_mut().and_then(|e| e.voice_mut(channel as usize)) else {
+        return false;
+    };
+    let tuning = voice.instrument.tuning_target();
+    match &mut voice.instrument {
+        ChannelInstrument::Resonator(p) | ChannelInstrument::TwinCore(p) => {
+            p.select_preset(preset);
+            voice.instrument.set_tuning(tuning);
+            voice.param_locks = [None; CHANNEL_PARAM_LOCK_CAPACITY];
+            voice.saved_global_freq = None;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Current factory preset ID, or `UINT32_MAX` for other types/invalid channels.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_channel_preset(
+    engine: *const GooeyEngine,
+    channel: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|e| e.voice(channel as usize))
+        .and_then(|v| match &v.instrument {
+            ChannelInstrument::Resonator(p) | ChannelInstrument::TwinCore(p) => {
+                Some(p.preset() as u32)
+            }
+            _ => None,
+        })
+        .unwrap_or(u32::MAX)
 }
 
 /// Set a parameter on a channel's instrument, regardless of what synth type it holds.
@@ -3579,9 +3894,15 @@ pub unsafe extern "C" fn gooey_engine_set_channel_param_lock(
     let Some(voice) = engine.as_mut().and_then(|e| e.voice_mut(channel as usize)) else {
         return;
     };
-    if !voice.instrument.get_param(param).is_finite() {
+    if !value.is_finite() || !voice.instrument.get_param(param).is_finite() {
         return;
     }
+    let value = match voice.instrument.instrument_type() {
+        INSTRUMENT_RESONATOR => value.clamp(0.0, 1.0),
+        INSTRUMENT_TWIN_CORE if param >= TWIN_CORE_PARAM_BODY_MODE => value.round().clamp(0.0, 2.0),
+        INSTRUMENT_TWIN_CORE => value.clamp(0.0, 1.0),
+        _ => value,
+    };
     let Some(lock) = voice.param_locks.get_mut(param as usize) else {
         return;
     };
@@ -3668,15 +3989,7 @@ pub unsafe extern "C" fn gooey_engine_set_channel_tuning(
     let Some(voice) = engine.voice_mut(channel as usize) else {
         return;
     };
-    let tuning_param = match voice.instrument.instrument_type() {
-        INSTRUMENT_KICK => KICK_PARAM_TUNING,
-        INSTRUMENT_SNARE => SNARE_PARAM_TUNING,
-        INSTRUMENT_HIHAT => HIHAT_PARAM_TUNING,
-        INSTRUMENT_TOM => TOM_PARAM_TUNING,
-        INSTRUMENT_BASS => BASS_PARAM_TUNING,
-        _ => return,
-    };
-    voice.instrument.set_param(tuning_param, value);
+    voice.instrument.set_tuning(value);
 }
 
 /// Get the current tuning value for a channel (0.0–1.0).
@@ -5244,6 +5557,7 @@ impl GooeyEngine {
     }
 
     fn release_controlled_chord(&mut self) {
+        self.pending_live_chord_handoff = false;
         let Some(active) = self.controlled_chord.take() else {
             return;
         };
@@ -5318,15 +5632,61 @@ impl GooeyEngine {
             notes: sounding_notes,
             note_count: sounding_count as u8,
             loop_owned,
+            trigger_beat: self.mixer.transport_beat(),
         });
     }
 
-    /// Apply a clip player action to the poly synth without recording.
-    fn apply_performance_action(&mut self, action: PlayerAction) {
+    /// Let a just-recorded event take ownership of its live strike once.
+    fn arm_live_chord_handoff(&mut self) {
+        self.pending_live_chord_handoff = self
+            .controlled_chord
+            .is_some_and(|active| !active.loop_owned);
+    }
+
+    fn live_chord_matches_recorded_onset(
+        &self,
+        active: ControlledChord,
+        event: PreparedChordEvent,
+    ) -> bool {
+        let length = f64::from(self.performance.length_ticks());
+        let live_tick = (active.trigger_beat * f64::from(TICKS_PER_QUARTER)).rem_euclid(length);
+        let distance = (live_tick - f64::from(event.event.start_tick)).abs();
+        // A sixteenth-note recording can round by half a grid step. One
+        // extra tick allows for the delay until the next render buffer.
+        let near_onset =
+            distance.min(length - distance) <= f64::from(TICKS_PER_QUARTER) / 8.0 + 1.0;
+        active.target == event.target
+            && active.target_id == event.target_id
+            && active.note_count as usize == event.notes().len()
+            && active.notes[..active.note_count as usize] == *event.notes()
+            && near_onset
+    }
+
+    fn apply_performance_action(&mut self, action: PlayerAction, install_rescan: bool) {
         self.performance.set_applying_playback(true);
         match action {
-            PlayerAction::Trigger(event) => self
-                .trigger_controlled_chord(self.chord_control.with_loop_piano_velocity(event), true),
+            PlayerAction::Trigger(event) => {
+                if self.pending_live_chord_handoff {
+                    if let Some(active) = self.controlled_chord.filter(|active| !active.loop_owned)
+                    {
+                        if self.live_chord_matches_recorded_onset(active, event) {
+                            self.controlled_chord.as_mut().unwrap().loop_owned = true;
+                            self.pending_live_chord_handoff = false;
+                            self.performance.set_applying_playback(false);
+                            return;
+                        }
+                        if install_rescan {
+                            self.performance.set_applying_playback(false);
+                            return;
+                        }
+                    }
+                }
+                self.pending_live_chord_handoff = false;
+                self.trigger_controlled_chord(
+                    self.chord_control.with_loop_piano_velocity(event),
+                    true,
+                );
+            }
             PlayerAction::Release => self.release_loop_owned_chord(),
         }
         self.performance.set_applying_playback(false);
@@ -5920,6 +6280,24 @@ pub extern "C" fn gooey_engine_instrument_count() -> u32 {
     INSTRUMENT_COUNT
 }
 
+/// Number of addressable channel slots (four kit strips and one bass strip).
+#[no_mangle]
+pub extern "C" fn gooey_engine_channel_count() -> u32 {
+    NUM_INSTRUMENTS as u32
+}
+
+/// Number of indexed Resonator channel controls.
+#[no_mangle]
+pub extern "C" fn gooey_engine_resonator_param_count() -> u32 {
+    RESONATOR_PARAM_COUNT
+}
+
+/// Number of indexed Twin Core channel controls, including two discrete modes.
+#[no_mangle]
+pub extern "C" fn gooey_engine_twin_core_param_count() -> u32 {
+    TWIN_CORE_PARAM_COUNT
+}
+
 /// Get the number of available global effects
 #[no_mangle]
 pub extern "C" fn gooey_engine_global_effect_count() -> u32 {
@@ -6323,7 +6701,7 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_offset(
     engine.lfos[lfo_index as usize].offset
 }
 
-/// Add a route from an LFO to an instrument parameter
+/// Add a route from an LFO to a channel parameter
 ///
 /// Each LFO can have multiple routes to different parameters.
 /// Final modulation applied to target = (offset + sine * amount) * depth
@@ -6331,7 +6709,7 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_offset(
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
 /// * `lfo_index` - LFO index (0-7)
-/// * `instrument` - Target instrument (INSTRUMENT_KICK, INSTRUMENT_SNARE, etc.)
+/// * `instrument` - Target channel slot index (0–4), independent of its type
 /// * `param` - Target parameter index (KICK_PARAM_FREQUENCY, etc.)
 /// * `depth` - Per-route depth (0.0 to 1.0) - scales the LFO output for this target
 ///
@@ -6720,7 +7098,7 @@ pub unsafe extern "C" fn gooey_engine_get_instrument_pan(
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
-/// * `instrument` - Instrument ID (INSTRUMENT_KICK, etc.)
+/// * `instrument` - Channel slot index (0–4), regardless of selected type
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`
@@ -6731,7 +7109,9 @@ pub unsafe extern "C" fn gooey_engine_blend_enable(engine: *mut GooeyEngine, ins
     }
     let engine = &mut *engine;
     if let Some(voice) = engine.voice_mut(instrument as usize) {
-        voice.blend_enabled = true;
+        if !matches!(voice.blender, ChannelBlender::None) {
+            voice.blend_enabled = true;
+        }
     }
 }
 
@@ -11739,6 +12119,531 @@ pub unsafe extern "C" fn gooey_engine_loop_render_to_wav(
         }
     }
     writer.finalize().is_ok()
+}
+
+// =============================================================================
+// Selectable percussion engine
+// =============================================================================
+
+/// Opaque host-facing percussion voice with a selectable synthesis topology.
+pub struct GooeyPercussionEngine {
+    voice: PercussionEngine,
+    sample_rate: f32,
+    time: f64,
+}
+
+fn percussion_engine_kind(kind: u32) -> Option<PercussionEngineKind> {
+    match kind {
+        PERCUSSION_ENGINE_ROUTING_MATRIX => Some(PercussionEngineKind::RoutingMatrix),
+        PERCUSSION_ENGINE_TWIN_CORE => Some(PercussionEngineKind::TwinCore),
+        _ => None,
+    }
+}
+
+fn percussion_preset(preset: u32) -> Option<PercussionPreset> {
+    match preset {
+        PERCUSSION_PRESET_KICK => Some(PercussionPreset::Kick),
+        PERCUSSION_PRESET_TOM => Some(PercussionPreset::Tom),
+        PERCUSSION_PRESET_SNARE => Some(PercussionPreset::Snare),
+        PERCUSSION_PRESET_CLAP_HYBRID => Some(PercussionPreset::ClapHybrid),
+        PERCUSSION_PRESET_METALLIC => Some(PercussionPreset::Metallic),
+        _ => None,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gooey_percussion_engine_new(
+    sample_rate: f32,
+    kind: u32,
+) -> *mut GooeyPercussionEngine {
+    let Some(kind) = percussion_engine_kind(kind) else {
+        return std::ptr::null_mut();
+    };
+    let sample_rate = if sample_rate.is_finite() && sample_rate > 0.0 {
+        sample_rate
+    } else {
+        44_100.0
+    };
+    Box::into_raw(Box::new(GooeyPercussionEngine {
+        voice: PercussionEngine::with_selection(sample_rate, kind, PercussionPreset::Kick),
+        sample_rate,
+        time: 0.0,
+    }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_destroy(voice: *mut GooeyPercussionEngine) {
+    if !voice.is_null() {
+        drop(Box::from_raw(voice));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_select(
+    voice: *mut GooeyPercussionEngine,
+    kind: u32,
+) -> bool {
+    let (Some(voice), Some(kind)) = (voice.as_mut(), percussion_engine_kind(kind)) else {
+        return false;
+    };
+    voice.voice.select_engine(kind);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_get_selected(
+    voice: *const GooeyPercussionEngine,
+) -> u32 {
+    voice
+        .as_ref()
+        .map_or(u32::MAX, |voice| voice.voice.kind() as u32)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_set_preset(
+    voice: *mut GooeyPercussionEngine,
+    preset: u32,
+) -> bool {
+    let (Some(voice), Some(preset)) = (voice.as_mut(), percussion_preset(preset)) else {
+        return false;
+    };
+    voice.voice.select_preset(preset);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_get_preset(
+    voice: *const GooeyPercussionEngine,
+) -> u32 {
+    voice
+        .as_ref()
+        .map_or(u32::MAX, |voice| voice.voice.preset() as u32)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_parameter_count(
+    voice: *const GooeyPercussionEngine,
+) -> u32 {
+    voice
+        .as_ref()
+        .map_or(0, |voice| voice.voice.parameter_count() as u32)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_parameter_name(
+    voice: *const GooeyPercussionEngine,
+    parameter: u32,
+) -> *const c_char {
+    const ROUTING_NAMES: [&[u8]; 9] = [
+        b"pitch\0",
+        b"pitch_sweep\0",
+        b"sweep_time\0",
+        b"decay\0",
+        b"body_character\0",
+        b"noise\0",
+        b"coupling\0",
+        b"drive\0",
+        b"volume\0",
+    ];
+    const TWIN_NAMES: [&[u8]; 12] = [
+        b"tune\0",
+        b"detune\0",
+        b"length\0",
+        b"body_bias\0",
+        b"fm_decay\0",
+        b"fm_depth\0",
+        b"trigger_delay\0",
+        b"harmonics\0",
+        b"noise_filter\0",
+        b"noise_decay\0",
+        b"noise_bias\0",
+        b"volume\0",
+    ];
+    let Some(voice) = voice.as_ref() else {
+        return std::ptr::null();
+    };
+    let names = match voice.voice.kind() {
+        PercussionEngineKind::RoutingMatrix => ROUTING_NAMES.as_slice(),
+        PercussionEngineKind::TwinCore => TWIN_NAMES.as_slice(),
+    };
+    names
+        .get(parameter as usize)
+        .map_or(std::ptr::null(), |name| name.as_ptr().cast())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_set_parameter(
+    voice: *mut GooeyPercussionEngine,
+    parameter: u32,
+    value: f32,
+) -> bool {
+    voice.as_mut().is_some_and(|voice| {
+        voice
+            .voice
+            .set_parameter_normalized(parameter as usize, value)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_get_parameter(
+    voice: *const GooeyPercussionEngine,
+    parameter: u32,
+) -> f32 {
+    voice
+        .as_ref()
+        .and_then(|voice| voice.voice.parameter_normalized(parameter as usize))
+        .unwrap_or(f32::NAN)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_trigger(
+    voice: *mut GooeyPercussionEngine,
+    velocity: f32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.trigger_with_velocity(voice.time, velocity);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_render(
+    voice: *mut GooeyPercussionEngine,
+    output: *mut f32,
+    frame_count: u32,
+) -> bool {
+    if output.is_null() {
+        return false;
+    }
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    let output = slice::from_raw_parts_mut(output, frame_count as usize);
+    let step = 1.0 / voice.sample_rate as f64;
+    for sample in output {
+        *sample = voice.voice.tick(voice.time);
+        voice.time += step;
+    }
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_reset(voice: *mut GooeyPercussionEngine) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.reset();
+    voice.time = 0.0;
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_percussion_engine_set_midi_note(
+    voice: *mut GooeyPercussionEngine,
+    note: u8,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.set_midi_note(note.min(127));
+    true
+}
+
+// =============================================================================
+// Standalone twin-core percussion voice (engine-specific advanced controls)
+// =============================================================================
+
+/// Opaque standalone handle for hosts that do not use `GooeyEngine`.
+pub struct GooeyTwinCorePercVoice {
+    voice: TwinCorePercVoice,
+    sample_rate: f32,
+    time: f64,
+}
+
+fn twin_core_perc_preset(preset: u32) -> Option<TwinCorePercConfig> {
+    match preset {
+        TWIN_CORE_PERC_PRESET_KICK => Some(TwinCorePercConfig::kick()),
+        TWIN_CORE_PERC_PRESET_TOM => Some(TwinCorePercConfig::tom()),
+        TWIN_CORE_PERC_PRESET_SNARE => Some(TwinCorePercConfig::snare()),
+        TWIN_CORE_PERC_PRESET_CLAP => Some(TwinCorePercConfig::clap()),
+        TWIN_CORE_PERC_PRESET_METALLIC => Some(TwinCorePercConfig::metallic()),
+        _ => None,
+    }
+}
+
+/// Allocate a standalone twin-core percussion voice. Destroy it with
+/// `gooey_twin_core_perc_destroy`.
+#[no_mangle]
+pub extern "C" fn gooey_twin_core_perc_new(sample_rate: f32) -> *mut GooeyTwinCorePercVoice {
+    let sample_rate = if sample_rate.is_finite() && sample_rate > 0.0 {
+        sample_rate
+    } else {
+        44_100.0
+    };
+    Box::into_raw(Box::new(GooeyTwinCorePercVoice {
+        voice: TwinCorePercVoice::new(sample_rate),
+        sample_rate,
+        time: 0.0,
+    }))
+}
+
+/// # Safety
+/// `voice` must be null or a pointer returned by `gooey_twin_core_perc_new`
+/// that has not already been destroyed.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_destroy(voice: *mut GooeyTwinCorePercVoice) {
+    if !voice.is_null() {
+        drop(Box::from_raw(voice));
+    }
+}
+
+/// Replace the voice with a factory preset. Returns false for an invalid handle
+/// or preset ID.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_set_preset(
+    voice: *mut GooeyTwinCorePercVoice,
+    preset: u32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    let Some(config) = twin_core_perc_preset(preset) else {
+        return false;
+    };
+    voice.voice = TwinCorePercVoice::with_config(voice.sample_rate, config);
+    true
+}
+
+/// Trigger both the body and noise envelopes at the current render time.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_trigger(
+    voice: *mut GooeyTwinCorePercVoice,
+    velocity: f32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.trigger_with_velocity(voice.time, velocity);
+    true
+}
+
+/// Trigger only the independent noise envelope at the current render time.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_trigger_noise(
+    voice: *mut GooeyTwinCorePercVoice,
+    velocity: f32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice
+        .voice
+        .trigger_noise_with_velocity(voice.time, velocity);
+    true
+}
+
+/// Render mono samples into a caller-owned buffer and advance the voice clock.
+///
+/// # Safety
+/// `output` must point to at least `frame_count` writable `f32` values and must
+/// not overlap `voice`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_render(
+    voice: *mut GooeyTwinCorePercVoice,
+    output: *mut f32,
+    frame_count: u32,
+) -> bool {
+    if output.is_null() {
+        return false;
+    }
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    let output = slice::from_raw_parts_mut(output, frame_count as usize);
+    let time_step = 1.0 / voice.sample_rate as f64;
+    for sample in output {
+        *sample = voice.voice.tick(voice.time);
+        voice.time += time_step;
+    }
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_reset(voice: *mut GooeyTwinCorePercVoice) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.reset();
+    voice.time = 0.0;
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_is_active(
+    voice: *const GooeyTwinCorePercVoice,
+) -> bool {
+    voice.as_ref().is_some_and(|voice| voice.voice.is_active())
+}
+
+/// Set one of the 12 continuous controls using a normalized 0–1 value.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_set_parameter(
+    voice: *mut GooeyTwinCorePercVoice,
+    parameter: u32,
+    value: f32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    if parameter >= TWIN_CORE_PERC_PARAM_COUNT || !value.is_finite() {
+        return false;
+    }
+    voice
+        .voice
+        .set_parameter_normalized(parameter as usize, value);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_get_parameter(
+    voice: *const GooeyTwinCorePercVoice,
+    parameter: u32,
+) -> f32 {
+    voice
+        .as_ref()
+        .and_then(|voice| voice.voice.parameter_normalized(parameter as usize))
+        .unwrap_or(f32::NAN)
+}
+
+/// Return a static, null-terminated parameter name, or null for an invalid ID.
+#[no_mangle]
+pub extern "C" fn gooey_twin_core_perc_parameter_name(parameter: u32) -> *const c_char {
+    const NAMES: [&[u8]; 12] = [
+        b"tune\0",
+        b"detune\0",
+        b"length\0",
+        b"body_bias\0",
+        b"fm_decay\0",
+        b"fm_depth\0",
+        b"trigger_delay\0",
+        b"harmonics\0",
+        b"noise_filter\0",
+        b"noise_decay\0",
+        b"noise_bias\0",
+        b"volume\0",
+    ];
+    NAMES
+        .get(parameter as usize)
+        .map_or(std::ptr::null(), |name| name.as_ptr().cast())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_set_body_mode(
+    voice: *mut GooeyTwinCorePercVoice,
+    mode: u32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    let mode = match mode {
+        TWIN_CORE_PERC_BODY_LOW => TwinCorePercBodyMode::Low,
+        TWIN_CORE_PERC_BODY_MID => TwinCorePercBodyMode::Mid,
+        TWIN_CORE_PERC_BODY_HIGH => TwinCorePercBodyMode::High,
+        _ => return false,
+    };
+    voice.voice.set_body_mode(mode);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_get_body_mode(
+    voice: *const GooeyTwinCorePercVoice,
+) -> u32 {
+    match voice
+        .as_ref()
+        .map(|voice| voice.voice.config_targets().body_mode)
+    {
+        Some(TwinCorePercBodyMode::Low) => TWIN_CORE_PERC_BODY_LOW,
+        Some(TwinCorePercBodyMode::Mid) => TWIN_CORE_PERC_BODY_MID,
+        Some(TwinCorePercBodyMode::High) => TWIN_CORE_PERC_BODY_HIGH,
+        None => u32::MAX,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_set_noise_mode(
+    voice: *mut GooeyTwinCorePercVoice,
+    mode: u32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    let mode = match mode {
+        TWIN_CORE_PERC_NOISE_LOWPASS => TwinCorePercNoiseMode::Lowpass,
+        TWIN_CORE_PERC_NOISE_HIGHPASS => TwinCorePercNoiseMode::Highpass,
+        TWIN_CORE_PERC_NOISE_BODY => TwinCorePercNoiseMode::Body,
+        _ => return false,
+    };
+    voice.voice.set_noise_mode(mode);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_get_noise_mode(
+    voice: *const GooeyTwinCorePercVoice,
+) -> u32 {
+    match voice
+        .as_ref()
+        .map(|voice| voice.voice.config_targets().noise_mode)
+    {
+        Some(TwinCorePercNoiseMode::Lowpass) => TWIN_CORE_PERC_NOISE_LOWPASS,
+        Some(TwinCorePercNoiseMode::Highpass) => TWIN_CORE_PERC_NOISE_HIGHPASS,
+        Some(TwinCorePercNoiseMode::Body) => TWIN_CORE_PERC_NOISE_BODY,
+        None => u32::MAX,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_set_seed(
+    voice: *mut GooeyTwinCorePercVoice,
+    seed: u32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.set_seed(seed);
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_set_midi_note(
+    voice: *mut GooeyTwinCorePercVoice,
+    note: u8,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    voice.voice.set_midi_note(note.min(127));
+    true
+}
+
+/// Set a safety ring limit in seconds. A non-positive value disables it.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_twin_core_perc_set_ring_limit(
+    voice: *mut GooeyTwinCorePercVoice,
+    seconds: f32,
+) -> bool {
+    let Some(voice) = voice.as_mut() else {
+        return false;
+    };
+    let limit = if seconds.is_finite() && seconds > 0.0 {
+        Some(seconds)
+    } else {
+        None
+    };
+    voice.voice.set_ring_limit_secs(limit);
+    true
 }
 
 // =============================================================================
