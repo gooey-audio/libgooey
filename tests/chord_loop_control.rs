@@ -71,6 +71,10 @@ fn ffi_validation_sorting_lengths_and_generation_are_atomic() {
     assert_eq!(GOOEY_CHORD_LOOP_MAX_EVENTS, 512);
 
     unsafe {
+        assert!(!gooey_engine_chord_loop_set_piano_velocity(
+            ptr::null(),
+            0.4
+        ));
         assert!(!gooey_engine_chord_enqueue_trigger(
             ptr::null(),
             ptr::null()
@@ -82,6 +86,11 @@ fn ffi_validation_sorting_lengths_and_generation_are_atomic() {
         );
 
         let engine = gooey_engine_new(SR);
+        assert!(gooey_engine_chord_loop_set_piano_velocity(engine, 0.4));
+        assert!(!gooey_engine_chord_loop_set_piano_velocity(
+            engine,
+            f32::NAN
+        ));
         assert_eq!(
             gooey_engine_chord_loop_replace(engine, ptr::null(), 1, 384),
             0
@@ -478,6 +487,38 @@ fn piano_events_trigger_on_exact_tick_samples_for_all_nebula_lengths() {
             }
             gooey_engine_free(engine);
         }
+    }
+}
+
+#[test]
+fn changing_loop_piano_velocity_keeps_the_active_chord_and_transport() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let piano = gooey_engine_piano_register(engine) as u32;
+        commit_full_piano(engine, piano);
+        let event = GooeyChordLoopEvent {
+            start_tick: 0,
+            duration_ticks: 96,
+            chord: chord(GOOEY_CHORD_TARGET_PIANO, piano, 0),
+        };
+        let generation = gooey_engine_chord_loop_replace(engine, &event, 1, 96);
+        let _ = render(engine, 1);
+        gooey_engine_sequencer_start(engine);
+        let _ = render(engine, 1);
+        assert_eq!(gooey_engine_piano_active_voices(engine, piano), 3);
+
+        let beat_before = gooey_engine_transport_get_beat_position(engine);
+        assert!(gooey_engine_chord_loop_set_piano_velocity(engine, 0.2));
+        assert!(gooey_engine_chord_loop_set_piano_velocity(engine, 0.7));
+        let _ = render(engine, 128);
+
+        assert_eq!(gooey_engine_piano_active_voices(engine, piano), 3);
+        assert_eq!(
+            gooey_engine_chord_loop_get_applied_generation(engine),
+            generation
+        );
+        assert!(gooey_engine_transport_get_beat_position(engine) > beat_before);
+        gooey_engine_free(engine);
     }
 }
 

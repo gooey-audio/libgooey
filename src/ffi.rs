@@ -5682,7 +5682,10 @@ impl GooeyEngine {
                     }
                 }
                 self.pending_live_chord_handoff = false;
-                self.trigger_controlled_chord(event, true);
+                self.trigger_controlled_chord(
+                    self.chord_control.with_loop_piano_velocity(event),
+                    true,
+                );
             }
             PlayerAction::Release => self.release_loop_owned_chord(),
         }
@@ -7851,6 +7854,22 @@ pub unsafe extern "C" fn gooey_engine_chord_loop_get_applied_generation(
     engine
         .as_ref()
         .map_or(0, |engine| engine.chord_control.applied_generation())
+}
+
+/// Set the strike strength used by future piano chord-loop triggers. This does
+/// not replace the clip or touch the chord currently sounding. Non-piano loop
+/// events and direct chord triggers keep their event velocities.
+///
+/// # Safety
+/// `engine` must be null or a valid live engine pointer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_chord_loop_set_piano_velocity(
+    engine: *const GooeyEngine,
+    velocity: f32,
+) -> bool {
+    engine
+        .as_ref()
+        .is_some_and(|engine| engine.chord_control.set_loop_piano_velocity(velocity))
 }
 
 /// Atomically stage a complete set of normalized edits for one preset.
