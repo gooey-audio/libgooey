@@ -72,6 +72,14 @@ pub struct ChordClipEvent {
     pub preset: u32,
     pub octave: i32,
     pub velocity: f32,
+    pub gate: ChordGate,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChordGate {
+    #[default]
+    Held,
+    Struck,
 }
 
 /// Render-ready chord event. Harmony resolution and voicing allocation happen
@@ -180,6 +188,7 @@ pub(crate) fn prepare_chord_event(
             preset,
             octave,
             velocity: velocity.clamp(0.0, 1.0),
+            gate: ChordGate::Held,
         },
         chord,
         notes,
@@ -1087,6 +1096,7 @@ mod tests {
             preset: 0,
             octave: 4,
             velocity: 0.8,
+            gate: ChordGate::Held,
         })
     }
 
@@ -1135,6 +1145,7 @@ mod tests {
             preset: 0,
             octave: 4,
             velocity: 0.9,
+            gate: ChordGate::Held,
         }];
         cut_gates_at(&mut events, 40, DEFAULT_LENGTH_TICKS);
         assert_eq!(events.len(), 1);
@@ -1250,6 +1261,7 @@ mod tests {
             preset: 1,
             octave: 4,
             velocity: 0.9,
+            gate: ChordGate::Held,
         }));
 
         let a = rec.update_clock(0.0, true);
@@ -1278,6 +1290,7 @@ mod tests {
             preset: 0,
             octave: 4,
             velocity: 1.0,
+            gate: ChordGate::Held,
         }));
         rec.clear_clip();
         assert_eq!(rec.event_count(), 0);

@@ -485,6 +485,7 @@ struct Voice {
     velocity: f32,
     modulation: [f32; POLY_PARAM_COUNT as usize],
     active: bool,
+    struck: bool,
     trigger_order: u64,
 }
 
@@ -505,6 +506,7 @@ impl Voice {
             velocity: 1.0,
             modulation: [0.0; POLY_PARAM_COUNT as usize],
             active: false,
+            struck: false,
             trigger_order: 0,
         }
     }
@@ -644,10 +646,14 @@ impl PolySynth {
     }
 
     pub fn trigger_note(&mut self, note: u8, velocity: f32) {
-        self.trigger_note_at(note, velocity, self.current_time);
+        self.trigger_note_at(note, velocity, self.current_time, false);
     }
 
-    fn trigger_note_at(&mut self, note: u8, velocity: f32, time: f64) {
+    pub fn strike_note(&mut self, note: u8, velocity: f32) {
+        self.trigger_note_at(note, velocity, self.current_time, true);
+    }
+
+    fn trigger_note_at(&mut self, note: u8, velocity: f32, time: f64, struck: bool) {
         let velocity = if velocity.is_finite() {
             velocity.clamp(0.0, 1.0)
         } else {
@@ -690,6 +696,7 @@ impl PolySynth {
         voice.velocity = velocity;
         voice.modulation = modulation;
         voice.active = true;
+        voice.struck = struck;
         voice.trigger_order = self.trigger_counter;
         self.trigger_counter = self.trigger_counter.wrapping_add(1);
 
@@ -808,6 +815,16 @@ impl PolySynth {
             return StereoFrame::default();
         }
 
+        if voice.struck
+            && voice.amp_envelope.release_time_start.is_none()
+            && current_time - voice.amp_envelope.trigger_time
+                >= f64::from(voice.amp_envelope.attack_time + voice.amp_envelope.decay_time)
+        {
+            voice.amp_envelope.release(current_time);
+            voice.pitch_envelope.release(current_time);
+            voice.filter_envelope.release(current_time);
+        }
+
         let amp_env = voice.amp_envelope.get_amplitude(current_time);
         if !voice.amp_envelope.is_active {
             voice.active = false;
@@ -893,7 +910,7 @@ impl PolySynth {
 impl Instrument for PolySynth {
     fn trigger_with_velocity(&mut self, time: f64, velocity: f32) {
         let note = self.pending_note.unwrap_or(60);
-        self.trigger_note_at(note, velocity, time);
+        self.trigger_note_at(note, velocity, time, false);
         self.pending_note = None;
     }
 
@@ -917,6 +934,30 @@ impl Instrument for PolySynth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn struck_voice_releases_after_decay_while_held_voice_sustains() {
+        let mut config = PolySynthConfig::default();
+        config.amp_envelope.attack = 0.01;
+        config.amp_envelope.decay = 0.02;
+        config.amp_envelope.sustain = 0.5;
+        config.amp_envelope.release = 0.03;
+        let mut struck = PolySynth::with_config(48_000.0, config.clone());
+        let mut held = PolySynth::with_config(48_000.0, config);
+        struck.strike_note(60, 0.8);
+        held.trigger_note(60, 0.8);
+        for frame in 0..12_000 {
+            let time = frame as f64 / 48_000.0;
+            struck.tick_frame(time);
+            held.tick_frame(time);
+        }
+        assert!(!struck.is_active());
+        assert!(held.is_active());
+        assert!(held
+            .voices
+            .iter()
+            .any(|v| v.active && v.amp_envelope.release_time_start.is_none()));
+    }
 
     fn open_config() -> PolySynthConfig {
         let mut config = PolySynthConfig::default();

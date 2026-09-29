@@ -19,6 +19,7 @@ fn chord(target: u32, target_id: u32, degree: u32) -> GooeyChordEvent {
         preset: POLY_PRESET_DEFAULT,
         octave: 4,
         velocity: 0.8,
+        gate: GOOEY_CHORD_GATE_HELD,
     }
 }
 
@@ -27,6 +28,36 @@ fn loop_event(start_tick: u32, duration_ticks: u32, degree: u32) -> GooeyChordLo
         start_tick,
         duration_ticks,
         chord: chord(GOOEY_CHORD_TARGET_POLY, 0, degree),
+    }
+}
+
+#[test]
+fn struck_loop_piano_ends_before_its_region_while_held_piano_sustains() {
+    unsafe {
+        for gate in [GOOEY_CHORD_GATE_HELD, GOOEY_CHORD_GATE_STRUCK] {
+            let engine = gooey_engine_new(SR);
+            let piano = gooey_engine_piano_register(engine) as u32;
+            commit_full_piano(engine, piano);
+            gooey_engine_set_bpm(engine, 120.0);
+            let event = GooeyChordLoopEvent {
+                start_tick: 0,
+                duration_ticks: 384,
+                chord: GooeyChordEvent {
+                    gate,
+                    ..chord(GOOEY_CHORD_TARGET_PIANO, piano, 0)
+                },
+            };
+            assert_ne!(gooey_engine_chord_loop_replace(engine, &event, 1, 384), 0);
+            gooey_engine_sequencer_start(engine);
+            let _ = render(engine, 48_000);
+            let voices = gooey_engine_piano_active_voices(engine, piano);
+            if gate == GOOEY_CHORD_GATE_STRUCK {
+                assert_eq!(voices, 0);
+            } else {
+                assert!(voices > 0);
+            }
+            gooey_engine_free(engine);
+        }
     }
 }
 
@@ -65,6 +96,8 @@ unsafe fn commit_full_piano(engine: *mut GooeyEngine, piano: u32) {
 
 #[test]
 fn ffi_validation_sorting_lengths_and_generation_are_atomic() {
+    assert_eq!(GOOEY_CHORD_GATE_HELD, 0);
+    assert_eq!(GOOEY_CHORD_GATE_STRUCK, 1);
     assert_eq!(GOOEY_CHORD_TARGET_POLY, 0);
     assert_eq!(GOOEY_CHORD_TARGET_PIANO, 1);
     assert_eq!(GOOEY_CHORD_LOOP_TICKS_PER_QUARTER, 96);
@@ -86,6 +119,11 @@ fn ffi_validation_sorting_lengths_and_generation_are_atomic() {
         );
 
         let engine = gooey_engine_new(SR);
+        let invalid_gate = GooeyChordEvent {
+            gate: 99,
+            ..chord(GOOEY_CHORD_TARGET_POLY, 0, 0)
+        };
+        assert!(!gooey_engine_chord_enqueue_trigger(engine, &invalid_gate));
         assert!(gooey_engine_chord_loop_set_piano_velocity(engine, 0.4));
         assert!(!gooey_engine_chord_loop_set_piano_velocity(
             engine,
