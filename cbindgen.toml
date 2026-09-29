@@ -12,6 +12,7 @@ include = [
     "GooeyPolyModRoute",
     "GooeyChordEvent",
     "GooeyChordLoopEvent",
+    "GooeyBassLoopEvent",
     "GooeyPolyParamValue",
     "GooeyLiveControl",
     "GooeyDrumStep",
