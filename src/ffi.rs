@@ -51,8 +51,9 @@ use crate::music::{
 };
 use crate::performance::control::{ChordControl, ChordControlScratch};
 use crate::performance::{
-    prepare_chord_event, ChordCommandAction, ChordLoopSnapshot, PerformanceRecorder, PlayerAction,
-    PreparedChordEvent, RecordMode, CHORD_TARGET_PIANO, CHORD_TARGET_POLY, TICKS_PER_QUARTER,
+    prepare_chord_event, ChordCommandAction, ChordGate, ChordLoopSnapshot, PerformanceRecorder,
+    PlayerAction, PreparedChordEvent, RecordMode, CHORD_TARGET_PIANO, CHORD_TARGET_POLY,
+    TICKS_PER_QUARTER,
 };
 use crate::utils::{PresetBlender, SmoothedParam};
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -5600,8 +5601,11 @@ impl GooeyEngine {
                 }
                 self.poly_synth.release_all();
                 for &note in event.notes() {
-                    self.poly_synth
-                        .trigger_note(note, event.event.velocity.clamp(0.0, 1.0));
+                    if event.event.gate == ChordGate::Struck {
+                        self.poly_synth.strike_note(note, event.event.velocity);
+                    } else {
+                        self.poly_synth.trigger_note(note, event.event.velocity);
+                    }
                     sounding_notes[sounding_count] = note;
                     sounding_count += 1;
                 }
@@ -5617,7 +5621,12 @@ impl GooeyEngine {
                 let note_count = event.notes().len();
                 for (index, &note) in event.notes().iter().enumerate() {
                     let velocity = piano.chord_velocity_at(event.event.velocity, index, note_count);
-                    if piano.note_on(note, velocity) {
+                    let triggered = if event.event.gate == ChordGate::Struck {
+                        piano.strike_note(note, velocity)
+                    } else {
+                        piano.note_on(note, velocity)
+                    };
+                    if triggered {
                         sounding_notes[sounding_count] = note;
                         sounding_count += 1;
                     }
@@ -7366,6 +7375,10 @@ pub const POLY_PRESET_COUNT: u32 = 5;
 pub const GOOEY_CHORD_TARGET_POLY: u32 = 0;
 /// Queued chord target: a registered multi-sample piano.
 pub const GOOEY_CHORD_TARGET_PIANO: u32 = 1;
+/// The chord follows note-on and explicit release events (the zero-initialized default).
+pub const GOOEY_CHORD_GATE_HELD: u32 = 0;
+/// The chord releases after the synth's attack and decay or the piano sample's attack.
+pub const GOOEY_CHORD_GATE_STRUCK: u32 = 1;
 /// Chord-loop timeline resolution in ticks per quarter note.
 pub const GOOEY_CHORD_LOOP_TICKS_PER_QUARTER: u32 = 96;
 /// Maximum events accepted in one immutable chord-loop snapshot.
@@ -7384,6 +7397,8 @@ pub struct GooeyChordEvent {
     pub preset: u32,
     pub octave: i32,
     pub velocity: f32,
+    /// `GOOEY_CHORD_GATE_HELD` or `GOOEY_CHORD_GATE_STRUCK`.
+    pub gate: u32,
 }
 
 #[repr(C)]
@@ -7747,7 +7762,12 @@ fn prepare_ffi_chord(event: GooeyChordEvent) -> Option<PreparedChordEvent> {
     if event.target == GOOEY_CHORD_TARGET_POLY && event.preset >= POLY_PRESET_COUNT {
         return None;
     }
-    prepare_chord_event(
+    let gate = match event.gate {
+        GOOEY_CHORD_GATE_HELD => ChordGate::Held,
+        GOOEY_CHORD_GATE_STRUCK => ChordGate::Struck,
+        _ => return None,
+    };
+    let mut prepared = prepare_chord_event(
         event.target,
         event.target_id,
         event.chord_set,
@@ -7758,7 +7778,9 @@ fn prepare_ffi_chord(event: GooeyChordEvent) -> Option<PreparedChordEvent> {
         event.preset,
         event.octave,
         event.velocity,
-    )
+    )?;
+    prepared.event.gate = gate;
+    Some(prepared)
 }
 
 /// Queue a chord gesture for the next available render-buffer boundary.

@@ -633,6 +633,8 @@ struct MsVoice {
     trigger_order: u64,
     /// The key is still physically down.
     held: bool,
+    /// Release this key when its sample attack has reached full level.
+    struck: bool,
     /// The key was released while the sustain pedal was down, so the voice
     /// keeps ringing until the pedal lifts.
     sustained: bool,
@@ -664,6 +666,7 @@ impl Default for MsVoice {
             dt: 0.0,
             trigger_order: 0,
             held: false,
+            struck: false,
             sustained: false,
             fade: 1.0,
             fade_step: 0.0,
@@ -721,6 +724,7 @@ impl MsVoice {
         self.dt = 1.0 / engine_rate as f64;
         self.trigger_order = trigger_order;
         self.held = true;
+        self.struck = false;
         self.sustained = false;
         self.fade = 1.0;
         self.fade_step = 0.0;
@@ -1023,6 +1027,22 @@ impl MultiSampleInstrument {
         self.start_zone_voice(note, midi_velocity, velocity, ZoneTrigger::Attack)
     }
 
+    /// A pad hit: keep the sample attack intact, then let the damper control
+    /// determine its tail on the audio clock.
+    pub fn strike_note(&mut self, note: u8, velocity: f32) -> bool {
+        if !self.note_on(note, velocity) {
+            return false;
+        }
+        if let Some(voice) = self
+            .voices
+            .iter_mut()
+            .find(|voice| voice.active() && voice.trigger_order == self.trigger_counter)
+        {
+            voice.struck = true;
+        }
+        true
+    }
+
     /// Release a key. With the sustain pedal down the voice keeps ringing and
     /// is only released when the pedal lifts. Voices from
     /// [`LoopMode::OneShot`] zones ignore this entirely and play to the end.
@@ -1245,6 +1265,23 @@ impl MultiSampleInstrument {
             span.tick();
         }
 
+        let mut releases = [0u8; MULTISAMPLE_VOICE_COUNT];
+        let mut release_count = 0;
+        for voice in &mut self.voices {
+            if voice.active()
+                && voice.struck
+                && voice.held
+                && voice.elapsed_secs >= f64::from(voice.envelope.attack_time).max(voice.dt)
+            {
+                voice.struck = false;
+                releases[release_count] = voice.note;
+                release_count += 1;
+            }
+        }
+        for note in &releases[..release_count] {
+            self.note_off(*note);
+        }
+
         let mut out = StereoFrame::default();
         for voice in &mut self.voices {
             out += voice.tick();
@@ -1403,6 +1440,46 @@ impl Instrument for MultiSampleInstrument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn struck_piano_releases_after_attack_and_held_piano_does_not() {
+        let mut map = SampleMap::new();
+        let mut zone = SampleZone::new(flat_buffer(SR as usize, 1.0), 60);
+        zone.envelope = ADSRConfig::new(0.01, 0.01, 1.0, 0.08);
+        map.push_zone(zone).unwrap();
+        let map = map.build();
+        let mut struck = MultiSampleInstrument::with_map(SR, map.clone());
+        let mut held = MultiSampleInstrument::with_map(SR, map);
+        struck.snap_params();
+        held.snap_params();
+        assert!(struck.strike_note(60, 1.0));
+        assert!(held.note_on(60, 1.0));
+        for _ in 0..400 {
+            struck.tick_frame();
+            held.tick_frame();
+        }
+        assert!(struck
+            .voices
+            .iter()
+            .any(|v| v.held && v.envelope.release_time_start.is_none()));
+        for _ in 0..400 {
+            struck.tick_frame();
+            held.tick_frame();
+        }
+        assert!(struck
+            .voices
+            .iter()
+            .any(|v| !v.held && v.envelope.release_time_start.is_some()));
+        assert!(held
+            .voices
+            .iter()
+            .any(|v| v.held && v.envelope.release_time_start.is_none()));
+        for _ in 0..8_000 {
+            struck.tick_frame();
+        }
+        assert!(!struck.is_active());
+        assert!(held.is_active());
+    }
     use crate::utils::gain_to_db;
 
     const SR: f32 = 44_100.0;
