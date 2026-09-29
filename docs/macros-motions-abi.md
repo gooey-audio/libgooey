@@ -105,7 +105,7 @@ A macro has one driver at a time. The newest one wins:
 | action | effect on the macro's motion | effect on the macro's LFO |
 |---|---|---|
 | `gooey_engine_macro_lfo_start` | stops (including a pending, quantized one) | starts or restarts from 0 |
-| `gooey_engine_motion_trigger` | starts or restarts | stops; the motion starts from the LFO's current value |
+| `gooey_engine_motion_trigger` | starts or restarts | stops; a motion without an explicit start value starts from the value `gooey_engine_macro_get_value` last reported, just as `gooey_engine_macro_lfo_stop` holds it |
 | `gooey_engine_macro_set_value` | stops | stops; the macro takes the manual value |
 | `gooey_engine_macro_capture_commit` | stops | stops; the macro is set to 0 |
 

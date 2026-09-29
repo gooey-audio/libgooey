@@ -686,7 +686,10 @@ fn concurrent_control_calls_while_rendering_stay_coherent() {
     rendering.store(false, Ordering::Relaxed);
     render.join().unwrap();
 
-    // The engine is still fully controllable and coherent afterwards.
+    // The host threads can outpace a slow render thread and fill the command
+    // queue (calls then return false). Render until everything queued has
+    // applied; the engine is then fully controllable and coherent.
+    engine.render_seconds(0.05);
     unsafe {
         assert!(gooey_engine_motion_stop_all(engine.0));
         assert!(gooey_engine_macro_lfo_stop_all(engine.0));

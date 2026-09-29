@@ -13603,7 +13603,9 @@ pub unsafe extern "C" fn gooey_engine_motion_get_quantize(
 }
 
 /// Start (or restart) a configured motion at the next render buffer. Any
-/// other motion or LFO driving the same macro stops. Returns false when the slot is
+/// other motion or LFO driving the same macro stops. A motion without an
+/// explicit start that takes over a running LFO starts from the macro value
+/// last reported by `gooey_engine_macro_get_value`. Returns false when the slot is
 /// unconfigured or the command queue is full.
 ///
 /// # Safety
@@ -13619,9 +13621,18 @@ pub unsafe extern "C" fn gooey_engine_motion_trigger(
     engine
         .automation_control
         .edit(|state| {
-            let Some(definition) = state.motions[slot] else {
+            let Some(mut definition) = state.motions[slot] else {
                 return false;
             };
+            // Taking over a running LFO, a motion without an explicit start
+            // starts from the value the host last saw, just as an LFO stop
+            // holds it. The render thread's LFO may have moved on since, so
+            // this keeps the projection below equal to the rendered outcome.
+            if definition.start.is_none() && state.lfo_running(definition.macro_index) {
+                definition.start = engine
+                    .automation_control
+                    .macro_value(definition.macro_index);
+            }
             if !state.push(AutomationCommand::StartMotion { slot, definition }) {
                 return false;
             }
@@ -14103,6 +14114,61 @@ mod automation_tests {
         }
         render(&mut engine, 0.05);
         assert_eq!(live_cutoff(&engine), held);
+    }
+
+    #[test]
+    fn return_motion_taking_over_an_lfo_returns_to_its_projected_value() {
+        let mut engine = GooeyEngine::new(48_000.0);
+        let engine_ptr: *mut GooeyEngine = &mut engine;
+        unsafe {
+            assert!(gooey_engine_macro_add_mapping(
+                engine_ptr,
+                0,
+                PARAM_TARGET_POLY,
+                0,
+                POLY_PARAM_FILTER_CUTOFF,
+                0.9,
+                0.1,
+            ));
+            assert!(gooey_engine_macro_lfo_set_shape(
+                engine_ptr,
+                0,
+                MACRO_LFO_SHAPE_TRIANGLE
+            ));
+            assert!(gooey_engine_macro_lfo_start(engine_ptr, 0));
+        }
+        render(&mut engine, 0.3);
+        // A render running concurrently with the host has moved the LFO past
+        // the value the host last saw.
+        let seen = engine.automation_control.macro_value(0).unwrap() - 0.05;
+        engine.automation_control.publish_macro_value(0, seen);
+        unsafe {
+            assert!(gooey_engine_motion_configure(engine_ptr, 0, 0, 1.0));
+            assert!(gooey_engine_motion_set_duration(
+                engine_ptr,
+                0,
+                MOTION_DURATION_MS,
+                50.0
+            ));
+            assert!(gooey_engine_motion_set_end_mode(
+                engine_ptr,
+                0,
+                MOTION_END_RETURN
+            ));
+            assert!(gooey_engine_motion_trigger(engine_ptr, 0));
+            // The slot's own setting is untouched.
+            assert!(gooey_engine_motion_get_start(engine_ptr, 0).is_nan());
+        }
+        let projected =
+            unsafe { gooey_engine_poly_get_param(engine_ptr, POLY_PARAM_FILTER_CUTOFF) };
+        assert!((projected - (0.9 - 0.8 * seen)).abs() < 1e-6);
+
+        render(&mut engine, 0.2);
+        assert_eq!(
+            engine.automation_control.motion_phase(0),
+            Some(MOTION_STATE_IDLE)
+        );
+        assert!((live_cutoff(&engine) - projected).abs() < 1e-6);
     }
 
     #[test]
