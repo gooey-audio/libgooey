@@ -1,4 +1,5 @@
-//! Allocator probe: macros and motions never allocate or free on the render thread.
+//! Allocator probe: macros, motions, and macro LFOs never allocate or free on
+//! the render thread.
 
 use gooey::ffi::*;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -29,7 +30,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 #[test]
-fn macros_and_motions_render_without_allocating() {
+fn macros_motions_and_lfos_render_without_allocating() {
     unsafe {
         let engine = gooey_engine_new(48_000.0);
         let mut output = vec![0.0_f32; 256 * 2];
@@ -122,6 +123,58 @@ fn macros_and_motions_render_without_allocating() {
         assert_eq!(gooey_engine_macro_get_value(engine, 1), 0.0);
         assert_eq!(gooey_engine_macro_get_value(engine, 2), 0.0);
         assert_eq!(gooey_engine_macro_get_value(engine, 4), 0.5);
+
+        // Macro LFOs: all 16 running at once through start, live setting
+        // changes, phase resets, tempo changes, overrides, and stops.
+        for macro_index in 0..MACRO_COUNT {
+            assert!(gooey_engine_macro_lfo_set_shape(
+                engine,
+                macro_index,
+                macro_index % 4
+            ));
+            assert!(gooey_engine_macro_lfo_set_rate(
+                engine,
+                macro_index,
+                macro_index % 7
+            ));
+            assert!(gooey_engine_macro_lfo_start(engine, macro_index));
+        }
+        ALLOCATIONS.store(0, Ordering::Relaxed);
+        DEALLOCATIONS.store(0, Ordering::Relaxed);
+        for _ in 0..16 {
+            render(&mut output);
+        }
+        assert!(gooey_engine_macro_lfo_set_rate(
+            engine,
+            0,
+            LFO_TIMING_SIXTEENTH
+        ));
+        assert!(gooey_engine_macro_lfo_set_shape(
+            engine,
+            1,
+            MACRO_LFO_SHAPE_SQUARE
+        ));
+        assert!(gooey_engine_macro_lfo_reset_phase(engine, 2));
+        assert!(gooey_engine_macro_lfo_start(engine, 3));
+        assert!(gooey_engine_motion_trigger(engine, 4));
+        assert!(gooey_engine_macro_set_value(engine, 5, 0.25));
+        gooey_engine_set_bpm(engine, 90.0);
+        for _ in 0..16 {
+            render(&mut output);
+        }
+        assert!(gooey_engine_macro_lfo_stop(engine, 6));
+        assert!(gooey_engine_macro_lfo_stop_all(engine));
+        for _ in 0..4 {
+            render(&mut output);
+        }
+        assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+        assert_eq!(DEALLOCATIONS.load(Ordering::Relaxed), 0);
+        for macro_index in 0..MACRO_COUNT {
+            assert_eq!(
+                gooey_engine_macro_lfo_get_state(engine, macro_index),
+                MACRO_LFO_STATE_STOPPED
+            );
+        }
 
         gooey_engine_free(engine);
     }

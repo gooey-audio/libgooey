@@ -1,15 +1,18 @@
-//! Macros and motions.
+//! Macros, motions, and macro LFOs.
 //!
 //! A macro is one 0-1 control connected to many parameters (see
 //! [`macros`]). A motion is a one-shot, retriggerable automation of a macro's
-//! value over a beat- or time-based duration (see [`motion`]). The engine
-//! owning the parameters decides what a [`ParamTarget`] addresses and performs
-//! the writes; this module is allocation-free and engine-agnostic.
+//! value over a beat- or time-based duration (see [`motion`]). A macro LFO
+//! cycles a macro's value continuously at a tempo-synced rate (see [`lfo`]).
+//! The engine owning the parameters decides what a [`ParamTarget`] addresses
+//! and performs the writes; this module is allocation-free and engine-agnostic.
 
 pub(crate) mod control;
+pub mod lfo;
 pub mod macros;
 pub mod motion;
 
+pub use lfo::{MacroLfoRunner, MacroLfoSettings, MacroLfoShape};
 pub use macros::{
     active_definition, MacroBank, MacroDefinition, MacroMapping, ParamTarget, MACRO_COUNT,
     MACRO_MAX_MAPPINGS,

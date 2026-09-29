@@ -7,9 +7,9 @@ use crate::automation::control::{
     AutomationCommand, AutomationControl, AutomationState, AUTOMATION_QUEUE_CAPACITY,
 };
 use crate::automation::{
-    active_definition, MacroBank, MacroDefinition, MacroMapping, MotionClock, MotionCurve,
-    MotionDefinition, MotionDuration, MotionEndMode, MotionPhase, MotionQuantize, MotionRunner,
-    ParamTarget,
+    active_definition, MacroBank, MacroDefinition, MacroLfoRunner, MacroLfoSettings, MacroLfoShape,
+    MacroMapping, MotionClock, MotionCurve, MotionDefinition, MotionDuration, MotionEndMode,
+    MotionPhase, MotionQuantize, MotionRunner, ParamTarget,
 };
 use crate::effects::{
     DelayEffect, DelayTiming, Effect, FeedbackWaveshaper, LowpassFilterEffect, PlateReverbEffect,
@@ -1202,14 +1202,16 @@ pub struct GooeyEngine {
     // consults it so a monitoring aid can never land in an exported file.
     offline_bounce: bool,
 
-    // Macros (one 0-1 control driving many parameters) and motions (one-shot
-    // automation of a macro). Hosts edit through `automation_control`; the
-    // render thread owns `macros` and `motions` and applies queued commands at
+    // Macros (one 0-1 control driving many parameters), motions (one-shot
+    // automation of a macro), and macro LFOs (continuous cycling of a macro).
+    // Hosts edit through `automation_control`; the render thread owns
+    // `macros`, `motions`, and `macro_lfos` and applies queued commands at
     // buffer boundaries. See `src/automation/`.
     automation_control: AutomationControl,
     automation_scratch: std::collections::VecDeque<AutomationCommand>,
     macros: MacroBank,
     motions: MotionRunner,
+    macro_lfos: MacroLfoRunner,
     /// Frames rendered since the last control-rate automation tick.
     automation_frames: u32,
     /// Host-side snapshot taken by `gooey_engine_macro_capture_begin`;
@@ -1504,6 +1506,7 @@ impl GooeyEngine {
             ),
             macros: MacroBank::new(),
             motions: MotionRunner::new(),
+            macro_lfos: MacroLfoRunner::new(),
             automation_frames: 0,
             macro_capture: None,
         }
@@ -2349,7 +2352,9 @@ impl GooeyEngine {
         }
     }
 
-    /// Apply queued macro/motion commands at the buffer boundary.
+    /// Apply queued macro/motion/LFO commands at the buffer boundary. A macro
+    /// has one owner: starting a motion or an LFO, or a manual value, stops
+    /// whichever other driver held it.
     fn apply_automation_commands(&mut self) {
         self.automation_control
             .drain_into(&mut self.automation_scratch);
@@ -2364,23 +2369,39 @@ impl GooeyEngine {
                 }
                 AutomationCommand::SetMacroValue { index, value } => {
                     self.motions.stop_macro(index);
+                    self.macro_lfos.stop_macro(index);
                     self.macros.set_value(index, value);
                 }
                 AutomationCommand::StartMotion { slot, definition } => {
+                    self.macro_lfos.stop_macro(definition.macro_index);
                     self.motions
                         .start(slot, definition, &clock, &mut self.macros)
                 }
                 AutomationCommand::StopMotion { slot } => self.motions.stop(slot),
                 AutomationCommand::StopAll => self.motions.stop_all(),
+                AutomationCommand::StartLfo { index, settings } => {
+                    self.motions.stop_macro(index);
+                    self.macro_lfos.start(index, settings, &mut self.macros);
+                }
+                AutomationCommand::ConfigureLfo { index, settings } => {
+                    self.macro_lfos.configure(index, settings)
+                }
+                AutomationCommand::StopLfo { index, hold } => {
+                    self.macro_lfos.stop(index, hold, &mut self.macros)
+                }
+                AutomationCommand::ResetLfoPhase { index } => {
+                    self.macro_lfos.reset_phase(index, &mut self.macros)
+                }
             }
         }
     }
 
-    /// Advance motions and write every macro whose value changed.
+    /// Advance motions and LFOs, then write every macro whose value changed.
     fn tick_automation(&mut self, transport_running: bool, transport_beat: f64) {
         let frames = std::mem::take(&mut self.automation_frames);
         let clock = self.motion_clock(transport_running, transport_beat);
         self.motions.advance(frames, &clock, &mut self.macros);
+        self.macro_lfos.advance(frames, &clock, &mut self.macros);
         for index in 0..crate::automation::MACRO_COUNT {
             if let Some((definition, value)) = self.macros.take_dirty(index) {
                 for mapping in definition.mappings() {
@@ -2394,6 +2415,11 @@ impl GooeyEngine {
         for index in 0..crate::automation::MACRO_COUNT {
             self.automation_control
                 .publish_macro_value(index, self.macros.value(index));
+            self.automation_control.publish_lfo(
+                index,
+                self.macro_lfos.phase(index),
+                self.macro_lfos.value(index),
+            );
         }
         for slot in 0..crate::automation::MOTION_SLOT_COUNT {
             self.automation_control.publish_motion(
@@ -2528,12 +2554,15 @@ impl GooeyEngine {
     /// getters report macro-driven values and a later unrelated preset edit
     /// does not snap those parameters back. Host thread only.
     fn project_poly_macro(&self, index: usize, value: f32) {
-        let Some(definition) = self
-            .automation_control
-            .read(|state| active_definition(&state.macros, index))
-        else {
-            return;
-        };
+        self.automation_control
+            .read(|state| self.project_poly_macro_locked(state, index, value));
+    }
+
+    /// `project_poly_macro` for callers already holding the automation lock.
+    /// Projecting under that lock (automation, then poly; never the reverse)
+    /// keeps concurrent host calls' projections in command order.
+    fn project_poly_macro_locked(&self, state: &AutomationState, index: usize, value: f32) {
+        let definition = active_definition(&state.macros, index);
         for mapping in definition.mappings() {
             if mapping.target.kind == PARAM_TARGET_POLY {
                 self.poly_control
@@ -12676,10 +12705,11 @@ pub unsafe extern "C" fn gooey_twin_core_perc_set_ring_limit(
 // parameters. Each mapping stores the parameter value at macro 0 ("from") and
 // at macro 1 ("to"). A motion is a one-shot automation of one macro's value:
 // it ramps the macro to a target over a duration along a curve, then holds,
-// returns, or snaps back. See docs/macros-motions-abi.md.
+// returns, or snaps back. A macro LFO cycles one macro's value continuously at
+// a tempo-synced rate. See docs/macros-motions-abi.md.
 //
-// Threading: macro/motion definition edits, macro values, trigger/stop, and
-// status getters go through a render-boundary queue and atomics and may be
+// Threading: macro/motion/LFO definition edits, macro values, trigger/stop,
+// and status getters go through a render-boundary queue and atomics and may be
 // called while rendering. Capture begin/commit/cancel read and write
 // parameters through the legacy setter paths and follow the same
 // host-serialized contract as `gooey_engine_set_*_param`.
@@ -12764,6 +12794,25 @@ const _: () = assert!(MotionPhase::Pending as u32 == MOTION_STATE_PENDING);
 const _: () = assert!(MotionPhase::Forward as u32 == MOTION_STATE_RUNNING);
 const _: () = assert!(MotionPhase::Returning as u32 == MOTION_STATE_RETURNING);
 
+/// Macro LFO shape: raised cosine, 0 → 1 → 0 over a cycle.
+pub const MACRO_LFO_SHAPE_SINE: u32 = 0;
+/// Macro LFO shape: linear 0 → 1 → 0.
+pub const MACRO_LFO_SHAPE_TRIANGLE: u32 = 1;
+/// Macro LFO shape: linear ramp 0 → 1, then jump back to 0.
+pub const MACRO_LFO_SHAPE_SAW: u32 = 2;
+/// Macro LFO shape: 0 for the first half of the cycle, 1 for the second.
+pub const MACRO_LFO_SHAPE_SQUARE: u32 = 3;
+
+/// Macro LFO state: not driving its macro.
+pub const MACRO_LFO_STATE_STOPPED: u32 = 0;
+/// Macro LFO state: cycling its macro.
+pub const MACRO_LFO_STATE_RUNNING: u32 = 1;
+
+const _: () = assert!(MacroLfoShape::Sine as u32 == MACRO_LFO_SHAPE_SINE);
+const _: () = assert!(MacroLfoShape::Triangle as u32 == MACRO_LFO_SHAPE_TRIANGLE);
+const _: () = assert!(MacroLfoShape::Saw as u32 == MACRO_LFO_SHAPE_SAW);
+const _: () = assert!(MacroLfoShape::Square as u32 == MACRO_LFO_SHAPE_SQUARE);
+
 /// Frames between macro/motion updates (~0.7 ms at 48 kHz). Parameter
 /// smoothers interpolate between updates.
 const AUTOMATION_CONTROL_INTERVAL: u32 = 32;
@@ -12818,6 +12867,49 @@ impl GooeyEngine {
 
     fn macro_definition(&self, index: usize) -> Option<MacroDefinition> {
         self.automation_control.read(|state| state.macros[index])
+    }
+
+    /// Edit a macro LFO's settings. A running LFO takes them at the next
+    /// buffer, keeping its phase.
+    fn edit_macro_lfo(&self, macro_index: u32, edit: impl FnOnce(&mut MacroLfoSettings)) -> bool {
+        let Some(index) = macro_slot(macro_index) else {
+            return false;
+        };
+        self.automation_control
+            .edit(|state| {
+                let mut settings = state.lfos[index];
+                edit(&mut settings);
+                if state.lfo_running(index)
+                    && !state.push(AutomationCommand::ConfigureLfo { index, settings })
+                {
+                    return false;
+                }
+                state.lfos[index] = settings;
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    fn macro_lfo_settings(&self, macro_index: u32) -> Option<MacroLfoSettings> {
+        let index = macro_slot(macro_index)?;
+        self.automation_control.read(|state| state.lfos[index])
+    }
+
+    /// Queue a stop for a running LFO. It holds the macro value the host last
+    /// observed (published by the previous buffer), so the macro getter, the
+    /// poly projection, and the rendered parameters all agree on it.
+    fn stop_macro_lfo_locked(&self, state: &mut AutomationState, index: usize) -> bool {
+        if !state.lfo_running(index) {
+            return true;
+        }
+        let hold = self.automation_control.macro_value(index).unwrap_or(0.0);
+        if !state.push(AutomationCommand::StopLfo { index, hold }) {
+            return false;
+        }
+        let phase = self.automation_control.lfo_phase(index).unwrap_or(0.0);
+        self.automation_control.publish_lfo(index, phase, hold);
+        self.project_poly_macro_locked(state, index, hold);
+        true
     }
 
     /// Mirror a macro's latest published value into the poly projection.
@@ -13138,8 +13230,8 @@ pub unsafe extern "C" fn gooey_engine_macro_get_mapping(
     true
 }
 
-/// Set a macro's position (0-1, clamped) by hand. Stops any motion driving
-/// the macro, like grabbing a fader during automation. Mapped parameters
+/// Set a macro's position (0-1, clamped) by hand. Stops any motion or LFO
+/// driving the macro, like grabbing a fader during automation. Mapped parameters
 /// follow within one control interval.
 ///
 /// # Safety
@@ -13157,15 +13249,17 @@ pub unsafe extern "C" fn gooey_engine_macro_set_value(
         return false;
     }
     let value = value.clamp(0.0, 1.0);
-    let queued = engine
+    engine
         .automation_control
-        .edit(|state| state.push(AutomationCommand::SetMacroValue { index, value }));
-    if queued != Some(true) {
-        return false;
-    }
-    engine.automation_control.publish_macro_value(index, value);
-    engine.project_poly_macro(index, value);
-    true
+        .edit(|state| {
+            if !state.push(AutomationCommand::SetMacroValue { index, value }) {
+                return false;
+            }
+            engine.automation_control.publish_macro_value(index, value);
+            engine.project_poly_macro_locked(state, index, value);
+            true
+        })
+        .unwrap_or(false)
 }
 
 /// A macro's live position (animates while a motion runs), or NaN when invalid.
@@ -13509,7 +13603,7 @@ pub unsafe extern "C" fn gooey_engine_motion_get_quantize(
 }
 
 /// Start (or restart) a configured motion at the next render buffer. Any
-/// other motion driving the same macro stops. Returns false when the slot is
+/// other motion or LFO driving the same macro stops. Returns false when the slot is
 /// unconfigured or the command queue is full.
 ///
 /// # Safety
@@ -13522,29 +13616,31 @@ pub unsafe extern "C" fn gooey_engine_motion_trigger(
     let (Some(engine), Some(slot)) = (engine.as_ref(), motion_slot(slot)) else {
         return false;
     };
-    let started = engine.automation_control.edit(|state| {
-        let definition = state.motions[slot]?;
-        state
-            .push(AutomationCommand::StartMotion { slot, definition })
-            .then_some(definition)
-    });
-    let Some(Some(definition)) = started else {
-        return false;
-    };
-    // Project where the macro will come to rest so poly getters and later
-    // preset edits agree with the motion's outcome.
-    let resting = match definition.end_mode {
-        MotionEndMode::Hold => Some(definition.target),
-        MotionEndMode::Return | MotionEndMode::SnapBack => definition.start.or_else(|| {
-            engine
-                .automation_control
-                .macro_value(definition.macro_index)
-        }),
-    };
-    if let Some(resting) = resting {
-        engine.project_poly_macro(definition.macro_index, resting);
-    }
-    true
+    engine
+        .automation_control
+        .edit(|state| {
+            let Some(definition) = state.motions[slot] else {
+                return false;
+            };
+            if !state.push(AutomationCommand::StartMotion { slot, definition }) {
+                return false;
+            }
+            // Project where the macro will come to rest so poly getters and
+            // later preset edits agree with the motion's outcome.
+            let resting = match definition.end_mode {
+                MotionEndMode::Hold => Some(definition.target),
+                MotionEndMode::Return | MotionEndMode::SnapBack => definition.start.or_else(|| {
+                    engine
+                        .automation_control
+                        .macro_value(definition.macro_index)
+                }),
+            };
+            if let Some(resting) = resting {
+                engine.project_poly_macro_locked(state, definition.macro_index, resting);
+            }
+            true
+        })
+        .unwrap_or(false)
 }
 
 /// Stop a motion where it is. The macro keeps its current value.
@@ -13628,6 +13724,250 @@ pub unsafe extern "C" fn gooey_engine_motion_get_progress(
         .unwrap_or(f32::NAN)
 }
 
+// -----------------------------------------------------------------------------
+// Macro LFOs
+// -----------------------------------------------------------------------------
+
+/// Cycle length for a macro LFO rate: LFO_TIMING_FOUR_BARS through
+/// LFO_TIMING_SIXTEENTH (LFO_TIMING_THIRTY_SECOND is not accepted).
+fn macro_lfo_division(rate: u32) -> Option<MusicalDivision> {
+    MusicalDivision::from_timing_constant(rate)
+        .filter(|division| *division != MusicalDivision::ThirtySecond)
+}
+
+/// Set a macro LFO's shape (MACRO_LFO_SHAPE_*). Default: sine. A running LFO
+/// switches shape at the next buffer without losing its phase.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_lfo_set_shape(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+    shape: u32,
+) -> bool {
+    let (Some(engine), Some(shape)) = (engine.as_ref(), MacroLfoShape::from_u32(shape)) else {
+        return false;
+    };
+    engine.edit_macro_lfo(macro_index, |settings| settings.shape = shape)
+}
+
+/// A macro LFO's shape, or AUTOMATION_INVALID for an invalid macro.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_lfo_get_shape(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.macro_lfo_settings(macro_index))
+        .map_or(AUTOMATION_INVALID, |settings| settings.shape.as_u32())
+}
+
+/// Set a macro LFO's cycle length as an LFO_TIMING_* constant from
+/// LFO_TIMING_SIXTEENTH (1/16 note) to LFO_TIMING_FOUR_BARS. Default: one
+/// bar. Cycles follow the engine BPM; a running LFO changes speed at the next
+/// buffer without losing its phase.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_lfo_set_rate(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+    rate: u32,
+) -> bool {
+    let (Some(engine), Some(division)) = (engine.as_ref(), macro_lfo_division(rate)) else {
+        return false;
+    };
+    engine.edit_macro_lfo(macro_index, |settings| settings.division = division)
+}
+
+/// A macro LFO's rate (LFO_TIMING_*), or AUTOMATION_INVALID for an invalid
+/// macro.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_lfo_get_rate(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .and_then(|engine| engine.macro_lfo_settings(macro_index))
+        .map_or(AUTOMATION_INVALID, |settings| {
+            settings.division.timing_constant()
+        })
+}
+
+/// Start (or restart) a macro's LFO from phase 0 at the next render buffer.
+/// The macro jumps to 0 and then cycles through its mappings continuously,
+/// whether or not the transport runs. Any motion driving the macro stops.
+/// Returns false for an invalid macro or a full command queue.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_lfo_start(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+) -> bool {
+    let (Some(engine), Some(index)) = (engine.as_ref(), macro_slot(macro_index)) else {
+        return false;
+    };
+    engine
+        .automation_control
+        .edit(|state| {
+            let settings = state.lfos[index];
+            if !state.push(AutomationCommand::StartLfo { index, settings }) {
+                return false;
+            }
+            let start = settings.shape.eval(0.0);
+            engine.automation_control.publish_macro_value(index, start);
+            engine.automation_control.publish_lfo(index, 0.0, start);
+            engine.project_poly_macro_locked(state, index, start);
+            true
+        })
+        .unwrap_or(false)
+}
+
+/// Stop a macro's LFO. The macro holds the value last reported by
+/// `gooey_engine_macro_get_value`. Stopping an LFO that is not running
+/// succeeds and changes nothing.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_lfo_stop(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+) -> bool {
+    let (Some(engine), Some(index)) = (engine.as_ref(), macro_slot(macro_index)) else {
+        return false;
+    };
+    engine
+        .automation_control
+        .edit(|state| engine.stop_macro_lfo_locked(state, index))
+        .unwrap_or(false)
+}
+
+/// Stop every macro LFO; each macro holds its last reported value. Stops
+/// nothing and returns false when the command queue cannot take them all.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_lfo_stop_all(engine: *const GooeyEngine) -> bool {
+    let Some(engine) = engine.as_ref() else {
+        return false;
+    };
+    engine
+        .automation_control
+        .edit(|state| {
+            let running = (0..crate::automation::MACRO_COUNT)
+                .filter(|&index| state.lfo_running(index))
+                .count();
+            if !state.has_room(running) {
+                return false;
+            }
+            (0..crate::automation::MACRO_COUNT)
+                .all(|index| engine.stop_macro_lfo_locked(state, index))
+        })
+        .unwrap_or(false)
+}
+
+/// Restart a running macro LFO's cycle at phase 0 (the macro jumps to 0)
+/// without changing its settings. Does nothing when the LFO is stopped.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_lfo_reset_phase(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+) -> bool {
+    let (Some(engine), Some(index)) = (engine.as_ref(), macro_slot(macro_index)) else {
+        return false;
+    };
+    engine
+        .automation_control
+        .edit(|state| {
+            if !state.lfo_running(index) {
+                return true;
+            }
+            if !state.push(AutomationCommand::ResetLfoPhase { index }) {
+                return false;
+            }
+            let start = state.lfos[index].shape.eval(0.0);
+            engine.automation_control.publish_macro_value(index, start);
+            engine.automation_control.publish_lfo(index, 0.0, start);
+            true
+        })
+        .unwrap_or(false)
+}
+
+/// A macro LFO's state (MACRO_LFO_STATE_*), or AUTOMATION_INVALID for an
+/// invalid macro. Reflects start/stop calls, motion triggers, and manual
+/// macro values immediately.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_lfo_get_state(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+) -> u32 {
+    engine
+        .as_ref()
+        .zip(macro_slot(macro_index))
+        .and_then(|(engine, index)| engine.automation_control.read(|s| s.lfo_running(index)))
+        .map_or(AUTOMATION_INVALID, |running| {
+            if running {
+                MACRO_LFO_STATE_RUNNING
+            } else {
+                MACRO_LFO_STATE_STOPPED
+            }
+        })
+}
+
+/// A macro LFO's output (0-1) as of the last rendered buffer; after a stop,
+/// the held value. NaN for an invalid macro.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_lfo_get_value(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .zip(macro_slot(macro_index))
+        .and_then(|(engine, index)| engine.automation_control.lfo_value(index))
+        .unwrap_or(f32::NAN)
+}
+
+/// A macro LFO's cycle phase (0-1) as of the last rendered buffer, or NaN for
+/// an invalid macro.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_macro_lfo_get_phase(
+    engine: *const GooeyEngine,
+    macro_index: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .zip(macro_slot(macro_index))
+        .and_then(|(engine, index)| engine.automation_control.lfo_phase(index))
+        .unwrap_or(f32::NAN)
+}
+
 #[cfg(test)]
 mod automation_tests {
     use super::*;
@@ -13702,6 +14042,67 @@ mod automation_tests {
         }
         render(&mut engine, 0.01);
         assert!((live_cutoff(&engine) - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn poly_lfo_reasserts_over_preset_edits_and_holds_after_stop() {
+        let mut engine = GooeyEngine::new(48_000.0);
+        let engine_ptr: *mut GooeyEngine = &mut engine;
+        unsafe {
+            assert!(gooey_engine_macro_add_mapping(
+                engine_ptr,
+                0,
+                PARAM_TARGET_POLY,
+                0,
+                POLY_PARAM_FILTER_CUTOFF,
+                0.9,
+                0.1,
+            ));
+            assert!(gooey_engine_macro_lfo_set_shape(
+                engine_ptr,
+                0,
+                MACRO_LFO_SHAPE_TRIANGLE
+            ));
+            assert!(gooey_engine_macro_lfo_set_rate(
+                engine_ptr,
+                0,
+                LFO_TIMING_HALF
+            ));
+            assert!(gooey_engine_macro_lfo_start(engine_ptr, 0));
+        }
+        render(&mut engine, 0.3);
+        let mapped =
+            |engine: &GooeyEngine| 0.9 - 0.8 * engine.automation_control.macro_value(0).unwrap();
+        assert!((live_cutoff(&engine) - mapped(&engine)).abs() < 1e-6);
+
+        // An unrelated preset edit re-applies the projected config (the LFO's
+        // start value); the running LFO reasserts its parameter.
+        unsafe {
+            assert!(gooey_engine_poly_set_param(
+                engine_ptr,
+                POLY_PARAM_VOLUME,
+                0.3
+            ));
+        }
+        render(&mut engine, 0.05);
+        assert!((live_cutoff(&engine) - mapped(&engine)).abs() < 1e-6);
+        assert!(live_cutoff(&engine) < 0.8, "not snapped back to `from`");
+
+        // After a stop, the projection matches the held value exactly, so a
+        // later preset edit leaves the live parameter where it is.
+        unsafe { assert!(gooey_engine_macro_lfo_stop(engine_ptr, 0)) };
+        render(&mut engine, 0.01);
+        let held = live_cutoff(&engine);
+        assert!((held - mapped(&engine)).abs() < 1e-6);
+        unsafe {
+            assert!(gooey_engine_poly_set_param(
+                engine_ptr,
+                POLY_PARAM_VOLUME,
+                0.4
+            ));
+        }
+        render(&mut engine, 0.05);
+        assert_eq!(live_cutoff(&engine), held);
     }
 
     #[test]
