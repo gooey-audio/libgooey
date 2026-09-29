@@ -36,6 +36,10 @@ Approximate recording stages:
 
 ![Successful final mixdown after recording](assets/loop-studio/mixdown.png)
 
+### Imported audio and instrument audition without an output device
+
+![Imported WAV and held Pluck chord in explicitly silent engine mode](assets/loop-studio/import-audition.png)
+
 The saved song has six nonoverlapping chord gates, two live hits, and three
 automation lanes: bass gain (53 points), chord filter (50 points), and master
 gain (18 points). Repeating the interaction naturally changes recorded tick
@@ -58,8 +62,27 @@ completes successfully with existing library warnings, but no diagnostics in
 the new studio module, examples, or tests. Repository-wide `-D warnings` is not
 clean; unrelated DSP/API warnings were not suppressed or rewritten.
 
-Extended final-build render and live-soak verification are being completed;
-their measured results will be added before submission.
+The native GUI additionally completed a **600-second live playback soak**,
+captured with its actual virtual-device audio. FFmpeg analysis found zero
+NaN/Inf samples, peak −7.54 dBFS, RMS −17.74 dBFS, and no silence interval longer
+than 100 ms below −60 dBFS. Both native and silent GUI processes closed cleanly
+through the window manager. Silent-mode interaction separately exercised
+transport, hit/gain recording, an imported 10.28-second WAV, and a Pluck-preset
+chord audition; its header explicitly reports that it produces no device sound.
+
+The **final-build 100,000-block offline stress run passed**: 51,200,000 stereo
+frames (1066.67 seconds / 17.78 minutes of audio) rendered in 441.70 seconds
+while gains/mutes changed every block. Every sample was checked finite. Its
+subsequent 32-bar mixdown also passed independent WAV inspection: 3,273,931
+stereo frames at 48 kHz, peak 0.4624, RMS 0.1527, with two seconds of tails.
+This timing was measured under concurrent verification load, not presented as
+a universal performance guarantee. A 10,000-block final-build benchmark under
+concurrent GUI/DSP load took 81.38 seconds.
+
+An oversized 3,000,000-block attempt was deliberately stopped after that
+benchmark and replaced by the bounded final run. An earlier 300,000-block run
+from before the robustness fixes was superseded and stopped during cleanup.
+Neither cancelled preliminary run is counted as passing final-build evidence.
 
 ## Reproduction
 
@@ -91,6 +114,12 @@ saved data are also inspected independently; this is not a comprehensive
 cross-platform GUI-test framework. The video and selected screenshots are
 committed here; large generated WAV/JSON and extended recordings stay under
 `/tmp/opencode/` rather than adding megabytes of duplicate audio/sample data.
+
+The extended run's output/log are `/tmp/opencode/studio-final-stress-32bars.wav`
+and `/tmp/opencode/studio-final-extended-render.log`. The complete 10-minute
+screen/audio soak is `/tmp/opencode/studio-live-soak-10minutes.mp4`, with analysis
+in `/tmp/opencode/studio-live-soak-audio-stats.log`. These are server-local
+artifacts; the smaller complete interaction video is the committed evidence.
 
 ## Problems caught by independent review
 

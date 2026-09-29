@@ -1,6 +1,7 @@
 # Loop Studio
 
 [Actual screenshots, screen/audio recording, and independent verification](loop-studio-verification.md).
+[Engine API findings and proposed production extensions](loop-studio-api-findings.md).
 
 Loop Studio is a working, deliberately bounded DAW-style proof of concept. It
 uses the existing libgooey drum/bass sequencers, Nebula/poly synth, performance
