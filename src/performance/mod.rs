@@ -4,6 +4,7 @@
 //! looping clip locked to the engine transport (same beat clock as drum sequencers).
 
 pub(crate) mod control;
+pub(crate) mod note_clip;
 
 use std::sync::Arc;
 
@@ -929,7 +930,7 @@ impl PerformanceRecorder {
     }
 }
 
-fn absolute_beat_tick(beat_position: f64) -> u64 {
+pub(crate) fn absolute_beat_tick(beat_position: f64) -> u64 {
     if !beat_position.is_finite() || beat_position <= 0.0 {
         return 0;
     }

@@ -50,6 +50,9 @@ use crate::music::{
     apply_voicing, available_voicings, Chord, ChordSet, Key, NoteName, ScaleType, VoicingType,
 };
 use crate::performance::control::{ChordControl, ChordControlScratch};
+use crate::performance::note_clip::{
+    NoteClipControl, NoteClipEvent, NoteClipPlayer, NOTE_CLIP_MAX_EVENTS,
+};
 use crate::performance::{
     prepare_chord_event, ChordCommandAction, ChordGate, ChordLoopSnapshot, PerformanceRecorder,
     PlayerAction, PreparedChordEvent, RecordMode, CHORD_TARGET_PIANO, CHORD_TARGET_POLY,
@@ -1172,6 +1175,10 @@ pub struct GooeyEngine {
     chord_control: ChordControl,
     chord_control_scratch: ChordControlScratch,
     chord_retired: Vec<std::sync::Arc<ChordLoopSnapshot>>,
+    /// Looping note clip for the bass voice, replayed from the same transport
+    /// as the chord loop.
+    bass_clip_control: NoteClipControl,
+    bass_clip_player: NoteClipPlayer,
     controlled_chord: Option<ControlledChord>,
     /// A live pad strike is waiting for its recorded clip event to take over.
     pending_live_chord_handoff: bool,
@@ -1482,6 +1489,8 @@ impl GooeyEngine {
             chord_control,
             chord_control_scratch: ChordControlScratch::default(),
             chord_retired: Vec::with_capacity(32),
+            bass_clip_control: NoteClipControl::new(),
+            bass_clip_player: NoteClipPlayer::new(),
             controlled_chord: None,
             pending_live_chord_handoff: false,
             samplers: std::array::from_fn(|_| None),
@@ -1703,6 +1712,23 @@ impl GooeyEngine {
 
     /// Push a MIDI event without growing the buffer. Drops the event if at capacity.
     #[inline]
+    /// Retune the bass voice to a clip note and strike it on this sample.
+    fn trigger_bass_clip_note(&mut self, event: NoteClipEvent, sample_offset: u32) {
+        let time = self.current_time;
+        let Some(voice) = self.voice_mut(INSTRUMENT_BASS as usize) else {
+            return;
+        };
+        if let Some((freq_min, freq_max)) =
+            Self::freq_range_for_instrument(voice.instrument.instrument_type())
+        {
+            let normalized = Self::midi_note_to_normalized_freq(event.note, freq_min, freq_max);
+            voice.instrument.set_param(0, normalized);
+            voice.instrument.snap_params();
+        }
+        voice.instrument.trigger_with_velocity(time, event.velocity);
+        self.push_midi_event(INSTRUMENT_BASS, event.velocity, sample_offset);
+    }
+
     fn push_midi_event(&mut self, instrument_index: u32, velocity: f32, sample_offset: u32) {
         if self.pending_midi_events.len() < MIDI_EVENT_CAPACITY {
             self.pending_midi_events.push(GooeyMidiEvent {
@@ -1768,6 +1794,7 @@ impl GooeyEngine {
         self.apply_sampler_control_commands();
         self.apply_piano_control_commands();
         let immediate_chord_install = self.apply_chord_control_commands();
+        self.bass_clip_control.apply_to(&mut self.bass_clip_player);
         self.apply_automation_commands();
 
         // Number of stereo frames this buffer holds (two slots per frame).
@@ -1977,6 +2004,13 @@ impl GooeyEngine {
                     }
                 }
                 self.performance.clear_pending_sampler_hits();
+            }
+
+            if let Some(event) =
+                self.bass_clip_player
+                    .tick(transport_beat, transport_running, transport_generation)
+            {
+                self.trigger_bass_clip_note(event, sample_offset);
             }
 
             // Macros and motions run at control rate, before the LFOs so an
@@ -7383,6 +7417,8 @@ pub const GOOEY_CHORD_GATE_STRUCK: u32 = 1;
 pub const GOOEY_CHORD_LOOP_TICKS_PER_QUARTER: u32 = 96;
 /// Maximum events accepted in one immutable chord-loop snapshot.
 pub const GOOEY_CHORD_LOOP_MAX_EVENTS: u32 = 512;
+/// Maximum notes accepted in one bass-loop snapshot.
+pub const GOOEY_BASS_LOOP_MAX_EVENTS: u32 = NOTE_CLIP_MAX_EVENTS as u32;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -7407,6 +7443,21 @@ pub struct GooeyChordLoopEvent {
     pub start_tick: u32,
     pub duration_ticks: u32,
     pub chord: GooeyChordEvent,
+}
+
+/// One note of a bass-loop clip, on the chord-loop tick grid
+/// (`GOOEY_CHORD_LOOP_TICKS_PER_QUARTER`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GooeyBassLoopEvent {
+    pub start_tick: u32,
+    /// Used for validation: notes may not overlap on the looping timeline. The
+    /// bass voice is a one-shot decay voice, so the next note retriggers it.
+    pub duration_ticks: u32,
+    /// MIDI note number. The bass voice covers roughly 23 (B0) to 55 (G3).
+    pub midi_note: u8,
+    /// Strike velocity, clamped to 0..1.
+    pub velocity: f32,
 }
 
 #[repr(C)]
@@ -7876,6 +7927,70 @@ pub unsafe extern "C" fn gooey_engine_chord_loop_get_applied_generation(
     engine
         .as_ref()
         .map_or(0, |engine| engine.chord_control.applied_generation())
+}
+
+/// Validate, copy, and stage a complete bass-loop clip. The clip replays on the
+/// bass voice from the shared transport (the same clock as the chord loop), so
+/// equal `length_ticks` keep the two phase-locked. The newest accepted clip
+/// installs at the next render boundary without resetting transport phase.
+/// Returns the staged generation, or 0 when the clip is rejected (zero length,
+/// a note starting outside the clip, a zero duration, or overlapping notes).
+///
+/// # Safety
+/// `engine` must be null or a valid live engine pointer. When `event_count` is
+/// nonzero, `events` must reference that many readable events for this call.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_bass_loop_replace(
+    engine: *const GooeyEngine,
+    events: *const GooeyBassLoopEvent,
+    event_count: u32,
+    length_ticks: u32,
+) -> u64 {
+    let Some(engine) = engine.as_ref() else {
+        return 0;
+    };
+    if event_count > GOOEY_BASS_LOOP_MAX_EVENTS || (event_count > 0 && events.is_null()) {
+        return 0;
+    }
+    let source = if event_count == 0 {
+        &[][..]
+    } else {
+        slice::from_raw_parts(events, event_count as usize)
+    };
+    let notes = source
+        .iter()
+        .map(|event| NoteClipEvent {
+            start_tick: event.start_tick,
+            duration_ticks: event.duration_ticks,
+            note: event.midi_note,
+            velocity: event.velocity,
+        })
+        .collect();
+    engine.bass_clip_control.replace(notes, length_ticks)
+}
+
+/// Remove the bass-loop clip at the next render boundary.
+///
+/// # Safety
+/// `engine` must be null or a valid live engine pointer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_bass_loop_clear(engine: *const GooeyEngine) -> u64 {
+    engine
+        .as_ref()
+        .map_or(0, |engine| engine.bass_clip_control.clear())
+}
+
+/// Return the bass-loop generation most recently installed by the render thread.
+///
+/// # Safety
+/// `engine` must be null or a valid live engine pointer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_bass_loop_get_applied_generation(
+    engine: *const GooeyEngine,
+) -> u64 {
+    engine
+        .as_ref()
+        .map_or(0, |engine| engine.bass_clip_control.applied_generation())
 }
 
 /// Set the strike strength used by future piano chord-loop triggers. This does
