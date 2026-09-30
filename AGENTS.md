@@ -42,9 +42,10 @@ src/
 │   ├── waveshaper.rs
 │   └── limiter.rs       # Brick-wall limiter
 │
-├── automation/          # Macros (one 0-1 control → many params) + motions (one-shot macro automation)
+├── automation/          # Macros (one 0-1 control → many params) + motions (one-shot macro automation) + macro LFOs
 │   ├── macros.rs        # ParamTarget, MacroMapping/Definition, render-owned MacroBank
 │   ├── motion.rs        # MotionDefinition, curves/end modes/quantize, MotionRunner pool
+│   ├── lfo.rs           # Per-macro tempo-synced LFO (sine/tri/saw/square), MacroLfoRunner
 │   └── control.rs       # Host→render command queue + published values (C ABI in ffi.rs)
 │
 ├── utils/

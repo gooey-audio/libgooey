@@ -57,6 +57,20 @@ impl MusicalDivision {
             _ => None,
         }
     }
+
+    /// Inverse of [`MusicalDivision::from_timing_constant`].
+    pub fn timing_constant(&self) -> u32 {
+        match self {
+            MusicalDivision::FourBars => 0,
+            MusicalDivision::TwoBars => 1,
+            MusicalDivision::OneBar => 2,
+            MusicalDivision::Half => 3,
+            MusicalDivision::Quarter => 4,
+            MusicalDivision::Eighth => 5,
+            MusicalDivision::Sixteenth => 6,
+            MusicalDivision::ThirtySecond => 7,
+        }
+    }
 }
 
 /// LFO sync mode
