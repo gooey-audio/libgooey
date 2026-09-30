@@ -1,5 +1,7 @@
 # Loop Studio
 
+[Current central-app capture and independent integration verification](omni-studio-verification.md).
+
 [Historical standalone screenshots, screen/audio recording, and independent verification](loop-studio-verification.md).
 [Engine API findings and proposed production extensions](loop-studio-api-findings.md).
 

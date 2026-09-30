@@ -33,10 +33,23 @@ same audio backend, scope, diagnostics and controls everywhere.
   shared allocation probe and five new panel/lifecycle/recording/export tests.
   Studio-free GUI headless suites pass in both configurations (16 tests each).
   Dynamic 10s/panel/rate stress (80s audio) and 10s shared-worker soak pass.
-- [ ] Parent independently verify prerequisite and capture combined graphical
-  interactions/device output; publication and extended captures remain parent-owned.
-- [ ] Capture central-app interactions, run extended verification, publish
-  prerequisite and update #267 base/dependency and descriptions. Do not merge.
+- [x] (2026-09-30) Parent independently verifies prerequisite native/no-native
+  886-test suites, 3600-second synthesized dynamic stress, 180-second real worker
+  soak and actual cross-panel native GUI/audio capture with single-stream checks.
+- [x] (2026-09-30) Parent independently verifies stacked native/no-native
+  947-test suites and 120-second/18216-block worker/control soak; captures actual
+  shared Studio recording/switch/save/export/reload and verifies GUI/headless
+  mixdowns byte-identical. New evidence in `docs/omni-studio-verification.md`.
+- [x] (2026-09-30) Include latest prerequisite evidence commits by rebase onto
+  458abbc; push stacked migration with explicit force-with-lease and update #267
+  base to `omni-gui-test-app` and its description through GitHub REST. No merge.
+- [x] (2026-09-30) Independently repeat four-panel dynamic stress: all eight
+  300-second panel/rate cases pass (2400 synthesized seconds). Clippy has no new
+  GUI/studio diagnostics; formatting/whitespace/Python syntax pass. Prepare final
+  central Studio artifacts and measured docs for publication.
+- [ ] Confirm prerequisite PR submission: browser form is prepared but there is
+  no connected browser automation. Code, captures and integration are complete;
+  #267 already bases on the published prerequisite branch. No main merge.
 
 ## Surprises & Discoveries
 
@@ -69,16 +82,24 @@ not acquire GUI/audio-device dependencies. Date/author: 2026-09-29, parent agent
 
 ## Outcomes & Retrospective
 
-Loop Studio is rebased on prerequisite a006112 and now implemented in
+Loop Studio is rebased on prerequisite 458abbc and now implemented in
 `src/gui/studio.rs` behind `studio-gui = [studio, gui]`. Its old example is a
 three-line central-shell launcher. No base-worktree source was edited. Existing
 musical controls, file workflows and artifacts were retained; historical
 standalone captures are labeled as such. Renderer mount preserves the Studio
 constructed at the chosen host rate. Deactivation releases/finalizes/stops only
 after host shutdown, and inactive UI cannot retrigger it. Prepared replacements
-are constructed/reclaimed off callback, including rewind/demo/new. Publication
-and captures remain the parent agent's responsibility; no commits/pushes/merges
-have been made for the migration edits.
+are constructed/reclaimed off callback, including rewind/demo/new. Parent has
+committed/pushed migration source and updated #267's base to the prerequisite.
+Fresh native GUI/audio evidence verifies the complete recorded-song workflow
+and switching during active recording/held input. Saved GUI/headless exports
+match exactly. Both stacked release suites pass 947 tests. Shared diagnostics
+expose real contention (680 lock misses and 41 over-budget blocks by the captured
+mixdown), so no glitch-free/real-time promise is made. Final dynamic stress also
+passes all eight cases (2400 synthesized seconds). New selected screenshots
+and the actual 69-second central GUI/audio recording accompany measured docs.
+Prerequisite PR browser submission is the remaining publishing blocker, not
+an implementation or verification gap. No main-branch merge has occurred.
 
 ## Context and Orientation
 
@@ -197,7 +218,7 @@ captures or claims of physical-speaker audition. Native example binaries link;
 no-native central and compatibility examples also ran the stress/soak commands.
 
 Rebased preserved commits: b63fd13 → 68812f8, 4859150 → 6db044a,
-9520695 → a256b5a, all on prerequisite a006112. Migration edits are uncommitted
+9520695 → a256b5a, all on prerequisite a006112. Migration edits were uncommitted
 as requested; `src/gui/studio.rs` is a new file to include in the parent commit.
 Cargo regenerated the lockfile after removal of standalone eframe feature
 wiring, pruning unused WGPU/legacy dependencies rather than updating DSP APIs.
