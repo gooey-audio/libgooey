@@ -1,5 +1,7 @@
 # Gooey Omni Lab
 
+[Actual GUI/audio captures and independent verification](omni-gui-verification.md).
+
 Open **one application**, with a single audio owner and common stereo waveform,
 spectrum, peak/RMS meters and health counters:
 
