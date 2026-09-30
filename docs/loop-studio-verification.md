@@ -1,5 +1,11 @@
 # Independent Loop Studio verification
 
+> **Historical standalone evidence:** the images and recordings below were
+> captured before migration to Gooey Omni Lab. They verify the original musical
+> workflows and engine output, not the current central-shell layout or shared
+> host lifecycle. Keep them as historical artifacts; new central-app captures
+> are owned by parent review. Current entrypoints are in [usage](loop-studio.md).
+
 ## Actual GUI interaction recording
 
 [Watch the 70-second screen recording with live engine audio](assets/loop-studio/interactions.mp4).

@@ -55,6 +55,30 @@ This fixes overlaps exposed by real GUI overdubbing, not merely file validation.
 
 ## Production APIs made necessary by the POC
 
+### Implemented central GUI extension (not a second host)
+
+With `studio-gui`, `src/gui/studio.rs::StudioPanel` mounts through public
+`gooey::gui::{GuiPanel, PanelFactory, BlockRenderer, InterleavedAdapter}`. The
+factory constructs the safe Studio at the shared host's actual sample rate;
+renderer mounts only adapt its existing interleaved stereo API. The shell alone
+owns eframe/CPAL/silent rendering and common diagnostics. Studio uses shared
+engineering-unit sliders and observable control-lock recovery; its callback
+uses `try_lock` and counts silenced lock misses/render errors in `AudioHealth`.
+
+`deactivate`, invoked after the host stops, releases held chords, finalizes
+recording, stops transport and clears held UI state. Remount retains the song,
+including finalized automation/performance; it never rebuilds Studio implicitly.
+Load/import/demo/new/rewind prepare replacement engines on file/control workers,
+then swap on the GUI thread and reclaim the old engine outside the lock.
+Save/export snapshot on the GUI thread and perform file I/O/fresh-engine export
+off-thread. This remains a bounded POC, not a render/control endpoint split.
+
+The central command is `cargo run --release --features studio-gui --example
+omni_gui -- --panel "Loop Studio" --demo`; the `loop_studio` example simply
+selects that panel in the same app. `--load SESSION`, `--silent`, `--list`,
+`--stress SECONDS` and `--soak SECONDS` are shared entrypoint options. Historical
+standalone captures are explicitly marked in the evidence document.
+
 ### One authoritative transport with pause/seek semantics
 
 The legacy sequencer's Start schedules an immediate trigger; the original

@@ -1,6 +1,6 @@
 # Loop Studio
 
-[Actual screenshots, screen/audio recording, and independent verification](loop-studio-verification.md).
+[Historical standalone screenshots, screen/audio recording, and independent verification](loop-studio-verification.md).
 [Engine API findings and proposed production extensions](loop-studio-api-findings.md).
 
 Loop Studio is a working, deliberately bounded DAW-style proof of concept. It
@@ -14,14 +14,20 @@ PCM shaker audio, not a downloaded sample.
 From the repository root:
 
 ```bash
+cargo run --release --features studio-gui --example omni_gui -- --panel "Loop Studio" --demo
+# Compatibility alias, same application and audio host:
 cargo run --release --features studio-gui --example loop_studio -- --demo
 ```
 
 Use **release** mode for live audio. The default native feature uses CPAL's
-default audio device. If device discovery/configuration fails, the GUI reports
-the error and starts its silent render clock instead. Supported device formats
-are f32, i16 and u16; unsupported formats also fall back. Runtime device errors
-are reported to stderr; restart with `--silent` if a device disappears.
+default audio device. If device discovery/configuration fails, the shared shell
+reports the error and falls back to its silent renderer. All CPAL f32/f64 and
+signed/unsigned 8/16/32/64-bit formats are supported. Runtime device errors are
+counted in the shared health view; restart with `--silent` if a device disappears.
+`--load session.json` initializes a stopped saved song (takes precedence over
+`--demo`). `--panel`, `--list`, `--stress SECONDS`, and `--soak SECONDS` use the
+same central entrypoint as the other labs. `studio-gui` enables `studio` + `gui`;
+the `studio` feature alone remains device/window independent.
 
 For Linux without an audio device, including virtual X:
 
@@ -38,8 +44,13 @@ run real engine rendering: silent mode discards samples, but transport, meters,
 recording, automation and export still work. It does not produce device sound.
 Neither studio feature enables the repository's GLFW visualization feature.
 
-The initial window is 1380×940. Content scrolls vertically on smaller displays;
-transport and file controls remain pinned at the top and bottom.
+The shared initial window is 1440×1000 (minimum 900×700). Studio content scrolls
+vertically; transport and file controls remain pinned alongside central panel
+navigation and stereo scope/spectrum/health. Switching labs, Stop audio, and
+window close stop the host first, then release held chords, finalize recording,
+and stop studio transport. Returning retains the song and DSP, but starts with
+transport stopped and no held input. While host audio is stopped the studio
+editor is suspended; Resume audio restores it without rebuilding the song.
 
 ## Make, play and record a song
 
@@ -87,7 +98,9 @@ transport and file controls remain pinned at the top and bottom.
    is not a pause-safe resume API; this studio deliberately uses consistent
    restart semantics rather than letting drum/chord/loop and automation phases
    diverge. **Rewind** rebuilds from the saved musical state at beat
-   zero and preserves play/stop, but disarms recording and clears DSP tails.
+    zero on a preparation worker and preserves play/stop, but disarms recording
+    and clears DSP tails. If audio is stopped while preparation runs, the result
+    remains stopped when installed.
 
 The grid, chord performance, hit performance and automation are repeating
 one-bar clips (384 ticks at 96 ticks per quarter note). A tick is a musical
@@ -214,9 +227,17 @@ capture. The underlying library supports richer racks/clip grids; this interface
 does not pretend to expose all of them. “Recording” here means capturing musical
 gestures and parameters, not recording a microphone.
 
-The desktop audio callback reuses fixed scratch buffers, but shares a mutex with
-the GUI. Most file work and mixdown happen off that mutex; drawing, session
-snapshot copying and engine swaps can still delay a callback. Synth-tone preset
+`src/gui/studio.rs` implements the public `GuiPanel` extension contract using
+`InterleavedAdapter` and `BlockRenderer`; `examples/loop_studio.rs` is only a
+selected-panel launcher. The sole stream/silent-worker owner is `GuiAudio` in
+`src/gui/audio.rs`. The factory creates Studio at the host's negotiated rate;
+mounting a renderer does not recreate it or discard saved song state.
+
+The desktop audio callback reuses fixed scratch buffers and uses `try_lock`:
+GUI contention silences that block and increments shared lock-miss health,
+rather than waiting. File preparation, save/export, session copying, engine
+construction and replacement reclamation occur off the callback. Drawing,
+snapshot copying and engine swaps can still cause silenced blocks. Synth-tone preset
 updates also use the existing engine control path. This POC is not a guaranteed
 allocation-free, lock-free hard-real-time host. Future production work should
 move studio commands/snapshots to dedicated render/control endpoints and retain

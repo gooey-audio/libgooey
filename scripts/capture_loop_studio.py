@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Exercise the real X11 studio GUI and capture its actual output.
+"""Historical standalone Loop Studio capture recipe (pre-Omni-Lab layout).
+
+Retained to explain the original evidence. Its coordinates/window selectors do
+not target the current central shell; parent review owns new central captures.
 
 Run the native release GUI with --demo on a 1440x1000 X display first.
 Requires xdotool, ImageMagick, ffmpeg and an audio monitor (see --help).

@@ -17,19 +17,21 @@
 
 ### Loop Studio desktop and headless mixdown
 
-The optional [Loop Studio](docs/loop-studio.md) is a working four-track Rust GUI:
+The optional [Loop Studio](docs/loop-studio.md) panel in the same Omni Lab is a working four-track editor:
 drums, bass, Nebula/poly-synth chords, and an audio loop, with mixing, effects,
 performance/automation recording, JSON save/load, and stereo WAV export.
 
 ```bash
-cargo run --release --features studio-gui --example loop_studio -- --demo
+cargo run --release --features studio-gui --example omni_gui -- --panel "Loop Studio" --demo
+# The loop_studio example is a thin compatibility alias for that panel.
 # No audio device required (also works under virtual X):
 cargo run --release --no-default-features --features studio-gui --example loop_studio -- --silent --demo
 # No window or audio device required:
 cargo run --release --no-default-features --features studio --example studio_render -- --export mix.wav --bars 4
 ```
 
-`studio-gui` enables X11/Wayland and does **not** enable GLFW visualization.
+`studio-gui` enables `studio` + the shared `gui` host (including X11/Wayland),
+not a separate application or GLFW visualization.
 The reusable `gooey::studio::{Session, Studio}` API is available with `studio`.
 
 ### Local Development
