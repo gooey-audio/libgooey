@@ -41,18 +41,25 @@ not imply that the POC is hard real-time or that underruns cannot occur.
 
 ## Verification commands
 
-The independent release library/integration suite passed **886 tests**:
+The independent release library/integration suites passed **886 tests each**
+with and without native audio:
 
 ```sh
 cargo test --release --no-default-features --features gui --lib --tests
+cargo test --release --features gui --lib --tests
 cargo build --release --features gui --example omni_gui
 ```
 
 The implementation pass additionally tested native and device-free suites,
 headless layouts, input state, panel deactivation, parameter/route descriptors,
-effect/instrument changes and bounded telemetry; it ran a 3600-second synthesized
-stress scenario and a 180-second real-time silent worker/control soak. Parent
-repeats the extended stress and soak independently before final submission.
+effect/instrument changes and bounded telemetry. The parent independently
+repeated the **3600-second synthesized dynamic stress**: 600 seconds for each
+of three panels at 44.1 and 48 kHz, 103359 and 112500 blocks per panel
+respectively. All six runs passed. The parent also repeated the **180-second
+wall-clock silent worker/control soak**, 180 panel auditions and 28014 blocks,
+with no nonfinite audio or renderer failures. Linux `ios` feature compatibility
+also passed independently. Final logs are server-local at
+`/tmp/opencode/omni-independent-{tests,native-tests,stress,soak}.log`.
 
 Capture reproduction (install Xvfb, Openbox, ffmpeg, xdotool, ImageMagick and
 PulseAudio CLI utilities; create the monitor sink on the existing audio server):

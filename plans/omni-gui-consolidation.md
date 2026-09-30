@@ -21,7 +21,9 @@ Users should open `cargo run --example omni_gui --features gui` and switch betwe
 - [x] (2026-09-29) Native GUI binaries, all compatible examples with gui/visualization/crossterm/bounce/midi, and no-default-feature ios builds pass. Format/diff checks pass. Normal Clippy passes with 99 pre-existing warnings, none in src/gui; strict -D warnings remains blocked by those unrelated baseline lints.
 - [x] (2026-09-29) Attempted optional retired GLFW and unrelated plots compatibility builds: blocked respectively by missing cmake and fontconfig.pc in this environment. Unified GUI requires neither; record these gaps rather than claim success.
 - [x] (2026-09-30) Re-ran final native/no-native 886-test suites and rebuilt all three GUI binaries after the final keyboard shortcut/focus guard; handoff is ready, with source and plan still uncommitted as requested.
-- [ ] Parent review, independent Xvfb/device captures, and authorized commit/push (intentionally outside this implementation handoff).
+- [x] (2026-09-30) Parent reviews and commits source; independently passes release native/no-native 886-test suites, all six dynamic 600-second stress cases, and 180-second worker/control soak (28014 blocks).
+- [x] (2026-09-30) Capture actual native GUI/audio interaction across all labs, held-key switches, 24 repeated active panel switches and host stop/resume. Assert one actual stream after every switch; publish selected screenshots/video and reproducible script.
+- [x] (2026-09-30) Commit/push standalone prerequisite branch `omni-gui-test-app`; open prefilled web PR creation with full description. Submission is not confirmed because browser automation is disconnected. Loop Studio integration is separately underway.
 
 ## Surprises & Discoveries
 
@@ -45,7 +47,7 @@ Decision: general effects are created/swapped on the GUI thread, with effect tai
 
 ## Outcomes & Retrospective
 
-The substantive prerequisite is ready for parent review. Native and no-native builds/tests pass; final dynamic stress covers 3600 synthesized seconds and the latest real-worker/control soak covers 180 wall-clock seconds, in addition to earlier static stress and a 120-second soak. The public factory/panel/render adapters are documented for mounting Studio later without creating another application or worker. No commits or pushes have been made. Parent owns independent graphical captures and later Studio migration; no Studio source is present here. Remaining POC constraints are non-hard-real-time legacy Engine internals, effect-tail resets on edits, general descriptor interfaces without getters, and an explicitly isolated legacy window compatibility exception. Optional retired GLFW/plots builds require missing environment dependencies; strict lint cleanliness cannot be claimed for the unchanged baseline.
+The standalone prerequisite is implemented, reviewed, committed and pushed. Parent independently repeated native/no-native 886-test suites, dynamic stress across 3600 synthesized seconds, and the 180-second worker/control soak, then recorded actual native GUI/audio operation and checked single-stream ownership during repeated panel switches. The public factory/panel/render adapters are documented for mounting Studio later without creating another application or worker. No Studio source is present in this prerequisite. The browser creation form is prepared but no PR number is yet confirmed. Remaining POC constraints are non-hard-real-time legacy Engine internals, effect-tail resets on edits, general descriptor interfaces without getters, and an explicitly isolated legacy window compatibility exception. Optional retired GLFW/plots builds require missing environment dependencies; strict lint cleanliness cannot be claimed for the unchanged baseline.
 
 ## Context and Orientation
 
@@ -80,3 +82,5 @@ Revision note: created on resume to make the pending implementation restartable;
 Revision note: recorded substantive implementation, compatibility decisions, clock discovery and actual test/stress evidence; final soak and compatibility checks remain explicit rather than presumed complete.
 
 Revision note: finalized the handoff with actual native/no-native counts, dynamic long-run and real-worker evidence, baseline lint limitations, stale HiHat compatibility fix, and precise missing-dependency gaps. No commit was made because parent review is required first.
+
+Revision note: parent completes independent review/testing and actual native GUI/audio captures, commits/pushes the prerequisite source/evidence, and repeats dynamic long-run/worker soaks. Distinguish prepared web PR form from confirmed submission. Later Studio integration stays on its existing branch and is not imported into the standalone prerequisite.
