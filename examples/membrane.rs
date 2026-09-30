@@ -189,6 +189,10 @@ fn render_display(membrane: &MembraneInstrument, trigger_count: u32) {
 
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
+    if cfg!(feature = "visualization") {
+        #[cfg(feature = "visualization")]
+        return gooey::gui::run_experiment("Membrane", "Dry", false, false);
+    }
     let sample_rate = 44100.0;
 
     // Create membrane instrument (noise + envelope + resonator)

@@ -252,6 +252,10 @@ fn render_display(state: &LabState, selected: usize) {
 
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
+    if cfg!(feature = "visualization") {
+        #[cfg(feature = "visualization")]
+        return gooey::gui::run_experiment("Snare", "Reverb", true, false);
+    }
     let sample_rate = 44100.0;
 
     let mut engine = Engine::new(sample_rate);

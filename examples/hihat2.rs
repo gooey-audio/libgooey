@@ -154,6 +154,10 @@ fn render_display(
 
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
+    if cfg!(feature = "visualization") {
+        #[cfg(feature = "visualization")]
+        return gooey::gui::run_experiment("HiHat", "Dry", false, false);
+    }
     let sample_rate = 44100.0;
 
     let hihat = Arc::new(Mutex::new(HiHat2::with_config(

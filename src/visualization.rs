@@ -4,7 +4,11 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "visualization")]
 use std::collections::VecDeque;
 
-#[cfg(feature = "visualization")]
+#[cfg(feature = "legacy-visualization")]
+pub mod waveform_display;
+
+#[cfg(not(feature = "legacy-visualization"))]
+#[path = "visualization/retired_display.rs"]
 pub mod waveform_display;
 
 #[cfg(feature = "visualization")]

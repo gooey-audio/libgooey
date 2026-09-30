@@ -13,7 +13,10 @@ default = ["native"]
 native = ["cpal"]
 ios = ["bounce"]  # iOS target - no native audio output, just the engine
 crossterm = ["dep:crossterm"]
-visualization = ["glfw", "gl", "rustfft", "eframe"]
+visualization = ["gui"]
+# Explicit compatibility escape hatch for external WaveformDisplay consumers.
+legacy-visualization = ["visualization", "glfw", "gl"]
+gui = ["eframe", "rustfft"]
 midi = ["midir"]  # MIDI input support for examples
 bounce = ["hound"]  # Offline audio bounce/export to WAV
 plots = ["rustfft", "plotters", "hound"]  # Offline aliasing spectrum/spectrogram PNGs
@@ -108,11 +111,15 @@ required-features = ["native", "crossterm"]
 
 [[example]]
 name = "polysynth_gui"
-required-features = ["native", "visualization"]
+required-features = ["gui"]
 
 [[example]]
 name = "resonator_voice_gui"
-required-features = ["native", "visualization"]
+required-features = ["gui"]
+
+[[example]]
+name = "omni_gui"
+required-features = ["gui"]
 
 [[example]]
 name = "bounce"

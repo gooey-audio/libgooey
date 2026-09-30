@@ -10,6 +10,8 @@
 - Optional metronome / monitor click, locked to the transport and excluded from offline exports
 - C FFI for integration with Swift/iOS and other languages
 - Cross-platform support (native, iOS)
+- One extensible graphical test application: PolySynth, resonator graph/sequencer,
+  instrument/effects auditions, shared stereo scopes and audio diagnostics
 
 ## Building
 
@@ -19,12 +21,20 @@
 # Build for native (desktop)
 cargo build --release
 
-# Run examples
-cargo run --example kick
-cargo run --example snare
-cargo run --example hihat
+# Open the unified graphical laboratory
+cargo run --example omni_gui --features gui
+
+# Run terminal examples (without a GUI)
+cargo run --example kick --features crossterm
+cargo run --example snare --features crossterm
+cargo run --example hihat --features crossterm
 cargo run --example sampler_rack --features native,crossterm
 ```
+
+See [Omni GUI usage, migration inventory, extension API and verification](docs/omni-gui.md).
+Use `-- --silent` to render without an audio device, or build with
+`--no-default-features --features gui`. Existing graphical example names select
+panels in this same application; `visualization` is now an alias for `gui`.
 
 ### iOS
 

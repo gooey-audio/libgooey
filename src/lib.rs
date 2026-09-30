@@ -25,6 +25,9 @@ pub mod bounce;
 
 pub use frame::StereoFrame;
 
+#[cfg(feature = "gui")]
+pub mod gui;
+
 // Visualization module (optional)
 #[cfg(feature = "visualization")]
 pub mod visualization;

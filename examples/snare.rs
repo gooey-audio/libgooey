@@ -494,6 +494,10 @@ impl MidiHandler {
 
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
+    if cfg!(feature = "visualization") {
+        #[cfg(feature = "visualization")]
+        return gooey::gui::run_experiment("Snare", "Dry", false, false);
+    }
     let sample_rate = 44100.0;
 
     // Create shared snare drum that both audio thread and main thread can access

@@ -51,6 +51,11 @@ src/
 │   ├── smoother.rs      # SmoothedParam: bounded param with ~15ms exponential smoothing
 │   └── blendable.rs     # PresetBlender: cross-fade between parameter sets
 │
+├── gui/                # Optional unified eframe test shell + public panel extensions
+│   ├── mod.rs          # Sole App/entrypoint, factories, keyboard/widgets/debug view
+│   ├── audio.rs        # Sole GUI CPAL/silent owner, block adapters, bounded telemetry
+│   └── poly.rs / resonator.rs / experiments.rs # Editors, never audio hosts
+│
 ├── envelope.rs          # ADSR envelope with curve shaping
 ├── metronome.rs         # Optional transport-locked monitor click (post-limiter by default)
 ├── dsl.rs               # Line-based DSL for declarative instrument setup
@@ -103,5 +108,7 @@ default so the signal flow above remains the backward-compatible behavior.
 | `native` | Desktop audio via CPAL (default) |
 | `ios` | iOS target — engine only, no audio output |
 | `crossterm` | Terminal UI for examples |
-| `visualization` | Waveform display (glfw, gl, rustfft) |
+| `gui` | Unified eframe test app, block-render extensions, scopes/spectrum/health |
+| `visualization` | Compatibility alias for `gui`; example graphical entries share shell |
+| `legacy-visualization` | Explicit external compatibility for retired GLFW window API |
 | `midi` | MIDI input support (midir) |

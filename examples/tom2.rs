@@ -207,6 +207,10 @@ fn render_display(tom: &Tom2, selected: usize, trigger_count: u32, velocity: f32
 
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
+    if cfg!(feature = "visualization") {
+        #[cfg(feature = "visualization")]
+        return gooey::gui::run_experiment("Tom2", "Dry", false, false);
+    }
     let sample_rate = 44100.0;
 
     // Create Tom2 instrument

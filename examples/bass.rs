@@ -297,6 +297,10 @@ fn render_display(
 
 #[cfg(feature = "native")]
 fn main() -> anyhow::Result<()> {
+    if cfg!(feature = "visualization") {
+        #[cfg(feature = "visualization")]
+        return gooey::gui::run_experiment("Bass", "Dry", false, false);
+    }
     let sample_rate = 44100.0;
 
     let bass = Arc::new(Mutex::new(BassSynth::new(sample_rate)));
