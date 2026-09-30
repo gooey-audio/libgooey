@@ -3,6 +3,8 @@ mod audio;
 mod experiments;
 mod poly;
 mod resonator;
+#[cfg(feature = "studio-gui")]
+pub mod studio;
 pub use audio::*;
 pub use eframe::egui;
 use std::sync::{atomic::Ordering, Arc};
@@ -71,6 +73,18 @@ pub fn parameter(
     range: std::ops::RangeInclusive<f32>,
 ) -> bool {
     ui.add(egui::Slider::new(value, range).text(name)).changed()
+}
+
+/// Engineering-unit frequency controls share the slider widget while retaining
+/// a logarithmic gesture scale (the value and bounds stay in native units).
+pub fn parameter_logarithmic(
+    ui: &mut egui::Ui,
+    name: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> bool {
+    ui.add(egui::Slider::new(value, range).text(name).logarithmic(true))
+        .changed()
 }
 
 pub struct Keyboard {
@@ -162,11 +176,27 @@ impl Keyboard {
 }
 
 pub fn builtin_factories() -> Vec<PanelFactory> {
-    vec![
+    builtin_factories_with_demo(false)
+}
+fn builtin_factories_with_demo(_demo: bool) -> Vec<PanelFactory> {
+    #[allow(unused_mut)]
+    let mut factories: Vec<PanelFactory> = vec![
         Box::new(|rate| Box::new(poly::PolyPanel::new(rate))),
         Box::new(resonator::panel),
         Box::new(|rate| Box::new(experiments::Experiments::new(rate))),
-    ]
+    ];
+    #[cfg(feature = "studio-gui")]
+    factories.push(Box::new(move |rate| {
+        Box::new(studio::StudioPanel::new(
+            rate,
+            if _demo {
+                crate::studio::Session::demo()
+            } else {
+                crate::studio::Session::default()
+            },
+        ))
+    }));
+    factories
 }
 
 /// Shared shell. Extensions supply factories; construction occurs at the
@@ -416,7 +446,27 @@ fn plot(ui: &mut egui::Ui, label: &str, values: &[f32], second: Option<&[f32]>, 
 /// Single desktop entrypoint, also accepting --silent, --panel NAME, --list,
 /// and --stress SECONDS (accelerated device-free audio plus headless layout).
 pub fn run(default_panel: Option<&str>) -> anyhow::Result<()> {
-    run_with(builtin_factories(), default_panel)
+    let demo = std::env::args().any(|arg| arg == "--demo");
+    #[allow(unused_mut)]
+    let mut factories = builtin_factories_with_demo(demo);
+    #[cfg(feature = "studio-gui")]
+    {
+        let args: Vec<_> = std::env::args().collect();
+        if let Some(index) = args.iter().position(|arg| arg == "--load") {
+            let path = args
+                .get(index + 1)
+                .filter(|path| !path.starts_with("--"))
+                .ok_or_else(|| anyhow::anyhow!("--load requires a session path"))?
+                .clone();
+            // Startup I/O precedes the audio host and stays off its callback.
+            let song = std::thread::spawn(move || crate::studio::Session::load(path))
+                .join()
+                .map_err(|_| anyhow::anyhow!("Session load worker panicked"))??;
+            *factories.last_mut().expect("studio factory") =
+                Box::new(move |rate| Box::new(studio::StudioPanel::new(rate, song.clone())));
+        }
+    }
+    run_with(factories, default_panel)
 }
 /// Compatibility graphical entry for formerly waveform-equipped terminal labs.
 pub fn run_experiment(
@@ -438,6 +488,17 @@ pub fn run_with(factories: Vec<PanelFactory>, default_panel: Option<&str>) -> an
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            #[cfg(feature = "studio-gui")]
+            "--demo" => index += 1,
+            #[cfg(feature = "studio-gui")]
+            "--load" => {
+                anyhow::ensure!(
+                    args.get(index + 1)
+                        .is_some_and(|value| !value.starts_with("--")),
+                    "--load requires a session path"
+                );
+                index += 2;
+            }
             "--silent" | "--list" | "--help" => index += 1,
             "--panel" | "--stress" | "--soak" => {
                 anyhow::ensure!(
@@ -452,7 +513,7 @@ pub fn run_with(factories: Vec<PanelFactory>, default_panel: Option<&str>) -> an
         }
     }
     if args.iter().any(|arg| arg == "--help") {
-        println!("Gooey Omni Lab: --panel NAME --silent --list --stress AUDIO_SECONDS --soak WALL_SECONDS\nStress renders all panels at 44100/48000 Hz without a device/window. Soak repeatedly switches the real silent worker with headless GUI frames.");
+        println!("Gooey Omni Lab: --panel NAME --silent --list --stress AUDIO_SECONDS --soak WALL_SECONDS\nWith studio-gui: --demo or --load SESSION initializes Loop Studio (load takes precedence).\nStress renders all panels at 44100/48000 Hz without a device/window. Soak repeatedly switches the real silent worker with headless GUI frames.");
         return Ok(());
     }
     let option = |name: &str| {
@@ -865,7 +926,7 @@ mod tests {
         let mut app = OmniApp::new(builtin_factories(), None, true).expect("shell");
         let ctx = egui::Context::default();
         for size in [[900.0, 700.0], [1440.0, 1000.0]] {
-            for index in 0..3 {
+            for index in 0..app.panels.len() {
                 app.select(index).expect("panel");
                 let output = ctx.run(
                     egui::RawInput {

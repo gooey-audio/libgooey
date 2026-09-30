@@ -22,6 +22,8 @@ pub mod sequencer;
 pub mod utils;
 
 pub mod bounce;
+#[cfg(feature = "studio")]
+pub mod studio;
 
 pub use frame::StereoFrame;
 

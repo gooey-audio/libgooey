@@ -1244,6 +1244,8 @@ dependencies = [
  "midir",
  "plotters",
  "rustfft",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

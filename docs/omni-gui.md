@@ -13,6 +13,18 @@ cargo run --release --no-default-features --example omni_gui --features gui -- -
 ```
 
 Panel names are `PolySynth`, `Resonator`, and `Experiments` (case-insensitive).
+The stacked Loop Studio feature adds `Loop Studio` to this same registry:
+
+```sh
+cargo run --release --features studio-gui --example omni_gui -- --panel "Loop Studio" --demo
+cargo run --no-default-features --features studio-gui --example omni_gui -- --panel "Loop Studio" --silent --load studio-session.json
+```
+
+Its compatibility `loop_studio` launcher selects the same panel. `--demo` and
+`--load SESSION` initialize that panel without changing other labs; load wins
+when both are supplied. See [Loop Studio](loop-studio.md) for recording, files,
+mixdown and its after-host-stop lifecycle. These capabilities belong to the
+stacked feature, not the independently reviewable prerequisite.
 `--silent` still synthesizes continuously, but never opens an audio device.
 Without `native`, silent rendering is the only backend. Device initialization
 failure is shown in the shell and falls back to silent rendering. Stress mode
