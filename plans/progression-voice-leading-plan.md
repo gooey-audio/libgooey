@@ -12,7 +12,7 @@ After this change, an embedded host can hand libgooey an ordered chord progressi
 - [x] (2026-10-01 22:12Z) Implemented the pure Rust progression optimizer and seeded, randomized near-optimal selector.
 - [x] (2026-10-01 22:14Z) Exposed the additive, in-place C function over `GooeyChordEvent` arrays and regenerated `include/gooey.h`.
 - [x] (2026-10-01 22:20Z) Added Rust unit and FFI integration coverage; formatting, 536 library tests, four FFI tests, the iOS release build, generated-header C syntax check, and diff checks pass.
-- [ ] Commit, push, and open the libgooey pull request that the Nebula client change depends upon.
+- [x] (2026-10-01 22:24Z) Committed and pushed the engine change, then opened libgooey pull request #270.
 
 ## Surprises & Discoveries
 
@@ -45,7 +45,7 @@ After this change, an embedded host can hand libgooey an ordered chord progressi
 
 ## Outcomes & Retrospective
 
-The implementation now provides a pure, bounded cyclic optimizer, deterministic seeded variation, and an atomic C ABI that changes only voicing IDs. All 536 libgooey library tests and four new FFI integration tests pass; the iOS-feature release build regenerates a C header accepted by clang. The remaining delivery step is to commit, push, and link the upstream pull request from the dependent Nebula change.
+The implementation provides a pure, bounded cyclic optimizer, deterministic seeded variation, and an atomic C ABI that changes only voicing IDs. All 536 libgooey library tests and four new FFI integration tests pass; the iOS-feature release build regenerates a C header accepted by clang. The engine work is published as [libgooey pull request #270](https://github.com/gooey-audio/libgooey/pull/270), ready for the dependent Nebula change to link.
 
 ## Context and Orientation
 
