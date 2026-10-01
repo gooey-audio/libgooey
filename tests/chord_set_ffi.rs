@@ -432,3 +432,66 @@ fn piano_chord_set_trigger_sounds_every_note_and_rejects_a_bad_set() {
         gooey_engine_free(engine);
     }
 }
+
+fn entry_tones(set: u32, root: u32, scale: u32, degree: u32) -> Vec<u8> {
+    let mut out = [0_u8; 8];
+    let count = unsafe {
+        gooey_chord_set_entry_tones(set, root, scale, degree, out.as_mut_ptr(), out.len() as u32)
+    };
+    out[..count as usize].to_vec()
+}
+
+#[test]
+fn entry_tones_spell_each_pad_from_its_root() {
+    // C major I triad and ii7: plain root-position stacks.
+    assert_eq!(entry_tones(CHORD_SET_TRIADS, 0, SCALE_MAJOR, 0), [0, 4, 7]);
+    assert_eq!(
+        entry_tones(CHORD_SET_SEVENTHS, 0, SCALE_MAJOR, 1),
+        [0, 3, 7, 10]
+    );
+    // Neo Soul pad 2 is a dominant 7#9 — the altered ninth stays compound.
+    let altered = entry_tones(CHORD_SET_NEO_SOUL, 0, SCALE_MAJOR, 2);
+    assert_eq!(&altered[..4], [0, 4, 7, 10]);
+    assert!(altered[4] > 12);
+
+    for set in 0..CHORD_SET_COUNT {
+        for scale in [SCALE_MAJOR, SCALE_MINOR] {
+            for degree in 0..CHORD_SET_PAD_COUNT {
+                let tones = entry_tones(set, 5, scale, degree);
+                assert_eq!(
+                    tones.len() as u32,
+                    gooey_chord_set_entry_note_count(set, scale, degree)
+                );
+                assert_eq!(tones[0], 0, "set {set} scale {scale} pad {degree}");
+                assert!(tones.windows(2).all(|pair| pair[0] < pair[1]));
+            }
+        }
+    }
+}
+
+#[test]
+fn entry_tones_respect_capacity_and_reject_bad_input() {
+    let mut out = [0xAA_u8; 4];
+    unsafe {
+        assert_eq!(
+            gooey_chord_set_entry_tones(CHORD_SET_SEVENTHS, 0, SCALE_MAJOR, 0, out.as_mut_ptr(), 2),
+            2
+        );
+        assert_eq!(out, [0, 4, 0xAA, 0xAA]);
+        assert_eq!(
+            gooey_chord_set_entry_tones(CHORD_SET_COUNT, 0, SCALE_MAJOR, 0, out.as_mut_ptr(), 4),
+            0
+        );
+        assert_eq!(
+            gooey_chord_set_entry_tones(
+                CHORD_SET_TRIADS,
+                0,
+                SCALE_MAJOR,
+                0,
+                std::ptr::null_mut(),
+                4
+            ),
+            0
+        );
+    }
+}
