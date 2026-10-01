@@ -47,7 +47,8 @@ use crate::mixer::{
     RetrimTiming, StereoSampleBuffer,
 };
 use crate::music::{
-    apply_voicing, available_voicings, Chord, ChordSet, Key, NoteName, ScaleType, VoicingType,
+    apply_voicing, available_voicings, transform_progression_voicings, Chord, ChordSet, Key,
+    NoteName, ProgressionChord, ScaleType, VoiceLeadingStrategy, VoicingType, PADS_PER_SET,
 };
 use crate::performance::control::{ChordControl, ChordControlScratch};
 use crate::performance::{
@@ -7412,6 +7413,10 @@ pub const GOOEY_CHORD_GATE_STRUCK: u32 = 1;
 pub const GOOEY_CHORD_LOOP_TICKS_PER_QUARTER: u32 = 96;
 /// Maximum events accepted in one immutable chord-loop snapshot.
 pub const GOOEY_CHORD_LOOP_MAX_EVENTS: u32 = 512;
+/// Deterministically choose the lowest-cost cyclic voice leading.
+pub const GOOEY_VOICE_LEADING_BEST: u32 = 0;
+/// Choose a seeded, near-optimal cyclic voicing variation.
+pub const GOOEY_VOICE_LEADING_RANDOM: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -7568,6 +7573,37 @@ fn voicing_from_id(id: u32) -> VoicingType {
         VOICING_SHELL => VoicingType::Shell,
         VOICING_ROOTLESS => VoicingType::Rootless,
         _ => VoicingType::RootPosition,
+    }
+}
+
+fn checked_voicing_from_id(id: u32) -> Option<VoicingType> {
+    match id {
+        VOICING_ROOT_POSITION => Some(VoicingType::RootPosition),
+        VOICING_FIRST_INVERSION => Some(VoicingType::FirstInversion),
+        VOICING_SECOND_INVERSION => Some(VoicingType::SecondInversion),
+        VOICING_THIRD_INVERSION => Some(VoicingType::ThirdInversion),
+        VOICING_OPEN => Some(VoicingType::OpenVoicing),
+        VOICING_DROP2 => Some(VoicingType::Drop2),
+        VOICING_DROP3 => Some(VoicingType::Drop3),
+        VOICING_SPREAD => Some(VoicingType::Spread),
+        VOICING_SHELL => Some(VoicingType::Shell),
+        VOICING_ROOTLESS => Some(VoicingType::Rootless),
+        _ => None,
+    }
+}
+
+fn voicing_id(voicing: VoicingType) -> u32 {
+    match voicing {
+        VoicingType::RootPosition => VOICING_ROOT_POSITION,
+        VoicingType::FirstInversion => VOICING_FIRST_INVERSION,
+        VoicingType::SecondInversion => VOICING_SECOND_INVERSION,
+        VoicingType::ThirdInversion => VOICING_THIRD_INVERSION,
+        VoicingType::OpenVoicing => VOICING_OPEN,
+        VoicingType::Drop2 => VOICING_DROP2,
+        VoicingType::Drop3 => VOICING_DROP3,
+        VoicingType::Spread => VOICING_SPREAD,
+        VoicingType::Shell => VOICING_SHELL,
+        VoicingType::Rootless => VOICING_ROOTLESS,
     }
 }
 
@@ -7810,6 +7846,81 @@ fn prepare_ffi_chord(event: GooeyChordEvent) -> Option<PreparedChordEvent> {
     )?;
     prepared.event.gate = gate;
     Some(prepared)
+}
+
+/// Rewrite only the named voicings in a caller-owned chord progression.
+///
+/// The chords are scored as a cycle, including the transition from the last
+/// event back to the first. `GOOEY_VOICE_LEADING_BEST` is deterministic;
+/// `GOOEY_VOICE_LEADING_RANDOM` uses `seed` to choose a changed, near-optimal
+/// variation. Target, target id, preset, octave, velocity and gate are never
+/// modified. This is a pure music-theory operation and requires no engine.
+///
+/// Returns false for an unknown strategy, more than
+/// `GOOEY_CHORD_LOOP_MAX_EVENTS`, a null pointer with a nonzero count, or any
+/// invalid harmony field. Validation completes before the first write, so a
+/// failed call never partially changes the array. A zero count is a successful
+/// no-op and permits a null pointer.
+///
+/// # Safety
+/// `events` may be null when `event_count` is zero; otherwise it must point to
+/// `event_count` readable and writable `GooeyChordEvent` values.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_chord_progression_transform_voicings(
+    events: *mut GooeyChordEvent,
+    event_count: u32,
+    strategy: u32,
+    seed: u64,
+) -> bool {
+    let strategy = match strategy {
+        GOOEY_VOICE_LEADING_BEST => VoiceLeadingStrategy::Best,
+        GOOEY_VOICE_LEADING_RANDOM => VoiceLeadingStrategy::Randomized { seed },
+        _ => return false,
+    };
+    if event_count > GOOEY_CHORD_LOOP_MAX_EVENTS {
+        return false;
+    }
+    if event_count == 0 {
+        return true;
+    }
+    if events.is_null() {
+        return false;
+    }
+
+    let events = std::slice::from_raw_parts_mut(events, event_count as usize);
+    let mut progression = Vec::with_capacity(events.len());
+    for event in events.iter() {
+        if event.root >= 12
+            || (event.scale_type != SCALE_MAJOR && event.scale_type != SCALE_MINOR)
+            || event.degree as usize >= PADS_PER_SET
+            || !(0..=8).contains(&event.octave)
+        {
+            return false;
+        }
+        let Some(set) = ChordSet::from_id(event.chord_set) else {
+            return false;
+        };
+        let Some(current_voicing) = checked_voicing_from_id(event.voicing) else {
+            return false;
+        };
+        let key = Key::new(root_from_id(event.root), scale_from_id(event.scale_type));
+        let chord = set.chord(&key, event.degree as usize);
+        if !available_voicings(&chord.quality).contains(&current_voicing) {
+            return false;
+        }
+        progression.push(ProgressionChord {
+            chord,
+            octave: event.octave as i8,
+            current_voicing,
+        });
+    }
+
+    let transformed = transform_progression_voicings(&progression, strategy);
+    debug_assert_eq!(events.len(), transformed.len());
+    for (event, voicing) in events.iter_mut().zip(transformed) {
+        event.voicing = voicing_id(voicing);
+    }
+    true
 }
 
 /// Queue a chord gesture for the next available render-buffer boundary.
