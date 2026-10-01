@@ -8,12 +8,15 @@
 //! `waveform.rs`.
 
 use std::array;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicU64, Ordering};
 
 use crate::ffi::OUTPUT_SCOPE_POINT_COUNT;
 
 const POINT_COUNT: usize = OUTPUT_SCOPE_POINT_COUNT as usize;
 const POINTS_PER_SECOND: f32 = POINT_COUNT as f32;
+/// Copies attempted before a reader that keeps getting lapped by the writer
+/// blanks the overwritten bins instead of retrying.
+const READ_ATTEMPTS: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct OutputScopePeak {
@@ -24,7 +27,11 @@ pub(crate) struct OutputScopePeak {
 /// Fixed ring of packed `{min, max}` bins plus a monotonic write position.
 pub(crate) struct OutputScopeBuffer {
     peaks: [AtomicU64; POINT_COUNT],
+    /// Bins fully published. Readers copy up to this position.
     write_position: AtomicU64,
+    /// Bins whose publish has begun (`write_position` or one ahead). Readers
+    /// re-check it after copying to detect slots overwritten mid-read.
+    publish_started: AtomicU64,
 }
 
 impl OutputScopeBuffer {
@@ -32,6 +39,7 @@ impl OutputScopeBuffer {
         Self {
             peaks: array::from_fn(|_| AtomicU64::new(pack_peak(OutputScopePeak::default()))),
             write_position: AtomicU64::new(0),
+            publish_started: AtomicU64::new(0),
         }
     }
 
@@ -40,6 +48,12 @@ impl OutputScopeBuffer {
     fn publish(&self, peak: OutputScopePeak) {
         let position = self.write_position.load(Ordering::Relaxed);
         let index = position as usize % POINT_COUNT;
+        // Pairs with the fence in `read_once`: a reader whose slot load sees
+        // this overwrite is guaranteed to then see `publish_started > position`
+        // and discard the slot as belonging to a newer ring generation.
+        self.publish_started
+            .store(position.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
         self.peaks[index].store(pack_peak(sanitize_peak(peak)), Ordering::Relaxed);
         self.write_position
             .store(position.wrapping_add(1), Ordering::Release);
@@ -48,22 +62,55 @@ impl OutputScopeBuffer {
     /// Copy the newest `min(len, POINT_COUNT)` bins into `out_min` / `out_max`,
     /// oldest first, zero-padding the front when fewer bins have been
     /// published. Returns the total number of bins published so far.
+    ///
+    /// If the writer laps the reader mid-copy, the copy is retried; after
+    /// `READ_ATTEMPTS` the oldest bins it overwrote are zeroed rather than
+    /// shown out of order.
     pub fn read(&self, out_min: &mut [f32], out_max: &mut [f32]) -> u64 {
         let count = out_min.len().min(out_max.len()).min(POINT_COUNT);
+        let (out_min, out_max) = (&mut out_min[..count], &mut out_max[..count]);
+        let mut attempt = 0;
+        loop {
+            let (end, padding, overwritten) = self.read_once(out_min, out_max);
+            attempt += 1;
+            if overwritten == 0 {
+                return end;
+            }
+            if attempt == READ_ATTEMPTS {
+                out_min[padding..padding + overwritten].fill(0.0);
+                out_max[padding..padding + overwritten].fill(0.0);
+                return end;
+            }
+        }
+    }
+
+    /// One copy pass. Returns the write position, the padding length, and how
+    /// many of the oldest copied bins the writer may have overwritten with a
+    /// newer ring generation while they were being read.
+    fn read_once(&self, out_min: &mut [f32], out_max: &mut [f32]) -> (u64, usize, usize) {
+        let count = out_min.len();
         let end = self.write_position.load(Ordering::Acquire);
         let available = end.min(count as u64) as usize;
-        let start = end.wrapping_sub(available as u64);
+        let start = end - available as u64;
         let padding = count - available;
 
         out_min[..padding].fill(0.0);
         out_max[..padding].fill(0.0);
         for offset in 0..available {
-            let index = start.wrapping_add(offset as u64) as usize % POINT_COUNT;
+            let index = (start + offset as u64) as usize % POINT_COUNT;
             let peak = unpack_peak(self.peaks[index].load(Ordering::Relaxed));
             out_min[padding + offset] = peak.min;
             out_max[padding + offset] = peak.max;
         }
-        end
+
+        // Bin `p` is clobbered once the writer starts publishing
+        // `p + POINT_COUNT`, so only bins from `started - POINT_COUNT` on are
+        // known to belong to this snapshot.
+        fence(Ordering::Acquire);
+        let started = self.publish_started.load(Ordering::Relaxed);
+        let oldest_intact = started.saturating_sub(POINT_COUNT as u64);
+        let overwritten = oldest_intact.saturating_sub(start).min(available as u64) as usize;
+        (end, padding, overwritten)
     }
 }
 
@@ -226,6 +273,56 @@ mod tests {
         let mut max = [f32::NAN; 8];
         assert_eq!(buffer.read(&mut min, &mut max), 5);
         assert_eq!(max, [0.0, 0.0, 0.0, 0.0, 0.1, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn concurrent_reads_never_mix_ring_generations() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        // Bin `p` carries `(p + 1) / 2^24`, exact in f32, so a coherent
+        // snapshot is a run of zero padding followed by consecutive steps.
+        const STEP: f32 = 1.0 / (1 << 24) as f32;
+        const PUBLISHES: u64 = 1 << 22;
+
+        let buffer = Arc::new(OutputScopeBuffer::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let buffer = Arc::clone(&buffer);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                for position in 0..PUBLISHES {
+                    let value = (position + 1) as f32 * STEP;
+                    buffer.publish(OutputScopePeak {
+                        min: -value,
+                        max: value,
+                    });
+                }
+                done.store(true, Ordering::Release);
+            })
+        };
+
+        let mut min = vec![0.0; POINT_COUNT];
+        let mut max = vec![0.0; POINT_COUNT];
+        let mut reads = 0;
+        while !done.load(Ordering::Acquire) || reads == 0 {
+            let end = buffer.read(&mut min, &mut max);
+            reads += 1;
+            let first = max.iter().position(|value| *value != 0.0);
+            let Some(first) = first else {
+                continue;
+            };
+            assert_eq!(max[POINT_COUNT - 1], end as f32 * STEP, "newest bin");
+            for index in first + 1..POINT_COUNT {
+                assert_eq!(
+                    max[index] - max[index - 1],
+                    STEP,
+                    "bin {index} after {reads} reads"
+                );
+                assert_eq!(min[index], -max[index]);
+            }
+        }
+        writer.join().unwrap();
     }
 
     #[test]

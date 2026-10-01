@@ -1325,6 +1325,16 @@ impl GooeyEngine {
         }
     }
 
+    /// Feed one emitted frame to the output scope. Offline bounce renders
+    /// faster than real time, so it is kept out of the live display.
+    #[inline]
+    fn capture_output_scope(&mut self, output: StereoFrame) {
+        if !self.offline_bounce {
+            self.output_scope_capture
+                .push_stereo(&self.output_scope, output.l, output.r);
+        }
+    }
+
     fn new(sample_rate: f32) -> Self {
         let bpm = 120.0;
 
@@ -1806,6 +1816,10 @@ impl GooeyEngine {
                 for sample in buffer.iter_mut() {
                     *sample = 0.0;
                 }
+                // The silence is still live output, so the scope keeps scrolling.
+                for _ in 0..frame_count {
+                    self.capture_output_scope(StereoFrame::default());
+                }
                 return;
             }
             ArmResolution::NotPending => None,
@@ -1854,6 +1868,7 @@ impl GooeyEngine {
             if let Some(fire_at) = arm_fires_at {
                 if sample_offset < fire_at {
                     frame.fill(0.0);
+                    self.capture_output_scope(StereoFrame::default());
                     sample_offset += 1;
                     continue;
                 }
@@ -2185,10 +2200,7 @@ impl GooeyEngine {
                 )
             };
             self.record_final_output_telemetry(telemetry_pre_limiter, output);
-            if !self.offline_bounce {
-                self.output_scope_capture
-                    .push_stereo(&self.output_scope, output.l, output.r);
-            }
+            self.capture_output_scope(output);
 
             // Write the frame interleaved as [left, right].
             frame[0] = output.l;

@@ -81,6 +81,28 @@ fn silence_keeps_the_scope_scrolling() {
 }
 
 #[test]
+fn armed_start_silence_keeps_the_scope_scrolling() {
+    unsafe {
+        let engine = gooey_engine_new(SAMPLE_RATE);
+        let host_now: u64 = 1_000_000_000;
+        gooey_engine_set_render_host_time(engine, host_now, 1.0);
+        // Fires 1.5 buffers out: one fully silent buffer, then a silent
+        // 2_400-frame prefix before the arm resolves mid-buffer.
+        gooey_engine_sequencer_start_at_host_time(engine, host_now + 7_200, 0.0);
+
+        let _ = render(engine, 4_800);
+        let (position, _, _) = read_scope(engine);
+        assert_eq!(position, 4_800 / 47);
+
+        gooey_engine_set_render_host_time(engine, host_now + 4_800, 1.0);
+        let _ = render(engine, 4_800);
+        let (position, _, _) = read_scope(engine);
+        assert_eq!(position, 9_600 / 47);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
 fn short_reads_return_the_newest_bins() {
     unsafe {
         let engine = gooey_engine_new(SAMPLE_RATE);
