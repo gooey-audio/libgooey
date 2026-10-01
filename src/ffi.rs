@@ -31,9 +31,9 @@ use crate::instruments::poly_synth_control::{PolySynthControl, PolySynthPending}
 use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
     BassConfig, BassSynth, FilterSlope, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum,
-    MelodyVoice, NoiseColor, PercussionEngine, PercussionEngineKind, PercussionPreset,
-    PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer, SamplerBuffer,
-    SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config, TwinCorePercBodyMode,
+    MelodyNotePool, MelodyVoice, NoiseColor, PercussionEngine, PercussionEngineKind,
+    PercussionPreset, PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer,
+    SamplerBuffer, SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config, TwinCorePercBodyMode,
     TwinCorePercConfig, TwinCorePercNoiseMode, TwinCorePercVoice,
 };
 use crate::live_control::{
@@ -5619,7 +5619,10 @@ impl GooeyEngine {
 
     fn trigger_controlled_chord(&mut self, event: PreparedChordEvent, loop_owned: bool) {
         self.release_controlled_chord();
-        self.melody.set_harmony(event.chord);
+        self.melody.set_harmony_in_key(
+            event.chord,
+            resolve_key(event.event.root, event.event.scale_type),
+        );
 
         let mut sounding_notes = [0; 6];
         let mut sounding_count = 0usize;
@@ -7590,8 +7593,11 @@ fn root_from_id(id: u32) -> NoteName {
 /// audibly wrong chords rather than merely shifting a key.
 fn resolve_chord(chord_set: u32, root: u32, scale_type: u32, degree: u32) -> Option<Chord> {
     let set = ChordSet::from_id(chord_set)?;
-    let key = Key::new(root_from_id(root), scale_from_id(scale_type));
-    Some(set.chord(&key, degree as usize))
+    Some(set.chord(&resolve_key(root, scale_type), degree as usize))
+}
+
+fn resolve_key(root: u32, scale_type: u32) -> Key {
+    Key::new(root_from_id(root), scale_from_id(scale_type))
 }
 
 fn factory_poly_preset_config(id: u32) -> Option<PolySynthConfig> {
@@ -7725,7 +7731,9 @@ pub unsafe extern "C" fn gooey_engine_poly_trigger_chord_set(
     let midi_notes = apply_voicing(&chord, voicing_type, octave_clamped);
 
     // Release any currently sounding notes, then trigger the new chord
-    engine.melody.set_harmony(chord);
+    engine
+        .melody
+        .set_harmony_in_key(chord, resolve_key(root, scale_type));
     engine.poly_synth.release_all();
     for note in &midi_notes {
         engine.poly_synth.trigger_note(*note, velocity);
@@ -8235,12 +8243,20 @@ pub unsafe extern "C" fn gooey_engine_poly_get_param(
 // Chord-aware live melody
 // =============================================================================
 
+/// Melody note pool: only the latched chord's own tones.
+pub const MELODY_NOTE_POOL_CHORD: u32 = 0;
+/// Melody note pool (default): chord tones plus the key's tensions that do not
+/// clash with the chord, such as the 9th and 6th over a major triad but not
+/// the 4th a half step above its third.
+pub const MELODY_NOTE_POOL_KEY: u32 = 1;
+
 /// Begin a melodic gesture from an intended MIDI note.
 ///
-/// The note is snapped to the nearest tone of the most recently triggered
-/// chord. Returns the sounding MIDI note, or -1 when the input is invalid or no
-/// harmony has been established yet. A valid gesture begun before the first
-/// chord is retained silently and starts when a chord later becomes active.
+/// The note is snapped to the nearest eligible pitch for the most recently
+/// triggered chord; see `gooey_engine_melody_set_note_pool`. Returns the
+/// sounding MIDI note, or -1 when the input is invalid or no harmony has been
+/// established yet. A valid gesture begun before the first chord is retained
+/// silently and starts when a chord later becomes active.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
@@ -8264,7 +8280,7 @@ pub unsafe extern "C" fn gooey_engine_melody_note_on(
 
 /// Move an active melodic gesture to another intended MIDI note.
 ///
-/// Retuning is legato: when quantization chooses a different chord tone, the
+/// Retuning is legato: when quantization chooses a different pitch, the
 /// held synth voice changes pitch without restarting its envelopes or phase.
 /// Returns -1 for invalid input, when no gesture is held, or while a valid
 /// pre-harmony gesture is still silent.
@@ -8327,6 +8343,44 @@ pub unsafe extern "C" fn gooey_engine_melody_has_harmony(engine: *const GooeyEng
 pub unsafe extern "C" fn gooey_engine_melody_clear_harmony(engine: *mut GooeyEngine) {
     if let Some(engine) = engine.as_mut() {
         engine.melody.clear_harmony();
+    }
+}
+
+/// Choose which pitches the melody may land on (`MELODY_NOTE_POOL_*`). A held
+/// gesture retunes to the new pool immediately. Returns false for a null
+/// engine or an unknown pool, leaving the current pool unchanged.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_melody_set_note_pool(
+    engine: *mut GooeyEngine,
+    pool: u32,
+) -> bool {
+    let pool = match pool {
+        MELODY_NOTE_POOL_CHORD => MelodyNotePool::Chord,
+        MELODY_NOTE_POOL_KEY => MelodyNotePool::ChordAndKey,
+        _ => return false,
+    };
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    engine.melody.set_note_pool(pool);
+    true
+}
+
+/// Return the current `MELODY_NOTE_POOL_*`, or the default for a null engine.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_melody_get_note_pool(engine: *const GooeyEngine) -> u32 {
+    let pool = engine.as_ref().map_or(MelodyNotePool::default(), |engine| {
+        engine.melody.note_pool()
+    });
+    match pool {
+        MelodyNotePool::Chord => MELODY_NOTE_POOL_CHORD,
+        MelodyNotePool::ChordAndKey => MELODY_NOTE_POOL_KEY,
     }
 }
 
@@ -9559,7 +9613,9 @@ pub unsafe extern "C" fn gooey_engine_piano_trigger_chord_set(
         any_sounded |= sounded;
     }
     if any_sounded {
-        engine.melody.set_harmony(chord);
+        engine
+            .melody
+            .set_harmony_in_key(chord, resolve_key(root, scale_type));
     }
     all_sounded
 }
