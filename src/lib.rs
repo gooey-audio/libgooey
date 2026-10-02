@@ -19,6 +19,7 @@ pub mod mixer;
 pub mod music;
 pub mod performance;
 pub mod sequencer;
+mod track_tape;
 pub mod utils;
 
 pub mod bounce;
