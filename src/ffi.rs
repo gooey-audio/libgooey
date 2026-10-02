@@ -216,7 +216,7 @@ impl Drop for GooeyLiveControl {
 
 /// A polymorphic instrument that can be any drum synth type.
 /// Each channel holds one of these, enabling runtime instrument reassignment.
-enum ChannelInstrument {
+pub(crate) enum ChannelInstrument {
     Kick(KickDrum),
     Snare(SnareDrum),
     HiHat(HiHat2),
@@ -738,7 +738,7 @@ impl ChannelInstrument {
 }
 
 /// A polymorphic preset blender matching the instrument type on a channel.
-enum ChannelBlender {
+pub(crate) enum ChannelBlender {
     None,
     Kick(PresetBlender<KickConfig>),
     Snare(PresetBlender<SnareConfig>),
@@ -1041,6 +1041,7 @@ struct DrumKit {
 }
 
 pub struct GooeyEngine {
+    track_tape: Option<crate::track_tape::Renderer>,
     /// Installed once, before rendering, by `gooey_engine_live_control_new`.
     live_control: Option<Arc<LiveControlShared>>,
 
@@ -1391,7 +1392,8 @@ impl GooeyEngine {
 
         // Create LFO pool (8 LFOs, all disabled by default with quarter note timing)
         let lfos = std::array::from_fn(|_| Lfo::with_sample_rate(sample_rate));
-        let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] = std::array::from_fn(|_| Vec::new());
+        let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] =
+            std::array::from_fn(|_| Vec::with_capacity(16));
         let mixer = Mixer::new(sample_rate);
         let mixer_control = mixer.control();
         let sampler_control = SamplerControl::new();
@@ -1401,6 +1403,7 @@ impl GooeyEngine {
         let chord_control = ChordControl::new();
 
         Self {
+            track_tape: None,
             live_control: None,
             kit,
             bass,
@@ -1628,6 +1631,140 @@ impl GooeyEngine {
             };
             let generation = command.generation();
             match command {
+                LiveCommand::MasterOrder { order, .. } => {
+                    self.effect_order = order;
+                    self.reset_effect_states();
+                }
+                LiveCommand::Edit {
+                    op, a, b, c, x, y, ..
+                } => unsafe {
+                    let e = self as *mut GooeyEngine;
+                    match op {
+                        0 => gooey_engine_mixer_set_track_pan(e, a, x),
+                        1 => gooey_engine_mixer_set_track_mute(e, a, x > 0.),
+                        2 => gooey_engine_mixer_set_track_solo(e, a, x > 0.),
+                        3 => gooey_engine_set_master_gain(e, x),
+                        4 => gooey_engine_set_global_effect_enabled(e, a, x > 0.),
+                        5 => gooey_engine_set_global_effect_param(e, a, b, x),
+                        6 => {
+                            gooey_engine_sequencer_set_instrument_step_with_velocity(
+                                e,
+                                a,
+                                b,
+                                x > 0.,
+                                y,
+                            );
+                        }
+                        7 => gooey_engine_sequencer_set_instrument_step_blend(e, a, b, x, y),
+                        8 => gooey_engine_sequencer_clear_instrument_step_blend(e, a, b),
+                        9 => {
+                            gooey_engine_blend_enable(e, a);
+                            gooey_engine_blend_set_position(e, a, x, y);
+                        }
+                        10 => gooey_engine_set_instrument_gain(e, a, x),
+                        11 => gooey_engine_set_instrument_mute(e, a, x > 0.),
+                        12 => gooey_engine_set_instrument_solo(e, a, x > 0.),
+                        13 => gooey_engine_set_channel_tuning(e, a, x),
+                        14 => {
+                            if x < 0. {
+                                gooey_engine_clear_channel_param_lock(e, a, b);
+                            } else {
+                                gooey_engine_set_channel_param_lock(e, a, b, x);
+                            }
+                        }
+                        15 => {
+                            gooey_engine_clear_channel_param_locks(e, a);
+                        }
+                        17 => gooey_engine_set_lfo_enabled(e, a, x > 0.),
+                        18 => gooey_engine_set_lfo_timing(e, a, b),
+                        19 => gooey_engine_set_lfo_amount(e, a, x),
+                        20 => gooey_engine_set_lfo_offset(e, a, x),
+                        21 => {
+                            gooey_engine_clear_lfo_routes(e, a);
+                            gooey_engine_add_lfo_route(e, a, b, c, x);
+                        }
+                        22 => {
+                            self.bpm = x;
+                            for seq in self.sequencers_iter_mut() {
+                                seq.set_bpm(x);
+                            }
+                            for rack in self.samplers.iter_mut().flatten() {
+                                rack.sequencer_mut().set_bpm(x);
+                            }
+                            self.delay.set_bpm(x);
+                            for lfo in &mut self.lfos {
+                                lfo.set_bpm(x);
+                            }
+                            self.mixer.set_bpm(x);
+                            self.metronome.set_bpm(x);
+                            self.graph.set_bpm(x);
+                        }
+                        23 => gooey_engine_set_swing(e, x),
+                        24 => {
+                            self.pending_arm_host_time = None;
+                            for seq in self.sequencers_iter_mut() {
+                                seq.reset();
+                                seq.start();
+                            }
+                            for rack in self.samplers.iter_mut().flatten() {
+                                rack.transport_reset();
+                            }
+                            self.mixer.transport_reset();
+                            self.mixer.transport_start();
+                        }
+                        25 => {
+                            self.pending_arm_host_time = None;
+                            for seq in self.sequencers_iter_mut() {
+                                seq.stop();
+                            }
+                            for rack in self.samplers.iter_mut().flatten() {
+                                rack.transport_stop();
+                            }
+                            self.mixer.transport_stop();
+                        }
+                        26 => gooey_engine_set_sequencer_triggers_enabled(e, x > 0.),
+                        27 => {
+                            if c == 128 {
+                                gooey_engine_sequencer_clear_instrument_step_note(e, a, b);
+                            } else {
+                                gooey_engine_sequencer_set_instrument_step_note(e, a, b, c as u8);
+                            };
+                            gooey_engine_sequencer_set_instrument_step(e, a, b, c != 128);
+                        }
+                        29 => gooey_engine_set_metronome_enabled(e, x > 0.),
+                        30 => {
+                            gooey_engine_piano_set_param(e, a, b, x);
+                        }
+                        31 => {
+                            gooey_engine_piano_set_velocity_mode(e, a, x);
+                        }
+                        32 => {
+                            gooey_engine_chord_loop_set_piano_velocity(e, x);
+                        }
+                        33 => gooey_engine_load_bass_preset(e, a),
+                        _ => {}
+                    }
+                },
+                LiveCommand::ReplaceVoice {
+                    channel,
+                    mut prepared,
+                    ..
+                } => {
+                    if let Some(voice) = self.voice_mut(channel) {
+                        let tuning = voice.instrument.tuning_target();
+                        prepared.0.set_tuning(tuning);
+                        std::mem::swap(&mut voice.instrument, &mut prepared.0);
+                        std::mem::swap(&mut voice.blender, &mut prepared.1);
+                        let kind = voice.instrument.instrument_type();
+                        voice.blend_corner_presets =
+                            ChannelBlender::default_corner_preset_ids(kind);
+                        voice.param_locks = [None; CHANNEL_PARAM_LOCK_CAPACITY];
+                        voice.saved_global_freq = None;
+                        voice.blend_enabled = kind <= INSTRUMENT_TOM;
+                        voice.restore_blend();
+                    }
+                    shared.retire_voice(prepared);
+                }
                 LiveCommand::SetTrackGain { track, gain, .. } => {
                     self.graph.set_track_gain(track, gain);
                 }
@@ -1655,6 +1792,13 @@ impl GooeyEngine {
                 } => self.graph.effect_set_param(track, slot, param, value),
             }
             shared.mark_applied(generation);
+        }
+        for channel in 0..4 {
+            for param in 0..32 {
+                let value =
+                    unsafe { gooey_engine_get_channel_param(self, channel as u32, param as u32) };
+                shared.publish_param(channel, param, value);
+            }
         }
     }
 
@@ -1767,6 +1911,10 @@ impl GooeyEngine {
         // Commands are applied at buffer boundaries, including buffers that
         // are temporarily silent while a host-time arm is pending.
         self.mixer.apply_control_commands();
+        let beat = self.mixer.transport_beat();
+        if let Some(tape) = &mut self.track_tape {
+            tape.begin_buffer(beat);
+        }
         self.apply_poly_control_commands();
         self.apply_sampler_control_commands();
         self.apply_piano_control_commands();
@@ -2072,6 +2220,15 @@ impl GooeyEngine {
                     .as_mut()
                     .map_or(StereoFrame::default(), MultiSampleInstrument::tick_frame);
                 self.graph.scatter(SOURCE_PIANO_BASE + index as u32, frame);
+            }
+            if let Some(tape) = &mut self.track_tape {
+                let dry = tape.tracks.map(|t| self.graph.dry_frame(t));
+                if let Some(playback) = tape.frame(transport_beat, transport_running, dry) {
+                    self.graph.clear_scratch();
+                    for (track, frame) in tape.tracks.into_iter().zip(playback) {
+                        self.graph.replace_dry_frame(track, frame);
+                    }
+                }
             }
             let mut stereo = self.graph.mix_down();
 
@@ -9982,6 +10139,28 @@ fn live_effect_param_is_valid(effect: u32, param: u32, value: f32) -> bool {
         (EFFECT_DELAY, DELAY_PARAM_TIMING) => (DELAY_TIMING_WHOLE..=DELAY_TIMING_SIXTEENTH_TRIPLET)
             .any(|timing| value == timing as f32),
         (EFFECT_DELAY, DELAY_PARAM_FEEDBACK) => (0.0..=0.95).contains(&value),
+        (EFFECT_DELAY, DELAY_PARAM_FILTER_CUTOFF) => (20.0..=20_000.0).contains(&value),
+        (EFFECT_DELAY, DELAY_PARAM_PINGPONG) => value == 0. || value == 1.,
+        (EFFECT_COMPRESSOR, COMPRESSOR_PARAM_THRESHOLD) => (-60.0..=0.).contains(&value),
+        (EFFECT_COMPRESSOR, COMPRESSOR_PARAM_RATIO) => (1.0..=20.).contains(&value),
+        (EFFECT_COMPRESSOR, COMPRESSOR_PARAM_ATTACK) => (0.1..=100.).contains(&value),
+        (EFFECT_COMPRESSOR, COMPRESSOR_PARAM_RELEASE) => (5.0..=1000.).contains(&value),
+        (EFFECT_COMPRESSOR, COMPRESSOR_PARAM_MIX) => (0.0..=1.).contains(&value),
+        (EFFECT_SATURATION, 0..=2) | (EFFECT_TILT_FILTER, 0..=1) | (EFFECT_PLATE_REVERB, 0..=5) => {
+            (0.0..=1.).contains(&value)
+        }
+        (EFFECT_WAVESHAPER, WAVESHAPER_PARAM_DRIVE) => (1.0..=10.).contains(&value),
+        (EFFECT_WAVESHAPER, WAVESHAPER_PARAM_MIX) => (0.0..=1.).contains(&value),
+        (EFFECT_FEEDBACK_WAVESHAPER, FEEDBACK_WAVESHAPER_PARAM_DRIVE) => {
+            (1.0..=100.).contains(&value)
+        }
+        (EFFECT_FEEDBACK_WAVESHAPER, FEEDBACK_WAVESHAPER_PARAM_FEEDBACK) => {
+            (0.0..=0.98).contains(&value)
+        }
+        (EFFECT_FEEDBACK_WAVESHAPER, FEEDBACK_WAVESHAPER_PARAM_FILTER_CUTOFF) => {
+            (200.0..=20_000.).contains(&value)
+        }
+        (EFFECT_FEEDBACK_WAVESHAPER, FEEDBACK_WAVESHAPER_PARAM_MIX) => (0.0..=1.).contains(&value),
         (EFFECT_DELAY, DELAY_PARAM_MIX) => (0.0..=1.0).contains(&value),
         (EFFECT_REVERB, REVERB_PARAM_DECAY | REVERB_PARAM_MIX | REVERB_PARAM_DAMPING) => {
             (0.0..=1.0).contains(&value)
@@ -10009,8 +10188,16 @@ unsafe fn build_live_rack(
     for descriptor in descriptors {
         if !matches!(
             descriptor.effect,
-            EFFECT_LOWPASS_FILTER | EFFECT_DELAY | EFFECT_REVERB
-        ) || descriptor.param_count > 3
+            EFFECT_LOWPASS_FILTER
+                | EFFECT_DELAY
+                | EFFECT_REVERB
+                | EFFECT_SATURATION
+                | EFFECT_COMPRESSOR
+                | EFFECT_TILT_FILTER
+                | EFFECT_PLATE_REVERB
+                | EFFECT_WAVESHAPER
+                | EFFECT_FEEDBACK_WAVESHAPER
+        ) || descriptor.param_count > 6
             || (descriptor.param_count != 0 && descriptor.params.is_null())
         {
             return None;
@@ -10020,7 +10207,7 @@ unsafe fn build_live_rack(
         } else {
             slice::from_raw_parts(descriptor.params, descriptor.param_count as usize)
         };
-        let mut seen = [false; 5];
+        let mut seen = [false; 6];
         for parameter in params {
             let Some(flag) = seen.get_mut(parameter.param as usize) else {
                 return None;
@@ -14263,5 +14450,307 @@ mod output_stage_tests {
         }
         assert_eq!(engine.limiter_threshold.get(), 0.1);
         assert_eq!(engine.limiter.process_stereo(input), hard_output);
+    }
+}
+
+/// Worker/control endpoint for three synchronized pre-strip stereo tracks.
+/// Attach only while rendering is stopped. Control calls have one producer;
+/// drain has one worker consumer; feed has one worker producer. Retain endpoint
+/// until workers join; engine and endpoint may be destroyed in either order.
+pub struct GooeyTrackTape {
+    shared: Arc<crate::track_tape::Shared>,
+}
+/// # Safety
+/// Engine must be valid and stopped; tracks must be distinct existing mixer tracks.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_track_tape_new(
+    engine: *mut GooeyEngine,
+    a: u32,
+    b: u32,
+    c: u32,
+) -> *mut GooeyTrackTape {
+    let Some(e) = engine.as_mut() else {
+        return std::ptr::null_mut();
+    };
+    if e.track_tape.is_some()
+        || a == b
+        || b == c
+        || a == c
+        || [a, b, c]
+            .iter()
+            .any(|t| *t as usize >= e.graph.track_count())
+    {
+        return std::ptr::null_mut();
+    }
+    let shared = crate::track_tape::Shared::new();
+    e.track_tape = Some(crate::track_tape::Renderer::new(
+        shared.clone(),
+        [a as usize, b as usize, c as usize],
+    ));
+    Box::into_raw(Box::new(GooeyTrackTape { shared }))
+}
+/// # Safety
+/// Endpoint must be valid; join its worker threads before freeing it.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_track_tape_free(t: *mut GooeyTrackTape) {
+    if !t.is_null() {
+        drop(Box::from_raw(t));
+    }
+}
+/// Queue command: 0 return to live, 1 arm at beat, 2 stop, 3 play frame count,
+/// 4 arm at the next 4/4 bar computed by render.
+/// Returns generation or zero on invalid arguments/full queue.
+/// # Safety
+/// Valid endpoint. One serialized control producer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_track_tape_command(
+    t: *const GooeyTrackTape,
+    command: u32,
+    start_beat: f64,
+    frames: u64,
+) -> u64 {
+    let Some(t) = t.as_ref() else {
+        return 0;
+    };
+    let c = match command {
+        0 => crate::track_tape::Command::Live,
+        1 if start_beat.is_finite() && start_beat >= 0. => {
+            crate::track_tape::Command::Arm(start_beat)
+        }
+        2 => crate::track_tape::Command::Stop,
+        3 if frames > 0 => crate::track_tape::Command::Play(frames),
+        4 => crate::track_tape::Command::ArmNextBar,
+        _ => return 0,
+    };
+    t.shared.command(c)
+}
+/// State: 0 live, 1 armed, 2 recording, 3 stopped, 4 playing, 5 ended, 6 overflow, 7 underrun.
+/// # Safety
+/// Valid endpoint; snapshot fields use acquire atomic reads.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_track_tape_get_state(t: *const GooeyTrackTape) -> u32 {
+    t.as_ref()
+        .map_or(0, |t| t.shared.state.load(Ordering::Acquire))
+}
+/// # Safety
+/// Valid endpoint.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_track_tape_get_frames(t: *const GooeyTrackTape) -> u64 {
+    t.as_ref()
+        .map_or(0, |t| t.shared.frames.load(Ordering::Acquire))
+}
+/// # Safety
+/// Valid endpoint.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_track_tape_get_applied_generation(t: *const GooeyTrackTape) -> u64 {
+    t.as_ref()
+        .map_or(0, |t| t.shared.applied.load(Ordering::Acquire))
+}
+/// Drain capture. Layout per frame: aL,aR,bL,bR,cL,cR. Returns frames copied.
+/// # Safety
+/// Valid endpoint and output with capacity_frames * 6 floats. Single worker consumer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_track_tape_drain(
+    t: *const GooeyTrackTape,
+    out: *mut f32,
+    capacity_frames: u32,
+) -> u32 {
+    if out.is_null() {
+        return 0;
+    }
+    t.as_ref().map_or(0, |t| {
+        t.shared.drain(std::slice::from_raw_parts_mut(
+            out,
+            capacity_frames as usize * 6,
+        )) as u32
+    })
+}
+/// Feed playback; returns accepted frames. Retry remainder when queue is full.
+/// # Safety
+/// Valid endpoint and finite input with frames * 6 floats. Single worker producer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_track_tape_feed(
+    t: *const GooeyTrackTape,
+    input: *const f32,
+    frames: u32,
+) -> u32 {
+    if input.is_null() {
+        return 0;
+    }
+    let samples = std::slice::from_raw_parts(input, frames as usize * 6);
+    if samples.iter().any(|x| !x.is_finite()) {
+        return 0;
+    }
+    t.as_ref().map_or(0, |t| t.shared.feed(samples) as u32)
+}
+/// Discard previous capture, only after stop/live acknowledgement and worker drain.
+/// # Safety
+/// Valid endpoint. Single capture consumer; must not run during active capture.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_track_tape_discard_capture(t: *const GooeyTrackTape) {
+    if let Some(t) = t.as_ref() {
+        if matches!(t.shared.state.load(Ordering::Acquire), 0 | 3 | 5 | 6 | 7) {
+            t.shared.discard_capture();
+        }
+    }
+}
+
+/// Queue a bounded primitive studio edit. See docs/track-tape.md for opcode table.
+/// Invalid opcodes/nonfinite values return zero. Parameter-specific bounds use
+/// the corresponding legacy setter. Only render executes the setter.
+/// # Safety
+/// Valid endpoint, one serialized control producer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_edit(
+    control: *mut GooeyLiveControl,
+    op: u32,
+    a: u32,
+    b: u32,
+    c: u32,
+    x: f32,
+    y: f32,
+) -> u64 {
+    let Some(control) = control.as_mut() else {
+        return 0;
+    };
+    control.shared.reap_retired();
+    if !x.is_finite() || !y.is_finite() || !matches!(op,0..=15|17..=27|29..=33) {
+        return 0;
+    }
+    let Some(generation) = live_generation(control) else {
+        return 0;
+    };
+    control
+        .shared
+        .submit(LiveCommand::Edit {
+            generation,
+            op,
+            a,
+            b,
+            c,
+            x,
+            y,
+        })
+        .map_or(0, |_| generation)
+}
+/// Prepare a drum-slot instrument and preset on control, swap on render, retire
+/// old DSP on control. Preserves sequencer/mixer/tuning; resets parameter locks.
+/// # Safety
+/// Valid endpoint, one serialized control producer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_replace_voice(
+    control: *mut GooeyLiveControl,
+    channel: u32,
+    kind: u32,
+    preset: u32,
+) -> u64 {
+    let Some(control) = control.as_mut() else {
+        return 0;
+    };
+    control.shared.reap_retired();
+    if channel >= 4 || !matches!(kind, 0..=3 | 5 | 6) || preset > 4 {
+        return 0;
+    }
+    let Some(generation) = live_generation(control) else {
+        return 0;
+    };
+    if !control.shared.reserve_voice() {
+        return 0;
+    }
+    let rate = control.sample_rate;
+    let instrument = match kind {
+        0 => ChannelInstrument::Kick(KickDrum::new(rate)),
+        1 => ChannelInstrument::Snare(SnareDrum::new(rate)),
+        2 => ChannelInstrument::HiHat(HiHat2::new(rate)),
+        3 => ChannelInstrument::Tom(Tom2::new(rate)),
+        5 => ChannelInstrument::Resonator(PercussionEngine::with_selection(
+            rate,
+            PercussionEngineKind::RoutingMatrix,
+            PercussionPreset::ALL[preset as usize],
+        )),
+        6 => ChannelInstrument::TwinCore(PercussionEngine::with_selection(
+            rate,
+            PercussionEngineKind::TwinCore,
+            PercussionPreset::ALL[preset as usize],
+        )),
+        _ => unreachable!(),
+    };
+    let prepared = Box::new((instrument, ChannelBlender::default_for_type(kind)));
+    match control.shared.submit(LiveCommand::ReplaceVoice {
+        generation,
+        channel: channel as usize,
+        prepared,
+    }) {
+        Ok(()) => generation,
+        Err(command) => {
+            drop(command);
+            control.shared.release_voice_credit();
+            0
+        }
+    }
+}
+
+/// Queue the complete nine-effect master order; limiter always remains final.
+/// # Safety
+/// Valid endpoint and ids points to count u32s. Serialized control producer.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_set_master_order(
+    control: *mut GooeyLiveControl,
+    ids: *const u32,
+    count: u32,
+) -> u64 {
+    let Some(c) = control.as_mut() else {
+        return 0;
+    };
+    c.shared.reap_retired();
+    if ids.is_null() || count != 9 {
+        return 0;
+    }
+    let input = std::slice::from_raw_parts(ids, 9);
+    if input
+        .iter()
+        .enumerate()
+        .any(|(i, x)| !is_reorderable_effect(*x) || input[..i].contains(x))
+    {
+        return 0;
+    }
+    let Some(generation) = live_generation(c) else {
+        return 0;
+    };
+    c.shared
+        .submit(LiveCommand::MasterOrder {
+            generation,
+            order: input.try_into().unwrap(),
+        })
+        .map_or(0, |_| generation)
+}
+/// Read render-published drum parameter target; NaN for bad channel/parameter.
+/// # Safety
+/// Valid endpoint. Safe to poll concurrently with rendering.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_get_channel_param(
+    control: *const GooeyLiveControl,
+    channel: u32,
+    param: u32,
+) -> f32 {
+    control.as_ref().map_or(f32::NAN, |c| {
+        c.shared.channel_param(channel as usize, param as usize)
+    })
+}
+
+/// Apply pending tape/control commands after the host has synchronously stopped
+/// its audio callback. Allows interrupted recordings to finalize without waiting
+/// for a callback that the OS will not issue.
+/// # Safety
+/// Valid engine. Host MUST ensure no render call is active or can start.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_track_tape_flush_stopped(engine: *mut GooeyEngine) {
+    if let Some(e) = engine.as_mut() {
+        e.apply_live_control_commands();
+        e.mixer.apply_control_commands();
+        let beat = e.mixer.transport_beat();
+        if let Some(t) = &mut e.track_tape {
+            t.begin_buffer(beat);
+        }
     }
 }

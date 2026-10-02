@@ -27,6 +27,24 @@ pub(crate) struct DrumCell {
 // render consumer deallocate when the command is applied.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum LiveCommand {
+    MasterOrder {
+        generation: u64,
+        order: [u32; 9],
+    },
+    Edit {
+        generation: u64,
+        op: u32,
+        a: u32,
+        b: u32,
+        c: u32,
+        x: f32,
+        y: f32,
+    },
+    ReplaceVoice {
+        generation: u64,
+        channel: usize,
+        prepared: Box<(crate::ffi::ChannelInstrument, crate::ffi::ChannelBlender)>,
+    },
     SetTrackGain {
         generation: u64,
         track: usize,
@@ -58,7 +76,10 @@ pub(crate) enum LiveCommand {
 impl LiveCommand {
     pub(crate) fn generation(&self) -> u64 {
         match self {
-            Self::SetTrackGain { generation, .. }
+            Self::MasterOrder { generation, .. }
+            | Self::Edit { generation, .. }
+            | Self::ReplaceVoice { generation, .. }
+            | Self::SetTrackGain { generation, .. }
             | Self::SetSourceTrim { generation, .. }
             | Self::ReplaceDrumPattern { generation, .. }
             | Self::ReplaceTrackRack { generation, .. }
@@ -219,9 +240,15 @@ pub(crate) struct LiveControlShared {
     pub(crate) lifecycle: Arc<EngineLifecycle>,
     commands: SpscRing<LiveCommand, LIVE_QUEUE_CAPACITY>,
     retired: SpscRing<EffectChain, LIVE_QUEUE_CAPACITY>,
+    retired_voices: SpscRing<
+        Box<(crate::ffi::ChannelInstrument, crate::ffi::ChannelBlender)>,
+        LIVE_QUEUE_CAPACITY,
+    >,
+    voice_credits: AtomicUsize,
     next_generation: AtomicU64,
     last_applied_generation: AtomicU64,
     rack_busy: Box<[AtomicBool]>,
+    channel_params: Box<[AtomicU64]>,
 }
 
 impl LiveControlShared {
@@ -230,8 +257,13 @@ impl LiveControlShared {
             lifecycle,
             commands: SpscRing::new(),
             retired: SpscRing::new(),
+            retired_voices: SpscRing::new(),
+            voice_credits: AtomicUsize::new(LIVE_QUEUE_CAPACITY),
             next_generation: AtomicU64::new(1),
             last_applied_generation: AtomicU64::new(0),
+            channel_params: (0..128)
+                .map(|_| AtomicU64::new(0.5_f32.to_bits() as u64))
+                .collect(),
             rack_busy: (0..track_count)
                 .map(|_| AtomicBool::new(false))
                 .collect::<Vec<_>>()
@@ -263,6 +295,17 @@ impl LiveControlShared {
         self.commands.pop()
     }
 
+    pub(crate) fn publish_param(&self, channel: usize, param: usize, value: f32) {
+        if let Some(p) = self.channel_params.get(channel * 32 + param) {
+            p.store(value.to_bits() as u64, Ordering::Release);
+        }
+    }
+    pub(crate) fn channel_param(&self, channel: usize, param: usize) -> f32 {
+        if channel >= 4 || param >= 32 {
+            return f32::NAN;
+        }
+        f32::from_bits(self.channel_params[channel * 32 + param].load(Ordering::Acquire) as u32)
+    }
     pub(crate) fn mark_applied(&self, generation: u64) {
         self.last_applied_generation
             .store(generation, Ordering::Release);
@@ -297,7 +340,25 @@ impl LiveControlShared {
 
     /// Drain on the control thread so effect graph destructors never run in the
     /// render callback.
+    pub(crate) fn reserve_voice(&self) -> bool {
+        self.voice_credits
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+    }
+    pub(crate) fn release_voice_credit(&self) {
+        self.voice_credits.fetch_add(1, Ordering::Release);
+    }
+    pub(crate) fn retire_voice(
+        &self,
+        voice: Box<(crate::ffi::ChannelInstrument, crate::ffi::ChannelBlender)>,
+    ) {
+        assert!(self.retired_voices.push(voice).is_ok());
+    }
     pub(crate) fn reap_retired(&self) {
+        while let Some(voice) = self.retired_voices.pop() {
+            drop(voice);
+            self.release_voice_credit();
+        }
         while let Some(rack) = self.retired.pop() {
             drop(rack);
         }

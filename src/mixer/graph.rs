@@ -404,6 +404,15 @@ impl MixerGraph {
     // --- render path (allocation-free) ---
 
     /// Zero every per-track accumulator. Call once at the top of each sample.
+    pub(crate) fn dry_frame(&self, track: usize) -> StereoFrame {
+        self.scratch.get(track).copied().unwrap_or_default()
+    }
+    pub(crate) fn replace_dry_frame(&mut self, track: usize, frame: StereoFrame) {
+        if let Some(f) = self.scratch.get_mut(track) {
+            *f = frame;
+        }
+    }
+
     pub fn clear_scratch(&mut self) {
         for s in &mut self.scratch {
             *s = StereoFrame::default();
