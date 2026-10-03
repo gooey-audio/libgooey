@@ -68,6 +68,12 @@ fn render(engine: *mut GooeyEngine, frames: usize) -> Vec<f32> {
 }
 
 unsafe fn commit_full_piano(engine: *mut GooeyEngine, piano: u32) {
+    commit_piano_with_release(engine, piano, 0.0);
+}
+
+/// A nonzero release keeps a struck-over chord's voices ringing in their
+/// tails, which is what makes a re-strike countable.
+unsafe fn commit_piano_with_release(engine: *mut GooeyEngine, piano: u32, release_secs: f32) {
     assert!(gooey_engine_piano_zone_begin(engine, piano));
     let pcm = vec![0.4_f32; 4096];
     assert!(gooey_engine_piano_zone_add(
@@ -85,7 +91,7 @@ unsafe fn commit_full_piano(engine: *mut GooeyEngine, piano: u32) {
         0.0,
         0.0,
         0.5,
-        0.0,
+        release_secs,
         PIANO_LOOP_CONTINUOUS,
         0,
         2_048,
@@ -701,5 +707,57 @@ fn producer_staging_can_run_concurrently_with_finite_monotonic_rendering() {
         let _ = render(engine, 1);
         assert!(gooey_engine_chord_loop_get_applied_generation(engine) > 0);
         gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn preserving_replacement_does_not_restrike_the_sounding_piano_chord() {
+    unsafe {
+        for preserve in [false, true] {
+            let engine = gooey_engine_new(SR);
+            let piano = gooey_engine_piano_register(engine) as u32;
+            commit_piano_with_release(engine, piano, 1.0);
+            gooey_engine_set_bpm(engine, 120.0);
+            let event = |voicing| GooeyChordLoopEvent {
+                start_tick: 0,
+                duration_ticks: 384,
+                chord: GooeyChordEvent {
+                    voicing,
+                    ..chord(GOOEY_CHORD_TARGET_PIANO, piano, 0)
+                },
+            };
+            let original = event(VOICING_ROOT_POSITION);
+            assert_ne!(
+                gooey_engine_chord_loop_replace(engine, &original, 1, 384),
+                0
+            );
+            gooey_engine_sequencer_start(engine);
+            let _ = render(engine, 4_800);
+            let sounding = gooey_engine_piano_active_voices(engine, piano);
+            assert_eq!(sounding, 3);
+
+            let revoiced = event(VOICING_FIRST_INVERSION);
+            let generation = if preserve {
+                gooey_engine_chord_loop_replace_preserving_sounding(engine, &revoiced, 1, 384)
+            } else {
+                gooey_engine_chord_loop_replace(engine, &revoiced, 1, 384)
+            };
+            assert_ne!(generation, 0);
+            let _ = render(engine, 128);
+            assert_eq!(
+                gooey_engine_chord_loop_get_applied_generation(engine),
+                generation
+            );
+            let voices = gooey_engine_piano_active_voices(engine, piano);
+            if preserve {
+                assert_eq!(voices, sounding, "the ringing chord was struck again");
+            } else {
+                assert!(
+                    voices > sounding,
+                    "default replace should strike the new voicing"
+                );
+            }
+            gooey_engine_free(engine);
+        }
     }
 }

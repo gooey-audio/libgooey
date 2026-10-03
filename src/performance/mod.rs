@@ -105,6 +105,10 @@ pub(crate) struct ChordLoopSnapshot {
     pub(crate) generation: u64,
     pub(crate) length_ticks: u32,
     pub(crate) events: Vec<PreparedChordEvent>,
+    /// Whether installing this clip mid-playback strikes the chord now
+    /// covering the playhead. When false, a chord that is already sounding
+    /// keeps ringing and the new clip is first heard at its next boundary.
+    pub(crate) retrigger_sounding: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -580,12 +584,18 @@ impl PerformanceRecorder {
         });
 
         let mut installed_generation = None;
+        // Set when the installed clip asked to leave the sounding chord alone;
+        // carries whether that chord was being held through the leading gap.
+        let mut held_through_install = None;
         // Host replacements are drained once per render buffer. Install the
         // newest one on that buffer's first clock sample instead of waiting for
         // the old clip to wrap. The monotonic transport beat remains the source
         // of phase, so changing clip length cannot restart or desynchronise it.
         if retired.len() < retired.capacity() {
             if let Some(snapshot) = self.pending_snapshot.take() {
+                if !snapshot.retrigger_sounding && self.playing_index.is_some() {
+                    held_through_install = Some(self.carrying_last_chord);
+                }
                 installed_generation = Some(self.install_snapshot(snapshot, retired));
             }
         }
@@ -660,14 +670,61 @@ impl PerformanceRecorder {
         self.last_tick = tick;
         self.last_absolute_tick = Some(absolute_tick);
         self.populate_sampler_hits(tick);
-        ClockUpdate {
-            action: self.playback_action_at(
+        let adopted = match held_through_install {
+            Some(was_carrying) if !discontinuity && !wrapped => {
+                self.adopt_sounding_chord(tick, was_carrying)
+            }
+            _ => None,
+        };
+        let action = adopted.unwrap_or_else(|| {
+            self.playback_action_at(
                 tick,
                 discontinuity || wrapped || installed_generation.is_some(),
                 wrapped && !discontinuity,
-            ),
+            )
+        });
+        ClockUpdate {
+            action,
             installed_generation,
         }
+    }
+
+    /// Point playback at the freshly installed clip's event under the playhead
+    /// without striking it, so the chord already ringing carries on until the
+    /// next boundary. A rest under the playhead releases the old chord. Returns
+    /// `None` when an event starts on this very tick, leaving the normal rescan
+    /// to strike it as it would have anyway.
+    fn adopt_sounding_chord(
+        &mut self,
+        tick: u32,
+        was_carrying: bool,
+    ) -> Option<Option<PlayerAction>> {
+        let length_ticks = self.length_ticks;
+        let events = self.active_events();
+        if let Some(index) = covering_sorted_event(events, tick, length_ticks) {
+            if events[index].event.start_tick == tick {
+                return None;
+            }
+            self.playing_index = Some(index);
+            self.cache_next_event_boundary(Some(index), tick);
+            return Some(None);
+        }
+        if was_carrying {
+            let last = events.len().checked_sub(1);
+            let first_start = events.first().map(|event| event.event.start_tick);
+            if let (Some(last), Some(first_start)) = (last, first_start) {
+                if events[last].event.end_tick(length_ticks) == 0 && tick < first_start {
+                    self.playing_index = Some(last);
+                    self.carrying_last_chord = true;
+                    self.next_event_boundary = Some(first_start);
+                    return Some(None);
+                }
+            }
+        }
+        // `install_snapshot` already cleared `playing_index`, so a rescan
+        // would see nothing sounding and leave the old voices ringing.
+        self.cache_next_event_boundary(None, tick);
+        Some(Some(PlayerAction::Release))
     }
 
     /// Record a chord pad press at the current clock. Returns true if stamped.
@@ -1109,6 +1166,20 @@ mod tests {
             generation,
             length_ticks,
             events,
+            retrigger_sounding: true,
+        }))
+    }
+
+    fn preserving_snapshot(
+        generation: u64,
+        length_ticks: u32,
+        events: Vec<PreparedChordEvent>,
+    ) -> ChordClipEdit {
+        ChordClipEdit::Replace(Arc::new(ChordLoopSnapshot {
+            generation,
+            length_ticks,
+            events,
+            retrigger_sounding: false,
         }))
     }
 
@@ -1542,5 +1613,161 @@ mod tests {
         );
         assert_eq!(rec.length_ticks(), 192);
         assert_eq!(retired.len(), 1);
+    }
+
+    fn voiced_event(
+        start_tick: u32,
+        duration_ticks: u32,
+        degree: u32,
+        voicing: u32,
+    ) -> PreparedChordEvent {
+        prepared(ChordClipEvent {
+            start_tick,
+            duration_ticks,
+            chord_set: 1,
+            root: 0,
+            scale_type: 0,
+            degree,
+            voicing,
+            preset: 0,
+            octave: 4,
+            velocity: 0.8,
+            gate: ChordGate::Held,
+        })
+    }
+
+    /// Two chords across one bar, playing and mid-way through the first.
+    fn playing_mid_first_chord(retired: &mut Vec<Arc<ChordLoopSnapshot>>) -> PerformanceRecorder {
+        let mut rec = PerformanceRecorder::new();
+        rec.apply_clip_edit(
+            snapshot(1, 384, vec![host_event(0, 192, 0), host_event(192, 192, 4)]),
+            false,
+            retired,
+        );
+        let start = rec.update_clock_with_transport(0.0, true, 1, retired);
+        assert!(matches!(start.action, Some(PlayerAction::Trigger(_))));
+        assert!(rec
+            .update_clock_with_transport(1.0, true, 1, retired)
+            .action
+            .is_none());
+        rec
+    }
+
+    #[test]
+    fn preserving_replacement_leaves_the_sounding_chord_until_its_next_boundary() {
+        let mut retired = Vec::with_capacity(8);
+        let mut rec = playing_mid_first_chord(&mut retired);
+
+        let revoiced = vec![voiced_event(0, 192, 0, 1), voiced_event(192, 192, 4, 2)];
+        assert_eq!(
+            rec.apply_clip_edit(preserving_snapshot(2, 384, revoiced), true, &mut retired),
+            None
+        );
+        let install = rec.update_clock_with_transport(1.25, true, 1, &mut retired);
+        assert_eq!(install.installed_generation, Some(2));
+        assert!(install.action.is_none());
+        assert!(rec
+            .update_clock_with_transport(1.9, true, 1, &mut retired)
+            .action
+            .is_none());
+
+        let boundary = rec.update_clock_with_transport(2.0, true, 1, &mut retired);
+        assert!(matches!(
+            boundary.action,
+            Some(PlayerAction::Trigger(event)) if event.event.degree == 4 && event.event.voicing == 2
+        ));
+        let wrap = rec.update_clock_with_transport(4.0, true, 1, &mut retired);
+        assert!(matches!(
+            wrap.action,
+            Some(PlayerAction::Trigger(event)) if event.event.degree == 0 && event.event.voicing == 1
+        ));
+    }
+
+    #[test]
+    fn default_replacement_still_strikes_the_chord_under_the_playhead() {
+        let mut retired = Vec::with_capacity(8);
+        let mut rec = playing_mid_first_chord(&mut retired);
+
+        let revoiced = vec![voiced_event(0, 192, 0, 1), voiced_event(192, 192, 4, 2)];
+        rec.apply_clip_edit(snapshot(2, 384, revoiced), true, &mut retired);
+        let install = rec.update_clock_with_transport(1.25, true, 1, &mut retired);
+        assert!(matches!(
+            install.action,
+            Some(PlayerAction::Trigger(event)) if event.event.voicing == 1
+        ));
+    }
+
+    #[test]
+    fn preserving_replacement_into_a_rest_releases_the_sounding_chord() {
+        let mut retired = Vec::with_capacity(8);
+        let mut rec = playing_mid_first_chord(&mut retired);
+
+        rec.apply_clip_edit(
+            preserving_snapshot(2, 384, vec![host_event(192, 192, 4)]),
+            true,
+            &mut retired,
+        );
+        let install = rec.update_clock_with_transport(1.25, true, 1, &mut retired);
+        assert_eq!(install.action, Some(PlayerAction::Release));
+        assert!(rec
+            .update_clock_with_transport(1.5, true, 1, &mut retired)
+            .action
+            .is_none());
+        assert!(matches!(
+            rec.update_clock_with_transport(2.0, true, 1, &mut retired).action,
+            Some(PlayerAction::Trigger(event)) if event.event.degree == 4
+        ));
+    }
+
+    #[test]
+    fn preserving_replacement_strikes_an_event_starting_on_the_install_tick() {
+        let mut retired = Vec::with_capacity(8);
+        let mut rec = playing_mid_first_chord(&mut retired);
+
+        rec.apply_clip_edit(
+            preserving_snapshot(2, 384, vec![host_event(0, 120, 0), host_event(120, 264, 4)]),
+            true,
+            &mut retired,
+        );
+        let install = rec.update_clock_with_transport(1.25, true, 1, &mut retired);
+        assert!(matches!(
+            install.action,
+            Some(PlayerAction::Trigger(event)) if event.event.degree == 4
+        ));
+    }
+
+    #[test]
+    fn preserving_replacement_keeps_carrying_the_final_chord_through_the_leading_gap() {
+        let mut rec = PerformanceRecorder::new();
+        let mut retired = Vec::with_capacity(8);
+        rec.apply_clip_edit(
+            snapshot(1, 384, vec![host_event(96, 288, 0)]),
+            false,
+            &mut retired,
+        );
+        rec.update_clock_with_transport(0.0, true, 1, &mut retired);
+        assert!(matches!(
+            rec.update_clock_with_transport(1.0, true, 1, &mut retired)
+                .action,
+            Some(PlayerAction::Trigger(_))
+        ));
+        // Wrapping into the leading gap carries the final chord.
+        assert!(rec
+            .update_clock_with_transport(4.0, true, 1, &mut retired)
+            .action
+            .is_none());
+
+        rec.apply_clip_edit(
+            preserving_snapshot(2, 384, vec![voiced_event(96, 288, 0, 1)]),
+            true,
+            &mut retired,
+        );
+        let install = rec.update_clock_with_transport(4.5, true, 1, &mut retired);
+        assert_eq!(install.installed_generation, Some(2));
+        assert!(install.action.is_none());
+        assert!(matches!(
+            rec.update_clock_with_transport(5.0, true, 1, &mut retired).action,
+            Some(PlayerAction::Trigger(event)) if event.event.voicing == 1
+        ));
     }
 }
