@@ -23,6 +23,39 @@ fn samples_per_step(bpm: f32) -> usize {
     ((60.0 / bpm) / 4.0 * SR) as usize
 }
 
+unsafe fn gate_config(engine: *const GooeyEngine, preset: u32) -> GooeyPolyGateConfig {
+    let mut config = GooeyPolyGateConfig {
+        pattern: u32::MAX,
+        depth: f32::NAN,
+        smoothing: f32::NAN,
+    };
+    assert!(gooey_engine_poly_get_preset_gate(
+        engine,
+        preset,
+        &mut config
+    ));
+    config
+}
+
+unsafe fn active_gate_config(engine: *const GooeyEngine) -> GooeyPolyGateConfig {
+    let mut config = GooeyPolyGateConfig {
+        pattern: u32::MAX,
+        depth: f32::NAN,
+        smoothing: f32::NAN,
+    };
+    assert!(gooey_engine_poly_get_gate(engine, &mut config));
+    config
+}
+
+fn frame_energy(samples: &[f32], start: usize, end: usize) -> f32 {
+    samples
+        .chunks_exact(2)
+        .skip(start)
+        .take(end - start)
+        .map(|frame| frame[0] * frame[0] + frame[1] * frame[1])
+        .sum()
+}
+
 #[test]
 fn third_inversion_and_drop2_have_stable_ids_and_render_through_ffi() {
     assert_eq!(VOICING_THIRD_INVERSION, 3);
@@ -126,6 +159,72 @@ fn editable_presets_are_isolated_selectable_and_resettable() {
 }
 
 #[test]
+fn gate_configs_are_isolated_selectable_clamped_and_resettable() {
+    assert_eq!(POLY_GATE_PATTERN_OFF, 0);
+    assert_eq!(POLY_GATE_PATTERN_STRAIGHT_EIGHTHS, 1);
+    assert_eq!(POLY_GATE_PATTERN_OFFBEAT_EIGHTHS, 2);
+    assert_eq!(POLY_GATE_PATTERN_CHOPPER, 3);
+    assert_eq!(POLY_GATE_PATTERN_TRANCE, 4);
+    assert_eq!(POLY_GATE_PATTERN_SYNCOPATED, 5);
+    assert_eq!(POLY_GATE_PATTERN_COUNT, 6);
+
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let factory = gate_config(engine, POLY_PRESET_PAD);
+        assert_eq!(factory.pattern, POLY_GATE_PATTERN_OFF);
+        approx_eq(factory.depth, 1.0);
+        approx_eq(factory.smoothing, 0.1);
+
+        assert!(gooey_engine_poly_set_preset_gate(
+            engine,
+            POLY_PRESET_PAD,
+            GooeyPolyGateConfig {
+                pattern: POLY_GATE_PATTERN_TRANCE,
+                depth: 2.0,
+                smoothing: -1.0,
+            },
+        ));
+        let pad = gate_config(engine, POLY_PRESET_PAD);
+        assert_eq!(pad.pattern, POLY_GATE_PATTERN_TRANCE);
+        approx_eq(pad.depth, 1.0);
+        approx_eq(pad.smoothing, 0.0);
+        assert_eq!(
+            gate_config(engine, POLY_PRESET_DEFAULT).pattern,
+            POLY_GATE_PATTERN_OFF
+        );
+
+        assert!(gooey_engine_poly_set_preset(engine, POLY_PRESET_PAD));
+        let mut active = GooeyPolyGateConfig {
+            pattern: 0,
+            depth: 0.0,
+            smoothing: 0.0,
+        };
+        assert!(gooey_engine_poly_get_gate(engine, &mut active));
+        assert_eq!(active.pattern, POLY_GATE_PATTERN_TRANCE);
+
+        assert!(gooey_engine_poly_set_gate(
+            engine,
+            GooeyPolyGateConfig {
+                pattern: POLY_GATE_PATTERN_SYNCOPATED,
+                depth: 0.6,
+                smoothing: 0.4,
+            },
+        ));
+        assert!(gooey_engine_poly_get_gate(engine, &mut active));
+        assert_eq!(active.pattern, POLY_GATE_PATTERN_SYNCOPATED);
+        approx_eq(active.depth, 0.6);
+        approx_eq(active.smoothing, 0.4);
+
+        assert!(gooey_engine_poly_reset_preset(engine, POLY_PRESET_PAD));
+        let reset = gate_config(engine, POLY_PRESET_PAD);
+        assert_eq!(reset.pattern, POLY_GATE_PATTERN_OFF);
+        approx_eq(reset.depth, 1.0);
+        approx_eq(reset.smoothing, 0.1);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
 fn performance_replay_uses_the_engines_edited_preset_copy() {
     unsafe {
         let engine = gooey_engine_new(SR);
@@ -159,6 +258,15 @@ fn performance_replay_uses_the_engines_edited_preset_copy() {
             POLY_PARAM_STEREO_WIDTH,
             0.19,
         ));
+        assert!(gooey_engine_poly_set_preset_gate(
+            engine,
+            POLY_PRESET_PAD,
+            GooeyPolyGateConfig {
+                pattern: POLY_GATE_PATTERN_CHOPPER,
+                depth: 0.71,
+                smoothing: 0.23,
+            },
+        ));
         assert!(gooey_engine_poly_set_preset(engine, POLY_PRESET_DEFAULT));
         let _ = render(engine, samples_per_step(bpm) * 16 + 512);
 
@@ -167,6 +275,10 @@ fn performance_replay_uses_the_engines_edited_preset_copy() {
             gooey_engine_poly_get_param(engine, POLY_PARAM_STEREO_WIDTH),
             0.19,
         );
+        let replayed_gate = active_gate_config(engine);
+        assert_eq!(replayed_gate.pattern, POLY_GATE_PATTERN_CHOPPER);
+        approx_eq(replayed_gate.depth, 0.71);
+        approx_eq(replayed_gate.smoothing, 0.23);
         gooey_engine_free(engine);
     }
 }
@@ -285,6 +397,127 @@ fn invalid_poly_inputs_leave_state_unchanged() {
             0.5,
         ));
         assert!(gooey_engine_poly_get_param(ptr::null(), POLY_PARAM_VOLUME).is_nan());
+
+        let before_gate = gate_config(engine, POLY_PRESET_DEFAULT);
+        for invalid in [
+            GooeyPolyGateConfig {
+                pattern: POLY_GATE_PATTERN_COUNT,
+                depth: 0.5,
+                smoothing: 0.5,
+            },
+            GooeyPolyGateConfig {
+                pattern: POLY_GATE_PATTERN_TRANCE,
+                depth: f32::NAN,
+                smoothing: 0.5,
+            },
+            GooeyPolyGateConfig {
+                pattern: POLY_GATE_PATTERN_TRANCE,
+                depth: 0.5,
+                smoothing: f32::INFINITY,
+            },
+        ] {
+            assert!(!gooey_engine_poly_set_gate(engine, invalid));
+        }
+        let after_gate = gate_config(engine, POLY_PRESET_DEFAULT);
+        assert_eq!(after_gate.pattern, before_gate.pattern);
+        approx_eq(after_gate.depth, before_gate.depth);
+        approx_eq(after_gate.smoothing, before_gate.smoothing);
+        assert!(!gooey_engine_poly_set_gate(
+            ptr::null_mut(),
+            GooeyPolyGateConfig {
+                pattern: POLY_GATE_PATTERN_TRANCE,
+                depth: 1.0,
+                smoothing: 0.0,
+            },
+        ));
+        assert!(!gooey_engine_poly_get_gate(engine, ptr::null_mut()));
+        assert!(!gooey_engine_poly_get_preset_gate(
+            engine,
+            POLY_PRESET_COUNT,
+            ptr::null_mut()
+        ));
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn gate_bypasses_when_stopped_and_chops_transport_synced_steps() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let bpm = 120.0;
+        gooey_engine_set_bpm(engine, bpm);
+        assert!(gooey_engine_poly_set_gate(
+            engine,
+            GooeyPolyGateConfig {
+                // Beat zero is closed in the offbeat pattern.
+                pattern: POLY_GATE_PATTERN_OFFBEAT_EIGHTHS,
+                depth: 1.0,
+                smoothing: 0.0,
+            },
+        ));
+        gooey_engine_poly_trigger_chord(
+            engine,
+            0,
+            SCALE_MAJOR,
+            0,
+            VOICING_ROOT_POSITION,
+            POLY_PRESET_DEFAULT,
+            4,
+            1.0,
+        );
+        let stopped = render(engine, 2048);
+        let stopped_energy = frame_energy(&stopped, 512, 2048);
+        assert!(
+            stopped_energy > 1e-5,
+            "stopped gate must bypass: {stopped_energy}"
+        );
+
+        gooey_engine_sequencer_set_beat_position(engine, 0.0);
+        gooey_engine_sequencer_start(engine);
+        let running_closed = render(engine, 2048);
+        let running_energy = frame_energy(&running_closed, 0, 2048);
+        assert!(
+            running_energy < stopped_energy * 1e-4,
+            "closed transport step should mute: stopped={stopped_energy} running={running_energy}"
+        );
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn gate_open_and_closed_steps_follow_the_transport_grid() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let bpm = 120.0;
+        let step = samples_per_step(bpm);
+        gooey_engine_set_bpm(engine, bpm);
+        assert!(gooey_engine_poly_set_gate(
+            engine,
+            GooeyPolyGateConfig {
+                pattern: POLY_GATE_PATTERN_STRAIGHT_EIGHTHS,
+                depth: 1.0,
+                smoothing: 0.0,
+            },
+        ));
+        gooey_engine_poly_trigger_chord(
+            engine,
+            0,
+            SCALE_MAJOR,
+            0,
+            VOICING_ROOT_POSITION,
+            POLY_PRESET_DEFAULT,
+            4,
+            1.0,
+        );
+        gooey_engine_sequencer_start(engine);
+        let samples = render(engine, step * 2 + 32);
+        let open = frame_energy(&samples, step / 2, step);
+        let closed = frame_energy(&samples, step + 16, step * 2);
+        assert!(open > 1e-5, "open step should pass the synth: {open}");
+        assert!(
+            closed < open * 1e-4,
+            "closed step should be much quieter: open={open} closed={closed}"
+        );
         gooey_engine_free(engine);
     }
 }
