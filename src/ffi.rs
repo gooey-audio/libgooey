@@ -50,6 +50,7 @@ use crate::music::{
     apply_voicing, available_voicings, transform_progression_voicings, Chord, ChordSet, Key,
     NoteName, ProgressionChord, ScaleType, VoiceLeadingStrategy, VoicingType, PADS_PER_SET,
 };
+use crate::output_scope::{OutputScopeBuffer, OutputScopeCapture};
 use crate::performance::control::{ChordControl, ChordControlScratch};
 use crate::performance::{
     prepare_chord_event, ChordCommandAction, ChordGate, ChordLoopSnapshot, PerformanceRecorder,
@@ -1101,6 +1102,11 @@ pub struct GooeyEngine {
     /// Read-and-reset count of frames whose selected pre-limiter path exceeded
     /// full scale on either channel.
     final_output_overload_frames: AtomicU64,
+    /// Lock-free min/max bins of the post-limiter output, readable from any
+    /// thread via `gooey_engine_read_output_scope`.
+    output_scope: OutputScopeBuffer,
+    /// Render-thread accumulator for the scope bin currently being filled.
+    output_scope_capture: OutputScopeCapture,
 
     // LFO pool (8 LFOs with multi-target routing)
     lfos: [Lfo; LFO_COUNT],
@@ -1320,6 +1326,16 @@ impl GooeyEngine {
         }
     }
 
+    /// Feed one emitted frame to the output scope. Offline bounce renders
+    /// faster than real time, so it is kept out of the live display.
+    #[inline]
+    fn capture_output_scope(&mut self, output: StereoFrame) {
+        if !self.offline_bounce {
+            self.output_scope_capture
+                .push_stereo(&self.output_scope, output.l, output.r);
+        }
+    }
+
     fn new(sample_rate: f32) -> Self {
         let bpm = 120.0;
 
@@ -1438,6 +1454,8 @@ impl GooeyEngine {
             final_output_gain: SmoothedParam::new(1.0, 0.0, 4.0, sample_rate, 15.0),
             final_output_peak: AtomicU32::new(0.0_f32.to_bits()),
             final_output_overload_frames: AtomicU64::new(0),
+            output_scope: OutputScopeBuffer::new(),
+            output_scope_capture: OutputScopeCapture::new(sample_rate),
             // LFO pool
             lfos,
             lfo_enabled: [false; LFO_COUNT],
@@ -1799,6 +1817,10 @@ impl GooeyEngine {
                 for sample in buffer.iter_mut() {
                     *sample = 0.0;
                 }
+                // The silence is still live output, so the scope keeps scrolling.
+                for _ in 0..frame_count {
+                    self.capture_output_scope(StereoFrame::default());
+                }
                 return;
             }
             ArmResolution::NotPending => None,
@@ -1847,6 +1869,7 @@ impl GooeyEngine {
             if let Some(fire_at) = arm_fires_at {
                 if sample_offset < fire_at {
                     frame.fill(0.0);
+                    self.capture_output_scope(StereoFrame::default());
                     sample_offset += 1;
                     continue;
                 }
@@ -2178,6 +2201,7 @@ impl GooeyEngine {
                 )
             };
             self.record_final_output_telemetry(telemetry_pre_limiter, output);
+            self.capture_output_scope(output);
 
             // Write the frame interleaved as [left, right].
             frame[0] = output.l;
@@ -4890,6 +4914,57 @@ pub unsafe extern "C" fn gooey_engine_take_final_output_overload_frames(
             .final_output_overload_frames
             .swap(0, Ordering::Relaxed)
     })
+}
+
+// =============================================================================
+// Output scope
+// =============================================================================
+
+/// Number of min/max bins held by the output scope. Each bin spans
+/// `round(sample_rate / OUTPUT_SCOPE_POINT_COUNT)` frames, so the full scope
+/// covers about one second of audio.
+pub const OUTPUT_SCOPE_POINT_COUNT: u32 = 1024;
+
+/// Copy the newest min/max waveform bins of the post-limiter master output.
+///
+/// Each rendered frame is downmixed to mono (`(l + r) * 0.5`, clamped to ±1;
+/// non-finite frames count as 0) and folded into a bin of
+/// `round(sample_rate / OUTPUT_SCOPE_POINT_COUNT)` frames. Silence still
+/// publishes `{0, 0}` bins so the display keeps scrolling. Offline bounce does
+/// not feed the scope.
+///
+/// Writes the newest `min(count, OUTPUT_SCOPE_POINT_COUNT)` bins into
+/// `out_min` / `out_max`, oldest first. If fewer bins have been published than
+/// requested, the front is padded with 0.0.
+///
+/// Returns the total number of bins published so far — a monotonic write
+/// position the caller can compare between reads to skip redraws. Returns 0
+/// for a null engine; null output pointers write nothing but still return the
+/// position.
+///
+/// Lock-free and safe to call from any thread while the engine renders.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+/// `out_min` and `out_max` must each point to at least `count` floats, or be
+/// null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_read_output_scope(
+    engine: *const GooeyEngine,
+    out_min: *mut f32,
+    out_max: *mut f32,
+    count: u32,
+) -> u64 {
+    let Some(engine) = engine.as_ref() else {
+        return 0;
+    };
+    let count = count.min(OUTPUT_SCOPE_POINT_COUNT) as usize;
+    if out_min.is_null() || out_max.is_null() {
+        return engine.output_scope.read(&mut [], &mut []);
+    }
+    let out_min = slice::from_raw_parts_mut(out_min, count);
+    let out_max = slice::from_raw_parts_mut(out_max, count);
+    engine.output_scope.read(out_min, out_max)
 }
 
 // =============================================================================

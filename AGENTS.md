@@ -83,6 +83,12 @@ metronome is summed after tonal effects, then smoothed final gain is applied,
 and the existing optional limiter runs last. This alternate topology is off by
 default so the signal flow above remains the backward-compatible behavior.
 
+For UI waveforms, `gooey_engine_read_output_scope` returns a lock-free
+min/max envelope of the post-limiter output (`src/output_scope.rs`):
+`OUTPUT_SCOPE_POINT_COUNT` (1024) bins covering about one second, captured on
+the render thread next to the final-output peak telemetry. Offline bounce does
+not feed it.
+
 ## Key Patterns
 
 - **Config / Params split**: `Config` structs hold static presets (with named constructors like `punchy()`). `Params` structs hold runtime `SmoothedParam` instances for real-time control.
