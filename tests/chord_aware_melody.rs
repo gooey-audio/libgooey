@@ -121,6 +121,11 @@ fn pre_harmony_input_starts_on_chord_and_releases_are_independent() {
 fn chord_changes_retarget_legato_and_extensions_are_available() {
     unsafe {
         let engine = gooey_engine_new(SR);
+        // Chord tones only: with key tensions, G4 would hold over Dm7 as its 11th.
+        assert!(gooey_engine_melody_set_note_pool(
+            engine,
+            MELODY_NOTE_POOL_CHORD
+        ));
         gooey_engine_poly_trigger_chord(
             engine,
             0,
@@ -312,6 +317,11 @@ fn recorded_chord_playback_retargets_a_held_melody() {
     unsafe {
         let engine = gooey_engine_new(SR);
         let beat_frames = (SR as usize * 60) / 120;
+        // Chord tones only, so F#4 must move between G4 and F4.
+        assert!(gooey_engine_melody_set_note_pool(
+            engine,
+            MELODY_NOTE_POOL_CHORD
+        ));
 
         gooey_engine_set_bpm(engine, 120.0);
         gooey_engine_perf_set_record_mode(engine, PERF_RECORD_MODE_OVERDUB);
@@ -357,6 +367,100 @@ fn recorded_chord_playback_retargets_a_held_melody() {
         // melody to F4 from the same intended F#4 input.
         let _ = render(engine, beat_frames + 256);
         assert_eq!(gooey_engine_melody_get_note(engine), 65);
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn key_tensions_are_reachable_and_the_pool_is_switchable() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        assert_eq!(
+            gooey_engine_melody_get_note_pool(engine),
+            MELODY_NOTE_POOL_KEY
+        );
+
+        gooey_engine_poly_trigger_chord_set(
+            engine,
+            CHORD_SET_TRIADS,
+            0,
+            SCALE_MAJOR,
+            0,
+            VOICING_ROOT_POSITION,
+            POLY_PRESET_DEFAULT,
+            4,
+            0.8,
+        );
+        // C major triad in C: D4 and A4 are tensions, F4 is an avoid note.
+        assert_eq!(gooey_engine_melody_note_on(engine, 62, 0.8), 62);
+        assert_eq!(gooey_engine_melody_update_note(engine, 69), 69);
+        assert_eq!(gooey_engine_melody_update_note(engine, 65), 64);
+
+        // Narrowing the pool retunes the held gesture to a chord tone.
+        assert_eq!(gooey_engine_melody_update_note(engine, 69), 69);
+        assert!(gooey_engine_melody_set_note_pool(
+            engine,
+            MELODY_NOTE_POOL_CHORD
+        ));
+        assert_eq!(
+            gooey_engine_melody_get_note_pool(engine),
+            MELODY_NOTE_POOL_CHORD
+        );
+        assert_eq!(gooey_engine_melody_get_note(engine), 67);
+
+        assert!(!gooey_engine_melody_set_note_pool(engine, 2));
+        assert_eq!(
+            gooey_engine_melody_get_note_pool(engine),
+            MELODY_NOTE_POOL_CHORD
+        );
+        assert!(!gooey_engine_melody_set_note_pool(
+            std::ptr::null_mut(),
+            MELODY_NOTE_POOL_KEY
+        ));
+        assert_eq!(
+            gooey_engine_melody_get_note_pool(std::ptr::null()),
+            MELODY_NOTE_POOL_KEY
+        );
+
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
+fn recorded_playback_latches_the_key_of_each_event() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let beat_frames = (SR as usize * 60) / 120;
+
+        gooey_engine_set_bpm(engine, 120.0);
+        gooey_engine_perf_set_record_mode(engine, PERF_RECORD_MODE_OVERDUB);
+        gooey_engine_perf_set_record_armed(engine, true);
+        gooey_engine_sequencer_start(engine);
+        let _ = render(engine, 64);
+
+        // A minor triad in A minor: B is the 9th.
+        gooey_engine_poly_trigger_chord_set(
+            engine,
+            CHORD_SET_TRIADS,
+            9,
+            SCALE_MINOR,
+            0,
+            VOICING_ROOT_POSITION,
+            POLY_PRESET_DEFAULT,
+            4,
+            0.8,
+        );
+        let _ = render(engine, beat_frames);
+        gooey_engine_poly_release(engine);
+        gooey_engine_perf_set_record_armed(engine, false);
+        assert_eq!(gooey_engine_perf_get_event_count(engine), 1);
+
+        gooey_engine_melody_clear_harmony(engine);
+        assert_eq!(gooey_engine_melody_note_on(engine, 71, 0.8), -1);
+
+        let _ = render(engine, beat_frames * 4 + 256);
+        assert_eq!(gooey_engine_melody_get_note(engine), 71);
 
         gooey_engine_free(engine);
     }
