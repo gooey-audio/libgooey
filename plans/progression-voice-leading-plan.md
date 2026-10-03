@@ -13,6 +13,7 @@ After this change, an embedded host can hand libgooey an ordered chord progressi
 - [x] (2026-10-01 22:14Z) Exposed the additive, in-place C function over `GooeyChordEvent` arrays and regenerated `include/gooey.h`.
 - [x] (2026-10-01 22:20Z) Added Rust unit and FFI integration coverage; formatting, 536 library tests, four FFI tests, the iOS release build, generated-header C syntax check, and diff checks pass.
 - [x] (2026-10-01 22:24Z) Committed and pushed the engine change, then opened libgooey pull request #270.
+- [x] (2026-10-03 00:19Z) Addressed review feedback by enforcing the near-optimal ceiling on the deterministic changed-path fallback and adding a long-identical-loop regression test; all 537 library tests and four FFI tests pass.
 
 ## Surprises & Discoveries
 
@@ -24,6 +25,9 @@ After this change, an embedded host can hand libgooey an ordered chord progressi
 
 - Observation: the dependent Nebula build initially exhausted the machine's free disk while Xcode duplicated its piano sample pack; this was environmental rather than a code or ABI failure.
   Evidence: Xcode reported `No space left on device` during the app-extension copy. Cleaning only Nebula DerivedData and libgooey's generated Cargo target freed enough space, after which all 194 Nebula tests passed.
+
+- Observation: the original deterministic fallback could return the cheapest changed cycle even when every changed cycle exceeded the randomizer's near-optimal ceiling.
+  Evidence: a 32-event loop of identical root-position Cmaj7 chords has a Best score of zero and an allowed maximum of eighteen, while its cheapest changed cycle scores above eighteen. The fallback now returns Best in that case.
 
 ## Decision Log
 
@@ -39,13 +43,13 @@ After this change, an embedded host can hand libgooey an ordered chord progressi
   Rationale: Nebula plays a loop, so optimizing a forward phrase while ignoring the wrap creates an audible seam.
   Date/Author: 2026-10-01 / Codex
 
-- Decision: Make randomization seeded and select only near-optimal cycles that differ from the current sequence when an alternative exists.
+- Decision: Make randomization seeded and select only near-optimal cycles that differ from the current sequence when a changed cycle fits the quality bound.
   Rationale: seeded behavior is reproducible in tests, while the near-optimal bound gives the dice action variety without abandoning voice-leading constraints.
   Date/Author: 2026-10-01 / Codex
 
 ## Outcomes & Retrospective
 
-The implementation provides a pure, bounded cyclic optimizer, deterministic seeded variation, and an atomic C ABI that changes only voicing IDs. All 536 libgooey library tests and four new FFI integration tests pass; the iOS-feature release build regenerates a C header accepted by clang. The engine work is published as [libgooey pull request #270](https://github.com/gooey-audio/libgooey/pull/270), ready for the dependent Nebula change to link.
+The implementation provides a pure, bounded cyclic optimizer, deterministic seeded variation, and an atomic C ABI that changes only voicing IDs. All 537 libgooey library tests and four new FFI integration tests pass; the iOS-feature release build regenerates a C header accepted by clang. Review confirmed and now regression-tests that the randomized fallback never weakens its quality ceiling. The engine work is published as [libgooey pull request #270](https://github.com/gooey-audio/libgooey/pull/270), ready for the dependent Nebula change to link.
 
 ## Context and Orientation
 
@@ -59,7 +63,7 @@ Create `src/music/voice_leading.rs` and export it from `src/music/mod.rs`. Defin
 
 For each chord, enumerate `available_voicings` and expand each candidate through `apply_voicing`. Score a candidate with a small change penalty, ten points per omitted chord tone, and a penalty for spans wider than two octaves. Score a transition with a non-crossing edit-distance alignment over sorted MIDI pitches: matched voices pay their semitone distance plus an extra charge beyond a perfect fifth, while inserted or removed voices pay twelve points. Add explicit bass and soprano motion charges so a low total hidden inside an implausible outer-voice leap cannot dominate.
 
-For Best, enumerate each possible first voicing and run dynamic programming through the remaining events, then add the closing last-to-first transition. Preserve deterministic tie-breaking by candidate order. For Randomized, first compute the best base score, then run seeded cost-perturbed searches and accept only differing cycles within thirty percent or eighteen points of the optimum. If no perturbed candidate qualifies, return the lowest-cost differing cycle; if no alternative exists, return the current sequence.
+For Best, enumerate each possible first voicing and run dynamic programming through the remaining events, then add the closing last-to-first transition. Preserve deterministic tie-breaking by candidate order. For Randomized, first compute the best base score, then run seeded cost-perturbed searches and accept only differing cycles within thirty percent or eighteen points of the optimum. If no perturbed candidate qualifies, use the lowest-cost differing cycle only when it also satisfies the bound; otherwise return Best rather than weakening the quality contract.
 
 In `src/ffi.rs`, add stable constants `GOOEY_VOICE_LEADING_BEST` and `GOOEY_VOICE_LEADING_RANDOM`, plus `gooey_chord_progression_transform_voicings(events, event_count, strategy, seed)`. Accept null only when the count is zero, reject more than `GOOEY_CHORD_LOOP_MAX_EVENTS`, validate every musical field and current voicing before writing, transform a copied Rust representation, and then update only each source struct's `voicing`. Invalid input must return false with the whole array unchanged. Document that target, target ID, preset, velocity, and gate are preserved rather than used for scoring.
 

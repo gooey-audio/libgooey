@@ -28,8 +28,8 @@ pub struct ProgressionChord {
 pub enum VoiceLeadingStrategy {
     /// The deterministic lowest-cost cycle.
     Best,
-    /// A seeded, near-optimal cycle that differs from the current one whenever
-    /// at least one chord has another valid voicing.
+    /// A seeded, near-optimal cycle that differs from the current one when a
+    /// changed cycle fits the quality bound.
     Randomized { seed: u64 },
 }
 
@@ -138,7 +138,12 @@ fn randomized_cycle(
             .iter()
             .map(|choices| vec![0; choices.len()])
             .collect::<Vec<_>>();
-        return solve_cycle(candidates, &zero_noise, true).unwrap_or(best);
+        if let Some(candidate) = solve_cycle(candidates, &zero_noise, true) {
+            if progression_score(candidates, &candidate) <= maximum_score {
+                return candidate;
+            }
+        }
+        return best;
     }
 
     let index = (rng.next_u64() as usize) % options.len();
@@ -435,6 +440,36 @@ mod tests {
             variants.len() > 1,
             "different seeds should explore more than one cycle"
         );
+    }
+
+    #[test]
+    fn randomization_fallback_never_bypasses_the_near_optimal_bound() {
+        // With enough identical root-position chords, changing all of them
+        // costs more than the fixed allowance, while changing only part of the
+        // loop also pays two expensive transition seams. No changed cycle is
+        // therefore eligible, regardless of the random search perturbations.
+        let repeated = chord(NoteName::C, ChordQuality::Major7, VoicingType::RootPosition);
+        let progression = vec![repeated; 32];
+        let candidates = progression
+            .iter()
+            .map(candidate_voicings)
+            .collect::<Vec<_>>();
+        let zero_noise = candidates
+            .iter()
+            .map(|choices| vec![0; choices.len()])
+            .collect::<Vec<_>>();
+        let best = transform_progression_voicings(&progression, VoiceLeadingStrategy::Best);
+        let maximum_score = progression_score(&candidates, &best) + 18;
+        let lowest_changed = solve_cycle(&candidates, &zero_noise, true)
+            .expect("each seventh chord has alternate named voicings");
+
+        assert!(progression_score(&candidates, &lowest_changed) > maximum_score);
+        let randomized = transform_progression_voicings(
+            &progression,
+            VoiceLeadingStrategy::Randomized { seed: 7 },
+        );
+        assert_eq!(randomized, best);
+        assert!(progression_score(&candidates, &randomized) <= maximum_score);
     }
 
     #[test]
