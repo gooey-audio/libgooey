@@ -8039,7 +8039,8 @@ pub unsafe extern "C" fn gooey_engine_chord_enqueue_release_all(
 
 /// Validate, copy, and stage a complete chord-loop snapshot. While transport
 /// is running, the newest accepted snapshot takes effect on the first sample
-/// of the next render buffer without resetting transport phase.
+/// of the next render buffer without resetting transport phase. The chord
+/// under the playhead is struck when the snapshot installs.
 ///
 /// # Safety
 /// `engine` must be null or a valid live engine pointer. When `event_count` is
@@ -8050,6 +8051,34 @@ pub unsafe extern "C" fn gooey_engine_chord_loop_replace(
     events: *const GooeyChordLoopEvent,
     event_count: u32,
     length_ticks: u32,
+) -> u64 {
+    chord_loop_replace(engine, events, event_count, length_ticks, true)
+}
+
+/// Like `gooey_engine_chord_loop_replace`, but a chord already sounding when
+/// the snapshot installs keeps ringing instead of being struck again. The new
+/// clip is first heard at its next event boundary, which suits edits such as
+/// re-voicing a progression that should not interrupt playback. A rest under
+/// the playhead in the new clip still releases the sounding chord.
+///
+/// # Safety
+/// Same contract as `gooey_engine_chord_loop_replace`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_chord_loop_replace_preserving_sounding(
+    engine: *const GooeyEngine,
+    events: *const GooeyChordLoopEvent,
+    event_count: u32,
+    length_ticks: u32,
+) -> u64 {
+    chord_loop_replace(engine, events, event_count, length_ticks, false)
+}
+
+unsafe fn chord_loop_replace(
+    engine: *const GooeyEngine,
+    events: *const GooeyChordLoopEvent,
+    event_count: u32,
+    length_ticks: u32,
+    retrigger_sounding: bool,
 ) -> u64 {
     let Some(engine) = engine.as_ref() else {
         return 0;
@@ -8074,7 +8103,9 @@ pub unsafe extern "C" fn gooey_engine_chord_loop_replace(
         event.event.duration_ticks = source_event.duration_ticks;
         prepared.push(event);
     }
-    engine.chord_control.replace(prepared, length_ticks)
+    engine
+        .chord_control
+        .replace(prepared, length_ticks, retrigger_sounding)
 }
 
 /// Clear the shared performance timeline at the next render boundary.

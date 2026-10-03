@@ -158,7 +158,12 @@ impl ChordControl {
         true
     }
 
-    pub(crate) fn replace(&self, mut events: Vec<PreparedChordEvent>, length_ticks: u32) -> u64 {
+    pub(crate) fn replace(
+        &self,
+        mut events: Vec<PreparedChordEvent>,
+        length_ticks: u32,
+        retrigger_sounding: bool,
+    ) -> u64 {
         if length_ticks == 0 || events.len() > CHORD_LOOP_MAX_EVENTS {
             return 0;
         }
@@ -195,6 +200,7 @@ impl ChordControl {
             generation,
             length_ticks,
             events,
+            retrigger_sounding,
         });
         let (retired, superseded) = {
             let Ok(mut state) = self.shared.queue.lock() else {
@@ -306,7 +312,7 @@ mod tests {
     #[test]
     fn sorts_and_rejects_cyclic_overlap_atomically() {
         let control = ChordControl::new();
-        let generation = control.replace(vec![event(96, 48), event(0, 48)], 192);
+        let generation = control.replace(vec![event(96, 48), event(0, 48)], 192, true);
         assert_ne!(generation, 0);
         let mut scratch = ChordControlScratch::default();
         control.drain_into(&mut scratch);
@@ -316,14 +322,17 @@ mod tests {
         assert_eq!(snapshot.events[0].event.start_tick, 0);
         assert_eq!(snapshot.events[1].event.start_tick, 96);
 
-        assert_eq!(control.replace(vec![event(180, 24), event(0, 20)], 192), 0);
+        assert_eq!(
+            control.replace(vec![event(180, 24), event(0, 20)], 192, true),
+            0
+        );
     }
 
     #[test]
     fn repeated_replacements_keep_only_newest_generation() {
         let control = ChordControl::new();
-        let first = control.replace(vec![event(0, 10)], 96);
-        let second = control.replace(vec![event(12, 10)], 96);
+        let first = control.replace(vec![event(0, 10)], 96, true);
+        let second = control.replace(vec![event(12, 10)], 96, true);
         assert!(second > first);
         let mut scratch = ChordControlScratch::default();
         control.drain_into(&mut scratch);
@@ -336,7 +345,7 @@ mod tests {
     #[test]
     fn newer_edit_retires_an_audio_pending_snapshot_without_dropping_it() {
         let control = ChordControl::new();
-        let first = control.replace(vec![event(0, 10)], 96);
+        let first = control.replace(vec![event(0, 10)], 96, true);
         let mut scratch = ChordControlScratch::default();
         control.drain_into(&mut scratch);
         assert!(matches!(
