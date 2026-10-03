@@ -20,6 +20,7 @@ pub mod music;
 pub(crate) mod output_scope;
 pub mod performance;
 pub mod sequencer;
+mod track_tape;
 pub mod utils;
 
 pub mod bounce;
