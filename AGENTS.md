@@ -6,41 +6,51 @@ Real-time audio synthesis engine in Rust. Drum synthesizers, sequencing, LFO mod
 
 ```
 src/
+├── lib.rs               # Crate root: module declarations + public re-exports
+├── ffi.rs               # The C ABI (`gooey_engine_*`) every iOS/macOS app links (~14.5k lines)
+│                        #   build.rs runs cbindgen → include/gooey.h (generated, not committed);
+│                        #   include/module.modulemap exposes it to Swift as `import Gooey`
+│
 ├── engine/              # Central coordinator: tick loop, instrument/effect ownership
 │   ├── mod.rs           # Engine struct, Instrument + Effect + Modulatable traits
 │   ├── engine_output.rs # CPAL audio thread integration (native only)
+│   ├── sequencer.rs     # Per-step blend settings used by the engine's sequencer
 │   └── lfo.rs           # LFO: BPM-synced or Hz-based sine modulator
 │
 ├── sequencer/           # 16-step sequencer with sample-accurate timing
 │   └── sequencer.rs     # Step triggers, parameter blending via PresetBlender
 │
-├── instruments/         # Drum synthesizers (all implement Instrument + Modulatable)
-│   ├── kick.rs          # Pitch-swept FM + noise + resonators
-│   ├── snare.rs         # Noise + pitched oscillators + resonators
-│   ├── hihat2.rs        # Metallic oscillators + click (closed/open modes)
-│   ├── tom2.rs          # Pitched percussion with frequency/decay control
-│   └── fm_snap.rs       # FM phase modulator utility
+├── instruments/         # Sound sources (drums implement Instrument + Modulatable)
+│   ├── kick.rs / reso_kick.rs        # FM kick; dual-resonator kick
+│   ├── snare.rs                      # Noise + pitched oscillators + resonators
+│   ├── hihat.rs / hihat2.rs          # Hi-hats (hihat2: metallic osc + click, closed/open)
+│   ├── tom.rs / tom2.rs              # Pitched percussion
+│   ├── percussion_engine.rs          # Selector over resonant percussion architectures
+│   ├── resonator_voice.rs / twin_core_perc.rs  # Two-mode resonant voice; Entity-style twin core
+│   ├── fm_snap.rs                    # FM phase modulator utility
+│   ├── bass.rs                       # Mono bass synth (polyBLEP osc + SVF + waveshaper)
+│   ├── poly_synth.rs (+ _control)    # Six-voice expressive stereo synth (Nebula/Tide chords)
+│   ├── mono_synth.rs / melody.rs     # Monophonic control over PolySynth; chord-aware melody
+│   ├── sampler.rs (+ _control)       # Fixed-size sample-pad rack
+│   ├── multisample*.rs               # Velocity-layered keyboard (piano pack load/prep/control)
+│   └── granulator.rs                 # Frozen-scan granular instrument
 │
-├── gen/                 # Signal generators
-│   ├── oscillator.rs    # Wavetable oscillator (sine, tri, square, saw)
-│   ├── morph_osc.rs     # Blends between waveforms
-│   ├── click_osc.rs     # Transient click/pop generator
-│   ├── pink_noise.rs    # 1/f noise
-│   └── waveform.rs      # Waveform lookup tables
+├── mixer/               # "Library owns the audio channels": multi-channel stereo loop mixer
+│   ├── mod.rs           # LoopMixer
+│   ├── graph.rs         # Host-defined mixer graph: named submix tracks fed by SourceIds
+│   ├── loop_channel.rs  # One loop player: start/end, speed, fader, mute/solo, effect chain
+│   ├── clip_grid.rs     # Transport-synced session clip grid over the loop mixer
+│   ├── effect_chain.rs / stereo_buffer.rs / control.rs  # Per-channel FX; shared buffers; cross-thread control
+│   └── wsola.rs         # Pitch-preserving time-stretch
 │
-├── filters/             # DSP filters
-│   ├── state_variable.rs / state_variable_tpt.rs
-│   ├── resonant_lowpass.rs / resonant_highpass.rs
-│   ├── biquad_bandpass.rs / biquad_highpass.rs
-│   └── membrane_resonator.rs
+├── music/               # Music theory: notes, intervals, scales, keys, chords
+│   ├── chord.rs / chord_set.rs       # Chords; named seven-pad palettes
+│   ├── voicing.rs / voice_leading.rs # Named voicings; loop-aware voicing selection
+│   ├── quantizer.rs / dynamics.rs    # Chord-tone pitch quantizer; per-voice strike strength
+│   └── key.rs / scale.rs / note.rs / interval.rs
 │
-├── effects/             # Audio effects (all implement Effect)
-│   ├── compressor.rs    # Tube compressor
-│   ├── delay.rs         # Delay with feedback
-│   ├── saturation.rs    # Tube saturation / waveshaping
-│   ├── lowpass_filter.rs
-│   ├── waveshaper.rs
-│   └── limiter.rs       # Brick-wall limiter
+├── performance/         # Clip recording + sample-accurate replay of live gestures (chords, loops)
+│   └── control.rs       # Nonblocking host→render control plane
 │
 ├── automation/          # Macros (one 0-1 control → many params) + motions (one-shot macro automation) + macro LFOs
 │   ├── macros.rs        # ParamTarget, MacroMapping/Definition, render-owned MacroBank
@@ -48,16 +58,55 @@ src/
 │   ├── lfo.rs           # Per-macro tempo-synced LFO (sine/tri/saw/square), MacroLfoRunner
 │   └── control.rs       # Host→render command queue + published values (C ABI in ffi.rs)
 │
+├── gen/                 # Signal generators
+│   ├── oscillator.rs    # Wavetable oscillator (sine, tri, square, saw)
+│   ├── polyblep.rs      # Band-limited saw/square
+│   ├── morph_osc.rs     # Blends between waveforms
+│   ├── click_osc.rs / exciter.rs  # Transient click; strike signals for resonant voices
+│   ├── pink_noise.rs    # 1/f noise
+│   └── waveform.rs      # Waveform lookup tables
+│
+├── filters/             # DSP filters
+│   ├── state_variable.rs / state_variable_tpt.rs
+│   ├── resonant_lowpass.rs / resonant_highpass.rs
+│   ├── biquad_bandpass.rs / biquad_highpass.rs
+│   └── membrane_resonator.rs / resonator.rs
+│
+├── effects/             # Audio effects (all implement Effect)
+│   ├── compressor.rs / entity_dynamics.rs  # Tube compressor; sidechain dynamics + feedback limiter
+│   ├── delay.rs         # Delay with feedback
+│   ├── reverb.rs / plate_reverb.rs         # Spring (allpass chain); Dattorro plate
+│   ├── saturation.rs / waveshaper.rs / feedback_waveshaper.rs
+│   ├── lowpass_filter.rs / tilt_filter.rs
+│   └── limiter.rs       # Brick-wall limiter
+│
 ├── utils/
 │   ├── smoother.rs      # SmoothedParam: bounded param with ~15ms exponential smoothing
-│   └── blendable.rs     # PresetBlender: cross-fade between parameter sets
+│   ├── blendable.rs     # PresetBlender: cross-fade between parameter sets
+│   ├── oversampler.rs   # Anti-alias oversampling around nonlinear stages
+│   └── db.rs / macro_map.rs / rng.rs
 │
+├── frame.rs             # StereoFrame: the engine's output currency
 ├── envelope.rs          # ADSR envelope with curve shaping
+├── max_curve.rs         # Max/MSP curve~ algorithm
 ├── metronome.rs         # Optional transport-locked monitor click (post-limiter by default)
+├── live_control.rs      # Lock-free control→render handoff for the opt-in live-control ABI
+├── output_scope.rs      # Lock-free min/max scope of the post-limiter output
+├── bounce.rs            # Offline render/export to WAV (`bounce` feature)
 ├── dsl.rs               # Line-based DSL for declarative instrument setup
-├── ffi.rs               # C FFI bindings for iOS/Swift integration
-└── visualization.rs     # Waveform display (feature-gated)
+└── visualization.rs (+ visualization/)  # Waveform/spectrogram display (feature-gated)
 ```
+
+Outside `src/`:
+
+| Path | What's there |
+| --- | --- |
+| `include/` | `module.modulemap` (committed) + generated `gooey.h` |
+| `tests/` | Integration tests, one file per area (`mixer_graph.rs`, `chord_loop_control.rs`, `ffi_*.rs`, ...); `tests/c/` has a C consumer of the live-control ABI |
+| `examples/` | Runnable demos and GUIs (`kick`, `polysynth_gui`, `reverb_lab`, `bounce`, `aliasing_plots`, ...); `examples/programs/*.gooey` are DSL programs |
+| `docs/` | ABI notes for consuming apps (`live-control-abi.md`, `macros-motions-abi.md`, `mixer-graph-migration.md`) |
+| `scripts/build-ios.sh` | Builds the iOS static libs; consuming apps use their own `build_libgooey_xcframework.sh` |
+| `plans/`, `.agent/PLANS.md` | Committed execution plans and the ExecPlan format |
 
 ## Core Traits
 
@@ -112,3 +161,18 @@ not feed it.
 | `crossterm` | Terminal UI for examples |
 | `visualization` | Waveform display (glfw, gl, rustfft) |
 | `midi` | MIDI input support (midir) |
+| `bounce` | Offline render/export to WAV (hound); enabled by `ios` |
+| `plots` | Offline aliasing spectrum/spectrogram PNGs (rustfft, plotters) |
+
+## Pull Requests
+
+- Apps consume libgooey through `ffi.rs`. When a PR adds or changes a
+  `gooey_engine_*` function, say so in the PR body and note which apps
+  (Nebula, Ripple, Kelp, Tide) need to follow up.
+- Put audible or visible evidence in the PR body when it helps review: a short
+  WAV render (`bounce` feature or an example), a plot (`plots` feature), or a
+  GUI example screenshot. Upload with `scripts/pr-screenshot.sh <files>`, which
+  stores them in Gooey Audio's shared public dev Blob store
+  (`GOOEY_DEV_PUBLIC_READ_WRITE_TOKEN`) under `libgooey/pr-screenshots/<branch>/`
+  and prints Markdown to paste. Never use `BLOB_READ_WRITE_TOKEN` for this; in
+  libgooey it is the private store that holds the piano pack.
