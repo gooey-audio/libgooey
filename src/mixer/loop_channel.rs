@@ -144,6 +144,9 @@ pub struct LoopChannel {
     clip_previous_beat: f64,
     clip_speed: SmoothedParam,
     clip_preserve_mix: SmoothedParam,
+    /// Transpose as a frequency ratio. Applied only to the WSOLA grain read
+    /// step, so it changes pitch without moving the beat-derived cursor.
+    clip_transpose: SmoothedParam,
     /// A buffer staged (from the main thread) to atomically replace `buffer` at
     /// the next bar-grid boundary. Taken by the audio thread in `advance()`.
     /// `has_pending` gates the audio thread so the common (nothing-queued) path
@@ -195,6 +198,7 @@ impl LoopChannel {
             clip_previous_beat: 0.0,
             clip_speed: SmoothedParam::new(1.0, 0.25, 4.0, sample_rate, FADER_SMOOTH_MS),
             clip_preserve_mix: SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, FADER_SMOOTH_MS),
+            clip_transpose: SmoothedParam::new(1.0, 0.25, 4.0, sample_rate, FADER_SMOOTH_MS),
             pending: Mutex::new(None),
             pending_divisions: AtomicU32::new(1),
             has_pending: AtomicBool::new(false),
@@ -267,10 +271,13 @@ impl LoopChannel {
         }
         let direct = buffer.read_wrapped(self.cursor);
         let mix = self.clip_preserve_mix.tick();
+        let transpose = self.clip_transpose.tick() as f64;
+        let transposing = (transpose - 1.0).abs() >= 1e-6 || !self.clip_transpose.is_settled();
+        let tape = self.warp_ratio() * speed;
         // Retain the allocated stretcher when bypassed and invalidate its tail,
         // so toggling preservation never drains stale audio from an old position.
-        if mix == 0.0
-            || ((self.warp_ratio() * speed - 1.0).abs() < 1e-6 && self.clip_speed.is_settled())
+        if !transposing
+            && (mix == 0.0 || ((tape - 1.0).abs() < 1e-6 && self.clip_speed.is_settled()))
         {
             if let Some(stretcher) = self.stretcher.as_mut() {
                 stretcher.reset(self.cursor);
@@ -281,10 +288,21 @@ impl LoopChannel {
         let stretcher = self
             .stretcher
             .get_or_insert_with(|| WsolaStretcher::new(engine_sample_rate, self.cursor));
+        // Grain pitch: transpose alone when preserving, stacked on the tape
+        // ratio when not. Interpolating in the log domain glides the pitch
+        // through a preservation toggle rather than blending two pitches.
+        let grain = if transposing {
+            transpose * tape.powf(1.0 - mix as f64)
+        } else {
+            1.0
+        };
         if stretcher.needs_refill() {
-            stretcher.synthesize_aligned_hop(buffer, &window, sr_ratio, self.cursor);
+            stretcher.synthesize_aligned_hop(buffer, &window, sr_ratio * grain, self.cursor);
         }
         let stretched = stretcher.drain();
+        if transposing {
+            return stretched;
+        }
         StereoFrame {
             l: direct.l * (1.0 - mix) + stretched.l * mix,
             r: direct.r * (1.0 - mix) + stretched.r * mix,
@@ -299,6 +317,14 @@ impl LoopChannel {
         } else {
             self.clip_speed.set_target(speed);
             self.clip_preserve_mix.set_target(mix);
+        }
+    }
+
+    pub(crate) fn set_clip_transpose(&mut self, ratio: f32, immediate: bool) {
+        if immediate {
+            self.clip_transpose.set_immediate(ratio);
+        } else {
+            self.clip_transpose.set_target(ratio);
         }
     }
 

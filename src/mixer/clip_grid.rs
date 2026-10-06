@@ -4,6 +4,12 @@ use super::{LoopChannel, PitchMode, StereoSampleBuffer, LOOP_CHANNEL_COUNT};
 
 pub const CLIP_COLUMN_COUNT: usize = LOOP_CHANNEL_COUNT;
 pub const CLIP_ROW_COUNT: usize = 8;
+/// Largest clip transpose, in semitones either way (a 0.25x..4x pitch ratio).
+pub const CLIP_TRANSPOSE_MAX_SEMITONES: f32 = 24.0;
+
+pub(crate) fn valid_transpose(semitones: f32) -> bool {
+    semitones.is_finite() && semitones.abs() <= CLIP_TRANSPOSE_MAX_SEMITONES
+}
 
 pub const CLIP_QUANTIZE_SIXTEENTH: u32 = 0;
 pub const CLIP_QUANTIZE_QUARTER: u32 = 1;
@@ -78,6 +84,8 @@ struct Clip {
     revision: u64,
     speed: f32,
     preserve_pitch: bool,
+    /// Pitch shift in semitones, independent of speed and transport timing.
+    transpose: f32,
     playback_configured: bool,
     buffer: StereoSampleBuffer,
     length_beats: f64,
@@ -103,12 +111,17 @@ impl Clip {
             revision: 0,
             speed: 1.0,
             preserve_pitch: true,
+            transpose: 0.0,
             playback_configured: false,
             buffer,
             length_beats,
             trim_start: 0.0,
             trim_end: 1.0,
         })
+    }
+
+    fn transpose_ratio(&self) -> f32 {
+        2f32.powf(self.transpose / 12.0)
     }
 
     /// Musical duration of the playable window, including wrap-around trims.
@@ -320,6 +333,43 @@ impl ClipGrid {
                         );
                     }
                     channel.set_clip_playback(speed, preserve_pitch, false);
+                }
+            }
+        }
+        true
+    }
+
+    /// Transpose a loaded clip live without changing its timing. Like
+    /// [`Self::set_playback`], a queued replacement only has its stored
+    /// setting edited.
+    pub fn set_transpose(
+        &mut self,
+        column: usize,
+        row: usize,
+        semitones: f32,
+        channels: &mut [LoopChannel],
+    ) -> bool {
+        if !Self::valid_slot(column, row) || !valid_transpose(semitones) {
+            return false;
+        }
+        let Some(clip) = self.slots[column][row].as_mut() else {
+            return false;
+        };
+        clip.transpose = semitones;
+        clip.playback_configured = true;
+        let ratio = clip.transpose_ratio();
+        if let Some(active) = self.columns[column].active_clip.as_mut() {
+            if active.revision == clip.revision {
+                let was_configured = active.playback_configured;
+                active.transpose = semitones;
+                active.playback_configured = true;
+                if let Some(channel) = channels.get_mut(column) {
+                    if !self.phase_aligned_launches && !was_configured {
+                        channel.seed_clip_phase_from_cursor(
+                            self.transport_beat - self.columns[column].launch_beat,
+                        );
+                    }
+                    channel.set_clip_transpose(ratio, false);
                 }
             }
         }
@@ -710,6 +760,7 @@ impl ClipGrid {
         channel.cancel_queued_swap();
         channel.set_buffer(clip.buffer.clone());
         channel.set_clip_playback(clip.speed, clip.preserve_pitch, true);
+        channel.set_clip_transpose(clip.transpose_ratio(), true);
         let launch_beat = if self.phase_aligned_launches {
             0.0
         } else {
@@ -1411,6 +1462,142 @@ mod playback_tests {
         assert_eq!(grid.slots[0][0].as_ref().unwrap().speed, 1.0);
         render(&mut grid, &mut channels, 1);
         assert_eq!(grid.columns[0].active_clip.as_ref().unwrap().speed, 1.0);
+    }
+
+    fn transposed(
+        speed: f32,
+        preserve: bool,
+        bpm: f32,
+        semitones: f32,
+    ) -> (ClipGrid, Vec<LoopChannel>) {
+        let (mut grid, mut channels) = setup(speed, preserve, bpm);
+        // Stored before the first render sample, so activation applies it.
+        assert!(grid.set_transpose(0, 0, semitones, &mut channels));
+        (grid, channels)
+    }
+
+    #[test]
+    fn transpose_shifts_pitch_and_stacks_on_tape_without_moving_position() {
+        for semitones in [-12.0, -5.0, 7.0, 12.0] {
+            for speed in [0.5, 1.0, 2.0] {
+                for bpm in [120.0, 180.0] {
+                    for preserve in [true, false] {
+                        let (mut grid, mut channels) = transposed(speed, preserve, bpm, semitones);
+                        let (mut ref_grid, mut ref_channels) = setup(speed, preserve, bpm);
+                        let samples = render(&mut grid, &mut channels, 16_000);
+                        render(&mut ref_grid, &mut ref_channels, 16_000);
+                        assert!(samples.iter().all(|x| x.is_finite() && x.abs() <= 0.31));
+                        let tape = if preserve { 1.0 } else { speed * bpm / 120.0 };
+                        let expected = 220.0 * 2f32.powf(semitones / 12.0) * tape;
+                        let hz = frequency(&samples[4_000..]);
+                        assert!(
+                            (hz - expected).abs() < expected * 0.08 + 2.0,
+                            "st={semitones}, speed={speed}, bpm={bpm}, preserve={preserve}: \
+                             {hz} vs {expected}"
+                        );
+                        assert_eq!(
+                            channels[0].position_normalized(),
+                            ref_channels[0].position_normalized(),
+                            "st={semitones}, speed={speed}, bpm={bpm}, preserve={preserve}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transposed_pulses_keep_the_loop_period() {
+        let data: Vec<f32> = (0..4_000)
+            .map(|i| {
+                if (1_000..1_400).contains(&i) {
+                    0.2
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let pulse = StereoSampleBuffer::from_interleaved(&data, 1, SR).unwrap();
+        for semitones in [-12.0, 12.0] {
+            for speed in [0.5, 1.0, 2.0] {
+                let (mut grid, mut channels) = setup(speed, true, 120.0);
+                grid.transport_stop(&mut channels);
+                assert!(grid.load_with_playback(0, 0, pulse.clone(), 120.0, speed, true));
+                assert!(grid.set_transpose(0, 0, semitones, &mut channels));
+                grid.transport_reset(&mut channels);
+                assert!(grid.launch_quantized(0, 0, LaunchQuantization::Bar));
+                grid.transport_start(&mut channels);
+                let period = 4_000.0 / speed as f64;
+                let samples = render(&mut grid, &mut channels, (period * 4.0) as usize);
+                let mut starts = Vec::new();
+                let mut previous = None;
+                for (i, x) in samples.iter().enumerate() {
+                    if x.abs() > 0.05 {
+                        if previous.is_none_or(|p| i - p > 400) {
+                            starts.push(i);
+                        }
+                        previous = Some(i);
+                    }
+                }
+                assert_eq!(starts.len(), 4, "st={semitones}, speed={speed}: {starts:?}");
+                for pair in starts.windows(2) {
+                    assert!(
+                        ((pair[1] - pair[0]) as f64 - period).abs() < 250.0,
+                        "st={semitones}, speed={speed}: {starts:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_transpose_keeps_position_and_returning_to_zero_restores_direct_audio() {
+        let (mut grid, mut channels) = setup(1.0, false, 120.0);
+        let (mut ref_grid, mut ref_channels) = setup(1.0, false, 120.0);
+        render(&mut grid, &mut channels, 5_000);
+        render(&mut ref_grid, &mut ref_channels, 5_000);
+        assert!(grid.set_transpose(0, 0, 7.0, &mut channels));
+        let samples = render(&mut grid, &mut channels, 8_000);
+        render(&mut ref_grid, &mut ref_channels, 8_000);
+        assert_eq!(
+            channels[0].position_normalized(),
+            ref_channels[0].position_normalized()
+        );
+        let expected = 220.0 * 2f32.powf(7.0 / 12.0);
+        assert!((frequency(&samples[4_000..]) - expected).abs() < expected * 0.08);
+        assert!(grid.set_transpose(0, 0, 0.0, &mut channels));
+        render(&mut grid, &mut channels, 4_000);
+        let back = render(&mut grid, &mut channels, 1_000);
+        render(&mut ref_grid, &mut ref_channels, 4_000);
+        assert_eq!(back, render(&mut ref_grid, &mut ref_channels, 1_000));
+    }
+
+    #[test]
+    fn replacement_transpose_waits_for_swap_and_other_columns_are_untouched() {
+        let (mut grid, mut channels) = setup(1.0, true, 120.0);
+        assert!(grid.load_with_playback(1, 0, tone(), 120.0, 1.0, true));
+        render(&mut grid, &mut channels, 4_000);
+        assert!(grid.load_with_playback(0, 0, tone(), 120.0, 1.0, true));
+        assert!(grid.set_transpose(0, 0, 5.0, &mut channels));
+        assert_eq!(grid.columns[0].active_clip.as_ref().unwrap().transpose, 0.0);
+        let before = render(&mut grid, &mut channels, 2_000);
+        assert!((frequency(&before) - 220.0).abs() < 20.0);
+        render(&mut grid, &mut channels, 10_001);
+        assert_eq!(grid.columns[0].active_clip.as_ref().unwrap().transpose, 5.0);
+        assert_eq!(grid.slots[1][0].as_ref().unwrap().transpose, 0.0);
+    }
+
+    #[test]
+    fn invalid_transpose_edits_are_rejected() {
+        let (mut grid, mut channels) = setup(1.0, true, 120.0);
+        for semitones in [f32::NAN, f32::INFINITY, -24.001, 24.001] {
+            assert!(!grid.set_transpose(0, 0, semitones, &mut channels));
+        }
+        assert!(!grid.set_transpose(0, 1, 2.0, &mut channels));
+        assert!(!grid.set_transpose(CLIP_COLUMN_COUNT, 0, 2.0, &mut channels));
+        assert!(grid.set_transpose(0, 0, -24.0, &mut channels));
+        assert!(grid.set_transpose(0, 0, 24.0, &mut channels));
+        assert_eq!(grid.slots[0][0].as_ref().unwrap().transpose, 24.0);
     }
 
     #[test]

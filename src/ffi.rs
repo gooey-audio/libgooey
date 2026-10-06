@@ -11005,6 +11005,9 @@ pub unsafe extern "C" fn gooey_engine_track_effect_type_at(
 pub const CLIP_COLUMN_COUNT: u32 = crate::mixer::CLIP_COLUMN_COUNT as u32;
 /// Number of rows in each clip-grid column.
 pub const CLIP_ROW_COUNT: u32 = crate::mixer::CLIP_ROW_COUNT as u32;
+/// Largest `gooey_engine_clip_set_transpose` value, in semitones either way.
+/// A literal so cbindgen can export it; mirrors the mixer constant.
+pub const CLIP_TRANSPOSE_MAX_SEMITONES: f32 = 24.0;
 
 /// Launch on the next straight sixteenth-note boundary.
 pub const CLIP_QUANTIZE_SIXTEENTH: u32 = crate::mixer::CLIP_QUANTIZE_SIXTEENTH;
@@ -11147,6 +11150,30 @@ pub unsafe extern "C" fn gooey_engine_clip_set_playback(
         engine
             .mixer_control
             .clip_set_playback(column as usize, row as usize, speed, preserve_pitch)
+    })
+}
+
+/// Transpose a loaded clip by `semitones` (finite, within
+/// +/-`CLIP_TRANSPOSE_MAX_SEMITONES`) without changing its timing: the clip
+/// stays locked to the transport grid at its current speed. Stacks with
+/// `gooey_engine_clip_set_playback`: with pitch preservation on, pitch moves
+/// by the transpose alone; with it off, speed and BPM repitch it as well.
+/// A queued replacement is edited without changing the outgoing audio.
+/// Returns false for an empty slot, invalid value, or rejected command.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_set_transpose(
+    engine: *mut GooeyEngine,
+    column: u32,
+    row: u32,
+    semitones: f32,
+) -> bool {
+    engine.as_ref().is_some_and(|engine| {
+        engine
+            .mixer_control
+            .clip_set_transpose(column as usize, row as usize, semitones)
     })
 }
 
@@ -14567,6 +14594,55 @@ mod automation_tests {
             .instrument
             .get_param(HIHAT_PARAM_TONE);
         assert!((tone - 0.25).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod clip_transpose_tests {
+    use super::*;
+
+    #[test]
+    fn transpose_requires_a_loaded_slot_and_a_finite_bounded_value() {
+        let engine = gooey_engine_new(48_000.0);
+        let samples = [0.1f32; 4_800];
+        unsafe {
+            assert!(!gooey_engine_clip_set_transpose(
+                std::ptr::null_mut(),
+                0,
+                0,
+                1.0
+            ));
+            assert!(!gooey_engine_clip_set_transpose(engine, 0, 0, 1.0));
+            assert!(gooey_engine_clip_load_with_playback(
+                engine,
+                0,
+                0,
+                samples.as_ptr(),
+                4_800,
+                1,
+                48_000.0,
+                120.0,
+                1.0,
+                true,
+            ));
+            assert!(gooey_engine_clip_set_transpose(engine, 0, 0, -7.0));
+            assert!(gooey_engine_clip_set_transpose(
+                engine,
+                0,
+                0,
+                CLIP_TRANSPOSE_MAX_SEMITONES
+            ));
+            for semitones in [f32::NAN, f32::INFINITY, 24.5, -24.5] {
+                assert!(!gooey_engine_clip_set_transpose(engine, 0, 0, semitones));
+            }
+            assert!(!gooey_engine_clip_set_transpose(
+                engine,
+                CLIP_COLUMN_COUNT,
+                0,
+                1.0
+            ));
+            gooey_engine_free(engine);
+        }
     }
 }
 

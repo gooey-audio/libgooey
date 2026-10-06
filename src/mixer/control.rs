@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{
-    loop_channel::RetiredLoopState, ChannelEffect, LaunchQuantization, PitchMode, RetrimTiming,
-    StereoSampleBuffer, CLIP_COLUMN_COUNT, CLIP_ROW_COUNT, LOOP_CHANNEL_COUNT,
+    clip_grid::valid_transpose, loop_channel::RetiredLoopState, ChannelEffect, LaunchQuantization,
+    PitchMode, RetrimTiming, StereoSampleBuffer, CLIP_COLUMN_COUNT, CLIP_ROW_COUNT,
+    LOOP_CHANNEL_COUNT,
 };
 
 /// Maximum number of control operations the audio thread applies in one sample.
@@ -91,6 +92,11 @@ pub(crate) enum MixerCommand {
         row: usize,
         speed: f32,
         preserve_pitch: bool,
+    },
+    ClipSetTranspose {
+        column: usize,
+        row: usize,
+        semitones: f32,
     },
     ClipUnload {
         column: usize,
@@ -605,6 +611,20 @@ impl MixerControl {
                 row,
                 speed,
                 preserve_pitch,
+            },
+            move |slots| slots[column][row],
+        )
+    }
+
+    pub fn clip_set_transpose(&self, column: usize, row: usize, semitones: f32) -> bool {
+        if column >= CLIP_COLUMN_COUNT || row >= CLIP_ROW_COUNT || !valid_transpose(semitones) {
+            return false;
+        }
+        self.enqueue_clip(
+            MixerCommand::ClipSetTranspose {
+                column,
+                row,
+                semitones,
             },
             move |slots| slots[column][row],
         )
