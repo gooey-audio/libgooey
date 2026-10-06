@@ -11072,6 +11072,84 @@ pub unsafe extern "C" fn gooey_engine_clip_load(
     }
 }
 
+/// Load or replace one clip-grid slot from interleaved audio.
+///
+/// `source_bpm` is required and must be finite and positive. Speed must be finite in 0.25..=4.0.
+/// Pitch preservation compensates both speed and BPM changes.
+/// Replacing the active slot keeps its old buffer sounding and schedules the
+/// replacement using the default launch quantization.
+///
+/// # Safety
+/// `engine` must be valid and `samples` must reference at least
+/// `frames * channels` readable `f32` values.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_load_with_playback(
+    engine: *mut GooeyEngine,
+    column: u32,
+    row: u32,
+    samples: *const f32,
+    frames: u32,
+    channels: u32,
+    sample_rate: f32,
+    source_bpm: f32,
+    speed: f32,
+    preserve_pitch: bool,
+) -> bool {
+    if !speed.is_finite()
+        || !(0.25..=4.0).contains(&speed)
+        || engine.is_null()
+        || samples.is_null()
+        || frames == 0
+        || channels == 0
+        || !source_bpm.is_finite()
+        || source_bpm <= 0.0
+        || column >= CLIP_COLUMN_COUNT
+        || row >= CLIP_ROW_COUNT
+    {
+        return false;
+    }
+    let Some(total) = (frames as usize).checked_mul(channels as usize) else {
+        return false;
+    };
+    let samples = slice::from_raw_parts(samples, total);
+    match StereoSampleBuffer::from_interleaved(samples, channels as usize, sample_rate) {
+        Ok(buffer) => {
+            // Defer the slot load to the audio thread (replacing the active slot
+            // touches the live channel); indices/bpm are validated above.
+            (*engine).mixer_control.clip_load_with_playback(
+                column as usize,
+                row as usize,
+                buffer,
+                source_bpm,
+                speed,
+                preserve_pitch,
+            )
+        }
+        Err(_) => false,
+    }
+}
+
+/// Set a loaded clip's speed (0.25..=4.0) and pitch preservation live.
+/// A queued replacement is edited without changing the outgoing audio.
+/// Returns false for an empty slot, invalid speed, or rejected command.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_set_playback(
+    engine: *mut GooeyEngine,
+    column: u32,
+    row: u32,
+    speed: f32,
+    preserve_pitch: bool,
+) -> bool {
+    engine.as_ref().is_some_and(|engine| {
+        engine
+            .mixer_control
+            .clip_set_playback(column as usize, row as usize, speed, preserve_pitch)
+    })
+}
+
 /// Unload a slot. An active slot stops and disappears at the default boundary;
 /// an inactive slot is removed immediately.
 ///
@@ -11278,6 +11356,28 @@ pub unsafe extern "C" fn gooey_engine_clip_set_default_quantization(
     engine
         .mixer_control
         .clip_set_default_quantization(quantization)
+}
+
+/// Configure clip launches to join the shared transport phrase position.
+///
+/// Opt-in (default false). Configure before launching any clips. When enabled,
+/// new clips, active-slot replacements and re-launches start at the current
+/// transport beat modulo their trimmed musical length, with beat zero as origin.
+/// This is applied on the audio thread at the actual quantized launch sample.
+/// Returns false for a null engine or a full control queue.
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_set_phase_aligned_launches(
+    engine: *mut GooeyEngine,
+    enabled: bool,
+) -> bool {
+    engine.as_ref().is_some_and(|engine| {
+        engine
+            .mixer_control
+            .clip_set_phase_aligned_launches(enabled)
+    })
 }
 
 /// Return the current default `CLIP_QUANTIZE_*` value (bar for a null engine).

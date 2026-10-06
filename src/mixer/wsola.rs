@@ -94,6 +94,13 @@ impl WsolaStretcher {
         }
     }
 
+    /// Invalidate the previous hop without reallocating scratch storage.
+    pub(crate) fn reset(&mut self, cursor: f64) {
+        self.have_prev_tail = false;
+        self.drain_idx = self.hop_len;
+        self.analysis_cursor = cursor;
+    }
+
     /// Whether `out_scratch` is exhausted and a new hop must be synthesized
     /// before the next `drain()`.
     pub(crate) fn needs_refill(&self) -> bool {
@@ -138,6 +145,51 @@ impl WsolaStretcher {
         } else {
             self.synthesize_next_hop_linear(buffer, window.lo, window.hi, sr_ratio, speed, warp)
         }
+    }
+
+    /// Transport-locked synthesis. Search around the supplied ideal position
+    /// each hop instead of accumulating correlation offsets. Grains cross the
+    /// playable window seam, so a phrase never restarts early to fit a grain.
+    pub(crate) fn synthesize_aligned_hop(
+        &mut self,
+        buffer: &StereoSampleBuffer,
+        window: &LoopWindow,
+        sr_ratio: f64,
+        cursor: f64,
+    ) {
+        let step = sr_ratio.max(1e-6);
+        let center = window.to_virtual(cursor).rem_euclid(window.span);
+        // With a silent reference, every correlation score ties. Keep the
+        // ideal center instead of choosing the earliest candidate, which can
+        // suppress a short onset at high compression ratios.
+        let reference_energy: f32 = self.prev_tail_mono.iter().map(|x| x * x).sum();
+        let best = if self.have_prev_tail && reference_energy > f32::EPSILON {
+            self.search_best_start_wrapped(buffer, window, center, step, window.span)
+        } else {
+            center
+        };
+        for (i, slot) in self.grain_scratch.iter_mut().enumerate() {
+            let v = (best + i as f64 * step).rem_euclid(window.span);
+            let raw = buffer.read_wrapped(window.to_physical(v));
+            *slot = raw.scaled(self.window[i]);
+        }
+        for i in 0..self.hop_len {
+            let prev = if self.have_prev_tail {
+                self.prev_tail[i]
+            } else {
+                StereoFrame::default()
+            };
+            let new = self.grain_scratch[i];
+            self.out_scratch[i] = StereoFrame {
+                l: prev.l + new.l,
+                r: prev.r + new.r,
+            };
+            self.prev_tail[i] = self.grain_scratch[self.hop_len + i];
+            self.prev_tail_mono[i] = self.prev_tail[i].l + self.prev_tail[i].r;
+        }
+        self.have_prev_tail = true;
+        self.drain_idx = 0;
+        self.analysis_cursor = window.to_physical(best);
     }
 
     /// Non-wrap hop synthesis: physical-frame math, byte-identical to the
@@ -522,6 +574,48 @@ mod tests {
             "2x warp should consume source material faster: fast={} slow={}",
             fast.analysis_cursor,
             slow.analysis_cursor
+        );
+    }
+    #[test]
+    fn aligned_hops_cross_loop_seams_without_early_restart_or_silence() {
+        let buffer =
+            StereoSampleBuffer::from_channels(vec![0.3; 2400], vec![0.3; 2400], SR).unwrap();
+        let window = full_window(2400.0);
+        let mut stretcher = WsolaStretcher::new(SR, 0.0);
+        for hop in 0..100 {
+            let cursor = (hop as f64 * 1700.0) % window.span;
+            stretcher.synthesize_aligned_hop(&buffer, &window, 1.0, cursor);
+            for _ in 0..stretcher.hop_len {
+                let out = stretcher.drain();
+                if hop > 0 {
+                    assert!((out.l - 0.3).abs() < 1e-5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aligned_hops_keep_pitch_at_double_tempo() {
+        let buffer = sine_buffer(2.0, 220.0, SR);
+        let window = full_window(buffer.len() as f64);
+        let mut stretcher = WsolaStretcher::new(SR, 0.0);
+        let mut crossings = 0;
+        let mut previous = 0.0;
+        for hop in 0..100 {
+            let cursor = (hop as f64 * stretcher.hop_len as f64 * 2.0) % window.span;
+            stretcher.synthesize_aligned_hop(&buffer, &window, 1.0, cursor);
+            for _ in 0..stretcher.hop_len {
+                let out = stretcher.drain().l;
+                if previous <= 0.0 && out > 0.0 {
+                    crossings += 1;
+                }
+                previous = out;
+            }
+        }
+        // Two seconds of output stays near 220 Hz, rather than 440 Hz.
+        assert!(
+            (crossings as f64 - 440.0).abs() < 20.0,
+            "{crossings} crossings"
         );
     }
 }

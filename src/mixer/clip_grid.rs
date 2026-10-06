@@ -75,6 +75,10 @@ impl RetrimTiming {
 
 #[derive(Clone, Debug)]
 struct Clip {
+    revision: u64,
+    speed: f32,
+    preserve_pitch: bool,
+    playback_configured: bool,
     buffer: StereoSampleBuffer,
     length_beats: f64,
     /// Normalized loop trim markers in `[0, 1]`. `trim_end < trim_start` selects
@@ -96,11 +100,25 @@ impl Clip {
         }
         buffer.set_source_bpm(Some(source_bpm));
         Some(Self {
+            revision: 0,
+            speed: 1.0,
+            preserve_pitch: true,
+            playback_configured: false,
             buffer,
             length_beats,
             trim_start: 0.0,
             trim_end: 1.0,
         })
+    }
+
+    /// Musical duration of the playable window, including wrap-around trims.
+    fn window_length_beats(&self) -> f64 {
+        let fraction = if self.trim_end > self.trim_start {
+            self.trim_end - self.trim_start
+        } else {
+            1.0 - self.trim_start + self.trim_end
+        };
+        self.length_beats * fraction
     }
 }
 
@@ -141,6 +159,8 @@ pub struct ClipGrid {
     slots: [[Option<Clip>; CLIP_ROW_COUNT]; CLIP_COLUMN_COUNT],
     columns: [ColumnState; CLIP_COLUMN_COUNT],
     default_quantization: LaunchQuantization,
+    phase_aligned_launches: bool,
+    next_revision: u64,
     transport_beat: f64,
     transport_running: bool,
     /// Bumped on every transport *discontinuity* (seek, reset, start) but never
@@ -161,12 +181,20 @@ impl ClipGrid {
             slots: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             columns: std::array::from_fn(|_| ColumnState::default()),
             default_quantization: LaunchQuantization::Bar,
+            phase_aligned_launches: false,
+            next_revision: 0,
             transport_beat: 0.0,
             transport_running: false,
             transport_generation: 0,
             bpm,
             sample_rate,
         }
+    }
+
+    /// Opt-in shared phrase origin for session hosts. Other apps retain
+    /// launch-from-start behavior. Configure before launching any clips.
+    pub fn set_phase_aligned_launches(&mut self, enabled: bool) {
+        self.phase_aligned_launches = enabled;
     }
 
     fn valid_slot(column: usize, row: usize) -> bool {
@@ -221,9 +249,11 @@ impl ClipGrid {
         if !Self::valid_slot(column, row) {
             return false;
         }
-        let Some(clip) = Clip::new(buffer, source_bpm) else {
+        let Some(mut clip) = Clip::new(buffer, source_bpm) else {
             return false;
         };
+        self.next_revision = self.next_revision.wrapping_add(1);
+        clip.revision = self.next_revision;
         self.slots[column][row] = Some(clip);
 
         if self.columns[column].active_row == Some(row) {
@@ -232,6 +262,66 @@ impl ClipGrid {
                 kind: PendingKind::Launch { row },
                 beat: target,
             });
+        }
+        true
+    }
+
+    pub fn load_with_playback(
+        &mut self,
+        column: usize,
+        row: usize,
+        buffer: StereoSampleBuffer,
+        source_bpm: f32,
+        speed: f32,
+        preserve_pitch: bool,
+    ) -> bool {
+        if !speed.is_finite()
+            || !(0.25..=4.0).contains(&speed)
+            || !self.load(column, row, buffer, source_bpm)
+        {
+            return false;
+        }
+        let clip = self.slots[column][row].as_mut().unwrap();
+        clip.speed = speed;
+        clip.preserve_pitch = preserve_pitch;
+        clip.playback_configured = true;
+        true
+    }
+
+    pub fn set_playback(
+        &mut self,
+        column: usize,
+        row: usize,
+        speed: f32,
+        preserve_pitch: bool,
+        channels: &mut [LoopChannel],
+    ) -> bool {
+        if !Self::valid_slot(column, row) || !speed.is_finite() || !(0.25..=4.0).contains(&speed) {
+            return false;
+        }
+        let Some(clip) = self.slots[column][row].as_mut() else {
+            return false;
+        };
+        clip.speed = speed;
+        clip.preserve_pitch = preserve_pitch;
+        clip.playback_configured = true;
+        if let Some(active) = self.columns[column].active_clip.as_mut() {
+            if active.revision == clip.revision {
+                // A pending replacement has a different revision: only edit
+                // its stored settings, never the outgoing channel.
+                let was_configured = active.playback_configured;
+                active.speed = speed;
+                active.preserve_pitch = preserve_pitch;
+                active.playback_configured = true;
+                if let Some(channel) = channels.get_mut(column) {
+                    if !self.phase_aligned_launches && !was_configured {
+                        channel.seed_clip_phase_from_cursor(
+                            self.transport_beat - self.columns[column].launch_beat,
+                        );
+                    }
+                    channel.set_clip_playback(speed, preserve_pitch, false);
+                }
+            }
         }
         true
     }
@@ -567,12 +657,18 @@ impl ClipGrid {
             let Some(clip) = state.active_clip.as_ref() else {
                 continue;
             };
-            let phase =
-                (beat - state.launch_beat).rem_euclid(clip.length_beats) / clip.length_beats;
+            let length = if self.phase_aligned_launches || clip.playback_configured {
+                clip.window_length_beats()
+            } else {
+                clip.length_beats
+            };
+            let source_beat = (beat - state.launch_beat) * clip.speed as f64;
+            let phase = source_beat.rem_euclid(length) / length;
             if let Some(channel) = channels.get_mut(column) {
                 // Map the musical phrase phase through the loop window so it
                 // lands correctly inside a trimmed (or wrapped) region.
                 channel.set_window_phase(phase as f32);
+                channel.seed_clip_phase(beat - state.launch_beat, clip.speed);
             }
         }
         true
@@ -613,10 +709,28 @@ impl ClipGrid {
         channel.set_pitch_mode(PitchMode::PreservePitch);
         channel.cancel_queued_swap();
         channel.set_buffer(clip.buffer.clone());
+        channel.set_clip_playback(clip.speed, clip.preserve_pitch, true);
+        let launch_beat = if self.phase_aligned_launches {
+            0.0
+        } else {
+            self.transport_beat
+        };
+        channel.seed_clip_phase(self.transport_beat - launch_beat, clip.speed);
+        if self.phase_aligned_launches {
+            // Compute at the actual render sample that activates this clip,
+            // never at generation completion or from a host timer.
+            let length = clip.window_length_beats();
+            let phase = (self.transport_beat * clip.speed as f64).rem_euclid(length) / length;
+            channel.set_window_phase(phase as f32);
+        }
         channel.set_playing(self.transport_running);
         self.columns[column].active_row = Some(row);
         self.columns[column].active_clip = Some(clip);
-        self.columns[column].launch_beat = self.transport_beat;
+        self.columns[column].launch_beat = if self.phase_aligned_launches {
+            0.0
+        } else {
+            self.transport_beat
+        };
     }
 
     fn stop_now(&mut self, column: usize, channels: &mut [LoopChannel]) {
@@ -636,6 +750,9 @@ impl ClipGrid {
     /// Apply due actions before this sample is rendered, then advance the
     /// monotonic beat clock after the sample has been produced.
     pub fn before_tick(&mut self, channels: &mut [LoopChannel]) {
+        for channel in channels.iter_mut() {
+            channel.set_transport_beat(None);
+        }
         if !self.transport_running {
             return;
         }
@@ -667,6 +784,16 @@ impl ClipGrid {
                     if let Some(channel) = channels.get_mut(column) {
                         channel.set_loop_window(retrim.start as f32, retrim.end as f32);
                     }
+                }
+            }
+            let state = &self.columns[column];
+            if state
+                .active_clip
+                .as_ref()
+                .is_some_and(|clip| self.phase_aligned_launches || clip.playback_configured)
+            {
+                if let Some(channel) = channels.get_mut(column) {
+                    channel.set_transport_beat(Some(self.transport_beat - state.launch_beat));
                 }
             }
         }
@@ -996,6 +1123,304 @@ mod tests {
             grid.before_tick(&mut channels);
             assert!(grid.transport_seek(2.0, &mut channels)); // phase 0.5 -> seam
             assert!(channels[0].position_normalized() < 0.01);
+        }
+    }
+    #[test]
+    fn phase_aligned_join_and_cycle_match_existing_audio_sample_for_sample() {
+        let mut grid = ClipGrid::new(SR, 60.0);
+        grid.set_phase_aligned_launches(true);
+        let mut channels = channels();
+        for channel in &mut channels {
+            channel.set_engine_bpm(60.0);
+        }
+        let samples: Vec<f32> = (0..1600).map(|i| i as f32 / 1600.0).collect();
+        let buffer = StereoSampleBuffer::from_channels(samples.clone(), samples, SR).unwrap();
+        grid.load(0, 0, buffer.clone(), 60.0);
+        grid.launch_at(0, 0, 0.0);
+        grid.transport_start(&mut channels);
+        step(&mut grid, &mut channels, 700);
+        grid.load(1, 0, buffer, 60.0);
+        grid.launch_quantized(1, 0, LaunchQuantization::Bar);
+        step(&mut grid, &mut channels, 100);
+        assert_eq!(grid.active_row(1), None);
+        for sample in 800..3201 {
+            grid.before_tick(&mut channels);
+            let a = channels[0].tick(SR);
+            let b = channels[1].tick(SR);
+            assert_eq!(a.l, b.l, "mismatched source audio at sample {sample}");
+            if sample % 1600 == 0 {
+                assert_eq!(a.l, 0.0);
+            }
+            grid.after_tick();
+        }
+    }
+
+    #[test]
+    fn phase_aligned_stretch_does_not_drift_after_tempo_changes() {
+        let mut grid = ClipGrid::new(SR, 60.0);
+        grid.set_phase_aligned_launches(true);
+        let mut channels = channels();
+        for channel in &mut channels {
+            channel.set_engine_bpm(60.0);
+        }
+        let (buffer, bpm) = clip(0.25, 1600, 60.0);
+        grid.load(0, 0, buffer.clone(), bpm);
+        grid.launch_at(0, 0, 0.0);
+        grid.transport_start(&mut channels);
+        step(&mut grid, &mut channels, 700);
+        grid.load(1, 0, buffer, bpm);
+        grid.launch_quantized(1, 0, LaunchQuantization::Bar);
+        grid.set_bpm(90.0);
+        for channel in &mut channels {
+            channel.set_engine_bpm(90.0);
+        }
+        step(&mut grid, &mut channels, 68);
+        assert_eq!(grid.active_row(1), Some(0));
+        for _ in 0..5000 {
+            grid.before_tick(&mut channels);
+            for channel in channels.iter_mut().take(2) {
+                let out = channel.tick(SR);
+                assert!(out.l.is_finite());
+            }
+            assert!(
+                (channels[0].position_normalized() - channels[1].position_normalized()).abs()
+                    < 1e-7
+            );
+            grid.after_tick();
+        }
+    }
+
+    #[test]
+    fn phase_aligned_trimmed_and_wrapped_windows_use_their_musical_duration() {
+        for (start, end, expected) in [(0.25, 0.75, 0.5), (0.75, 0.25, 0.0)] {
+            let mut grid = ClipGrid::new(SR, 60.0);
+            grid.set_phase_aligned_launches(true);
+            let mut channels = channels();
+            for channel in &mut channels {
+                channel.set_engine_bpm(60.0);
+            }
+            let (buffer, bpm) = clip(0.25, 1600, 60.0);
+            grid.load(0, 0, buffer, bpm);
+            grid.set_trim(0, 0, start, end, RetrimTiming::Immediate, &mut channels);
+            grid.transport_start(&mut channels);
+            grid.transport_seek(3.0, &mut channels);
+            grid.launch_quantized(0, 0, LaunchQuantization::Bar);
+            step(&mut grid, &mut channels, 101);
+            assert!(
+                (channels[0].position_normalized() - expected).abs() < 1e-6,
+                "{} != {expected}, beat {}",
+                channels[0].position_normalized(),
+                grid.transport_beat()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod playback_tests {
+    use super::*;
+    const SR: f32 = 8_000.0;
+
+    fn tone() -> StereoSampleBuffer {
+        let data: Vec<f32> = (0..32_000)
+            .map(|i| (i as f32 * std::f32::consts::TAU * 220.0 / SR).sin() * 0.3)
+            .collect();
+        StereoSampleBuffer::from_interleaved(&data, 1, SR).unwrap()
+    }
+    fn setup(speed: f32, preserve: bool, bpm: f32) -> (ClipGrid, Vec<LoopChannel>) {
+        let mut grid = ClipGrid::new(SR, bpm);
+        grid.set_phase_aligned_launches(true);
+        let mut channels: Vec<_> = (0..CLIP_COLUMN_COUNT)
+            .map(|_| LoopChannel::new(SR))
+            .collect();
+        for ch in &mut channels {
+            ch.set_engine_bpm(bpm);
+        }
+        assert!(grid.load_with_playback(0, 0, tone(), 120.0, speed, preserve));
+        assert!(grid.launch_quantized(0, 0, LaunchQuantization::Bar));
+        grid.transport_start(&mut channels);
+        (grid, channels)
+    }
+    fn render(grid: &mut ClipGrid, channels: &mut [LoopChannel], count: usize) -> Vec<f32> {
+        (0..count)
+            .map(|_| {
+                grid.before_tick(channels);
+                let frame = channels[0].tick(SR).l;
+                grid.after_tick();
+                frame
+            })
+            .collect()
+    }
+    fn frequency(samples: &[f32]) -> f32 {
+        let crossings = samples
+            .windows(2)
+            .filter(|w| w[0] <= 0.0 && w[1] > 0.0)
+            .count();
+        crossings as f32 * SR / samples.len() as f32
+    }
+
+    #[test]
+    fn speed_changes_duration_and_preservation_compensates_both_speed_and_bpm() {
+        for speed in [0.25, 0.5, 1.0, 2.0, 4.0] {
+            for bpm in [90.0, 120.0, 180.0] {
+                for preserve in [false, true] {
+                    let (mut grid, mut channels) = setup(speed, preserve, bpm);
+                    let samples = render(&mut grid, &mut channels, 16_000);
+                    assert!(samples.iter().all(|x| x.is_finite() && x.abs() <= 0.31));
+                    let hz = frequency(&samples[4_000..]);
+                    let expected = if preserve {
+                        220.0
+                    } else {
+                        220.0 * speed * bpm / 120.0
+                    };
+                    assert!(
+                        (hz - expected).abs() < expected * 0.08 + 2.0,
+                        "speed={speed}, bpm={bpm}, preserve={preserve}: {hz} vs {expected}"
+                    );
+                    let phase =
+                        ((15_999.0 * bpm as f64 / (60.0 * SR as f64) * speed as f64) % 8.0) / 8.0;
+                    assert!((channels[0].position_normalized() as f64 - phase).abs() < 1e-5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rendered_pulses_repeat_at_the_adjusted_loop_duration() {
+        let data: Vec<f32> = (0..4_000)
+            .map(|i| {
+                if (1_000..1_400).contains(&i) {
+                    0.2
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let pulse = StereoSampleBuffer::from_interleaved(&data, 1, SR).unwrap();
+        for speed in [0.25, 0.5, 1.0, 2.0, 4.0] {
+            for preserve in [false, true] {
+                let (mut grid, mut channels) = setup(speed, preserve, 120.0);
+                grid.transport_stop(&mut channels);
+                assert!(grid.load_with_playback(0, 0, pulse.clone(), 120.0, speed, preserve));
+                grid.transport_reset(&mut channels);
+                assert!(grid.launch_quantized(0, 0, LaunchQuantization::Bar));
+                grid.transport_start(&mut channels);
+                let period = 4_000.0 / speed as f64;
+                let samples = render(&mut grid, &mut channels, (period * 4.0) as usize);
+                let mut starts = Vec::new();
+                let mut previous = None;
+                for (i, x) in samples.iter().enumerate() {
+                    if *x > 0.05 {
+                        if previous.is_none_or(|p| i - p > 400) {
+                            starts.push(i);
+                        }
+                        previous = Some(i);
+                    }
+                }
+                assert_eq!(
+                    starts.len(),
+                    4,
+                    "speed={speed}, preserve={preserve}: {starts:?}"
+                );
+                for pair in starts.windows(2) {
+                    assert!(
+                        ((pair[1] - pair[0]) as f64 - period).abs() < 250.0,
+                        "speed={speed}, preserve={preserve}: {starts:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_bpm_changes_at_non_neutral_speed_keep_pitch_and_position() {
+        let (mut grid, mut channels) = setup(2.0, true, 120.0);
+        render(&mut grid, &mut channels, 5_000);
+        let before = channels[0].position_normalized();
+        grid.set_bpm(180.0);
+        channels[0].set_engine_bpm(180.0);
+        render(&mut grid, &mut channels, 1);
+        assert!((channels[0].position_normalized() - before).abs() < 0.001);
+        let samples = render(&mut grid, &mut channels, 8_000);
+        assert!((frequency(&samples[2_000..]) - 220.0).abs() < 20.0);
+    }
+
+    #[test]
+    fn live_rate_and_mode_changes_keep_position_and_other_channels_untouched() {
+        let (mut grid, mut channels) = setup(1.0, true, 120.0);
+        assert!(grid.load_with_playback(1, 0, tone(), 120.0, 1.0, true));
+        assert!(grid.launch_quantized(1, 0, LaunchQuantization::Bar));
+        render(&mut grid, &mut channels, 5_000);
+        let before = channels[0].position_normalized();
+        assert!(grid.set_playback(0, 0, 4.0, false, &mut channels));
+        render(&mut grid, &mut channels, 1);
+        assert!((channels[0].position_normalized() - before).abs() < 0.001);
+        assert_eq!(grid.slots[1][0].as_ref().unwrap().speed, 1.0);
+        let samples = render(&mut grid, &mut channels, 4_000);
+        assert!(samples.iter().all(|x| x.is_finite() && x.abs() <= 0.31));
+        assert!(grid.set_playback(0, 0, 0.25, true, &mut channels));
+        let samples = render(&mut grid, &mut channels, 8_000);
+        assert!(samples.iter().all(|x| x.is_finite() && x.abs() <= 0.31));
+        assert!((frequency(&samples[4_000..]) - 220.0).abs() < 20.0);
+    }
+
+    #[test]
+    fn replacement_settings_wait_for_swap_and_relaunch_applies_stored_rate() {
+        let (mut grid, mut channels) = setup(1.0, true, 120.0);
+        render(&mut grid, &mut channels, 4_000);
+        assert!(grid.load_with_playback(0, 0, tone(), 120.0, 4.0, false));
+        assert!(grid.set_playback(0, 0, 2.0, false, &mut channels));
+        assert_eq!(grid.columns[0].active_clip.as_ref().unwrap().speed, 1.0);
+        render(&mut grid, &mut channels, 12_001);
+        assert_eq!(grid.columns[0].active_clip.as_ref().unwrap().speed, 2.0);
+        assert!((channels[0].position_normalized() - 0.0).abs() < 1e-5);
+        assert!(grid.launch_quantized(0, 0, LaunchQuantization::Bar));
+        render(&mut grid, &mut channels, 16_000);
+        assert_eq!(grid.columns[0].active_clip.as_ref().unwrap().speed, 2.0);
+    }
+
+    #[test]
+    fn seek_pause_and_wrapped_trim_respect_playback_speed() {
+        let (mut grid, mut channels) = setup(2.0, true, 120.0);
+        render(&mut grid, &mut channels, 1);
+        assert!(grid.set_trim(0, 0, 0.75, 0.25, RetrimTiming::Immediate, &mut channels));
+        assert!(grid.transport_seek(1.0, &mut channels));
+        render(&mut grid, &mut channels, 1);
+        assert!(channels[0].position_normalized().abs() < 1e-5);
+        grid.transport_stop(&mut channels);
+        let before = channels[0].position_normalized();
+        render(&mut grid, &mut channels, 1_000);
+        assert_eq!(channels[0].position_normalized(), before);
+        grid.transport_start(&mut channels);
+        let samples = render(&mut grid, &mut channels, 5_000);
+        assert!(samples.iter().all(|x| x.is_finite() && x.abs() <= 0.31));
+        grid.transport_reset(&mut channels);
+        render(&mut grid, &mut channels, 1);
+        assert!((channels[0].position_normalized() - 0.75).abs() < 1e-5);
+    }
+
+    #[test]
+    fn invalid_playback_edits_do_not_replace_clip_or_change_settings() {
+        let (mut grid, mut channels) = setup(1.0, true, 120.0);
+        for speed in [f32::NAN, f32::INFINITY, 0.0, -1.0, 0.249, 4.001] {
+            assert!(!grid.load_with_playback(0, 0, tone(), 120.0, speed, false));
+            assert!(!grid.set_playback(0, 0, speed, false, &mut channels));
+        }
+        assert!(!grid.set_playback(0, 1, 2.0, false, &mut channels));
+        assert!(!grid.set_playback(CLIP_COLUMN_COUNT, 0, 2.0, false, &mut channels));
+        assert_eq!(grid.slots[0][0].as_ref().unwrap().speed, 1.0);
+        render(&mut grid, &mut channels, 1);
+        assert_eq!(grid.columns[0].active_clip.as_ref().unwrap().speed, 1.0);
+    }
+
+    #[test]
+    fn tiny_wrapped_windows_are_bounded_in_both_modes() {
+        for preserve in [true, false] {
+            let (mut grid, mut channels) = setup(4.0, preserve, 180.0);
+            render(&mut grid, &mut channels, 1);
+            assert!(grid.set_trim(0, 0, 0.9999, 0.0001, RetrimTiming::Immediate, &mut channels));
+            let samples = render(&mut grid, &mut channels, 4_000);
+            assert!(samples.iter().all(|x| x.is_finite() && x.abs() <= 0.31));
         }
     }
 }
