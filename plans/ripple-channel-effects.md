@@ -12,7 +12,7 @@ Ripple users can distort one kick or delay only a hi-hat without processing the 
 - [x] (2026-10-06) Add render-owned voice racks, producer-side descriptor validation, replacement commands, parameter commands, and off-thread retirement.
 - [x] (2026-10-06) Verify existing live-control, allocation, instrument-swap, and mixer tests; add voice isolation, stereo delay, mute/solo, generation, and queue-capacity tests.
 - [x] (2026-10-06) Add tempo, offline bounce, history-preserving parameter, concurrent rendering, and complete-transition allocation coverage; 978 Rust tests pass, two existing tests are ignored.
-- [ ] Complete all validation and open the libgooey PR linked to the dependent Ripple PR.
+- [x] (2026-10-06) Complete library/build validation and open linked libgooey #275 and Ripple #130 PRs. Ripple remains draft pending a library release and manual AUv3 host checks.
 
 ## Surprises & Discoveries
 
@@ -34,7 +34,7 @@ Decision: Put insert effects before channel gain and mute/solo. Rationale: gain 
 
 ## Outcomes & Retrospective
 
-The implementation and regression validation are complete: 978 Rust tests pass, with two existing ignored tests. The allocation probe covers the complete transition and retirement with zero render-thread allocations/deallocations. A compiled C consumer successfully calls the new APIs through the generated header and macOS static library. Device, simulator, and macOS static libraries have been built for Ripple's XCFramework. PR linkage remains before final delivery.
+The implementation and regression validation are complete: 978 Rust tests pass, with two existing ignored tests. The allocation probe covers the complete transition and retirement with zero render-thread allocations/deallocations. A compiled C consumer successfully calls the new APIs through the generated header and macOS static library. Device, simulator, and macOS static libraries have been built for Ripple's XCFramework. [libgooey PR #275](https://github.com/gooey-audio/libgooey/pull/275) and dependent [Ripple PR #130](https://github.com/gooey-audio/ripple/pull/130) are open and linked. Ripple's draft is gated on a concrete dependency release; its PR visual workflow builds code commit `9b5d20d1195079c8da8e9a9e54dd68bc9ce1128a` meanwhile. Seven Swift tests, iPhone/iPad UI tests, and iOS/Mac standalone plus extension builds pass. No AUv3 host is installed locally, so actual compact host interactions and reallocation remain release checks.
 
 ## Context and Orientation
 
@@ -105,3 +105,5 @@ Channel indices address the five existing voices; Ripple exposes indices 0 throu
 Revision note: Initial implementation and passing targeted tests recorded on 2026-10-06. Later revisions must record final validation and PR links here.
 
 Revision note: Full regression suite (978 passed, two ignored), complete-transition allocation coverage, and the C consumer have been verified. Generated headers follow the repository's existing artifact policy.
+
+Revision note: Linked PRs and downstream validation recorded on 2026-10-06. The dependency source pin identifies the tested code commit before this documentation-only revision.
