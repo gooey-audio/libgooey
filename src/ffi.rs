@@ -201,6 +201,8 @@ pub struct GooeyLiveControl {
     active_sources: Vec<bool>,
     projected_rack_generations: Vec<u64>,
     projected_rack_layouts: Vec<Vec<u32>>,
+    channel_rack_generations: [u64; NUM_INSTRUMENTS],
+    channel_rack_layouts: [Vec<u32>; NUM_INSTRUMENTS],
     sample_rate: f32,
     bpm: f32,
 }
@@ -933,6 +935,7 @@ const SLOT_PITCH_RANGE: f32 = crate::instruments::sampler::SLOT_PITCH_RANGE;
 /// previously parallel `[_; NUM_INSTRUMENTS]` arrays into a single owned column
 /// so voices can be grouped into a `DrumKit` collection and routed as sources.
 struct VoiceStrip {
+    effects: crate::mixer::effect_chain::LiveEffectRack,
     instrument: ChannelInstrument,
     sequencer: Sequencer,
     blender: ChannelBlender,
@@ -974,6 +977,7 @@ impl VoiceStrip {
         sample_rate: f32,
     ) -> Self {
         Self {
+            effects: crate::mixer::effect_chain::LiveEffectRack::new(),
             instrument,
             sequencer,
             blender: ChannelBlender::default_for_type(instrument_type),
@@ -1665,6 +1669,27 @@ impl GooeyEngine {
                     // validation on the producer guarantees this succeeds.
                     assert!(self.graph.replace_rack(track, rack));
                 }
+                LiveCommand::ReplaceChannelRack { channel, rack, .. } => {
+                    let sample_rate = self.sample_rate;
+                    let bpm = self.bpm;
+                    self.voice_mut(channel)
+                        .unwrap()
+                        .effects
+                        .replace(rack, sample_rate, bpm);
+                }
+                LiveCommand::SetChannelEffectParam {
+                    channel,
+                    slot,
+                    param,
+                    value,
+                    ..
+                } => {
+                    self.voice(channel)
+                        .unwrap()
+                        .effects
+                        .chain
+                        .set_param(slot, param, value);
+                }
                 LiveCommand::SetTrackEffectParam {
                     track,
                     slot,
@@ -1683,6 +1708,12 @@ impl GooeyEngine {
         };
         self.graph
             .retire_completed_racks(|track, rack| shared.retire_rack(track, rack));
+        let track_count = self.graph.track_count();
+        for (channel, voice) in self.voices_iter_mut().enumerate() {
+            voice
+                .effects
+                .retire(|rack| shared.retire_rack(track_count + channel, rack));
+        }
     }
 
     /// Resolve any `pending_arm_host_time` against the current
@@ -2045,12 +2076,23 @@ impl GooeyEngine {
             let mut bass_frame = StereoFrame::default();
             let time = self.current_time;
             for (ch, voice) in self.voices_iter_mut().enumerate() {
-                let ch_out = voice.instrument.tick(time)
-                    * voice.channel_gain.tick()
-                    * voice.mute_gain.tick();
+                let dry = voice.instrument.tick(time);
+                let gain = voice.channel_gain.tick();
+                let mute = voice.mute_gain.tick();
+                let ch_out = dry * gain * mute;
                 channel_outs[ch] = ch_out;
-
-                let panned = StereoFrame::panned(ch_out, voice.pan.tick());
+                let pan = voice.pan.tick();
+                // Keep the historical arithmetic for empty racks. Wet voices
+                // put gain and mute AFTER effects so their tails are silenced.
+                let panned = if voice.effects.chain.is_empty() && voice.effects.has_no_transition()
+                {
+                    StereoFrame::panned(ch_out, pan)
+                } else {
+                    voice
+                        .effects
+                        .process(StereoFrame::panned(dry, pan))
+                        .scaled(gain * mute)
+                };
                 if ch < KIT_VOICE_COUNT {
                     kit_frame += panned;
                 } else {
@@ -4998,6 +5040,9 @@ pub unsafe extern "C" fn gooey_engine_set_bpm(engine: *mut GooeyEngine, bpm: f32
 
     // Update delay BPM for clocked timing
     engine.delay.set_bpm(bpm);
+    for voice in engine.voices_iter() {
+        voice.effects.set_bpm(bpm);
+    }
 
     // Update LFO BPM values for BPM-synced LFOs
     for lfo in &mut engine.lfos {
@@ -10255,7 +10300,27 @@ fn live_effect_param_is_valid(effect: u32, param: u32, value: f32) -> bool {
         (EFFECT_DELAY, DELAY_PARAM_TIMING) => (DELAY_TIMING_WHOLE..=DELAY_TIMING_SIXTEENTH_TRIPLET)
             .any(|timing| value == timing as f32),
         (EFFECT_DELAY, DELAY_PARAM_FEEDBACK) => (0.0..=0.95).contains(&value),
-        (EFFECT_DELAY, DELAY_PARAM_MIX) => (0.0..=1.0).contains(&value),
+        (EFFECT_DELAY, DELAY_PARAM_MIX | DELAY_PARAM_PINGPONG) => (0.0..=1.0).contains(&value),
+        (EFFECT_DELAY, DELAY_PARAM_FILTER_CUTOFF) => (20.0..=20_000.0).contains(&value),
+        (
+            EFFECT_SATURATION,
+            SATURATION_PARAM_DRIVE | SATURATION_PARAM_WARMTH | SATURATION_PARAM_MIX,
+        ) => (0.0..=1.0).contains(&value),
+        (EFFECT_FEEDBACK_WAVESHAPER, FEEDBACK_WAVESHAPER_PARAM_DRIVE) => {
+            (1.0..=100.0).contains(&value)
+        }
+        (EFFECT_FEEDBACK_WAVESHAPER, FEEDBACK_WAVESHAPER_PARAM_FEEDBACK) => {
+            (0.0..=0.98).contains(&value)
+        }
+        (EFFECT_FEEDBACK_WAVESHAPER, FEEDBACK_WAVESHAPER_PARAM_FILTER_CUTOFF) => {
+            (200.0..=20_000.0).contains(&value)
+        }
+        (EFFECT_FEEDBACK_WAVESHAPER, FEEDBACK_WAVESHAPER_PARAM_MIX) => (0.0..=1.0).contains(&value),
+        (
+            EFFECT_PLATE_REVERB,
+            PLATE_PARAM_DECAY | PLATE_PARAM_MIX | PLATE_PARAM_DAMPING | PLATE_PARAM_PREDELAY
+            | PLATE_PARAM_WIDTH | PLATE_PARAM_SIZE,
+        ) => (0.0..=1.0).contains(&value),
         (EFFECT_REVERB, REVERB_PARAM_DECAY | REVERB_PARAM_MIX | REVERB_PARAM_DAMPING) => {
             (0.0..=1.0).contains(&value)
         }
@@ -10282,8 +10347,13 @@ unsafe fn build_live_rack(
     for descriptor in descriptors {
         if !matches!(
             descriptor.effect,
-            EFFECT_LOWPASS_FILTER | EFFECT_DELAY | EFFECT_REVERB
-        ) || descriptor.param_count > 3
+            EFFECT_LOWPASS_FILTER
+                | EFFECT_DELAY
+                | EFFECT_REVERB
+                | EFFECT_PLATE_REVERB
+                | EFFECT_SATURATION
+                | EFFECT_FEEDBACK_WAVESHAPER
+        ) || descriptor.param_count > 6
             || (descriptor.param_count != 0 && descriptor.params.is_null())
         {
             return None;
@@ -10293,7 +10363,7 @@ unsafe fn build_live_rack(
         } else {
             slice::from_raw_parts(descriptor.params, descriptor.param_count as usize)
         };
-        let mut seen = [false; 5];
+        let mut seen = [false; 6];
         for parameter in params {
             let Some(flag) = seen.get_mut(parameter.param as usize) else {
                 return None;
@@ -10338,7 +10408,7 @@ pub unsafe extern "C" fn gooey_engine_live_control_new(
         LIVE_QUEUE_CAPACITY,
         GOOEY_LIVE_CONTROL_QUEUE_CAPACITY as usize
     );
-    let shared = LiveControlShared::new(lifecycle, engine.graph.track_count());
+    let shared = LiveControlShared::new(lifecycle, engine.graph.track_count() + NUM_INSTRUMENTS);
     let projected_rack_layouts = (0..engine.graph.track_count())
         .map(|track| {
             (0..engine.graph.effect_count(track))
@@ -10354,6 +10424,8 @@ pub unsafe extern "C" fn gooey_engine_live_control_new(
             .collect(),
         projected_rack_generations: vec![0; engine.graph.track_count()],
         projected_rack_layouts,
+        channel_rack_generations: [0; NUM_INSTRUMENTS],
+        channel_rack_layouts: std::array::from_fn(|_| Vec::new()),
         sample_rate: engine.sample_rate,
         bpm: engine.bpm,
     };
@@ -10556,6 +10628,105 @@ pub unsafe extern "C" fn gooey_live_control_set_track_effect_param(
         .submit(LiveCommand::SetTrackEffectParam {
             generation,
             track,
+            slot,
+            param,
+            value,
+        })
+        .map_or(0, |_| generation)
+}
+
+/// Prepare and queue a voice insert rack, before channel gain and mute/solo.
+/// Channel is a stable voice index (0..gooey_engine_channel_count()), not an
+/// instrument type. Null plus zero clears it. Returns zero on rejection.
+/// Call from the endpoint's single serialized producer; descriptors are copied.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_replace_channel_rack(
+    control: *mut GooeyLiveControl,
+    channel: u32,
+    effects: *const GooeyEffectDescriptor,
+    effect_count: u32,
+) -> u64 {
+    let Some(control) = control.as_mut() else {
+        return 0;
+    };
+    control.shared.reap_retired();
+    let channel = channel as usize;
+    let busy_index = control.track_count + channel;
+    if channel >= NUM_INSTRUMENTS || control.shared.queue_is_full() {
+        return 0;
+    }
+    if !control.shared.begin_rack_transition(busy_index) {
+        return 0;
+    }
+    let Some((rack, layout)) =
+        build_live_rack(effects, effect_count, control.sample_rate, control.bpm)
+    else {
+        control.shared.cancel_rack_transition(busy_index);
+        return 0;
+    };
+    let Some(generation) = control.shared.next_generation() else {
+        control.shared.cancel_rack_transition(busy_index);
+        return 0;
+    };
+    match control.shared.submit(LiveCommand::ReplaceChannelRack {
+        generation,
+        channel,
+        rack,
+    }) {
+        Ok(()) => {
+            control.channel_rack_generations[channel] = generation;
+            control.channel_rack_layouts[channel] = layout;
+            generation
+        }
+        Err(_) => {
+            control.shared.cancel_rack_transition(busy_index);
+            0
+        }
+    }
+}
+
+/// Queue a voice-rack parameter edit for the accepted rack generation and slot.
+/// Returns zero for stale generations, invalid values, or a full queue.
+/// Successful edits preserve the existing DSP history.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_live_control_set_channel_effect_param(
+    control: *mut GooeyLiveControl,
+    channel: u32,
+    slot: u32,
+    rack_generation: u64,
+    param: u32,
+    value: f32,
+) -> u64 {
+    let Some(control) = control.as_mut() else {
+        return 0;
+    };
+    control.shared.reap_retired();
+    let channel = channel as usize;
+    let slot = slot as usize;
+    if rack_generation == 0
+        || control.channel_rack_generations.get(channel).copied() != Some(rack_generation)
+    {
+        return 0;
+    }
+    let Some(effect) = control
+        .channel_rack_layouts
+        .get(channel)
+        .and_then(|rack| rack.get(slot))
+        .copied()
+    else {
+        return 0;
+    };
+    if !live_effect_param_is_valid(effect, param, value) {
+        return 0;
+    }
+    let Some(generation) = live_generation(control) else {
+        return 0;
+    };
+    control
+        .shared
+        .submit(LiveCommand::SetChannelEffectParam {
+            generation,
+            channel,
             slot,
             param,
             value,
@@ -12213,6 +12384,11 @@ impl GooeyEngine {
         let samples_per_bar = 4.0_f64 * (60.0 / self.bpm as f64) * self.sample_rate as f64;
         let total_samples = (bars as f64 * samples_per_bar).round() as usize;
 
+        // Install accepted controls before resetting offline DSP history.
+        self.apply_live_control_commands();
+        for voice in self.voices_iter() {
+            voice.effects.reset();
+        }
         // Reset engine to a clean state
         self.current_time = 0.0;
 

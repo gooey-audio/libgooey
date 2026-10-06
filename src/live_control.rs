@@ -46,6 +46,18 @@ pub(crate) enum LiveCommand {
         track: usize,
         rack: EffectChain,
     },
+    ReplaceChannelRack {
+        generation: u64,
+        channel: usize,
+        rack: EffectChain,
+    },
+    SetChannelEffectParam {
+        generation: u64,
+        channel: usize,
+        slot: usize,
+        param: u32,
+        value: f32,
+    },
     SetTrackEffectParam {
         generation: u64,
         track: usize,
@@ -62,7 +74,9 @@ impl LiveCommand {
             | Self::SetSourceTrim { generation, .. }
             | Self::ReplaceDrumPattern { generation, .. }
             | Self::ReplaceTrackRack { generation, .. }
-            | Self::SetTrackEffectParam { generation, .. } => *generation,
+            | Self::SetTrackEffectParam { generation, .. }
+            | Self::ReplaceChannelRack { generation, .. }
+            | Self::SetChannelEffectParam { generation, .. } => *generation,
         }
     }
 }
