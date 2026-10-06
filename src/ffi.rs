@@ -8853,6 +8853,42 @@ pub extern "C" fn gooey_chord_set_entry_note_count(
     })
 }
 
+/// Chord tones of one pad, as root-position semitone offsets above the chord
+/// root (e.g. a minor seventh writes 0, 3, 7, 10).
+///
+/// Add the offsets to `gooey_chord_set_entry_root` to get absolute pitch
+/// classes; extensions above the octave keep their compound offset (a ninth is
+/// 14) so hosts can tell a 9th from a 2nd. Writes at most `capacity` offsets
+/// and returns how many were written. Returns 0 when `chord_set` is unknown or
+/// `out_semitones` is null.
+///
+/// # Safety
+/// When `capacity` is nonzero, `out_semitones` must be null or point to at
+/// least `capacity` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_chord_set_entry_tones(
+    chord_set: u32,
+    root: u32,
+    scale_type: u32,
+    degree: u32,
+    out_semitones: *mut u8,
+    capacity: u32,
+) -> u32 {
+    if out_semitones.is_null() {
+        return 0;
+    }
+    let Some(chord) = resolve_chord(chord_set, root, scale_type, degree) else {
+        return 0;
+    };
+    let intervals = chord.quality.interval_slice();
+    let count = intervals.len().min(capacity as usize);
+    let out = slice::from_raw_parts_mut(out_semitones, count);
+    for (slot, interval) in out.iter_mut().zip(intervals) {
+        *slot = interval.semitones();
+    }
+    count as u32
+}
+
 /// How many voicings are available for one pad's chord quality.
 ///
 /// Voicing ids passed to the trigger functions are `0 .. this count` in the
