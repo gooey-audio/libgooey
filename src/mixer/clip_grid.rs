@@ -778,7 +778,12 @@ impl ClipGrid {
     }
 
     pub fn transport_reset(&mut self, channels: &mut [LoopChannel]) {
-        self.cancel_all();
+        // Hosts reset before starting. Preserve launches staged while stopped
+        // for that first transport sample; resetting a running transport still
+        // cancels its pending actions, as does an explicit transport stop.
+        if self.transport_running {
+            self.cancel_all();
+        }
         self.transport_seek(0.0, channels);
     }
 

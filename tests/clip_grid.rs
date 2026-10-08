@@ -134,6 +134,42 @@ fn stopped_launch_starts_empty_column_on_first_transport_sample() {
 }
 
 #[test]
+fn stopped_atomic_launch_survives_later_live_transport_reset_and_start() {
+    unsafe {
+        let engine = gooey_engine_new(SR);
+        let control = gooey_engine_live_control_new(engine);
+        let samples = mono_clip(0.5, 4000);
+        assert!(gooey_engine_clip_load_and_launch(
+            engine,
+            3,
+            0,
+            samples.as_ptr(),
+            4000,
+            1,
+            SR,
+            60.0
+        ));
+        let _ = render(engine, 128); // Audio callback drains commands while stopped.
+        assert_eq!(gooey_engine_clip_get_active_row(engine, 3), -1);
+        assert_eq!(
+            gooey_engine_clip_get_state(engine, 3, 0),
+            CLIP_STATE_LOADED | CLIP_STATE_QUEUED
+        );
+        // Tide starts using one live reset/start command, in a later callback.
+        assert_ne!(gooey_live_control_edit(control, 24, 0, 0, 0, 0.0, 0.0), 0);
+        let output = render(engine, 128);
+        assert_eq!(gooey_engine_clip_get_active_row(engine, 3), 0);
+        assert_eq!(
+            gooey_engine_clip_get_state(engine, 3, 0),
+            CLIP_STATE_LOADED | CLIP_STATE_PLAYING
+        );
+        assert!(output.iter().any(|sample| sample.abs() > 0.01));
+        gooey_live_control_free(control);
+        gooey_engine_free(engine);
+    }
+}
+
+#[test]
 fn running_bar_requests_are_strictly_future_even_on_a_bar_boundary() {
     unsafe {
         let engine = gooey_engine_new(SR);
