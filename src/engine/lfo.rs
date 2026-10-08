@@ -82,12 +82,81 @@ pub enum LfoSyncMode {
     BpmSync(MusicalDivision),
 }
 
+/// Nonzero xorshift seed for sample & hold.
+const RNG_SEED: u32 = 0x9E37_79B9;
+
+/// LFO waveform. Every shape is bipolar (-1 to 1) and, like sine, starts at 0
+/// and rises, so switching shape keeps the cycle's alignment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LfoWaveform {
+    #[default]
+    Sine,
+    /// Linear 0 → 1 → 0 → -1 → 0.
+    Triangle,
+    /// Linear ramp from 0 up to 1, jump to -1, ramp back to 0.
+    Saw,
+    /// 1 for the first half of the cycle, -1 for the second.
+    Square,
+    /// A random level held for each cycle.
+    SampleHold,
+}
+
+impl LfoWaveform {
+    pub fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Sine),
+            1 => Some(Self::Triangle),
+            2 => Some(Self::Saw),
+            3 => Some(Self::Square),
+            4 => Some(Self::SampleHold),
+            _ => None,
+        }
+    }
+
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    /// Value at `phase` (0-1). Sample & hold has no fixed shape and returns
+    /// `held`, the level chosen for the current cycle.
+    pub fn eval(self, phase: f32, held: f32) -> f32 {
+        let phase = phase.rem_euclid(1.0);
+        match self {
+            Self::Sine => (phase * 2.0 * std::f32::consts::PI).sin(),
+            Self::Triangle => {
+                if phase < 0.25 {
+                    4.0 * phase
+                } else if phase < 0.75 {
+                    2.0 - 4.0 * phase
+                } else {
+                    4.0 * phase - 4.0
+                }
+            }
+            Self::Saw => 2.0 * (phase + 0.5).fract() - 1.0,
+            Self::Square => {
+                if phase < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+            Self::SampleHold => held,
+        }
+    }
+}
+
 /// Low Frequency Oscillator for modulation
 pub struct Lfo {
     sync_mode: LfoSyncMode,
     bpm: f32, // Current BPM (used when in BpmSync mode)
     phase: f32,
     sample_rate: f32,
+    waveform: LfoWaveform,
+    /// Latest `tick()` output.
+    last_value: f32,
+    /// Sample & hold level for the current cycle, and its xorshift state.
+    held: f32,
+    rng_state: u32,
 
     // Routing
     pub target_instrument: String,
@@ -106,6 +175,10 @@ impl Lfo {
             bpm: 120.0, // Default BPM
             phase: 0.0,
             sample_rate,
+            waveform: LfoWaveform::Sine,
+            last_value: 0.0,
+            held: 0.0,
+            rng_state: RNG_SEED,
             target_instrument: String::new(),
             target_parameter: String::new(),
             amount: 1.0,
@@ -121,6 +194,10 @@ impl Lfo {
             bpm: 120.0,
             phase: 0.0,
             sample_rate,
+            waveform: LfoWaveform::Sine,
+            last_value: 0.0,
+            held: 0.0,
+            rng_state: RNG_SEED,
             target_instrument: String::new(),
             target_parameter: String::new(),
             amount: 1.0,
@@ -143,6 +220,10 @@ impl Lfo {
             bpm,
             phase: 0.0,
             sample_rate,
+            waveform: LfoWaveform::Sine,
+            last_value: 0.0,
+            held: 0.0,
+            rng_state: RNG_SEED,
             target_instrument: String::new(),
             target_parameter: String::new(),
             amount: 1.0,
@@ -178,24 +259,39 @@ impl Lfo {
         self.sync_mode
     }
 
+    /// Set the waveform. Phase is kept, so the cycle stays aligned.
+    pub fn set_waveform(&mut self, waveform: LfoWaveform) {
+        self.waveform = waveform;
+    }
+
+    pub fn waveform(&self) -> LfoWaveform {
+        self.waveform
+    }
+
     /// Generate one sample and advance the phase
-    /// Returns: offset + (sine_value * amount)
+    /// Returns: offset + (waveform_value * amount)
     /// With default settings (amount=1.0, offset=0.0), this returns -1.0 to 1.0
     pub fn tick(&mut self) -> f32 {
-        // Calculate sine wave
-        let value = (self.phase * 2.0 * std::f32::consts::PI).sin();
+        let value = self.waveform.eval(self.phase, self.held);
 
         // Advance phase
         let phase_increment = self.frequency() / self.sample_rate;
         self.phase += phase_increment;
 
-        // Wrap phase to 0.0-1.0
+        // Wrap phase to 0.0-1.0, picking the next sample & hold level
         if self.phase >= 1.0 {
             self.phase -= 1.0;
+            self.held = self.next_random();
         }
 
         // Apply offset and amount
-        self.offset + (value * self.amount)
+        self.last_value = self.offset + (value * self.amount);
+        self.last_value
+    }
+
+    /// Latest output of `tick()`, including amount and offset.
+    pub fn value(&self) -> f32 {
+        self.last_value
     }
 
     /// Reset the phase to 0
@@ -203,8 +299,92 @@ impl Lfo {
         self.phase = 0.0;
     }
 
+    /// Uniform value in -1 to 1 (xorshift32; allocation- and lock-free).
+    fn next_random(&mut self) -> f32 {
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng_state = x;
+        (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+    }
+
     /// Get the current phase (0.0 to 1.0)
     pub fn phase(&self) -> f32 {
         self.phase
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHAPES: [LfoWaveform; 4] = [
+        LfoWaveform::Sine,
+        LfoWaveform::Triangle,
+        LfoWaveform::Saw,
+        LfoWaveform::Square,
+    ];
+
+    fn approx(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn waveforms_hit_expected_points() {
+        let points = [0.0, 0.25, 0.5, 0.75];
+        let expected = [
+            [0.0, 1.0, 0.0, -1.0],
+            [0.0, 1.0, 0.0, -1.0],
+            [0.0, 0.5, -1.0, -0.5],
+            [1.0, 1.0, -1.0, -1.0],
+        ];
+        for (shape, values) in SHAPES.iter().zip(expected) {
+            for (phase, value) in points.iter().zip(values) {
+                assert!(
+                    approx(shape.eval(*phase, 0.0), value),
+                    "{shape:?} at {phase}: {}",
+                    shape.eval(*phase, 0.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn waveform_constants_round_trip() {
+        for value in 0..5 {
+            assert_eq!(LfoWaveform::from_u32(value).unwrap().as_u32(), value);
+        }
+        assert_eq!(LfoWaveform::from_u32(5), None);
+    }
+
+    #[test]
+    fn sample_hold_holds_within_a_cycle_and_changes_across_cycles() {
+        // One cycle per 4 samples (an exact phase increment).
+        let mut lfo = Lfo::new(1.0, 4.0);
+        lfo.set_waveform(LfoWaveform::SampleHold);
+        let mut cycles = Vec::new();
+        for _ in 0..4 {
+            let first = lfo.tick();
+            for _ in 1..4 {
+                assert_eq!(lfo.tick(), first);
+            }
+            assert!((-1.0..=1.0).contains(&first));
+            cycles.push(first);
+        }
+        // The first cycle holds the initial level; later cycles are random.
+        assert!(cycles[1] != cycles[2] || cycles[2] != cycles[3]);
+    }
+
+    #[test]
+    fn value_reports_latest_tick_with_amount_and_offset() {
+        let mut lfo = Lfo::new(1.0, 4.0);
+        lfo.set_waveform(LfoWaveform::Square);
+        lfo.amount = 0.5;
+        lfo.offset = 0.25;
+        assert_eq!(lfo.value(), 0.0);
+        let output = lfo.tick();
+        assert!(approx(output, 0.75));
+        assert_eq!(lfo.value(), output);
     }
 }

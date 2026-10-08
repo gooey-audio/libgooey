@@ -15,7 +15,7 @@ use crate::effects::{
     DelayEffect, DelayTiming, Effect, FeedbackWaveshaper, LowpassFilterEffect, PlateReverbEffect,
     SoftLimiter, SpringReverbEffect, TiltFilterEffect, TubeCompressor, TubeSaturation, Waveshaper,
 };
-use crate::engine::lfo::{Lfo, MusicalDivision};
+use crate::engine::lfo::{Lfo, LfoWaveform, MusicalDivision};
 use crate::engine::{
     Instrument, Modulatable, Sequencer, SequencerBlendSetting, SequencerStepSettings,
 };
@@ -90,6 +90,23 @@ pub const LFO_TIMING_SIXTEENTH: u32 = 6;
 pub const LFO_TIMING_THIRTY_SECOND: u32 = 7;
 /// Invalid LFO value (returned on error or when LFO is in Hz mode)
 pub const LFO_INVALID: u32 = 0xFFFFFFFF;
+
+/// LFO waveform: sine (the default).
+pub const LFO_WAVEFORM_SINE: u32 = 0;
+/// LFO waveform: linear 0 → 1 → 0 → -1 → 0.
+pub const LFO_WAVEFORM_TRIANGLE: u32 = 1;
+/// LFO waveform: rising ramp, starting at 0 like sine.
+pub const LFO_WAVEFORM_SAW: u32 = 2;
+/// LFO waveform: 1 for the first half of the cycle, -1 for the second.
+pub const LFO_WAVEFORM_SQUARE: u32 = 3;
+/// LFO waveform: a random level held for each cycle.
+pub const LFO_WAVEFORM_SAMPLE_HOLD: u32 = 4;
+
+const _: () = assert!(LfoWaveform::Sine as u32 == LFO_WAVEFORM_SINE);
+const _: () = assert!(LfoWaveform::Triangle as u32 == LFO_WAVEFORM_TRIANGLE);
+const _: () = assert!(LfoWaveform::Saw as u32 == LFO_WAVEFORM_SAW);
+const _: () = assert!(LfoWaveform::Square as u32 == LFO_WAVEFORM_SQUARE);
+const _: () = assert!(LfoWaveform::SampleHold as u32 == LFO_WAVEFORM_SAMPLE_HOLD);
 
 // =============================================================================
 // Twin-core percussion standalone voice constants
@@ -6722,8 +6739,8 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_timing(
 
 /// Set the global modulation amount for an LFO
 ///
-/// This scales the LFO's sine wave amplitude before it's distributed to routes.
-/// Final modulation = (offset + sine * amount) * route_depth
+/// This scales the LFO's waveform amplitude before it's distributed to routes.
+/// Final modulation = (offset + waveform * amount) * route_depth
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -6771,7 +6788,7 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_amount(
 /// Set the center offset (DC bias) for an LFO
 ///
 /// This adds a constant value to the LFO output before distribution to routes.
-/// Final modulation = (offset + sine * amount) * route_depth
+/// Final modulation = (offset + waveform * amount) * route_depth
 ///
 /// Use offset to bias the modulation (e.g., offset=0.5 with amount=0.5 gives 0.0-1.0 range)
 ///
@@ -6977,6 +6994,70 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_phase(
     }
     let engine = &*engine;
     engine.lfos[lfo_index as usize].phase()
+}
+
+/// Set an LFO's waveform (LFO_WAVEFORM_*). Default: sine. Phase is kept, so
+/// the cycle stays aligned when the shape changes.
+///
+/// # Returns
+/// `true` if applied, `false` for an invalid engine, LFO index, or waveform
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_lfo_waveform(
+    engine: *mut GooeyEngine,
+    lfo_index: u32,
+    waveform: u32,
+) -> bool {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return false;
+    }
+    let Some(waveform) = LfoWaveform::from_u32(waveform) else {
+        return false;
+    };
+    let engine = &mut *engine;
+    engine.lfos[lfo_index as usize].set_waveform(waveform);
+    true
+}
+
+/// Get an LFO's waveform (LFO_WAVEFORM_*), or LFO_INVALID if invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_lfo_waveform(
+    engine: *const GooeyEngine,
+    lfo_index: u32,
+) -> u32 {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return LFO_INVALID;
+    }
+    let engine = &*engine;
+    engine.lfos[lfo_index as usize].waveform().as_u32()
+}
+
+/// Get an LFO's latest output, `offset + waveform * amount`, before each
+/// route's depth is applied. For displaying live modulation.
+///
+/// # Returns
+/// The latest output, or 0.0 if the LFO is disabled or the index is invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_lfo_value(
+    engine: *const GooeyEngine,
+    lfo_index: u32,
+) -> f32 {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return 0.0;
+    }
+    let engine = &*engine;
+    if !engine.lfo_enabled[lfo_index as usize] {
+        return 0.0;
+    }
+    engine.lfos[lfo_index as usize].value()
 }
 
 /// Get the number of snare parameters
