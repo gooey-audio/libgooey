@@ -389,6 +389,73 @@ impl EffectChain {
     }
 }
 
+/// Render-owned rack with a 10 ms crossfade and off-thread retirement.
+/// A replacement is accepted only after the previous old rack was retired.
+pub(crate) struct LiveEffectRack {
+    pub(crate) chain: EffectChain,
+    old: Option<EffectChain>,
+    remaining: usize,
+    total: usize,
+}
+
+impl LiveEffectRack {
+    pub(crate) fn new() -> Self {
+        Self {
+            chain: EffectChain::new(),
+            old: None,
+            remaining: 0,
+            total: 1,
+        }
+    }
+
+    pub(crate) fn has_no_transition(&self) -> bool {
+        self.old.is_none()
+    }
+
+    pub(crate) fn replace(&mut self, chain: EffectChain, sample_rate: f32, bpm: f32) {
+        assert!(self.old.is_none());
+        chain.set_bpm(bpm);
+        self.old = Some(std::mem::replace(&mut self.chain, chain));
+        self.total = (sample_rate * 0.010).round().max(1.0) as usize;
+        self.remaining = self.total;
+    }
+
+    pub(crate) fn process(&mut self, input: StereoFrame) -> StereoFrame {
+        let new_output = self.chain.process(input);
+        if self.remaining == 0 {
+            return new_output;
+        }
+        let old_output = self.old.as_ref().unwrap().process(input);
+        let progress = 1.0 - self.remaining as f32 / self.total as f32;
+        self.remaining -= 1;
+        old_output.scaled(1.0 - progress) + new_output.scaled(progress)
+    }
+
+    pub(crate) fn retire(&mut self, retire: impl FnOnce(EffectChain) -> Result<(), EffectChain>) {
+        if self.remaining == 0 {
+            if let Some(old) = self.old.take() {
+                if let Err(old) = retire(old) {
+                    self.old = Some(old);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_bpm(&self, bpm: f32) {
+        self.chain.set_bpm(bpm);
+        if let Some(old) = &self.old {
+            old.set_bpm(bpm);
+        }
+    }
+
+    pub(crate) fn reset(&self) {
+        self.chain.reset();
+        if let Some(old) = &self.old {
+            old.reset();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +529,41 @@ mod tests {
             .map(|frame| frame.l.abs().max(frame.r.abs()))
             .fold(0.0_f32, f32::max);
         assert!(peak > 1e-4);
+    }
+    #[test]
+    fn live_voice_rack_retimes_current_and_transitioning_delays() {
+        let mut rack = LiveEffectRack::new();
+        rack.chain.add(EFFECT_DELAY, SR, 120.0);
+        let mut next = EffectChain::new();
+        next.add(EFFECT_DELAY, SR, 80.0);
+        rack.replace(next, SR, 90.0);
+        rack.set_bpm(140.0);
+        for chain in [&rack.chain, rack.old.as_ref().unwrap()] {
+            let ChannelEffect::Delay(delay) = &chain.effects[0] else {
+                panic!("expected delay");
+            };
+            assert_eq!(delay.get_bpm(), 140.0);
+        }
+    }
+
+    #[test]
+    fn live_voice_rack_parameter_edit_keeps_echo_but_reset_clears_it() {
+        let mut rack = LiveEffectRack::new();
+        rack.chain.add(EFFECT_DELAY, SR, 120.0);
+        rack.chain.set_param(0, DELAY_PARAM_MIX, 1.0);
+        rack.chain.set_param(0, DELAY_PARAM_FEEDBACK, 0.5);
+        rack.process(StereoFrame::mono(1.0));
+        for _ in 0..22_040 {
+            rack.process(StereoFrame::default());
+        }
+        rack.chain.set_param(0, DELAY_PARAM_FEEDBACK, 0.7);
+        let peak = (0..32)
+            .map(|_| rack.process(StereoFrame::default()).l.abs())
+            .fold(0.0_f32, f32::max);
+        assert!(peak > 1e-4);
+        rack.reset();
+        for _ in 0..44_100 {
+            assert_eq!(rack.process(StereoFrame::default()), StereoFrame::default());
+        }
     }
 }
