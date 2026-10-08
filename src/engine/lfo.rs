@@ -154,9 +154,11 @@ pub struct Lfo {
     waveform: LfoWaveform,
     /// Latest `tick()` output.
     last_value: f32,
-    /// Sample & hold level for the current cycle, and its xorshift state.
+    /// Sample & hold level for the current cycle, its xorshift state, and the
+    /// seed `reset` returns to so repeated renders match.
     held: f32,
     rng_state: u32,
+    seed: u32,
 
     // Routing
     pub target_instrument: String,
@@ -179,6 +181,7 @@ impl Lfo {
             last_value: 0.0,
             held: 0.0,
             rng_state: RNG_SEED,
+            seed: RNG_SEED,
             target_instrument: String::new(),
             target_parameter: String::new(),
             amount: 1.0,
@@ -198,6 +201,7 @@ impl Lfo {
             last_value: 0.0,
             held: 0.0,
             rng_state: RNG_SEED,
+            seed: RNG_SEED,
             target_instrument: String::new(),
             target_parameter: String::new(),
             amount: 1.0,
@@ -224,6 +228,7 @@ impl Lfo {
             last_value: 0.0,
             held: 0.0,
             rng_state: RNG_SEED,
+            seed: RNG_SEED,
             target_instrument: String::new(),
             target_parameter: String::new(),
             amount: 1.0,
@@ -294,9 +299,20 @@ impl Lfo {
         self.last_value
     }
 
-    /// Reset the phase to 0
+    /// Seed sample & hold so LFOs sharing a timing don't produce identical
+    /// levels. Zero (invalid for xorshift) falls back to the default seed.
+    /// Restarts the random sequence.
+    pub fn set_random_seed(&mut self, seed: u32) {
+        self.seed = if seed == 0 { RNG_SEED } else { seed };
+        self.reset();
+    }
+
+    /// Reset the phase to 0 and restart the sample & hold sequence, so a
+    /// render after a reset (e.g. each bounce) modulates identically.
     pub fn reset(&mut self) {
         self.phase = 0.0;
+        self.held = 0.0;
+        self.rng_state = self.seed;
     }
 
     /// Uniform value in -1 to 1 (xorshift32; allocation- and lock-free).
@@ -374,6 +390,35 @@ mod tests {
         }
         // The first cycle holds the initial level; later cycles are random.
         assert!(cycles[1] != cycles[2] || cycles[2] != cycles[3]);
+    }
+
+    fn sample_hold_cycles(lfo: &mut Lfo, cycles: usize) -> Vec<f32> {
+        (0..cycles * 4).map(|_| lfo.tick()).step_by(4).collect()
+    }
+
+    #[test]
+    fn reset_restarts_the_sample_hold_sequence() {
+        let mut lfo = Lfo::new(1.0, 4.0);
+        lfo.set_waveform(LfoWaveform::SampleHold);
+        let first = sample_hold_cycles(&mut lfo, 6);
+        lfo.reset();
+        assert_eq!(sample_hold_cycles(&mut lfo, 6), first);
+    }
+
+    #[test]
+    fn distinct_seeds_give_distinct_sample_hold_levels() {
+        let mut a = Lfo::new(1.0, 4.0);
+        let mut b = Lfo::new(1.0, 4.0);
+        a.set_waveform(LfoWaveform::SampleHold);
+        b.set_waveform(LfoWaveform::SampleHold);
+        b.set_random_seed(12345);
+        assert_ne!(sample_hold_cycles(&mut a, 6), sample_hold_cycles(&mut b, 6));
+        // Zero is not a valid xorshift state; it falls back to the default.
+        let mut c = Lfo::new(1.0, 4.0);
+        c.set_waveform(LfoWaveform::SampleHold);
+        c.set_random_seed(0);
+        a.reset();
+        assert_eq!(sample_hold_cycles(&mut c, 6), sample_hold_cycles(&mut a, 6));
     }
 
     #[test]

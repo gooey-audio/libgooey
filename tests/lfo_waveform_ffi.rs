@@ -135,3 +135,41 @@ fn sine_value_tracks_phase() {
         );
     }
 }
+
+fn sample_hold_levels(engine: &Engine, lfo: u32, cycles: usize) -> Vec<f32> {
+    // One quarter note at 120 BPM is 24,000 frames; sample mid-cycle, away
+    // from the wrap where the next level is chosen.
+    engine.render_frames(12_000);
+    (0..cycles)
+        .map(|_| {
+            engine.render_frames(24_000);
+            unsafe { gooey_engine_get_lfo_value(engine.0, lfo) }
+        })
+        .collect()
+}
+
+fn enable_sample_hold(engine: &Engine, lfo: u32) {
+    unsafe {
+        gooey_engine_set_lfo_timing(engine.0, lfo, LFO_TIMING_QUARTER);
+        gooey_engine_set_lfo_waveform(engine.0, lfo, LFO_WAVEFORM_SAMPLE_HOLD);
+        gooey_engine_set_lfo_enabled(engine.0, lfo, true);
+    }
+}
+
+#[test]
+fn pooled_sample_hold_lfos_are_uncorrelated() {
+    let a = Engine::new();
+    let b = Engine::new();
+    enable_sample_hold(&a, 0);
+    enable_sample_hold(&b, 1);
+    assert_ne!(sample_hold_levels(&a, 0, 6), sample_hold_levels(&b, 1, 6));
+}
+
+#[test]
+fn phase_reset_restarts_sample_hold_levels() {
+    let engine = Engine::new();
+    enable_sample_hold(&engine, 3);
+    let first = sample_hold_levels(&engine, 3, 6);
+    unsafe { gooey_engine_reset_lfo_phase(engine.0, 3) };
+    assert_eq!(sample_hold_levels(&engine, 3, 6), first);
+}

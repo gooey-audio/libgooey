@@ -1116,6 +1116,9 @@ pub struct GooeyEngine {
     final_output_gain: SmoothedParam,
     /// Read-and-reset peak of frames emitted to the host.
     final_output_peak: AtomicU32,
+    /// Each LFO's latest output (f32 bits), published after every rendered
+    /// buffer so hosts can read it without racing `render`.
+    lfo_values: [AtomicU32; LFO_COUNT],
     /// Read-and-reset count of frames whose selected pre-limiter path exceeded
     /// full scale on either channel.
     final_output_overload_frames: AtomicU64,
@@ -1424,7 +1427,12 @@ impl GooeyEngine {
         let feedback_waveshaper = FeedbackWaveshaper::new(sample_rate, 1.0, 0.0, 2000.0, 0.0);
 
         // Create LFO pool (8 LFOs, all disabled by default with quarter note timing)
-        let lfos = std::array::from_fn(|_| Lfo::with_sample_rate(sample_rate));
+        let lfos = std::array::from_fn(|index| {
+            let mut lfo = Lfo::with_sample_rate(sample_rate);
+            // Distinct seeds keep pooled sample & hold LFOs uncorrelated.
+            lfo.set_random_seed(0x9E37_79B9 ^ (index as u32 + 1).wrapping_mul(0x85EB_CA6B));
+            lfo
+        });
         let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] = std::array::from_fn(|_| Vec::new());
         let mixer = Mixer::new(sample_rate);
         let mixer_control = mixer.control();
@@ -1470,6 +1478,7 @@ impl GooeyEngine {
             final_output_mix: SmoothedParam::new(0.0, 0.0, 1.0, sample_rate, 15.0),
             final_output_gain: SmoothedParam::new(1.0, 0.0, 4.0, sample_rate, 15.0),
             final_output_peak: AtomicU32::new(0.0_f32.to_bits()),
+            lfo_values: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             final_output_overload_frames: AtomicU64::new(0),
             output_scope: OutputScopeBuffer::new(),
             output_scope_capture: OutputScopeCapture::new(sample_rate),
@@ -2234,7 +2243,19 @@ impl GooeyEngine {
         self.mixer.publish_control_snapshot();
         self.publish_piano_meters();
         self.publish_automation_status();
+        self.publish_lfo_values();
         self.retire_live_control_racks();
+    }
+
+    fn publish_lfo_values(&self) {
+        for (index, slot) in self.lfo_values.iter().enumerate() {
+            let value = if self.lfo_enabled[index] {
+                self.lfos[index].value()
+            } else {
+                0.0
+            };
+            slot.store(value.to_bits(), Ordering::Release);
+        }
     }
 
     /// Set one global effect parameter (see `gooey_engine_set_global_effect_param`).
@@ -7038,7 +7059,9 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_waveform(
 }
 
 /// Get an LFO's latest output, `offset + waveform * amount`, before each
-/// route's depth is applied. For displaying live modulation.
+/// route's depth is applied, as published after the last rendered buffer.
+/// Safe to poll from a UI thread while rendering. For displaying live
+/// modulation.
 ///
 /// # Returns
 /// The latest output, or 0.0 if the LFO is disabled or the index is invalid
@@ -7057,7 +7080,7 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_value(
     if !engine.lfo_enabled[lfo_index as usize] {
         return 0.0;
     }
-    engine.lfos[lfo_index as usize].value()
+    f32::from_bits(engine.lfo_values[lfo_index as usize].load(Ordering::Acquire))
 }
 
 /// Get the number of snare parameters
