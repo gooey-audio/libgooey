@@ -19,7 +19,7 @@ mod wsola;
 pub use clip_grid::{
     ClipGrid, LaunchQuantization, RetrimTiming, CLIP_COLUMN_COUNT, CLIP_QUANTIZE_BAR,
     CLIP_QUANTIZE_IMMEDIATE, CLIP_QUANTIZE_QUARTER, CLIP_QUANTIZE_SIXTEENTH, CLIP_ROW_COUNT,
-    CLIP_STATE_LOADED, CLIP_STATE_PLAYING, CLIP_STATE_QUEUED,
+    CLIP_STATE_LOADED, CLIP_STATE_PLAYING, CLIP_STATE_QUEUED, CLIP_TRANSPOSE_MAX_SEMITONES,
 };
 pub(crate) use control::MixerCommand;
 pub use control::MixerControl;
@@ -128,8 +128,37 @@ impl Mixer {
                 row,
                 buffer,
                 source_bpm,
+                playback,
             } => {
-                self.clip_load(column, row, buffer, source_bpm);
+                if let Some((speed, preserve_pitch)) = playback {
+                    self.clip_grid.load_with_playback(
+                        column,
+                        row,
+                        buffer,
+                        source_bpm,
+                        speed,
+                        preserve_pitch,
+                    );
+                } else {
+                    self.clip_load(column, row, buffer, source_bpm);
+                }
+            }
+            MixerCommand::ClipSetPlayback {
+                column,
+                row,
+                speed,
+                preserve_pitch,
+            } => {
+                self.clip_grid
+                    .set_playback(column, row, speed, preserve_pitch, &mut self.channels);
+            }
+            MixerCommand::ClipSetTranspose {
+                column,
+                row,
+                semitones,
+            } => {
+                self.clip_grid
+                    .set_transpose(column, row, semitones, &mut self.channels);
             }
             MixerCommand::ClipUnload { column, row } => {
                 self.clip_unload(column, row);
@@ -164,6 +193,9 @@ impl Mixer {
             MixerCommand::ClipCancelAll => self.clip_cancel_all(),
             MixerCommand::ClipSetDefaultQuantization { quantization } => {
                 self.clip_set_default_quantization(quantization)
+            }
+            MixerCommand::ClipSetPhaseAlignedLaunches { enabled } => {
+                self.clip_grid.set_phase_aligned_launches(enabled);
             }
             MixerCommand::ClipSetTrim {
                 column,
