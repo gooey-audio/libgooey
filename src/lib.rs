@@ -17,6 +17,7 @@ pub mod instruments;
 pub(crate) mod live_control;
 pub mod mixer;
 pub mod music;
+pub(crate) mod output_scope;
 pub mod performance;
 pub mod sequencer;
 mod track_tape;

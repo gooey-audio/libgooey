@@ -5,7 +5,7 @@ use super::chord_set::ChordSet;
 use super::note::NoteName;
 use super::scale::ScaleType;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Key {
     pub root: NoteName,
     pub scale_type: ScaleType,

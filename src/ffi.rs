@@ -15,7 +15,7 @@ use crate::effects::{
     DelayEffect, DelayTiming, Effect, FeedbackWaveshaper, LowpassFilterEffect, PlateReverbEffect,
     SoftLimiter, SpringReverbEffect, TiltFilterEffect, TubeCompressor, TubeSaturation, Waveshaper,
 };
-use crate::engine::lfo::{Lfo, MusicalDivision};
+use crate::engine::lfo::{Lfo, LfoWaveform, MusicalDivision};
 use crate::engine::{
     Instrument, Modulatable, Sequencer, SequencerBlendSetting, SequencerStepSettings,
 };
@@ -31,9 +31,9 @@ use crate::instruments::poly_synth_control::{PolySynthControl, PolySynthPending}
 use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
     BassConfig, BassSynth, FilterSlope, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum,
-    MelodyVoice, NoiseColor, PercussionEngine, PercussionEngineKind, PercussionPreset,
-    PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer, SamplerBuffer,
-    SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config, TwinCorePercBodyMode,
+    MelodyNotePool, MelodyVoice, NoiseColor, PercussionEngine, PercussionEngineKind,
+    PercussionPreset, PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer,
+    SamplerBuffer, SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config, TwinCorePercBodyMode,
     TwinCorePercConfig, TwinCorePercNoiseMode, TwinCorePercVoice,
 };
 use crate::live_control::{
@@ -47,8 +47,10 @@ use crate::mixer::{
     RetrimTiming, StereoSampleBuffer,
 };
 use crate::music::{
-    apply_voicing, available_voicings, Chord, ChordSet, Key, NoteName, ScaleType, VoicingType,
+    apply_voicing, available_voicings, transform_progression_voicings, Chord, ChordSet, Key,
+    NoteName, ProgressionChord, ScaleType, VoiceLeadingStrategy, VoicingType, PADS_PER_SET,
 };
+use crate::output_scope::{OutputScopeBuffer, OutputScopeCapture};
 use crate::performance::control::{ChordControl, ChordControlScratch};
 use crate::performance::{
     prepare_chord_event, ChordCommandAction, ChordGate, ChordLoopSnapshot, PerformanceRecorder,
@@ -88,6 +90,23 @@ pub const LFO_TIMING_SIXTEENTH: u32 = 6;
 pub const LFO_TIMING_THIRTY_SECOND: u32 = 7;
 /// Invalid LFO value (returned on error or when LFO is in Hz mode)
 pub const LFO_INVALID: u32 = 0xFFFFFFFF;
+
+/// LFO waveform: sine (the default).
+pub const LFO_WAVEFORM_SINE: u32 = 0;
+/// LFO waveform: linear 0 → 1 → 0 → -1 → 0.
+pub const LFO_WAVEFORM_TRIANGLE: u32 = 1;
+/// LFO waveform: rising ramp, starting at 0 like sine.
+pub const LFO_WAVEFORM_SAW: u32 = 2;
+/// LFO waveform: 1 for the first half of the cycle, -1 for the second.
+pub const LFO_WAVEFORM_SQUARE: u32 = 3;
+/// LFO waveform: a random level held for each cycle.
+pub const LFO_WAVEFORM_SAMPLE_HOLD: u32 = 4;
+
+const _: () = assert!(LfoWaveform::Sine as u32 == LFO_WAVEFORM_SINE);
+const _: () = assert!(LfoWaveform::Triangle as u32 == LFO_WAVEFORM_TRIANGLE);
+const _: () = assert!(LfoWaveform::Saw as u32 == LFO_WAVEFORM_SAW);
+const _: () = assert!(LfoWaveform::Square as u32 == LFO_WAVEFORM_SQUARE);
+const _: () = assert!(LfoWaveform::SampleHold as u32 == LFO_WAVEFORM_SAMPLE_HOLD);
 
 // =============================================================================
 // Twin-core percussion standalone voice constants
@@ -1098,9 +1117,17 @@ pub struct GooeyEngine {
     final_output_gain: SmoothedParam,
     /// Read-and-reset peak of frames emitted to the host.
     final_output_peak: AtomicU32,
+    /// Each LFO's latest output (f32 bits), published after every rendered
+    /// buffer so hosts can read it without racing `render`.
+    lfo_values: [AtomicU32; LFO_COUNT],
     /// Read-and-reset count of frames whose selected pre-limiter path exceeded
     /// full scale on either channel.
     final_output_overload_frames: AtomicU64,
+    /// Lock-free min/max bins of the post-limiter output, readable from any
+    /// thread via `gooey_engine_read_output_scope`.
+    output_scope: OutputScopeBuffer,
+    /// Render-thread accumulator for the scope bin currently being filled.
+    output_scope_capture: OutputScopeCapture,
 
     // LFO pool (8 LFOs with multi-target routing)
     lfos: [Lfo; LFO_COUNT],
@@ -1320,6 +1347,16 @@ impl GooeyEngine {
         }
     }
 
+    /// Feed one emitted frame to the output scope. Offline bounce renders
+    /// faster than real time, so it is kept out of the live display.
+    #[inline]
+    fn capture_output_scope(&mut self, output: StereoFrame) {
+        if !self.offline_bounce {
+            self.output_scope_capture
+                .push_stereo(&self.output_scope, output.l, output.r);
+        }
+    }
+
     fn new(sample_rate: f32) -> Self {
         let bpm = 120.0;
 
@@ -1391,9 +1428,12 @@ impl GooeyEngine {
         let feedback_waveshaper = FeedbackWaveshaper::new(sample_rate, 1.0, 0.0, 2000.0, 0.0);
 
         // Create LFO pool (8 LFOs, all disabled by default with quarter note timing)
-        let lfos = std::array::from_fn(|_| Lfo::with_sample_rate(sample_rate));
-        let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] =
-            std::array::from_fn(|_| Vec::with_capacity(16));
+        let lfos = std::array::from_fn(|index| {
+            let mut lfo = Lfo::with_sample_rate(sample_rate);
+            lfo.set_random_seed(0x9E37_79B9 ^ (index as u32 + 1).wrapping_mul(0x85EB_CA6B));
+            lfo
+        });
+        let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] = std::array::from_fn(|_| Vec::with_capacity(16));
         let mixer = Mixer::new(sample_rate);
         let mixer_control = mixer.control();
         let sampler_control = SamplerControl::new();
@@ -1439,7 +1479,10 @@ impl GooeyEngine {
             final_output_mix: SmoothedParam::new(0.0, 0.0, 1.0, sample_rate, 15.0),
             final_output_gain: SmoothedParam::new(1.0, 0.0, 4.0, sample_rate, 15.0),
             final_output_peak: AtomicU32::new(0.0_f32.to_bits()),
+            lfo_values: std::array::from_fn(|_| AtomicU32::new(0.0_f32.to_bits())),
             final_output_overload_frames: AtomicU64::new(0),
+            output_scope: OutputScopeBuffer::new(),
+            output_scope_capture: OutputScopeCapture::new(sample_rate),
             // LFO pool
             lfos,
             lfo_enabled: [false; LFO_COUNT],
@@ -1946,6 +1989,10 @@ impl GooeyEngine {
                 for sample in buffer.iter_mut() {
                     *sample = 0.0;
                 }
+                // The silence is still live output, so the scope keeps scrolling.
+                for _ in 0..frame_count {
+                    self.capture_output_scope(StereoFrame::default());
+                }
                 return;
             }
             ArmResolution::NotPending => None,
@@ -1994,6 +2041,7 @@ impl GooeyEngine {
             if let Some(fire_at) = arm_fires_at {
                 if sample_offset < fire_at {
                     frame.fill(0.0);
+                    self.capture_output_scope(StereoFrame::default());
                     sample_offset += 1;
                     continue;
                 }
@@ -2334,6 +2382,7 @@ impl GooeyEngine {
                 )
             };
             self.record_final_output_telemetry(telemetry_pre_limiter, output);
+            self.capture_output_scope(output);
 
             // Write the frame interleaved as [left, right].
             frame[0] = output.l;
@@ -2349,7 +2398,19 @@ impl GooeyEngine {
         self.mixer.publish_control_snapshot();
         self.publish_piano_meters();
         self.publish_automation_status();
+        self.publish_lfo_values();
         self.retire_live_control_racks();
+    }
+
+    fn publish_lfo_values(&self) {
+        for (index, slot) in self.lfo_values.iter().enumerate() {
+            let value = if self.lfo_enabled[index] {
+                self.lfos[index].value()
+            } else {
+                0.0
+            };
+            slot.store(value.to_bits(), Ordering::Release);
+        }
     }
 
     /// Set one global effect parameter (see `gooey_engine_set_global_effect_param`).
@@ -5049,6 +5110,57 @@ pub unsafe extern "C" fn gooey_engine_take_final_output_overload_frames(
 }
 
 // =============================================================================
+// Output scope
+// =============================================================================
+
+/// Number of min/max bins held by the output scope. Each bin spans
+/// `round(sample_rate / OUTPUT_SCOPE_POINT_COUNT)` frames, so the full scope
+/// covers about one second of audio.
+pub const OUTPUT_SCOPE_POINT_COUNT: u32 = 1024;
+
+/// Copy the newest min/max waveform bins of the post-limiter master output.
+///
+/// Each rendered frame is downmixed to mono (`(l + r) * 0.5`, clamped to ±1;
+/// non-finite frames count as 0) and folded into a bin of
+/// `round(sample_rate / OUTPUT_SCOPE_POINT_COUNT)` frames. Silence still
+/// publishes `{0, 0}` bins so the display keeps scrolling. Offline bounce does
+/// not feed the scope.
+///
+/// Writes the newest `min(count, OUTPUT_SCOPE_POINT_COUNT)` bins into
+/// `out_min` / `out_max`, oldest first. If fewer bins have been published than
+/// requested, the front is padded with 0.0.
+///
+/// Returns the total number of bins published so far — a monotonic write
+/// position the caller can compare between reads to skip redraws. Returns 0
+/// for a null engine; null output pointers write nothing but still return the
+/// position.
+///
+/// Lock-free and safe to call from any thread while the engine renders.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+/// `out_min` and `out_max` must each point to at least `count` floats, or be
+/// null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_read_output_scope(
+    engine: *const GooeyEngine,
+    out_min: *mut f32,
+    out_max: *mut f32,
+    count: u32,
+) -> u64 {
+    let Some(engine) = engine.as_ref() else {
+        return 0;
+    };
+    let count = count.min(OUTPUT_SCOPE_POINT_COUNT) as usize;
+    if out_min.is_null() || out_max.is_null() {
+        return engine.output_scope.read(&mut [], &mut []);
+    }
+    let out_min = slice::from_raw_parts_mut(out_min, count);
+    let out_max = slice::from_raw_parts_mut(out_max, count);
+    engine.output_scope.read(out_min, out_max)
+}
+
+// =============================================================================
 // BPM control
 // =============================================================================
 
@@ -5776,7 +5888,10 @@ impl GooeyEngine {
 
     fn trigger_controlled_chord(&mut self, event: PreparedChordEvent, loop_owned: bool) {
         self.release_controlled_chord();
-        self.melody.set_harmony(event.chord);
+        self.melody.set_harmony_in_key(
+            event.chord,
+            resolve_key(event.event.root, event.event.scale_type),
+        );
 
         let mut sounding_notes = [0; 6];
         let mut sounding_count = 0usize;
@@ -6800,8 +6915,8 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_timing(
 
 /// Set the global modulation amount for an LFO
 ///
-/// This scales the LFO's sine wave amplitude before it's distributed to routes.
-/// Final modulation = (offset + sine * amount) * route_depth
+/// This scales the LFO's waveform amplitude before it's distributed to routes.
+/// Final modulation = (offset + waveform * amount) * route_depth
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -6849,7 +6964,7 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_amount(
 /// Set the center offset (DC bias) for an LFO
 ///
 /// This adds a constant value to the LFO output before distribution to routes.
-/// Final modulation = (offset + sine * amount) * route_depth
+/// Final modulation = (offset + waveform * amount) * route_depth
 ///
 /// Use offset to bias the modulation (e.g., offset=0.5 with amount=0.5 gives 0.0-1.0 range)
 ///
@@ -7055,6 +7170,72 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_phase(
     }
     let engine = &*engine;
     engine.lfos[lfo_index as usize].phase()
+}
+
+/// Set an LFO's waveform (LFO_WAVEFORM_*). Default: sine. Phase is kept, so
+/// the cycle stays aligned when the shape changes.
+///
+/// # Returns
+/// `true` if applied, `false` for an invalid engine, LFO index, or waveform
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_set_lfo_waveform(
+    engine: *mut GooeyEngine,
+    lfo_index: u32,
+    waveform: u32,
+) -> bool {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return false;
+    }
+    let Some(waveform) = LfoWaveform::from_u32(waveform) else {
+        return false;
+    };
+    let engine = &mut *engine;
+    engine.lfos[lfo_index as usize].set_waveform(waveform);
+    true
+}
+
+/// Get an LFO's waveform (LFO_WAVEFORM_*), or LFO_INVALID if invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_lfo_waveform(
+    engine: *const GooeyEngine,
+    lfo_index: u32,
+) -> u32 {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return LFO_INVALID;
+    }
+    let engine = &*engine;
+    engine.lfos[lfo_index as usize].waveform().as_u32()
+}
+
+/// Get an LFO's latest output, `offset + waveform * amount`, before each
+/// route's depth is applied, as published after the last rendered buffer.
+/// Safe to poll from a UI thread while rendering. For displaying live
+/// modulation.
+///
+/// # Returns
+/// The latest output, or 0.0 if the LFO is disabled or the index is invalid
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_lfo_value(
+    engine: *const GooeyEngine,
+    lfo_index: u32,
+) -> f32 {
+    if engine.is_null() || lfo_index as usize >= LFO_COUNT {
+        return 0.0;
+    }
+    let engine = &*engine;
+    if !engine.lfo_enabled[lfo_index as usize] {
+        return 0.0;
+    }
+    f32::from_bits(engine.lfo_values[lfo_index as usize].load(Ordering::Acquire))
 }
 
 /// Get the number of snare parameters
@@ -7569,6 +7750,10 @@ pub const GOOEY_CHORD_GATE_STRUCK: u32 = 1;
 pub const GOOEY_CHORD_LOOP_TICKS_PER_QUARTER: u32 = 96;
 /// Maximum events accepted in one immutable chord-loop snapshot.
 pub const GOOEY_CHORD_LOOP_MAX_EVENTS: u32 = 512;
+/// Deterministically choose the lowest-cost cyclic voice leading.
+pub const GOOEY_VOICE_LEADING_BEST: u32 = 0;
+/// Choose a seeded, near-optimal cyclic voicing variation.
+pub const GOOEY_VOICE_LEADING_RANDOM: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -7728,6 +7913,37 @@ fn voicing_from_id(id: u32) -> VoicingType {
     }
 }
 
+fn checked_voicing_from_id(id: u32) -> Option<VoicingType> {
+    match id {
+        VOICING_ROOT_POSITION => Some(VoicingType::RootPosition),
+        VOICING_FIRST_INVERSION => Some(VoicingType::FirstInversion),
+        VOICING_SECOND_INVERSION => Some(VoicingType::SecondInversion),
+        VOICING_THIRD_INVERSION => Some(VoicingType::ThirdInversion),
+        VOICING_OPEN => Some(VoicingType::OpenVoicing),
+        VOICING_DROP2 => Some(VoicingType::Drop2),
+        VOICING_DROP3 => Some(VoicingType::Drop3),
+        VOICING_SPREAD => Some(VoicingType::Spread),
+        VOICING_SHELL => Some(VoicingType::Shell),
+        VOICING_ROOTLESS => Some(VoicingType::Rootless),
+        _ => None,
+    }
+}
+
+fn voicing_id(voicing: VoicingType) -> u32 {
+    match voicing {
+        VoicingType::RootPosition => VOICING_ROOT_POSITION,
+        VoicingType::FirstInversion => VOICING_FIRST_INVERSION,
+        VoicingType::SecondInversion => VOICING_SECOND_INVERSION,
+        VoicingType::ThirdInversion => VOICING_THIRD_INVERSION,
+        VoicingType::OpenVoicing => VOICING_OPEN,
+        VoicingType::Drop2 => VOICING_DROP2,
+        VoicingType::Drop3 => VOICING_DROP3,
+        VoicingType::Spread => VOICING_SPREAD,
+        VoicingType::Shell => VOICING_SHELL,
+        VoicingType::Rootless => VOICING_ROOTLESS,
+    }
+}
+
 fn scale_from_id(id: u32) -> ScaleType {
     match id {
         SCALE_MINOR => ScaleType::NaturalMinor,
@@ -7747,8 +7963,11 @@ fn root_from_id(id: u32) -> NoteName {
 /// audibly wrong chords rather than merely shifting a key.
 fn resolve_chord(chord_set: u32, root: u32, scale_type: u32, degree: u32) -> Option<Chord> {
     let set = ChordSet::from_id(chord_set)?;
-    let key = Key::new(root_from_id(root), scale_from_id(scale_type));
-    Some(set.chord(&key, degree as usize))
+    Some(set.chord(&resolve_key(root, scale_type), degree as usize))
+}
+
+fn resolve_key(root: u32, scale_type: u32) -> Key {
+    Key::new(root_from_id(root), scale_from_id(scale_type))
 }
 
 fn factory_poly_preset_config(id: u32) -> Option<PolySynthConfig> {
@@ -7882,7 +8101,9 @@ pub unsafe extern "C" fn gooey_engine_poly_trigger_chord_set(
     let midi_notes = apply_voicing(&chord, voicing_type, octave_clamped);
 
     // Release any currently sounding notes, then trigger the new chord
-    engine.melody.set_harmony(chord);
+    engine
+        .melody
+        .set_harmony_in_key(chord, resolve_key(root, scale_type));
     engine.poly_synth.release_all();
     for note in &midi_notes {
         engine.poly_synth.trigger_note(*note, velocity);
@@ -7969,6 +8190,81 @@ fn prepare_ffi_chord(event: GooeyChordEvent) -> Option<PreparedChordEvent> {
     Some(prepared)
 }
 
+/// Rewrite only the named voicings in a caller-owned chord progression.
+///
+/// The chords are scored as a cycle, including the transition from the last
+/// event back to the first. `GOOEY_VOICE_LEADING_BEST` is deterministic;
+/// `GOOEY_VOICE_LEADING_RANDOM` uses `seed` to choose a changed, near-optimal
+/// variation. Target, target id, preset, octave, velocity and gate are never
+/// modified. This is a pure music-theory operation and requires no engine.
+///
+/// Returns false for an unknown strategy, more than
+/// `GOOEY_CHORD_LOOP_MAX_EVENTS`, a null pointer with a nonzero count, or any
+/// invalid harmony field. Validation completes before the first write, so a
+/// failed call never partially changes the array. A zero count is a successful
+/// no-op and permits a null pointer.
+///
+/// # Safety
+/// `events` may be null when `event_count` is zero; otherwise it must point to
+/// `event_count` readable and writable `GooeyChordEvent` values.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_chord_progression_transform_voicings(
+    events: *mut GooeyChordEvent,
+    event_count: u32,
+    strategy: u32,
+    seed: u64,
+) -> bool {
+    let strategy = match strategy {
+        GOOEY_VOICE_LEADING_BEST => VoiceLeadingStrategy::Best,
+        GOOEY_VOICE_LEADING_RANDOM => VoiceLeadingStrategy::Randomized { seed },
+        _ => return false,
+    };
+    if event_count > GOOEY_CHORD_LOOP_MAX_EVENTS {
+        return false;
+    }
+    if event_count == 0 {
+        return true;
+    }
+    if events.is_null() {
+        return false;
+    }
+
+    let events = std::slice::from_raw_parts_mut(events, event_count as usize);
+    let mut progression = Vec::with_capacity(events.len());
+    for event in events.iter() {
+        if event.root >= 12
+            || (event.scale_type != SCALE_MAJOR && event.scale_type != SCALE_MINOR)
+            || event.degree as usize >= PADS_PER_SET
+            || !(0..=8).contains(&event.octave)
+        {
+            return false;
+        }
+        let Some(set) = ChordSet::from_id(event.chord_set) else {
+            return false;
+        };
+        let Some(current_voicing) = checked_voicing_from_id(event.voicing) else {
+            return false;
+        };
+        let key = Key::new(root_from_id(event.root), scale_from_id(event.scale_type));
+        let chord = set.chord(&key, event.degree as usize);
+        if !available_voicings(&chord.quality).contains(&current_voicing) {
+            return false;
+        }
+        progression.push(ProgressionChord {
+            chord,
+            octave: event.octave as i8,
+            current_voicing,
+        });
+    }
+
+    let transformed = transform_progression_voicings(&progression, strategy);
+    debug_assert_eq!(events.len(), transformed.len());
+    for (event, voicing) in events.iter_mut().zip(transformed) {
+        event.voicing = voicing_id(voicing);
+    }
+    true
+}
+
 /// Queue a chord gesture for the next available render-buffer boundary.
 /// Safe for a control thread to call concurrently with rendering. Returns
 /// whether the command was accepted, not whether every piano note was mapped.
@@ -8002,7 +8298,8 @@ pub unsafe extern "C" fn gooey_engine_chord_enqueue_release_all(
 
 /// Validate, copy, and stage a complete chord-loop snapshot. While transport
 /// is running, the newest accepted snapshot takes effect on the first sample
-/// of the next render buffer without resetting transport phase.
+/// of the next render buffer without resetting transport phase. The chord
+/// under the playhead is struck when the snapshot installs.
 ///
 /// # Safety
 /// `engine` must be null or a valid live engine pointer. When `event_count` is
@@ -8013,6 +8310,34 @@ pub unsafe extern "C" fn gooey_engine_chord_loop_replace(
     events: *const GooeyChordLoopEvent,
     event_count: u32,
     length_ticks: u32,
+) -> u64 {
+    chord_loop_replace(engine, events, event_count, length_ticks, true)
+}
+
+/// Like `gooey_engine_chord_loop_replace`, but a chord already sounding when
+/// the snapshot installs keeps ringing instead of being struck again. The new
+/// clip is first heard at its next event boundary, which suits edits such as
+/// re-voicing a progression that should not interrupt playback. A rest under
+/// the playhead in the new clip still releases the sounding chord.
+///
+/// # Safety
+/// Same contract as `gooey_engine_chord_loop_replace`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_chord_loop_replace_preserving_sounding(
+    engine: *const GooeyEngine,
+    events: *const GooeyChordLoopEvent,
+    event_count: u32,
+    length_ticks: u32,
+) -> u64 {
+    chord_loop_replace(engine, events, event_count, length_ticks, false)
+}
+
+unsafe fn chord_loop_replace(
+    engine: *const GooeyEngine,
+    events: *const GooeyChordLoopEvent,
+    event_count: u32,
+    length_ticks: u32,
+    retrigger_sounding: bool,
 ) -> u64 {
     let Some(engine) = engine.as_ref() else {
         return 0;
@@ -8037,7 +8362,9 @@ pub unsafe extern "C" fn gooey_engine_chord_loop_replace(
         event.event.duration_ticks = source_event.duration_ticks;
         prepared.push(event);
     }
-    engine.chord_control.replace(prepared, length_ticks)
+    engine
+        .chord_control
+        .replace(prepared, length_ticks, retrigger_sounding)
 }
 
 /// Clear the shared performance timeline at the next render boundary.
@@ -8392,12 +8719,20 @@ pub unsafe extern "C" fn gooey_engine_poly_get_param(
 // Chord-aware live melody
 // =============================================================================
 
+/// Melody note pool: only the latched chord's own tones.
+pub const MELODY_NOTE_POOL_CHORD: u32 = 0;
+/// Melody note pool (default): chord tones plus the key's tensions that do not
+/// clash with the chord, such as the 9th and 6th over a major triad but not
+/// the 4th a half step above its third.
+pub const MELODY_NOTE_POOL_KEY: u32 = 1;
+
 /// Begin a melodic gesture from an intended MIDI note.
 ///
-/// The note is snapped to the nearest tone of the most recently triggered
-/// chord. Returns the sounding MIDI note, or -1 when the input is invalid or no
-/// harmony has been established yet. A valid gesture begun before the first
-/// chord is retained silently and starts when a chord later becomes active.
+/// The note is snapped to the nearest eligible pitch for the most recently
+/// triggered chord; see `gooey_engine_melody_set_note_pool`. Returns the
+/// sounding MIDI note, or -1 when the input is invalid or no harmony has been
+/// established yet. A valid gesture begun before the first chord is retained
+/// silently and starts when a chord later becomes active.
 ///
 /// # Safety
 /// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
@@ -8421,7 +8756,7 @@ pub unsafe extern "C" fn gooey_engine_melody_note_on(
 
 /// Move an active melodic gesture to another intended MIDI note.
 ///
-/// Retuning is legato: when quantization chooses a different chord tone, the
+/// Retuning is legato: when quantization chooses a different pitch, the
 /// held synth voice changes pitch without restarting its envelopes or phase.
 /// Returns -1 for invalid input, when no gesture is held, or while a valid
 /// pre-harmony gesture is still silent.
@@ -8484,6 +8819,44 @@ pub unsafe extern "C" fn gooey_engine_melody_has_harmony(engine: *const GooeyEng
 pub unsafe extern "C" fn gooey_engine_melody_clear_harmony(engine: *mut GooeyEngine) {
     if let Some(engine) = engine.as_mut() {
         engine.melody.clear_harmony();
+    }
+}
+
+/// Choose which pitches the melody may land on (`MELODY_NOTE_POOL_*`). A held
+/// gesture retunes to the new pool immediately. Returns false for a null
+/// engine or an unknown pool, leaving the current pool unchanged.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_melody_set_note_pool(
+    engine: *mut GooeyEngine,
+    pool: u32,
+) -> bool {
+    let pool = match pool {
+        MELODY_NOTE_POOL_CHORD => MelodyNotePool::Chord,
+        MELODY_NOTE_POOL_KEY => MelodyNotePool::ChordAndKey,
+        _ => return false,
+    };
+    let Some(engine) = engine.as_mut() else {
+        return false;
+    };
+    engine.melody.set_note_pool(pool);
+    true
+}
+
+/// Return the current `MELODY_NOTE_POOL_*`, or the default for a null engine.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_melody_get_note_pool(engine: *const GooeyEngine) -> u32 {
+    let pool = engine.as_ref().map_or(MelodyNotePool::default(), |engine| {
+        engine.melody.note_pool()
+    });
+    match pool {
+        MelodyNotePool::Chord => MELODY_NOTE_POOL_CHORD,
+        MelodyNotePool::ChordAndKey => MELODY_NOTE_POOL_KEY,
     }
 }
 
@@ -9716,7 +10089,9 @@ pub unsafe extern "C" fn gooey_engine_piano_trigger_chord_set(
         any_sounded |= sounded;
     }
     if any_sounded {
-        engine.melody.set_harmony(chord);
+        engine
+            .melody
+            .set_harmony_in_key(chord, resolve_key(root, scale_type));
     }
     all_sounded
 }
@@ -10919,6 +11294,9 @@ pub unsafe extern "C" fn gooey_engine_track_effect_type_at(
 pub const CLIP_COLUMN_COUNT: u32 = crate::mixer::CLIP_COLUMN_COUNT as u32;
 /// Number of rows in each clip-grid column.
 pub const CLIP_ROW_COUNT: u32 = crate::mixer::CLIP_ROW_COUNT as u32;
+/// Largest `gooey_engine_clip_set_transpose` value, in semitones either way.
+/// A literal so cbindgen can export it; mirrors the mixer constant.
+pub const CLIP_TRANSPOSE_MAX_SEMITONES: f32 = 24.0;
 
 /// Launch on the next straight sixteenth-note boundary.
 pub const CLIP_QUANTIZE_SIXTEENTH: u32 = crate::mixer::CLIP_QUANTIZE_SIXTEENTH;
@@ -10984,6 +11362,108 @@ pub unsafe extern "C" fn gooey_engine_clip_load(
         }
         Err(_) => false,
     }
+}
+
+/// Load or replace one clip-grid slot from interleaved audio.
+///
+/// `source_bpm` is required and must be finite and positive. Speed must be finite in 0.25..=4.0.
+/// Pitch preservation compensates both speed and BPM changes.
+/// Replacing the active slot keeps its old buffer sounding and schedules the
+/// replacement using the default launch quantization.
+///
+/// # Safety
+/// `engine` must be valid and `samples` must reference at least
+/// `frames * channels` readable `f32` values.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_load_with_playback(
+    engine: *mut GooeyEngine,
+    column: u32,
+    row: u32,
+    samples: *const f32,
+    frames: u32,
+    channels: u32,
+    sample_rate: f32,
+    source_bpm: f32,
+    speed: f32,
+    preserve_pitch: bool,
+) -> bool {
+    if !speed.is_finite()
+        || !(0.25..=4.0).contains(&speed)
+        || engine.is_null()
+        || samples.is_null()
+        || frames == 0
+        || channels == 0
+        || !source_bpm.is_finite()
+        || source_bpm <= 0.0
+        || column >= CLIP_COLUMN_COUNT
+        || row >= CLIP_ROW_COUNT
+    {
+        return false;
+    }
+    let Some(total) = (frames as usize).checked_mul(channels as usize) else {
+        return false;
+    };
+    let samples = slice::from_raw_parts(samples, total);
+    match StereoSampleBuffer::from_interleaved(samples, channels as usize, sample_rate) {
+        Ok(buffer) => {
+            // Defer the slot load to the audio thread (replacing the active slot
+            // touches the live channel); indices/bpm are validated above.
+            (*engine).mixer_control.clip_load_with_playback(
+                column as usize,
+                row as usize,
+                buffer,
+                source_bpm,
+                speed,
+                preserve_pitch,
+            )
+        }
+        Err(_) => false,
+    }
+}
+
+/// Set a loaded clip's speed (0.25..=4.0) and pitch preservation live.
+/// A queued replacement is edited without changing the outgoing audio.
+/// Returns false for an empty slot, invalid speed, or rejected command.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_set_playback(
+    engine: *mut GooeyEngine,
+    column: u32,
+    row: u32,
+    speed: f32,
+    preserve_pitch: bool,
+) -> bool {
+    engine.as_ref().is_some_and(|engine| {
+        engine
+            .mixer_control
+            .clip_set_playback(column as usize, row as usize, speed, preserve_pitch)
+    })
+}
+
+/// Transpose a loaded clip by `semitones` (finite, within
+/// +/-`CLIP_TRANSPOSE_MAX_SEMITONES`) without changing its timing: the clip
+/// stays locked to the transport grid at its current speed. Stacks with
+/// `gooey_engine_clip_set_playback`: with pitch preservation on, pitch moves
+/// by the transpose alone; with it off, speed and BPM repitch it as well.
+/// A queued replacement is edited without changing the outgoing audio.
+/// Returns false for an empty slot, invalid value, or rejected command.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_set_transpose(
+    engine: *mut GooeyEngine,
+    column: u32,
+    row: u32,
+    semitones: f32,
+) -> bool {
+    engine.as_ref().is_some_and(|engine| {
+        engine
+            .mixer_control
+            .clip_set_transpose(column as usize, row as usize, semitones)
+    })
 }
 
 /// Unload a slot. An active slot stops and disappears at the default boundary;
@@ -11192,6 +11672,28 @@ pub unsafe extern "C" fn gooey_engine_clip_set_default_quantization(
     engine
         .mixer_control
         .clip_set_default_quantization(quantization)
+}
+
+/// Configure clip launches to join the shared transport phrase position.
+///
+/// Opt-in (default false). Configure before launching any clips. When enabled,
+/// new clips, active-slot replacements and re-launches start at the current
+/// transport beat modulo their trimmed musical length, with beat zero as origin.
+/// This is applied on the audio thread at the actual quantized launch sample.
+/// Returns false for a null engine or a full control queue.
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_set_phase_aligned_launches(
+    engine: *mut GooeyEngine,
+    enabled: bool,
+) -> bool {
+    engine.as_ref().is_some_and(|engine| {
+        engine
+            .mixer_control
+            .clip_set_phase_aligned_launches(enabled)
+    })
 }
 
 /// Return the current default `CLIP_QUANTIZE_*` value (bar for a null engine).
@@ -14381,6 +14883,55 @@ mod automation_tests {
             .instrument
             .get_param(HIHAT_PARAM_TONE);
         assert!((tone - 0.25).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod clip_transpose_tests {
+    use super::*;
+
+    #[test]
+    fn transpose_requires_a_loaded_slot_and_a_finite_bounded_value() {
+        let engine = gooey_engine_new(48_000.0);
+        let samples = [0.1f32; 4_800];
+        unsafe {
+            assert!(!gooey_engine_clip_set_transpose(
+                std::ptr::null_mut(),
+                0,
+                0,
+                1.0
+            ));
+            assert!(!gooey_engine_clip_set_transpose(engine, 0, 0, 1.0));
+            assert!(gooey_engine_clip_load_with_playback(
+                engine,
+                0,
+                0,
+                samples.as_ptr(),
+                4_800,
+                1,
+                48_000.0,
+                120.0,
+                1.0,
+                true,
+            ));
+            assert!(gooey_engine_clip_set_transpose(engine, 0, 0, -7.0));
+            assert!(gooey_engine_clip_set_transpose(
+                engine,
+                0,
+                0,
+                CLIP_TRANSPOSE_MAX_SEMITONES
+            ));
+            for semitones in [f32::NAN, f32::INFINITY, 24.5, -24.5] {
+                assert!(!gooey_engine_clip_set_transpose(engine, 0, 0, semitones));
+            }
+            assert!(!gooey_engine_clip_set_transpose(
+                engine,
+                CLIP_COLUMN_COUNT,
+                0,
+                1.0
+            ));
+            gooey_engine_free(engine);
+        }
     }
 }
 

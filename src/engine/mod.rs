@@ -16,7 +16,7 @@ pub use sequencer::{
 };
 
 pub mod lfo;
-pub use lfo::{Lfo, LfoSyncMode, MusicalDivision};
+pub use lfo::{Lfo, LfoSyncMode, LfoWaveform, MusicalDivision};
 
 // Export WaveformDisplay when both native and visualization features are enabled
 #[cfg(all(feature = "native", feature = "visualization"))]
