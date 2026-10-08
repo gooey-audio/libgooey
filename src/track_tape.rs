@@ -1,4 +1,4 @@
-//! Three synchronized pre-strip stereo lanes. Render owns state; workers own PCM I/O.
+//! One to four synchronized pre-strip stereo lanes. Render owns state; workers own PCM I/O.
 use crate::frame::StereoFrame;
 use crate::live_control::SpscRing;
 use std::cell::UnsafeCell;
@@ -8,7 +8,7 @@ use std::sync::{
 };
 const CAPACITY: usize = 131072;
 #[derive(Clone, Copy, Default)]
-pub(crate) struct TapeFrame(pub [f32; 6]);
+pub(crate) struct TapeFrame(pub [f32; 8]);
 struct FrameRing {
     samples: Box<[UnsafeCell<TapeFrame>]>,
     head: AtomicU64,
@@ -61,6 +61,7 @@ pub(crate) enum Command {
     Live,
 }
 pub(crate) struct Shared {
+    pub channels: usize,
     commands: SpscRing<(u64, Command), 16>,
     capture: FrameRing,
     playback: FrameRing,
@@ -70,8 +71,9 @@ pub(crate) struct Shared {
     next: AtomicU64,
 }
 impl Shared {
-    pub fn new() -> Arc<Self> {
+    pub fn new(channels: usize) -> Arc<Self> {
         Arc::new(Self {
+            channels,
             commands: SpscRing::new(),
             capture: FrameRing::new(),
             playback: FrameRing::new(),
@@ -91,17 +93,19 @@ impl Shared {
     }
     pub fn drain(&self, output: &mut [f32]) -> usize {
         let mut n = 0;
-        for f in output.chunks_exact_mut(6) {
+        for f in output.chunks_exact_mut(self.channels) {
             let Some(v) = self.capture.pop() else { break };
-            f.copy_from_slice(&v.0);
+            f.copy_from_slice(&v.0[..self.channels]);
             n += 1;
         }
         n
     }
     pub fn feed(&self, input: &[f32]) -> usize {
         let mut n = 0;
-        for f in input.chunks_exact(6) {
-            if !self.playback.push(TapeFrame(f.try_into().unwrap())) {
+        for f in input.chunks_exact(self.channels) {
+            let mut frame = TapeFrame::default();
+            frame.0[..self.channels].copy_from_slice(f);
+            if !self.playback.push(frame) {
                 break;
             }
             n += 1;
@@ -115,14 +119,14 @@ impl Shared {
 }
 pub(crate) struct Renderer {
     pub shared: Arc<Shared>,
-    pub tracks: [usize; 3],
+    pub tracks: [usize; 4],
     mode: u32,
     start: f64,
     cursor: u64,
     total: u64,
 }
 impl Renderer {
-    pub fn new(shared: Arc<Shared>, tracks: [usize; 3]) -> Self {
+    pub fn new(shared: Arc<Shared>, tracks: [usize; 4]) -> Self {
         Self {
             shared,
             tracks,
@@ -175,15 +179,15 @@ impl Renderer {
         &mut self,
         beat: f64,
         running: bool,
-        dry: [StereoFrame; 3],
-    ) -> Option<[StereoFrame; 3]> {
+        dry: [StereoFrame; 4],
+    ) -> Option<[StereoFrame; 4]> {
         if self.mode == 1 && running && beat + 1e-9 >= self.start {
             self.mode = 2;
             self.shared.state.store(2, Ordering::Release);
         }
         if self.mode == 2 {
             if !self.shared.capture.push(TapeFrame([
-                dry[0].l, dry[0].r, dry[1].l, dry[1].r, dry[2].l, dry[2].r,
+                dry[0].l, dry[0].r, dry[1].l, dry[1].r, dry[2].l, dry[2].r, dry[3].l, dry[3].r,
             ])) {
                 self.mode = 6;
                 self.shared.state.store(6, Ordering::Release);
@@ -209,7 +213,7 @@ impl Renderer {
             }
         }
         if self.mode >= 4 {
-            Some([StereoFrame::default(); 3])
+            Some([StereoFrame::default(); 4])
         } else {
             None
         }
@@ -221,8 +225,8 @@ mod tests {
     use super::*;
     #[test]
     fn synchronized_next_bar_dry_capture() {
-        let s = Shared::new();
-        let mut r = Renderer::new(s.clone(), [0, 1, 2]);
+        let s = Shared::new(6);
+        let mut r = Renderer::new(s.clone(), [0, 1, 2, 0]);
         let g = s.command(Command::Arm(4.0));
         r.begin_buffer(0.0);
         assert_eq!(s.applied.load(Ordering::Acquire), g);
@@ -230,6 +234,7 @@ mod tests {
             StereoFrame { l: 1., r: 2. },
             StereoFrame { l: 3., r: 4. },
             StereoFrame { l: 5., r: 6. },
+            StereoFrame::default(),
         ];
         r.frame(3.99, true, dry);
         assert_eq!(s.frames.load(Ordering::Acquire), 0);
@@ -242,12 +247,12 @@ mod tests {
     }
     #[test]
     fn replay_once_and_silence_without_feedback() {
-        let s = Shared::new();
-        let mut r = Renderer::new(s.clone(), [0, 1, 2]);
+        let s = Shared::new(6);
+        let mut r = Renderer::new(s.clone(), [0, 1, 2, 0]);
         s.feed(&[1., 2., 3., 4., 5., 6.]);
         s.command(Command::Play(1));
         r.begin_buffer(0.0);
-        let dry = [StereoFrame::mono(99.); 3];
+        let dry = [StereoFrame::mono(99.); 4];
         assert_eq!(r.frame(0., false, dry).unwrap()[0].l, 1.);
         assert_eq!(r.frame(0., false, dry).unwrap()[0].l, 0.);
         let mut pcm = [0.; 6];
@@ -256,27 +261,27 @@ mod tests {
     }
     #[test]
     fn underrun_and_capture_overflow_are_explicit() {
-        let s = Shared::new();
-        let mut r = Renderer::new(s.clone(), [0, 1, 2]);
+        let s = Shared::new(6);
+        let mut r = Renderer::new(s.clone(), [0, 1, 2, 0]);
         s.command(Command::Play(1));
         r.begin_buffer(0.0);
-        r.frame(0., true, [StereoFrame::default(); 3]);
+        r.frame(0., true, [StereoFrame::default(); 4]);
         assert_eq!(s.state.load(Ordering::Acquire), 7);
         s.command(Command::Arm(0.));
         r.begin_buffer(0.0);
         for _ in 0..=CAPACITY {
-            r.frame(0., true, [StereoFrame::default(); 3]);
+            r.frame(0., true, [StereoFrame::default(); 4]);
         }
         assert_eq!(s.state.load(Ordering::Acquire), 6);
         assert_eq!(s.frames.load(Ordering::Acquire), CAPACITY as u64);
     }
     #[test]
     fn stopped_transport_never_starts_capture() {
-        let s = Shared::new();
-        let mut r = Renderer::new(s.clone(), [0, 1, 2]);
+        let s = Shared::new(6);
+        let mut r = Renderer::new(s.clone(), [0, 1, 2, 0]);
         s.command(Command::Arm(0.));
         r.begin_buffer(0.0);
-        r.frame(0., false, [StereoFrame::default(); 3]);
+        r.frame(0., false, [StereoFrame::default(); 4]);
         assert_eq!(s.frames.load(Ordering::Acquire), 0);
     }
 }

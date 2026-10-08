@@ -83,6 +83,18 @@ impl Mixer {
     fn apply_pending(&mut self) {
         let control = self.control.clone();
         control.reclaim_from_audio(&mut self.retired);
+        self.clip_grid.reclaim_into(&mut self.retired);
+        control.reclaim_from_audio(&mut self.retired);
+        // Defer accepted commands until control reclaims bounded retired PCM.
+        if self.clip_grid.retirement_space()
+            < control::MAX_COMMANDS_PER_TICK * CLIP_COLUMN_COUNT * (CLIP_ROW_COUNT + 1)
+                + CLIP_COLUMN_COUNT * 2
+        {
+            return;
+        }
+        if self.retired.capacity() - self.retired.len() < control::MAX_COMMANDS_PER_TICK {
+            return;
+        }
         control.drain_into(&mut self.command_scratch);
         while let Some(command) = self.command_scratch.pop_front() {
             self.apply(command);
@@ -129,6 +141,7 @@ impl Mixer {
                 buffer,
                 source_bpm,
                 playback,
+                launch,
             } => {
                 if let Some((speed, preserve_pitch)) = playback {
                     self.clip_grid.load_with_playback(
@@ -141,6 +154,9 @@ impl Mixer {
                     );
                 } else {
                     self.clip_load(column, row, buffer, source_bpm);
+                }
+                if launch {
+                    self.clip_launch(column, row, self.clip_grid.default_quantization());
                 }
             }
             MixerCommand::ClipSetPlayback {

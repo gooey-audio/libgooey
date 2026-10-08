@@ -55,7 +55,7 @@ src/
 ├── envelope.rs          # ADSR envelope with curve shaping
 ├── metronome.rs         # Optional transport-locked monitor click (post-limiter by default)
 ├── dsl.rs               # Line-based DSL for declarative instrument setup
-├── track_tape.rs        # Bounded three-bus dry capture/replay for C hosts
+├── track_tape.rs        # Bounded configurable-bus dry capture/replay for C hosts
 ├── ffi.rs               # C FFI bindings for iOS/Swift integration
 └── visualization.rs     # Waveform display (feature-gated)
 ```
@@ -116,4 +116,4 @@ not feed it.
 
 ## Mobile studio tape
 
-The additive tape endpoint captures three pre-strip stereo buses and substitutes dry PCM on replay. See `docs/track-tape.md` and `plans/mobile-track-tape.md`. Workers own storage; render owns alignment and state acknowledgements. Prepared voice/rack DSP retires on control. Queued runtime transport edits apply directly on render without entering the legacy mutex-backed host mixer queue.
+The additive tape endpoint captures one to four pre-strip stereo buses and substitutes dry PCM on replay. See `docs/track-tape.md` and `plans/mobile-track-tape.md`. Workers own storage; render owns alignment and state acknowledgements. Prepared voice/rack DSP retires on control. Queued runtime transport edits apply directly on render without entering the legacy mutex-backed host mixer queue.

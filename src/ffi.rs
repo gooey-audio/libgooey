@@ -1433,7 +1433,8 @@ impl GooeyEngine {
             lfo.set_random_seed(0x9E37_79B9 ^ (index as u32 + 1).wrapping_mul(0x85EB_CA6B));
             lfo
         });
-        let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] = std::array::from_fn(|_| Vec::with_capacity(16));
+        let lfo_routes: [Vec<LfoRoute>; LFO_COUNT] =
+            std::array::from_fn(|_| Vec::with_capacity(16));
         let mixer = Mixer::new(sample_rate);
         let mixer_control = mixer.control();
         let sampler_control = SamplerControl::new();
@@ -2273,7 +2274,12 @@ impl GooeyEngine {
                 let dry = tape.tracks.map(|t| self.graph.dry_frame(t));
                 if let Some(playback) = tape.frame(transport_beat, transport_running, dry) {
                     self.graph.clear_scratch();
-                    for (track, frame) in tape.tracks.into_iter().zip(playback) {
+                    for (track, frame) in tape
+                        .tracks
+                        .into_iter()
+                        .zip(playback)
+                        .take(tape.shared.channels / 2)
+                    {
                         self.graph.replace_dry_frame(track, frame);
                     }
                 }
@@ -11364,6 +11370,64 @@ pub unsafe extern "C" fn gooey_engine_clip_load(
     }
 }
 
+/// Reclaim retired loop PCM on the serialized control thread. Call periodically
+/// while rendering, even when the host is not editing clips.
+/// # Safety
+/// Valid engine; must not be called from render.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_reclaim_loop_buffers(engine: *const GooeyEngine) {
+    if let Some(engine) = engine.as_ref() {
+        engine.mixer_control.reclaim_retired();
+    }
+}
+
+/// Atomically queue a full-buffer pitch-preserving loop and its launch.
+/// Uses the default launch quantization and configured phrase alignment. Stopped
+/// transport stages the loop until start. Rejection preserves the prior slot.
+/// PCM preparation/copying occurs on the caller; retired audio is reclaimed off render.
+/// # Safety
+/// Valid engine and samples referencing frames * channels readable f32 values.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_clip_load_and_launch(
+    engine: *mut GooeyEngine,
+    column: u32,
+    row: u32,
+    samples: *const f32,
+    frames: u32,
+    channels: u32,
+    sample_rate: f32,
+    source_bpm: f32,
+) -> bool {
+    if engine.is_null()
+        || samples.is_null()
+        || frames == 0
+        || channels == 0
+        || !source_bpm.is_finite()
+        || source_bpm <= 0.0
+        || column >= CLIP_COLUMN_COUNT
+        || row >= CLIP_ROW_COUNT
+    {
+        return false;
+    }
+    let Some(total) = (frames as usize).checked_mul(channels as usize) else {
+        return false;
+    };
+    let samples = slice::from_raw_parts(samples, total);
+    match StereoSampleBuffer::from_interleaved(samples, channels as usize, sample_rate) {
+        Ok(buffer) => {
+            // Defer the slot load to the audio thread (replacing the active slot
+            // touches the live channel); indices/bpm are validated above.
+            (*engine).mixer_control.clip_load_and_launch(
+                column as usize,
+                row as usize,
+                buffer,
+                source_bpm,
+            )
+        }
+        Err(_) => false,
+    }
+}
+
 /// Load or replace one clip-grid slot from interleaved audio.
 ///
 /// `source_bpm` is required and must be finite and positive. Speed must be finite in 0.25..=4.0.
@@ -15020,25 +15084,47 @@ pub unsafe extern "C" fn gooey_engine_track_tape_new(
     b: u32,
     c: u32,
 ) -> *mut GooeyTrackTape {
+    let tracks = [a, b, c];
+    gooey_engine_track_tape_new_with_tracks(engine, tracks.as_ptr(), 3)
+}
+/// Attach one to four distinct pre-strip stereo buses, in interleaved lane order.
+/// Configure before rendering. The legacy constructor retains its six-channel layout.
+/// # Safety
+/// Valid stopped engine; tracks references track_count readable u32 values.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_track_tape_new_with_tracks(
+    engine: *mut GooeyEngine,
+    tracks: *const u32,
+    track_count: u32,
+) -> *mut GooeyTrackTape {
     let Some(e) = engine.as_mut() else {
         return std::ptr::null_mut();
     };
-    if e.track_tape.is_some()
-        || a == b
-        || b == c
-        || a == c
-        || [a, b, c]
-            .iter()
-            .any(|t| *t as usize >= e.graph.track_count())
+    if tracks.is_null() || !(1..=4).contains(&track_count) || e.track_tape.is_some() {
+        return std::ptr::null_mut();
+    }
+    let tracks = slice::from_raw_parts(tracks, track_count as usize);
+    if tracks
+        .iter()
+        .enumerate()
+        .any(|(i, t)| *t as usize >= e.graph.track_count() || tracks[..i].contains(t))
     {
         return std::ptr::null_mut();
     }
-    let shared = crate::track_tape::Shared::new();
-    e.track_tape = Some(crate::track_tape::Renderer::new(
-        shared.clone(),
-        [a as usize, b as usize, c as usize],
-    ));
+    let mut layout = [0; 4];
+    for (i, t) in tracks.iter().enumerate() {
+        layout[i] = *t as usize;
+    }
+    let shared = crate::track_tape::Shared::new(tracks.len() * 2);
+    e.track_tape = Some(crate::track_tape::Renderer::new(shared.clone(), layout));
     Box::into_raw(Box::new(GooeyTrackTape { shared }))
+}
+/// Number of interleaved float channels per frame; zero for null.
+/// # Safety
+/// Endpoint must be valid or null.
+#[no_mangle]
+pub unsafe extern "C" fn gooey_track_tape_get_channel_count(t: *const GooeyTrackTape) -> u32 {
+    t.as_ref().map_or(0, |t| t.shared.channels as u32)
 }
 /// # Safety
 /// Endpoint must be valid; join its worker threads before freeing it.
@@ -15097,9 +15183,9 @@ pub unsafe extern "C" fn gooey_track_tape_get_applied_generation(t: *const Gooey
     t.as_ref()
         .map_or(0, |t| t.shared.applied.load(Ordering::Acquire))
 }
-/// Drain capture. Layout per frame: aL,aR,bL,bR,cL,cR. Returns frames copied.
+/// Drain capture. Layout per frame: stereo pairs in constructor track order. Returns frames copied.
 /// # Safety
-/// Valid endpoint and output with capacity_frames * 6 floats. Single worker consumer.
+/// Valid endpoint and output with capacity_frames * get_channel_count(t) floats. Single worker consumer.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_track_tape_drain(
     t: *const GooeyTrackTape,
@@ -15112,13 +15198,13 @@ pub unsafe extern "C" fn gooey_track_tape_drain(
     t.as_ref().map_or(0, |t| {
         t.shared.drain(std::slice::from_raw_parts_mut(
             out,
-            capacity_frames as usize * 6,
+            capacity_frames as usize * t.shared.channels,
         )) as u32
     })
 }
 /// Feed playback; returns accepted frames. Retry remainder when queue is full.
 /// # Safety
-/// Valid endpoint and finite input with frames * 6 floats. Single worker producer.
+/// Valid endpoint and finite input with frames * get_channel_count(t) floats. Single worker producer.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_track_tape_feed(
     t: *const GooeyTrackTape,
@@ -15128,11 +15214,14 @@ pub unsafe extern "C" fn gooey_track_tape_feed(
     if input.is_null() {
         return 0;
     }
-    let samples = std::slice::from_raw_parts(input, frames as usize * 6);
+    let Some(t) = t.as_ref() else {
+        return 0;
+    };
+    let samples = std::slice::from_raw_parts(input, frames as usize * t.shared.channels);
     if samples.iter().any(|x| !x.is_finite()) {
         return 0;
     }
-    t.as_ref().map_or(0, |t| t.shared.feed(samples) as u32)
+    t.shared.feed(samples) as u32
 }
 /// Discard previous capture, only after stop/live acknowledgement and worker drain.
 /// # Safety

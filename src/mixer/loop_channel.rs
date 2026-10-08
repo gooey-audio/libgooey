@@ -180,6 +180,10 @@ impl RetiredLoopState {
         Self { buffer, stretcher }
     }
 
+    pub(crate) fn from_buffer(buffer: StereoSampleBuffer) -> Self {
+        Self::new(Some(buffer), None)
+    }
+
     fn is_empty(&self) -> bool {
         self.buffer.is_none() && self.stretcher.is_none()
     }
@@ -201,7 +205,7 @@ impl LoopChannel {
             effects: EffectChain::new(),
             pitch_mode: PitchMode::default(),
             engine_bpm: DEFAULT_ENGINE_BPM,
-            stretcher: None,
+            stretcher: Some(WsolaStretcher::new(sample_rate, 0.0)),
             transport_beat: None,
             clip_phase: 0.0,
             clip_previous_beat: 0.0,
@@ -504,7 +508,9 @@ impl LoopChannel {
                 // The buffer/cursor moved externally; drop any WSOLA stretcher so
                 // the PreservePitch path re-seeds on the new buffer (mirrors
                 // `set_buffer`/`restart`/`set_position`). No-op for other modes.
-                self.stretcher = None;
+                if let Some(stretcher) = self.stretcher.as_mut() {
+                    stretcher.reset(self.cursor);
+                }
                 self.swaps_completed.fetch_add(1, Ordering::Relaxed);
                 self.has_pending.store(false, Ordering::Release);
             }
@@ -555,7 +561,9 @@ impl LoopChannel {
         let len = buffer.len() as f64;
         self.buffer = Some(buffer);
         self.cursor = self.window(len).lo;
-        self.stretcher = None;
+        if let Some(stretcher) = self.stretcher.as_mut() {
+            stretcher.reset(self.cursor);
+        }
     }
 
     /// Realtime counterpart to [`Self::set_buffer`]. Removed data is retained
@@ -567,11 +575,14 @@ impl LoopChannel {
         retired: &mut Vec<RetiredLoopState>,
     ) {
         let len = buffer.len() as f64;
-        let previous = RetiredLoopState::new(self.buffer.replace(buffer), self.stretcher.take());
+        let previous = RetiredLoopState::new(self.buffer.replace(buffer), None);
         if !previous.is_empty() {
             retired.push(previous);
         }
         self.cursor = self.window(len).lo;
+        if let Some(stretcher) = self.stretcher.as_mut() {
+            stretcher.reset(self.cursor);
+        }
     }
 
     /// Drop the active sample buffer and reset playback state while preserving
@@ -580,7 +591,9 @@ impl LoopChannel {
         self.buffer = None;
         self.cursor = 0.0;
         self.playing = false;
-        self.stretcher = None;
+        if let Some(stretcher) = self.stretcher.as_mut() {
+            stretcher.reset(self.cursor);
+        }
     }
 
     pub fn set_playing(&mut self, playing: bool) {
@@ -605,7 +618,9 @@ impl LoopChannel {
 
     pub fn set_pitch_mode(&mut self, mode: PitchMode) {
         if self.pitch_mode == PitchMode::PreservePitch && mode != PitchMode::PreservePitch {
-            self.stretcher = None;
+            if let Some(stretcher) = self.stretcher.as_mut() {
+                stretcher.reset(self.cursor);
+            }
         }
         self.pitch_mode = mode;
     }
@@ -645,7 +660,9 @@ impl LoopChannel {
         };
         let len = buffer.len() as f64;
         self.cursor = self.window(len).lo;
-        self.stretcher = None;
+        if let Some(stretcher) = self.stretcher.as_mut() {
+            stretcher.reset(self.cursor);
+        }
     }
 
     /// Set the playhead to a normalized [0, 1] position of the full buffer,
@@ -660,7 +677,9 @@ impl LoopChannel {
         let window = self.window(len);
         let target = normalized.clamp(0.0, 1.0) as f64 * len;
         self.cursor = window.fold(target);
-        self.stretcher = None;
+        if let Some(stretcher) = self.stretcher.as_mut() {
+            stretcher.reset(self.cursor);
+        }
     }
 
     /// Live-resize the loop window without a click or phrase restart. Sets the
@@ -680,7 +699,9 @@ impl LoopChannel {
         let folded = window.fold(self.cursor);
         if folded != self.cursor {
             self.cursor = folded;
-            self.stretcher = None;
+            if let Some(stretcher) = self.stretcher.as_mut() {
+                stretcher.reset(self.cursor);
+            }
         }
     }
 
@@ -697,7 +718,9 @@ impl LoopChannel {
         let window = self.window(len);
         let v = (phase as f64).rem_euclid(1.0) * window.span;
         self.cursor = window.to_physical(v);
-        self.stretcher = None;
+        if let Some(stretcher) = self.stretcher.as_mut() {
+            stretcher.reset(self.cursor);
+        }
     }
 
     /// Stage a buffer to atomically replace `buffer` at the next bar-grid
@@ -713,6 +736,9 @@ impl LoopChannel {
 
     /// Drop a pending queued swap. No-op if nothing is queued.
     pub fn cancel_queued_swap(&mut self) {
+        if !self.has_pending.load(Ordering::Acquire) {
+            return;
+        }
         self.has_pending.store(false, Ordering::Release);
         *self.pending.lock().unwrap() = None;
     }

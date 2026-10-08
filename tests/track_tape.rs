@@ -248,12 +248,23 @@ thread_local! {
     static WATCH: Cell<bool> = const { Cell::new(false) };
     static ALLOCS: Cell<usize> = const { Cell::new(0) };
     static FREES: Cell<usize> = const { Cell::new(0) };
+    static SIZES: Cell<[usize; 16]> = const { Cell::new([0; 16]) };
 }
 struct CountedAllocator;
 unsafe impl GlobalAlloc for CountedAllocator {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         if WATCH.try_with(Cell::get).unwrap_or(false) {
-            ALLOCS.with(|n| n.set(n.get() + 1));
+            ALLOCS.with(|n| {
+                let index = n.get();
+                if index < 16 {
+                    SIZES.with(|v| {
+                        let mut sizes = v.get();
+                        sizes[index] = l.size();
+                        v.set(sizes);
+                    });
+                }
+                n.set(index + 1);
+            });
         }
         System.alloc(l)
     }
@@ -342,5 +353,189 @@ fn capture_overflow_retains_exact_synchronized_prefix() {
         gooey_live_control_free(c);
         gooey_engine_free(e);
         gooey_track_tape_free(t);
+    }
+}
+
+#[test]
+fn configurable_layouts_validate_and_keep_legacy_channel_stride() {
+    unsafe {
+        assert_eq!(gooey_track_tape_get_channel_count(ptr::null()), 0);
+        for count in 1..=4 {
+            let e = gooey_engine_new(RATE);
+            let tracks = [2, 0, 1, 3];
+            assert!(gooey_engine_track_tape_new_with_tracks(e, ptr::null(), count).is_null());
+            assert!(gooey_engine_track_tape_new_with_tracks(e, tracks.as_ptr(), 0).is_null());
+            assert!(gooey_engine_track_tape_new_with_tracks(e, tracks.as_ptr(), 5).is_null());
+            assert!(gooey_engine_track_tape_new_with_tracks(e, [0, 0].as_ptr(), 2).is_null());
+            assert!(gooey_engine_track_tape_new_with_tracks(e, [99].as_ptr(), 1).is_null());
+            let tape = gooey_engine_track_tape_new_with_tracks(e, tracks.as_ptr(), count);
+            assert!(!tape.is_null());
+            assert_eq!(gooey_track_tape_get_channel_count(tape), count * 2);
+            assert!(gooey_engine_track_tape_new_with_tracks(e, tracks.as_ptr(), count).is_null());
+            let channels = count as usize * 2;
+            gooey_engine_sequencer_start(e);
+            gooey_track_tape_command(tape, 1, 0., 0);
+            render(e, 128);
+            gooey_track_tape_command(tape, 2, 0., 0);
+            gooey_engine_track_tape_flush_stopped(e);
+            let mut pcm = vec![99.; 128 * channels + 4];
+            assert_eq!(gooey_track_tape_drain(tape, pcm.as_mut_ptr(), 128), 128);
+            assert_eq!(&pcm[128 * channels..], &[99.; 4]);
+            assert_eq!(gooey_track_tape_feed(tape, pcm.as_ptr(), 128), 128);
+            gooey_engine_free(e);
+            gooey_track_tape_free(tape);
+        }
+        let (e, t, c) = setup();
+        assert_eq!(gooey_track_tape_get_channel_count(t), 6);
+        gooey_live_control_free(c);
+        gooey_engine_free(e);
+        gooey_track_tape_free(t);
+    }
+}
+
+#[test]
+fn fourth_lane_captures_ai_before_strip_and_replay_replaces_live_ai() {
+    unsafe {
+        let e = gooey_engine_new(RATE);
+        let tape = gooey_engine_track_tape_new_with_tracks(e, [2, 0, 1, 3].as_ptr(), 4);
+        assert!(!tape.is_null());
+        assert!(gooey_engine_clip_set_phase_aligned_launches(e, true));
+        let clip = vec![0.7; 96000 * 2];
+        // One submission loads and stages first playback while stopped.
+        assert!(gooey_engine_clip_load_and_launch(
+            e,
+            3,
+            0,
+            clip.as_ptr(),
+            96000,
+            2,
+            RATE,
+            120.
+        ));
+        gooey_engine_set_master_gain(e, 1.);
+        gooey_engine_mixer_set_track_gain(e, 3, 0.5);
+        gooey_engine_sequencer_start(e);
+        gooey_track_tape_command(tape, 1, 0., 0);
+        render(e, 8192);
+        gooey_track_tape_command(tape, 2, 0., 0);
+        render(e, 64);
+        let mut captured = vec![0.; 8192 * 8];
+        assert_eq!(
+            gooey_track_tape_drain(tape, captured.as_mut_ptr(), 8192),
+            8192
+        );
+        assert!(captured.chunks_exact(8).any(|f| f[6] > 0.6));
+        assert!(captured
+            .chunks_exact(8)
+            .all(|f| f[..6].iter().all(|s| *s == 0.)));
+        let mut playback = vec![0.; 4096 * 8];
+        for f in playback.chunks_exact_mut(8) {
+            f[6] = 0.2;
+            f[7] = 0.4;
+        }
+        assert_eq!(gooey_track_tape_feed(tape, playback.as_ptr(), 4096), 4096);
+        gooey_track_tape_command(tape, 3, 0., 4096);
+        let out = render(e, 4096);
+        assert!((out[out.len() - 2] - 0.1).abs() < 0.001);
+        assert!((out[out.len() - 1] - 0.2).abs() < 0.001);
+        assert!(render(e, 128).iter().all(|s| s.abs() < 0.001));
+        assert_eq!(gooey_track_tape_get_state(tape), 5);
+        gooey_engine_free(e);
+        gooey_track_tape_free(tape);
+    }
+}
+
+#[test]
+fn atomic_clip_load_rejection_preserves_the_active_loop() {
+    unsafe {
+        let e = gooey_engine_new(RATE);
+        let original = vec![0.2; 96000 * 2];
+        assert!(gooey_engine_clip_load_and_launch(
+            e,
+            3,
+            0,
+            original.as_ptr(),
+            96000,
+            2,
+            RATE,
+            120.
+        ));
+        gooey_engine_set_master_gain(e, 1.);
+        gooey_engine_sequencer_start(e);
+        render(e, 8192);
+        let mut accepted = 0;
+        while gooey_engine_clip_set_phase_aligned_launches(e, true) {
+            accepted += 1;
+            assert!(accepted <= 4096);
+        }
+        let replacement = vec![0.8; 96000 * 2];
+        assert!(!gooey_engine_clip_load_and_launch(
+            e,
+            3,
+            0,
+            replacement.as_ptr(),
+            96000,
+            2,
+            RATE,
+            120.
+        ));
+        let out = render(e, 100000);
+        assert!((out[out.len() - 1] - 0.2).abs() < 0.001);
+        gooey_engine_free(e);
+    }
+}
+
+#[test]
+fn ai_load_replace_tempo_and_clear_never_allocate_or_free_on_render() {
+    unsafe {
+        let e = gooey_engine_new(RATE);
+        let tape = gooey_engine_track_tape_new_with_tracks(e, [2, 0, 1, 3].as_ptr(), 4);
+        let control = gooey_engine_live_control_new(e);
+        assert!(gooey_engine_clip_set_phase_aligned_launches(e, true));
+        let pcm = vec![0.2; 96000 * 2];
+        let mut out = [0.; 1024];
+        // Deliberately change tempo before first clip playback so WSOLA engages.
+        assert!(gooey_live_control_edit(control, 22, 0, 0, 0, 160., 0.) > 0);
+        assert!(gooey_live_control_edit(control, 24, 0, 0, 0, 0., 0.) > 0);
+        for index in 0..5 {
+            assert!(gooey_engine_clip_load_and_launch(
+                e,
+                3,
+                0,
+                pcm.as_ptr(),
+                96000,
+                2,
+                RATE,
+                120.
+            ));
+            ALLOCS.with(|n| n.set(0));
+            FREES.with(|n| n.set(0));
+            WATCH.with(|w| w.set(true));
+            for _ in 0..150 {
+                gooey_engine_render(e, out.as_mut_ptr(), 512);
+            }
+            WATCH.with(|w| w.set(false));
+            assert_eq!(
+                ALLOCS.with(Cell::get),
+                0,
+                "load/replace {index}, allocation sizes {:?}, frees {}",
+                SIZES.with(Cell::get),
+                FREES.with(Cell::get)
+            );
+            assert_eq!(FREES.with(Cell::get), 0, "load/replace {index}");
+            gooey_engine_reclaim_loop_buffers(e);
+        }
+        assert!(gooey_engine_clip_unload(e, 3, 0));
+        WATCH.with(|w| w.set(true));
+        for _ in 0..150 {
+            gooey_engine_render(e, out.as_mut_ptr(), 512);
+        }
+        WATCH.with(|w| w.set(false));
+        assert_eq!(ALLOCS.with(Cell::get), 0);
+        assert_eq!(FREES.with(Cell::get), 0);
+        gooey_engine_reclaim_loop_buffers(e);
+        gooey_live_control_free(control);
+        gooey_engine_free(e);
+        gooey_track_tape_free(tape);
     }
 }

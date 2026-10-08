@@ -86,6 +86,7 @@ pub(crate) enum MixerCommand {
         buffer: StereoSampleBuffer,
         source_bpm: f32,
         playback: Option<(f32, bool)>,
+        launch: bool,
     },
     ClipSetPlayback {
         column: usize,
@@ -537,7 +538,7 @@ impl MixerControl {
         buffer: StereoSampleBuffer,
         source_bpm: f32,
     ) -> bool {
-        self.enqueue_clip_load(column, row, buffer, source_bpm, None)
+        self.enqueue_clip_load(column, row, buffer, source_bpm, None, false)
     }
 
     pub fn clip_load_with_playback(
@@ -558,7 +559,19 @@ impl MixerControl {
             buffer,
             source_bpm,
             Some((speed, preserve_pitch)),
+            false,
         )
+    }
+
+    /// One queue transaction: rejection leaves the slot and active playback intact.
+    pub fn clip_load_and_launch(
+        &self,
+        column: usize,
+        row: usize,
+        buffer: StereoSampleBuffer,
+        source_bpm: f32,
+    ) -> bool {
+        self.enqueue_clip_load(column, row, buffer, source_bpm, None, true)
     }
 
     fn enqueue_clip_load(
@@ -568,6 +581,7 @@ impl MixerControl {
         buffer: StereoSampleBuffer,
         source_bpm: f32,
         playback: Option<(f32, bool)>,
+        launch: bool,
     ) -> bool {
         if column >= CLIP_COLUMN_COUNT
             || row >= CLIP_ROW_COUNT
@@ -584,6 +598,7 @@ impl MixerControl {
                 buffer,
                 source_bpm,
                 playback,
+                launch,
             },
             move |slots| {
                 slots[column][row] = true;
@@ -929,7 +944,20 @@ impl MixerControl {
         let Ok(mut state) = self.shared.queue.try_lock() else {
             return;
         };
-        state.retired.append(retired);
+        if state.retired.len() + retired.len() <= state.retired.capacity() {
+            state.retired.append(retired);
+        }
+    }
+
+    /// Control-thread maintenance; dropping retired PCM is never render work.
+    pub fn reclaim_retired(&self) {
+        let retired = self
+            .shared
+            .queue
+            .lock()
+            .ok()
+            .and_then(|mut state| Self::take_retired(&mut state));
+        drop(retired);
     }
 
     pub(crate) fn has_pending(&self) -> bool {

@@ -1,5 +1,6 @@
 //! Transport-synchronized session clip grid layered over the loop mixer.
 
+use super::loop_channel::RetiredLoopState;
 use super::{LoopChannel, PitchMode, StereoSampleBuffer, LOOP_CHANNEL_COUNT};
 
 pub const CLIP_COLUMN_COUNT: usize = LOOP_CHANNEL_COUNT;
@@ -186,6 +187,7 @@ pub struct ClipGrid {
     transport_generation: u64,
     bpm: f32,
     sample_rate: f32,
+    retired: Vec<StereoSampleBuffer>,
 }
 
 impl ClipGrid {
@@ -201,6 +203,29 @@ impl ClipGrid {
             transport_generation: 0,
             bpm,
             sample_rate,
+            retired: Vec::with_capacity(super::control::MAX_QUEUED_COMMANDS),
+        }
+    }
+
+    pub(crate) fn retirement_space(&self) -> usize {
+        self.retired.capacity() - self.retired.len()
+    }
+    pub(crate) fn reclaim_into(&mut self, destination: &mut Vec<RetiredLoopState>) {
+        while destination.len() < destination.capacity() {
+            let Some(buffer) = self.retired.pop() else {
+                break;
+            };
+            destination.push(RetiredLoopState::from_buffer(buffer));
+        }
+    }
+    fn retire_slot(&mut self, column: usize, row: usize) {
+        if let Some(clip) = self.slots[column][row].take() {
+            self.retired.push(clip.buffer);
+        }
+    }
+    fn retain_active(&mut self, column: usize) {
+        if let Some(clip) = &self.columns[column].active_clip {
+            self.retired.push(clip.buffer.clone());
         }
     }
 
@@ -259,7 +284,7 @@ impl ClipGrid {
         buffer: StereoSampleBuffer,
         source_bpm: f32,
     ) -> bool {
-        if !Self::valid_slot(column, row) {
+        if !Self::valid_slot(column, row) || self.retirement_space() == 0 {
             return false;
         }
         let Some(mut clip) = Clip::new(buffer, source_bpm) else {
@@ -267,6 +292,7 @@ impl ClipGrid {
         };
         self.next_revision = self.next_revision.wrapping_add(1);
         clip.revision = self.next_revision;
+        self.retire_slot(column, row);
         self.slots[column][row] = Some(clip);
 
         if self.columns[column].active_row == Some(row) {
@@ -373,7 +399,10 @@ impl ClipGrid {
     }
 
     pub fn unload(&mut self, column: usize, row: usize) -> bool {
-        if !Self::valid_slot(column, row) || self.slots[column][row].is_none() {
+        if !Self::valid_slot(column, row)
+            || self.slots[column][row].is_none()
+            || self.retirement_space() == 0
+        {
             return false;
         }
         if self.columns[column].active_row == Some(row) {
@@ -383,7 +412,7 @@ impl ClipGrid {
                 beat: target,
             });
         } else {
-            self.slots[column][row] = None;
+            self.retire_slot(column, row);
             if matches!(
                 self.columns[column].pending,
                 Some(ScheduledAction {
@@ -398,15 +427,19 @@ impl ClipGrid {
     }
 
     pub fn clear(&mut self, channels: &mut [LoopChannel]) {
+        if self.retirement_space() < CLIP_COLUMN_COUNT * (CLIP_ROW_COUNT + 1) {
+            return;
+        }
         for column in 0..CLIP_COLUMN_COUNT {
+            self.retain_active(column);
             if self.columns[column].active_row.is_some() {
                 if let Some(channel) = channels.get_mut(column) {
                     channel.clear_buffer();
                 }
             }
             self.columns[column] = ColumnState::default();
-            for slot in &mut self.slots[column] {
-                *slot = None;
+            for row in 0..CLIP_ROW_COUNT {
+                self.retire_slot(column, row);
             }
         }
     }
@@ -772,6 +805,7 @@ impl ClipGrid {
         let Some(channel) = channels.get_mut(column) else {
             return;
         };
+        self.retain_active(column);
         // Apply the slot's stored trim before `set_buffer` so the cursor lands
         // at the trimmed loop start.
         channel.set_loop_window(clip.trim_start as f32, clip.trim_end as f32);
@@ -805,6 +839,7 @@ impl ClipGrid {
     }
 
     fn stop_now(&mut self, column: usize, channels: &mut [LoopChannel]) {
+        self.retain_active(column);
         if let Some(channel) = channels.get_mut(column) {
             // Drop the grid buffer, not just playback: a stopped column keeps no
             // sounding material, so a later `clear` or legacy detach cannot
@@ -824,7 +859,7 @@ impl ClipGrid {
         for channel in channels.iter_mut() {
             channel.set_transport_beat(None);
         }
-        if !self.transport_running {
+        if !self.transport_running || self.retirement_space() < CLIP_COLUMN_COUNT * 2 {
             return;
         }
         let tolerance = self.beats_per_sample() * 0.5 + 1.0e-12;
@@ -841,7 +876,7 @@ impl ClipGrid {
                         PendingKind::StopAndUnload { row } => {
                             // `stop_now` already drops the channel buffer.
                             self.stop_now(column, channels);
-                            self.slots[column][row] = None;
+                            self.retire_slot(column, row);
                         }
                     }
                 }
