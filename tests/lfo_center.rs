@@ -199,3 +199,55 @@ fn changing_instrument_type_forgets_the_center() {
     engine.render(64);
     approx_eq(engine.param(KICK_CHANNEL, KICK_PARAM_PUNCH), fresh);
 }
+
+#[test]
+fn routes_to_non_modulatable_params_are_ignored() {
+    let engine = Engine::new();
+    let targets = [
+        // Baked at trigger time, so never a live destination.
+        (KICK_CHANNEL, KICK_PARAM_PITCH_ENVELOPE),
+        // Mode selectors.
+        (INSTRUMENT_HIHAT, HIHAT_PARAM_NOISE_COLOR),
+        (INSTRUMENT_HIHAT, HIHAT_PARAM_FILTER_SLOPE),
+        (INSTRUMENT_SNARE, SNARE_PARAM_FILTER_TYPE),
+    ];
+    let before: Vec<f32> = targets
+        .iter()
+        .map(|&(c, p)| engine.modulated(c, p))
+        .collect();
+    for (lfo, &(channel, param)) in targets.iter().enumerate() {
+        engine.constant_lfo(lfo as u32, channel, param, 0.8);
+    }
+    engine.render(64);
+    for (&(channel, param), before) in targets.iter().zip(before) {
+        approx_eq(engine.modulated(channel, param), before);
+    }
+}
+
+#[test]
+fn step_notes_keep_the_knob_center() {
+    let engine = Engine::new();
+    engine.set(KICK_CHANNEL, KICK_PARAM_FREQUENCY, 0.3);
+    engine.constant_lfo(0, KICK_CHANNEL, KICK_PARAM_FREQUENCY, 0.4);
+    // Let the LFO modulate before the note step saves the frequency.
+    engine.render(64);
+    unsafe {
+        gooey_engine_set_bpm(engine.0, 120.0);
+        for step in 0..2 {
+            gooey_engine_sequencer_set_instrument_step_with_velocity(
+                engine.0,
+                KICK_CHANNEL,
+                step,
+                true,
+                1.0,
+            );
+        }
+        // Step 0 plays a note; step 1 returns to the knob's frequency.
+        gooey_engine_sequencer_set_instrument_step_note(engine.0, KICK_CHANNEL, 0, 36);
+        gooey_engine_sequencer_start(engine.0);
+    }
+    // Past step 1 (16ths at 120 BPM are 0.125 s) but before step 2.
+    engine.render(8_820);
+    approx_eq(engine.param(KICK_CHANNEL, KICK_PARAM_FREQUENCY), 0.3);
+    approx_eq(engine.modulated(KICK_CHANNEL, KICK_PARAM_FREQUENCY), 0.5);
+}

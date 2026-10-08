@@ -16,9 +16,7 @@ use crate::effects::{
     SoftLimiter, SpringReverbEffect, TiltFilterEffect, TubeCompressor, TubeSaturation, Waveshaper,
 };
 use crate::engine::lfo::{Lfo, LfoWaveform, MusicalDivision};
-use crate::engine::{
-    Instrument, Modulatable, Sequencer, SequencerBlendSetting, SequencerStepSettings,
-};
+use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
 use crate::envelope::ADSRConfig;
 use crate::frame::StereoFrame;
 use crate::instruments::multisample::{
@@ -131,6 +129,17 @@ pub const PERCUSSION_PRESET_TOM: u32 = 1;
 pub const PERCUSSION_PRESET_SNARE: u32 = 2;
 pub const PERCUSSION_PRESET_CLAP_HYBRID: u32 = 3;
 pub const PERCUSSION_PRESET_METALLIC: u32 = 4;
+
+/// How a routed LFO drives a channel parameter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LfoTarget {
+    /// Swings around the parameter's own value.
+    Centered,
+    /// Mode selector set from the LFO's absolute output.
+    Mode,
+    /// Not a live LFO destination; routes to it are ignored.
+    None,
+}
 
 /// LFO route configuration
 #[derive(Clone, Copy)]
@@ -293,16 +302,6 @@ impl ChannelInstrument {
             Self::Tom(t) => t.tick(current_time),
             Self::Bass(b) => b.tick(current_time),
             Self::Resonator(p) | Self::TwinCore(p) => p.tick(current_time),
-        }
-    }
-
-    /// Get the current normalized frequency parameter (0-1) for pitched instruments.
-    fn get_freq_param(&self) -> Option<f32> {
-        match self {
-            Self::Kick(k) => Some(k.params.frequency.get()),
-            Self::Tom(t) => Some(t.tune()),
-            Self::Bass(b) => Some(b.params.frequency.get()),
-            _ => None,
         }
     }
 
@@ -623,146 +622,110 @@ impl ChannelInstrument {
         }
     }
 
-    /// Mode selectors, which LFOs drive by absolute value rather than around a center.
-    fn is_discrete_param(&self, param: u32) -> bool {
-        match self {
-            Self::Snare(_) => param == SNARE_PARAM_FILTER_TYPE,
+    /// How a routed LFO drives `param`. Only parameters the voice re-reads
+    /// while playing are destinations; routes to anything else are ignored.
+    fn lfo_target(&self, param: u32) -> LfoTarget {
+        let centered = match self {
+            // KICK_PARAM_PITCH_ENVELOPE is not modulatable: it is baked at
+            // trigger time and never re-read. Use KICK_PARAM_TUNING for live
+            // pitch modulation instead. Curve, start ratio and amp decay are
+            // latched at trigger, so modulating them shapes the next hit.
+            Self::Kick(_) => matches!(
+                param,
+                KICK_PARAM_FREQUENCY
+                    | KICK_PARAM_PUNCH
+                    | KICK_PARAM_SUB
+                    | KICK_PARAM_CLICK
+                    | KICK_PARAM_DECAY
+                    | KICK_PARAM_VOLUME
+                    | KICK_PARAM_TUNING
+                    | KICK_PARAM_PITCH_ENVELOPE_CURVE
+                    | KICK_PARAM_PITCH_START_RATIO
+                    | KICK_PARAM_PHASE_MOD_AMOUNT
+                    | KICK_PARAM_NOISE_AMOUNT
+                    | KICK_PARAM_NOISE_CUTOFF
+                    | KICK_PARAM_NOISE_RESONANCE
+                    | KICK_PARAM_OVERDRIVE
+                    | KICK_PARAM_FEEDBACK_AMOUNT
+                    | KICK_PARAM_FEEDBACK_CUTOFF
+                    | KICK_PARAM_AMP_DECAY
+                    | KICK_PARAM_AMP_DECAY_CURVE
+            ),
+            Self::Snare(_) => matches!(
+                param,
+                SNARE_PARAM_FREQUENCY
+                    | SNARE_PARAM_DECAY
+                    | SNARE_PARAM_BRIGHTNESS
+                    | SNARE_PARAM_VOLUME
+                    | SNARE_PARAM_TONAL
+                    | SNARE_PARAM_NOISE
+                    | SNARE_PARAM_PITCH_DROP
+                    | SNARE_PARAM_TONAL_DECAY
+                    | SNARE_PARAM_NOISE_DECAY
+                    | SNARE_PARAM_NOISE_TAIL_DECAY
+                    | SNARE_PARAM_FILTER_CUTOFF
+                    | SNARE_PARAM_FILTER_RESONANCE
+                    | SNARE_PARAM_XFADE
+                    | SNARE_PARAM_PHASE_MOD_AMOUNT
+                    | SNARE_PARAM_OVERDRIVE
+                    | SNARE_PARAM_AMP_DECAY
+                    | SNARE_PARAM_AMP_DECAY_CURVE
+                    | SNARE_PARAM_TONAL_DECAY_CURVE
+                    | SNARE_PARAM_TUNING
+            ),
+            // Noise color and filter slope are mode selectors, not destinations.
+            Self::HiHat(_) => matches!(
+                param,
+                HIHAT_PARAM_PITCH
+                    | HIHAT_PARAM_DECAY
+                    | HIHAT_PARAM_ATTACK
+                    | HIHAT_PARAM_TONE
+                    | HIHAT_PARAM_VOLUME
+                    | HIHAT_PARAM_TUNING
+            ),
+            Self::Tom(_) => matches!(
+                param,
+                TOM_PARAM_TUNE
+                    | TOM_PARAM_BEND
+                    | TOM_PARAM_TONE
+                    | TOM_PARAM_COLOR
+                    | TOM_PARAM_DECAY
+                    | TOM_PARAM_MEMBRANE
+                    | TOM_PARAM_MEMBRANE_Q
+                    | TOM_PARAM_VOLUME
+                    | TOM_PARAM_TUNING
+            ),
+            Self::Bass(_) => matches!(
+                param,
+                BASS_PARAM_FREQUENCY
+                    | BASS_PARAM_SUB_LEVEL
+                    | BASS_PARAM_OSC_LEVEL
+                    | BASS_PARAM_DETUNE_LEVEL
+                    | BASS_PARAM_DETUNE_AMOUNT
+                    | BASS_PARAM_OSC_SHAPE
+                    | BASS_PARAM_FILTER_CUTOFF
+                    | BASS_PARAM_FILTER_RESONANCE
+                    | BASS_PARAM_FILTER_ENV_AMOUNT
+                    | BASS_PARAM_FILTER_ENV_DECAY
+                    | BASS_PARAM_FILTER_ENV_CURVE
+                    | BASS_PARAM_AMP_DECAY
+                    | BASS_PARAM_AMP_DECAY_CURVE
+                    | BASS_PARAM_OVERDRIVE
+                    | BASS_PARAM_VOLUME
+                    | BASS_PARAM_TUNING
+            ),
+            Self::Resonator(p) => p.parameter_name(param as usize).is_some(),
             Self::TwinCore(_) => {
-                param == TWIN_CORE_PARAM_BODY_MODE || param == TWIN_CORE_PARAM_NOISE_MODE
-            }
-            _ => false,
-        }
-    }
-
-    /// Apply LFO modulation to a parameter. Uses bipolar modulation for smoothed params.
-    fn apply_modulation(&mut self, param: u32, value: f32) {
-        match self {
-            Self::Kick(k) => match param {
-                KICK_PARAM_FREQUENCY => k.params.frequency.set_bipolar(value),
-                KICK_PARAM_PUNCH => k.params.punch.set_bipolar(value),
-                KICK_PARAM_SUB => k.params.sub.set_bipolar(value),
-                KICK_PARAM_CLICK => k.params.click.set_bipolar(value),
-                KICK_PARAM_DECAY => k.params.oscillator_decay.set_bipolar(value),
-                // KICK_PARAM_PITCH_ENVELOPE is no longer modulatable: it was
-                // baked at trigger time and never re-read. Use KICK_PARAM_TUNING
-                // for live pitch modulation instead.
-                KICK_PARAM_VOLUME => k.params.volume.set_bipolar(value),
-                KICK_PARAM_TUNING => k.params.tuning.set_bipolar(value),
-                // Curve, start ratio and amp decay are latched at trigger, so
-                // modulating them shapes the next hit rather than the current one.
-                KICK_PARAM_PITCH_ENVELOPE_CURVE => k.params.pitch_envelope_curve.set_bipolar(value),
-                KICK_PARAM_PITCH_START_RATIO => k.params.pitch_start_ratio.set_bipolar(value),
-                KICK_PARAM_PHASE_MOD_AMOUNT => k.params.phase_mod_amount.set_bipolar(value),
-                KICK_PARAM_NOISE_AMOUNT => k.params.noise_amount.set_bipolar(value),
-                KICK_PARAM_NOISE_CUTOFF => k.params.noise_cutoff.set_bipolar(value),
-                KICK_PARAM_NOISE_RESONANCE => k.params.noise_resonance.set_bipolar(value),
-                KICK_PARAM_OVERDRIVE => k.params.overdrive.set_bipolar(value),
-                KICK_PARAM_FEEDBACK_AMOUNT => k.params.feedback.set_bipolar(value),
-                KICK_PARAM_FEEDBACK_CUTOFF => k.params.feedback_cutoff.set_bipolar(value),
-                KICK_PARAM_AMP_DECAY => k.params.amp_decay.set_bipolar(value),
-                KICK_PARAM_AMP_DECAY_CURVE => k.params.amp_decay_curve.set_bipolar(value),
-                _ => {}
-            },
-            Self::Snare(s) => match param {
-                SNARE_PARAM_FREQUENCY => s.params.frequency.set_bipolar(value),
-                SNARE_PARAM_DECAY => s.params.decay.set_bipolar(value),
-                SNARE_PARAM_BRIGHTNESS => s.params.brightness.set_bipolar(value),
-                SNARE_PARAM_VOLUME => s.params.volume.set_bipolar(value),
-                SNARE_PARAM_TONAL => s.params.tonal.set_bipolar(value),
-                SNARE_PARAM_NOISE => s.params.noise.set_bipolar(value),
-                SNARE_PARAM_PITCH_DROP => s.params.pitch_drop.set_bipolar(value),
-                SNARE_PARAM_TONAL_DECAY => s.params.tonal_decay.set_bipolar(value),
-                SNARE_PARAM_NOISE_DECAY => s.params.noise_decay.set_bipolar(value),
-                SNARE_PARAM_NOISE_TAIL_DECAY => s.params.noise_tail_decay.set_bipolar(value),
-                SNARE_PARAM_FILTER_CUTOFF => s.params.filter_cutoff.set_bipolar(value),
-                SNARE_PARAM_FILTER_RESONANCE => s.params.filter_resonance.set_bipolar(value),
-                SNARE_PARAM_XFADE => s.params.xfade.set_bipolar(value),
-                SNARE_PARAM_PHASE_MOD_AMOUNT => s.params.phase_mod_amount.set_bipolar(value),
-                SNARE_PARAM_OVERDRIVE => s.params.overdrive.set_bipolar(value),
-                SNARE_PARAM_AMP_DECAY => s.params.amp_decay.set_bipolar(value),
-                SNARE_PARAM_AMP_DECAY_CURVE => s.params.amp_decay_curve.set_bipolar(value),
-                SNARE_PARAM_TONAL_DECAY_CURVE => s.params.tonal_decay_curve.set_bipolar(value),
-                SNARE_PARAM_TUNING => s.params.tuning.set_bipolar(value),
-                _ => {}
-            },
-            Self::HiHat(h) => match param {
-                HIHAT_PARAM_PITCH => h.params.pitch.set_bipolar(value),
-                HIHAT_PARAM_DECAY => h.params.decay.set_bipolar(value),
-                HIHAT_PARAM_ATTACK => h.params.attack.set_bipolar(value),
-                HIHAT_PARAM_TONE => h.params.tone.set_bipolar(value),
-                HIHAT_PARAM_VOLUME => h.params.volume.set_bipolar(value),
-                HIHAT_PARAM_TUNING => h.params.tuning.set_bipolar(value),
-                _ => {}
-            },
-            Self::Tom(t) => {
-                // Tom2 uses 0-100 range, scale modulation accordingly
-                let scaled = value * 100.0;
-                match param {
-                    TOM_PARAM_TUNE => t.set_tune(scaled),
-                    TOM_PARAM_BEND => t.set_bend(scaled),
-                    TOM_PARAM_TONE => t.set_tone(scaled),
-                    TOM_PARAM_COLOR => t.set_color(scaled),
-                    TOM_PARAM_DECAY => t.set_decay(scaled),
-                    TOM_PARAM_MEMBRANE => t.set_membrane(scaled),
-                    TOM_PARAM_MEMBRANE_Q => t.set_membrane_q(scaled),
-                    TOM_PARAM_VOLUME => t.set_volume(scaled),
-                    // Tuning uses 0-1 directly (not 0-100)
-                    TOM_PARAM_TUNING => t.set_tuning(value.clamp(0.0, 1.0)),
-                    _ => {}
+                if param == TWIN_CORE_PARAM_BODY_MODE || param == TWIN_CORE_PARAM_NOISE_MODE {
+                    return LfoTarget::Mode;
                 }
+                param < TWIN_CORE_PERC_PARAM_COUNT
             }
-            Self::Bass(b) => match param {
-                BASS_PARAM_FREQUENCY => b.params.frequency.set_bipolar(value),
-                BASS_PARAM_SUB_LEVEL => b.params.sub_level.set_bipolar(value),
-                BASS_PARAM_OSC_LEVEL => b.params.osc_level.set_bipolar(value),
-                BASS_PARAM_DETUNE_LEVEL => b.params.detune_level.set_bipolar(value),
-                BASS_PARAM_DETUNE_AMOUNT => b.params.detune_amount.set_bipolar(value),
-                BASS_PARAM_OSC_SHAPE => b.params.osc_shape.set_bipolar(value),
-                BASS_PARAM_FILTER_CUTOFF => b.params.filter_cutoff.set_bipolar(value),
-                BASS_PARAM_FILTER_RESONANCE => b.params.filter_resonance.set_bipolar(value),
-                BASS_PARAM_FILTER_ENV_AMOUNT => b.params.filter_env_amount.set_bipolar(value),
-                BASS_PARAM_FILTER_ENV_DECAY => b.params.filter_env_decay.set_bipolar(value),
-                BASS_PARAM_FILTER_ENV_CURVE => b.params.filter_env_curve.set_bipolar(value),
-                BASS_PARAM_AMP_DECAY => b.params.amp_decay.set_bipolar(value),
-                BASS_PARAM_AMP_DECAY_CURVE => b.params.amp_decay_curve.set_bipolar(value),
-                BASS_PARAM_OVERDRIVE => b.params.overdrive.set_bipolar(value),
-                BASS_PARAM_VOLUME => b.params.volume.set_bipolar(value),
-                BASS_PARAM_TUNING => b.params.tuning.set_bipolar(value),
-                _ => {}
-            },
-            Self::Resonator(p) => {
-                if let Some(name) = p.parameter_name(param as usize) {
-                    if let Some(voice) = p.routing_matrix_mut() {
-                        let _ = voice.apply_modulation(name, value);
-                    }
-                }
-            }
-            Self::TwinCore(p) => {
-                if param < TWIN_CORE_PERC_PARAM_COUNT {
-                    p.set_parameter_normalized(
-                        param as usize,
-                        (value.clamp(-1.0, 1.0) + 1.0) * 0.5,
-                    );
-                } else if param == TWIN_CORE_PARAM_BODY_MODE || param == TWIN_CORE_PARAM_NOISE_MODE
-                {
-                    let mode = (value.clamp(-1.0, 1.0) + 1.0).round();
-                    if let Some(voice) = p.twin_core_mut() {
-                        if param == TWIN_CORE_PARAM_BODY_MODE {
-                            voice.set_body_mode(match mode as u32 {
-                                0 => TwinCorePercBodyMode::Low,
-                                1 => TwinCorePercBodyMode::Mid,
-                                _ => TwinCorePercBodyMode::High,
-                            });
-                        } else {
-                            voice.set_noise_mode(match mode as u32 {
-                                0 => TwinCorePercNoiseMode::Lowpass,
-                                1 => TwinCorePercNoiseMode::Highpass,
-                                _ => TwinCorePercNoiseMode::Body,
-                            });
-                        }
-                    }
-                }
-            }
+        };
+        if centered {
+            LfoTarget::Centered
+        } else {
+            LfoTarget::None
         }
     }
 }
@@ -1096,10 +1059,14 @@ impl VoiceStrip {
         for param in BitIter(self.lfo_touched) {
             let i = param as usize;
             let sum = self.lfo_sum[i];
-            if self.instrument.is_discrete_param(param) {
-                // Discrete modes have no meaningful center; keep absolute mapping.
-                self.instrument.apply_modulation(param, sum);
-                continue;
+            match self.instrument.lfo_target(param) {
+                LfoTarget::Centered => {}
+                LfoTarget::Mode => {
+                    // Modes have no meaningful center: -1..1 picks mode 0..2.
+                    self.instrument.set_param(param, sum.clamp(-1.0, 1.0) + 1.0);
+                    continue;
+                }
+                LfoTarget::None => continue,
             }
             let current = self.instrument.get_param(param);
             if !current.is_finite() {
@@ -2089,7 +2056,9 @@ impl GooeyEngine {
                                     Self::freq_range_for_instrument(instr_type)
                                 {
                                     if voice.saved_global_freq.is_none() {
-                                        voice.saved_global_freq = voice.instrument.get_freq_param();
+                                        // Save the knob value, not an LFO-modulated one,
+                                        // in the same normalized form `set_param` takes.
+                                        voice.saved_global_freq = Some(voice.param_center(0));
                                     }
                                     let normalized = Self::midi_note_to_normalized_freq(
                                         midi_note, freq_min, freq_max,
