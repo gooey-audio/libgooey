@@ -328,9 +328,7 @@ impl ClipGrid {
                 active.playback_configured = true;
                 if let Some(channel) = channels.get_mut(column) {
                     if !self.phase_aligned_launches && !was_configured {
-                        channel.seed_clip_phase_from_cursor(
-                            self.transport_beat - self.columns[column].launch_beat,
-                        );
+                        channel.seed_clip_phase_from_cursor(self.rendered_clip_beat(column));
                     }
                     channel.set_clip_playback(speed, preserve_pitch, false);
                 }
@@ -365,11 +363,9 @@ impl ClipGrid {
                 active.playback_configured = true;
                 if let Some(channel) = channels.get_mut(column) {
                     if !self.phase_aligned_launches && !was_configured {
-                        channel.seed_clip_phase_from_cursor(
-                            self.transport_beat - self.columns[column].launch_beat,
-                        );
+                        channel.seed_clip_phase_from_cursor(self.rendered_clip_beat(column));
                     }
-                    channel.set_clip_transpose(ratio, false);
+                    channel.set_clip_transpose(ratio);
                 }
             }
         }
@@ -632,6 +628,7 @@ impl ClipGrid {
             RetrimTiming::Immediate => {
                 if let Some(channel) = channels.get_mut(column) {
                     channel.set_loop_window(start as f32, end as f32);
+                    self.reseed_after_retrim(column, channel);
                 }
                 // An immediate retrim supersedes any queued one.
                 self.columns[column].pending_retrim = None;
@@ -642,6 +639,29 @@ impl ClipGrid {
             }
         }
         true
+    }
+
+    /// A transport-driven clip derives its cursor from the clip phase, which a
+    /// new window would reinterpret. Without phase-aligned launches, keep the
+    /// playhead where it is (the no-restart retrim contract). Phase-aligned
+    /// columns intentionally stay on the shared phrase position, measured from
+    /// the new loop start, like a relaunch.
+    fn reseed_after_retrim(&self, column: usize, channel: &mut LoopChannel) {
+        if !self.phase_aligned_launches {
+            channel.seed_clip_phase_from_cursor(self.rendered_clip_beat(column));
+        }
+    }
+
+    /// Clip-relative beat of the channel's current cursor. While running, the
+    /// cursor belongs to the last rendered sample, one sample behind the
+    /// transport beat, so seeding from it must not repeat that sample.
+    fn rendered_clip_beat(&self, column: usize) -> f64 {
+        let lag = if self.transport_running {
+            self.beats_per_sample()
+        } else {
+            0.0
+        };
+        self.transport_beat - self.columns[column].launch_beat - lag
     }
 
     /// The stored normalized loop-start marker for a slot, or `None` for an
@@ -760,7 +780,7 @@ impl ClipGrid {
         channel.cancel_queued_swap();
         channel.set_buffer(clip.buffer.clone());
         channel.set_clip_playback(clip.speed, clip.preserve_pitch, true);
-        channel.set_clip_transpose(clip.transpose_ratio(), true);
+        channel.set_clip_transpose(clip.transpose_ratio());
         let launch_beat = if self.phase_aligned_launches {
             0.0
         } else {
@@ -834,6 +854,7 @@ impl ClipGrid {
                     self.columns[column].pending_retrim = None;
                     if let Some(channel) = channels.get_mut(column) {
                         channel.set_loop_window(retrim.start as f32, retrim.end as f32);
+                        self.reseed_after_retrim(column, channel);
                     }
                 }
             }
@@ -1585,6 +1606,104 @@ mod playback_tests {
         render(&mut grid, &mut channels, 10_001);
         assert_eq!(grid.columns[0].active_clip.as_ref().unwrap().transpose, 5.0);
         assert_eq!(grid.slots[1][0].as_ref().unwrap().transpose, 0.0);
+    }
+
+    /// Smallest RMS over sliding windows of roughly one 220 Hz period.
+    fn min_window_rms(samples: &[f32]) -> f32 {
+        samples
+            .windows(36)
+            .step_by(4)
+            .map(|w| (w.iter().map(|x| x * x).sum::<f32>() / w.len() as f32).sqrt())
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// Largest sample-to-sample step: a 0.3 sine at 330 Hz moves < 0.08.
+    fn max_step(samples: &[f32]) -> f32 {
+        samples
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn engaging_and_bypassing_the_stretcher_is_click_free() {
+        // Steady 0.3 sine: RMS ~0.21. A freshly reset WSOLA hop used to start
+        // at the zero edge of its window, dropping the level toward silence,
+        // and bypass used to switch to the direct read at a different phase.
+        let edits: [(f32, bool, f32); 3] = [(1.0, false, 7.0), (1.0, true, -5.0), (2.0, true, 0.0)];
+        for (speed, preserve, semitones) in edits {
+            let (mut grid, mut channels) = setup(1.0, preserve, 120.0);
+            let mut before = render(&mut grid, &mut channels, 2_000);
+            assert!(grid.set_playback(0, 0, speed, preserve, &mut channels));
+            assert!(grid.set_transpose(0, 0, semitones, &mut channels));
+            let engage = render(&mut grid, &mut channels, 2_000);
+            let label = format!("speed={speed} st={semitones}");
+            assert!(
+                min_window_rms(&engage) > 0.15,
+                "engage {label}: {}",
+                min_window_rms(&engage)
+            );
+            before.extend_from_slice(&engage);
+            assert!(
+                max_step(&before) < 0.1,
+                "engage {label}: {}",
+                max_step(&before)
+            );
+            assert!(grid.set_playback(0, 0, 1.0, preserve, &mut channels));
+            assert!(grid.set_transpose(0, 0, 0.0, &mut channels));
+            let mut bypass = engage[1_999..].to_vec();
+            bypass.extend(render(&mut grid, &mut channels, 2_000));
+            assert!(
+                max_step(&bypass) < 0.1,
+                "bypass {label}: {}",
+                max_step(&bypass)
+            );
+            // The tail returns to the untouched direct level.
+            assert!(min_window_rms(&bypass[1_000..]) > 0.19, "settled {label}");
+        }
+    }
+
+    #[test]
+    fn retrim_keeps_the_playhead_without_phase_aligned_launches() {
+        for timing in [
+            RetrimTiming::Immediate,
+            RetrimTiming::Quantized(LaunchQuantization::Sixteenth),
+        ] {
+            let mut grid = ClipGrid::new(SR, 120.0);
+            let mut channels: Vec<_> = (0..CLIP_COLUMN_COUNT)
+                .map(|_| LoopChannel::new(SR))
+                .collect();
+            for ch in &mut channels {
+                ch.set_engine_bpm(120.0);
+            }
+            assert!(grid.load_with_playback(0, 0, tone(), 120.0, 1.0, true));
+            assert!(grid.set_transpose(0, 0, 3.0, &mut channels));
+            assert!(grid.launch_quantized(0, 0, LaunchQuantization::Bar));
+            grid.transport_start(&mut channels);
+            // Full loop is 32_000 frames; stop just short of a sixteenth boundary.
+            render(&mut grid, &mut channels, 6_399);
+            let before = channels[0].position_normalized();
+            assert!(grid.set_trim(0, 0, 0.1, 0.9, timing, &mut channels));
+            render(&mut grid, &mut channels, 2);
+            let after = channels[0].position_normalized();
+            let step = 2.0 / 32_000.0;
+            assert!(
+                (after - before - step).abs() < 1e-5,
+                "{timing:?}: {before} -> {after}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_aligned_retrim_follows_the_shared_phrase_position() {
+        let (mut grid, mut channels) = setup(1.0, true, 120.0);
+        render(&mut grid, &mut channels, 6_400);
+        assert!(grid.set_trim(0, 0, 0.1, 0.9, RetrimTiming::Immediate, &mut channels));
+        render(&mut grid, &mut channels, 1);
+        // The full 32_000-frame tone is 8 beats; the trimmed window is 6.4.
+        let beat = 6_400.0 * 120.0 / (60.0 * SR as f64);
+        let expected = 0.1 + (beat % 6.4) / 8.0;
+        assert!((channels[0].position_normalized() as f64 - expected).abs() < 1e-4);
     }
 
     #[test]

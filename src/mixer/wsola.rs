@@ -177,7 +177,13 @@ impl WsolaStretcher {
             let prev = if self.have_prev_tail {
                 self.prev_tail[i]
             } else {
-                StereoFrame::default()
+                // Seamless entry: stand in for the missing predecessor with the
+                // same read under the complementary window half, so the first
+                // hop plays at full level instead of fading in from silence.
+                let v = (best + i as f64 * step).rem_euclid(window.span);
+                buffer
+                    .read_wrapped(window.to_physical(v))
+                    .scaled(1.0 - self.window[i])
             };
             let new = self.grain_scratch[i];
             self.out_scratch[i] = StereoFrame {
