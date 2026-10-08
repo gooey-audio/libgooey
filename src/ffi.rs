@@ -133,7 +133,7 @@ pub const PERCUSSION_PRESET_CLAP_HYBRID: u32 = 3;
 pub const PERCUSSION_PRESET_METALLIC: u32 = 4;
 
 /// LFO route configuration
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct LfoRoute {
     /// Unique ID for this route (used for removal)
     id: u32,
@@ -623,6 +623,17 @@ impl ChannelInstrument {
         }
     }
 
+    /// Mode selectors, which LFOs drive by absolute value rather than around a center.
+    fn is_discrete_param(&self, param: u32) -> bool {
+        match self {
+            Self::Snare(_) => param == SNARE_PARAM_FILTER_TYPE,
+            Self::TwinCore(_) => {
+                param == TWIN_CORE_PARAM_BODY_MODE || param == TWIN_CORE_PARAM_NOISE_MODE
+            }
+            _ => false,
+        }
+    }
+
     /// Apply LFO modulation to a parameter. Uses bipolar modulation for smoothed params.
     fn apply_modulation(&mut self, param: u32, value: f32) {
         match self {
@@ -938,6 +949,28 @@ impl ChannelBlender {
 const KIT_VOICE_COUNT: usize = 4;
 /// Parameter-lock slots per channel; covers the largest instrument param set.
 const CHANNEL_PARAM_LOCK_CAPACITY: usize = 32;
+// LFO modulation tracks parameters in a `u32` bitmask.
+const _: () = assert!(CHANNEL_PARAM_LOCK_CAPACITY <= u32::BITS as usize);
+/// A parameter that moved further than this since the LFOs last wrote it was
+/// set by something else, which becomes the new LFO center.
+const LFO_WRITE_EPSILON: f32 = 1e-6;
+
+/// Iterates the set bit indices of a mask, lowest first.
+struct BitIter(u32);
+
+impl Iterator for BitIter {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        if self.0 == 0 {
+            return None;
+        }
+        let bit = self.0.trailing_zeros();
+        self.0 &= self.0 - 1;
+        Some(bit)
+    }
+}
+
 /// Maximum independently routable sampler racks in one FFI engine.
 pub const SAMPLER_RACK_MAX: u32 = 4;
 /// PCM pads in each sampler rack and steps in its sequencer.
@@ -979,6 +1012,18 @@ struct VoiceStrip {
     /// A locked value is re-applied after every preset blend so the XY pad
     /// and per-step blends cannot overwrite it. LFOs still modulate on top.
     param_locks: [Option<f32>; CHANNEL_PARAM_LOCK_CAPACITY],
+    /// LFO center per parameter: the normalized value the host, a lock, a
+    /// blend or a macro last set. Routed LFOs swing around it.
+    lfo_base: [f32; CHANNEL_PARAM_LOCK_CAPACITY],
+    /// Value the LFOs last wrote, so writes from anywhere else are seen as a
+    /// new center.
+    lfo_written: [f32; CHANNEL_PARAM_LOCK_CAPACITY],
+    /// Sum of every enabled route's output for the current sample.
+    lfo_sum: [f32; CHANNEL_PARAM_LOCK_CAPACITY],
+    /// One bit per parameter currently modulated around `lfo_base`.
+    lfo_active: u32,
+    /// One bit per parameter an enabled route touched this sample.
+    lfo_touched: u32,
 }
 
 impl VoiceStrip {
@@ -1008,7 +1053,85 @@ impl VoiceStrip {
             trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
             saved_global_freq: None,
             param_locks: [None; CHANNEL_PARAM_LOCK_CAPACITY],
+            lfo_base: [0.0; CHANNEL_PARAM_LOCK_CAPACITY],
+            lfo_written: [0.0; CHANNEL_PARAM_LOCK_CAPACITY],
+            lfo_sum: [0.0; CHANNEL_PARAM_LOCK_CAPACITY],
+            lfo_active: 0,
+            lfo_touched: 0,
         }
+    }
+
+    /// Add one route's output to this sample's modulation of `param`.
+    fn add_lfo_modulation(&mut self, param: u32, modulation: f32) {
+        let Some(sum) = self.lfo_sum.get_mut(param as usize) else {
+            return;
+        };
+        let bit = 1 << param;
+        if self.lfo_touched & bit == 0 {
+            self.lfo_touched |= bit;
+            *sum = 0.0;
+        }
+        *sum += modulation;
+    }
+
+    /// Write this sample's LFO modulation around each parameter's center, and
+    /// return parameters no route touched to their center.
+    ///
+    /// The center is whatever was last written by anything other than the LFOs
+    /// (host, lock, blend, macro), so moving the knob moves the sweep. A write
+    /// of exactly the value the LFOs last wrote can't be told apart and leaves
+    /// the center where it was.
+    fn apply_lfo_modulation(&mut self) {
+        let stale = self.lfo_active & !self.lfo_touched;
+        for param in BitIter(stale) {
+            // Keep a value written since the last LFO tick; otherwise restore.
+            let current = self.instrument.get_param(param);
+            if (current - self.lfo_written[param as usize]).abs() <= LFO_WRITE_EPSILON {
+                self.instrument
+                    .set_param(param, self.lfo_base[param as usize]);
+            }
+        }
+        self.lfo_active &= !stale;
+
+        for param in BitIter(self.lfo_touched) {
+            let i = param as usize;
+            let sum = self.lfo_sum[i];
+            if self.instrument.is_discrete_param(param) {
+                // Discrete modes have no meaningful center; keep absolute mapping.
+                self.instrument.apply_modulation(param, sum);
+                continue;
+            }
+            let current = self.instrument.get_param(param);
+            if !current.is_finite() {
+                continue;
+            }
+            let bit = 1 << param;
+            if self.lfo_active & bit == 0
+                || (current - self.lfo_written[i]).abs() > LFO_WRITE_EPSILON
+            {
+                self.lfo_base[i] = current;
+            }
+            self.instrument
+                .set_param(param, (self.lfo_base[i] + 0.5 * sum).clamp(0.0, 1.0));
+            self.lfo_written[i] = self.instrument.get_param(param);
+            self.lfo_active |= bit;
+        }
+        self.lfo_touched = 0;
+    }
+
+    /// The parameter's un-modulated value: its LFO center while modulated.
+    fn param_center(&self, param: u32) -> f32 {
+        if param < u32::BITS && self.lfo_active & (1 << param) != 0 {
+            self.lfo_base[param as usize]
+        } else {
+            self.instrument.get_param(param)
+        }
+    }
+
+    /// Forget LFO centers, e.g. when param indices change meaning.
+    fn reset_lfo_modulation(&mut self) {
+        self.lfo_active = 0;
+        self.lfo_touched = 0;
     }
 
     /// Blend the corner presets at (x,y) into the instrument, then re-apply
@@ -2032,8 +2155,8 @@ impl GooeyEngine {
                 self.performance.clear_pending_sampler_hits();
             }
 
-            // Macros and motions run at control rate, before the LFOs so an
-            // LFO routed to the same parameter still wins.
+            // Macros and motions run at control rate, before the LFOs, so an
+            // LFO routed to the same parameter swings around the macro value.
             self.automation_frames += 1;
             if self.automation_frames >= AUTOMATION_CONTROL_INTERVAL {
                 self.tick_automation(transport_running, transport_beat);
@@ -2046,12 +2169,17 @@ impl GooeyEngine {
                     let route_count = self.lfo_routes[lfo_idx].len();
 
                     for route_idx in 0..route_count {
-                        let channel = self.lfo_routes[lfo_idx][route_idx].instrument;
-                        let param = self.lfo_routes[lfo_idx][route_idx].param;
-                        let depth = self.lfo_routes[lfo_idx][route_idx].depth;
-                        let modulation = lfo_value * depth;
-                        self.apply_modulation_by_index(channel, param, modulation);
+                        let route = self.lfo_routes[lfo_idx][route_idx];
+                        if let Some(voice) = self.voice_mut(route.instrument as usize) {
+                            voice.add_lfo_modulation(route.param, lfo_value * route.depth);
+                        }
                     }
+                }
+            }
+            // Routes to the same parameter add up, centered on its knob value.
+            for ch in 0..NUM_INSTRUMENTS {
+                if let Some(voice) = self.voice_mut(ch) {
+                    voice.apply_lfo_modulation();
                 }
             }
 
@@ -2695,13 +2823,6 @@ impl GooeyEngine {
         self.plate_reverb.reset();
     }
 
-    /// Apply LFO modulation to a channel's instrument parameter by index
-    fn apply_modulation_by_index(&mut self, channel: u32, param: u32, value: f32) {
-        if let Some(voice) = self.voice_mut(channel as usize) {
-            voice.instrument.apply_modulation(param, value);
-        }
-    }
-
     /// Calculate the target gain for an instrument based on mute/solo state
     /// Returns 1.0 (full volume) or 0.0 (silent)
     #[inline]
@@ -2725,14 +2846,13 @@ impl GooeyEngine {
         1.0
     }
 
-    /// Borrow the first voice's instrument matching the given type.
-    fn instrument_by_type(&self, instrument_type: u32) -> Option<&ChannelInstrument> {
+    /// Borrow the first voice whose instrument matches the given type.
+    fn voice_by_type(&self, instrument_type: u32) -> Option<&VoiceStrip> {
         self.voices_iter()
-            .map(|v| &v.instrument)
-            .find(|i| i.instrument_type() == instrument_type)
+            .find(|v| v.instrument.instrument_type() == instrument_type)
     }
 
-    /// Mutable counterpart to [`instrument_by_type`](Self::instrument_by_type).
+    /// Borrow the first voice's instrument matching the given type, mutably.
     fn instrument_by_type_mut(&mut self, instrument_type: u32) -> Option<&mut ChannelInstrument> {
         self.voices_iter_mut()
             .map(|v| &mut v.instrument)
@@ -3812,6 +3932,7 @@ pub unsafe extern "C" fn gooey_engine_set_channel_instrument_type(
     voice.blend_corner_presets = ChannelBlender::default_corner_preset_ids(instrument_type);
     // Param indices mean different things per instrument type.
     voice.param_locks = [None; CHANNEL_PARAM_LOCK_CAPACITY];
+    voice.reset_lfo_modulation();
     voice.saved_global_freq = None;
     if matches!(instrument_type, INSTRUMENT_RESONATOR | INSTRUMENT_TWIN_CORE) {
         voice.blend_enabled = false;
@@ -3935,8 +4056,11 @@ pub unsafe extern "C" fn gooey_engine_set_channel_param(
 /// used by `gooey_engine_set_channel_param`.
 ///
 /// Returns the locked value if the parameter is locked, otherwise the current
-/// target (e.g. the blended value). Unlike `gooey_engine_get_kick_param` and
-/// friends, this reaches any channel, not just the first of a type.
+/// target (e.g. the blended value). While an LFO modulates the parameter this
+/// is the sweep's center, not the modulated value (see
+/// `gooey_engine_get_channel_param_modulated`). Unlike
+/// `gooey_engine_get_kick_param` and friends, this reaches any channel, not
+/// just the first of a type.
 ///
 /// # Returns
 /// The parameter value, or `NaN` if `engine` is null, `channel` is out of
@@ -3958,7 +4082,28 @@ pub unsafe extern "C" fn gooey_engine_get_channel_param(
         .get(param as usize)
         .copied()
         .flatten()
-        .unwrap_or_else(|| voice.instrument.get_param(param))
+        .unwrap_or_else(|| voice.param_center(param))
+}
+
+/// Read the value a channel parameter is actually targeting, including LFO
+/// modulation, in the same normalized form as `gooey_engine_get_channel_param`.
+///
+/// # Returns
+/// The parameter value, or `NaN` if `engine` is null, `channel` is out of
+/// range, or `param` is not valid for the channel's instrument type.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_channel_param_modulated(
+    engine: *const GooeyEngine,
+    channel: u32,
+    param: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|e| e.voice(channel as usize))
+        .map_or(f32::NAN, |voice| voice.instrument.get_param(param))
 }
 
 /// Lock a channel parameter to `value` so preset blending cannot overwrite it.
@@ -4326,10 +4471,9 @@ pub unsafe extern "C" fn gooey_engine_get_kick_param(
         return f32::NAN;
     }
     let engine = &*engine;
-    match engine.instrument_by_type(INSTRUMENT_KICK) {
-        Some(instr) => instr.get_param(param),
-        None => f32::NAN,
-    }
+    engine
+        .voice_by_type(INSTRUMENT_KICK)
+        .map_or(f32::NAN, |v| v.param_center(param))
 }
 
 /// Set a hi-hat parameter
@@ -4393,10 +4537,9 @@ pub unsafe extern "C" fn gooey_engine_get_hihat_param(
         return f32::NAN;
     }
     let engine = &*engine;
-    match engine.instrument_by_type(INSTRUMENT_HIHAT) {
-        Some(instr) => instr.get_param(param),
-        None => f32::NAN,
-    }
+    engine
+        .voice_by_type(INSTRUMENT_HIHAT)
+        .map_or(f32::NAN, |v| v.param_center(param))
 }
 
 /// Set a snare drum parameter
@@ -4472,10 +4615,9 @@ pub unsafe extern "C" fn gooey_engine_get_snare_param(
         return f32::NAN;
     }
     let engine = &*engine;
-    match engine.instrument_by_type(INSTRUMENT_SNARE) {
-        Some(instr) => instr.get_param(param),
-        None => f32::NAN,
-    }
+    engine
+        .voice_by_type(INSTRUMENT_SNARE)
+        .map_or(f32::NAN, |v| v.param_center(param))
 }
 
 /// Set a tom drum parameter
@@ -4537,10 +4679,9 @@ pub unsafe extern "C" fn gooey_engine_get_tom_param(engine: *const GooeyEngine, 
         return f32::NAN;
     }
     let engine = &*engine;
-    match engine.instrument_by_type(INSTRUMENT_TOM) {
-        Some(instr) => instr.get_param(param),
-        None => f32::NAN,
-    }
+    engine
+        .voice_by_type(INSTRUMENT_TOM)
+        .map_or(f32::NAN, |v| v.param_center(param))
 }
 
 /// Set a bass synth parameter
@@ -6761,7 +6902,9 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_timing(
 /// Set the global modulation amount for an LFO
 ///
 /// This scales the LFO's waveform amplitude before it's distributed to routes.
-/// Final modulation = (offset + waveform * amount) * route_depth
+/// Each routed parameter becomes
+/// `clamp(center + 0.5 * (offset + waveform * amount) * route_depth, 0, 1)`,
+/// where `center` is the parameter's own (knob) value.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -6808,10 +6951,10 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_amount(
 
 /// Set the center offset (DC bias) for an LFO
 ///
-/// This adds a constant value to the LFO output before distribution to routes.
-/// Final modulation = (offset + waveform * amount) * route_depth
-///
-/// Use offset to bias the modulation (e.g., offset=0.5 with amount=0.5 gives 0.0-1.0 range)
+/// This adds a constant value to the LFO output before distribution to routes,
+/// shifting the sweep away from each parameter's own value.
+/// Each routed parameter becomes
+/// `clamp(center + 0.5 * (offset + waveform * amount) * route_depth, 0, 1)`.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -6858,15 +7001,22 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_offset(
 
 /// Add a route from an LFO to a channel parameter
 ///
-/// Each LFO can have multiple routes to different parameters.
-/// Final modulation applied to target = (offset + sine * amount) * depth
+/// Each LFO can have multiple routes to different parameters. The LFO swings
+/// the parameter around its own value (the center), so setting the parameter
+/// while it is routed (`gooey_engine_set_channel_param`, a param lock, a blend,
+/// a macro) moves the center of the sweep:
+/// `clamp(center + 0.5 * (offset + waveform * amount) * depth, 0, 1)`.
+/// Several routes to one parameter add together. Parameter getters return the
+/// center, not the modulated value. When the last route to a parameter is
+/// removed or its LFO disabled, the parameter returns to its center.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
 /// * `lfo_index` - LFO index (0-7)
 /// * `instrument` - Target channel slot index (0–4), independent of its type
 /// * `param` - Target parameter index (KICK_PARAM_FREQUENCY, etc.)
-/// * `depth` - Per-route depth (0.0 to 1.0) - scales the LFO output for this target
+/// * `depth` - Per-route depth (0.0 to 1.0). At 1.0 a full-amount LFO sweeps
+///   ±0.5 of the parameter's normalized range.
 ///
 /// # Returns
 /// A route ID that can be used to remove this specific route, or LFO_INVALID on error
