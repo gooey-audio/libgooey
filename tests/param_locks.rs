@@ -197,7 +197,7 @@ fn lfo_still_modulates_a_locked_param() {
     let engine = Engine::new();
     unsafe {
         gooey_engine_set_channel_param_lock(engine.0, KICK_CHANNEL, KICK_PARAM_PUNCH, 0.1);
-        // A constant LFO output of 0.8 (bipolar) maps to a 0.9 target.
+        // A constant LFO output of 0.8 swings the locked 0.1 up by 0.4.
         gooey_engine_set_lfo_amount(engine.0, 0, 0.0);
         gooey_engine_set_lfo_offset(engine.0, 0, 0.8);
         gooey_engine_add_lfo_route(engine.0, 0, KICK_CHANNEL, KICK_PARAM_PUNCH, 1.0);
@@ -205,7 +205,10 @@ fn lfo_still_modulates_a_locked_param() {
     }
     engine.render(64);
     unsafe {
-        approx_eq(gooey_engine_get_kick_param(engine.0, KICK_PARAM_PUNCH), 0.9);
+        approx_eq(
+            gooey_engine_get_channel_param_modulated(engine.0, KICK_CHANNEL, KICK_PARAM_PUNCH),
+            0.5,
+        );
         // The lock itself is untouched.
         assert!(gooey_engine_channel_param_is_locked(
             engine.0,

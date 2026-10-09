@@ -16,9 +16,7 @@ use crate::effects::{
     SoftLimiter, SpringReverbEffect, TiltFilterEffect, TubeCompressor, TubeSaturation, Waveshaper,
 };
 use crate::engine::lfo::{Lfo, LfoWaveform, MusicalDivision};
-use crate::engine::{
-    Instrument, Modulatable, Sequencer, SequencerBlendSetting, SequencerStepSettings,
-};
+use crate::engine::{Instrument, Sequencer, SequencerBlendSetting, SequencerStepSettings};
 use crate::envelope::ADSRConfig;
 use crate::frame::StereoFrame;
 use crate::instruments::multisample::{
@@ -132,8 +130,19 @@ pub const PERCUSSION_PRESET_SNARE: u32 = 2;
 pub const PERCUSSION_PRESET_CLAP_HYBRID: u32 = 3;
 pub const PERCUSSION_PRESET_METALLIC: u32 = 4;
 
+/// How a routed LFO drives a channel parameter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LfoTarget {
+    /// Swings around the parameter's own value.
+    Centered,
+    /// Mode selector set from the LFO's absolute output.
+    Mode,
+    /// Not a live LFO destination; routes to it are ignored.
+    None,
+}
+
 /// LFO route configuration
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct LfoRoute {
     /// Unique ID for this route (used for removal)
     id: u32,
@@ -293,16 +302,6 @@ impl ChannelInstrument {
             Self::Tom(t) => t.tick(current_time),
             Self::Bass(b) => b.tick(current_time),
             Self::Resonator(p) | Self::TwinCore(p) => p.tick(current_time),
-        }
-    }
-
-    /// Get the current normalized frequency parameter (0-1) for pitched instruments.
-    fn get_freq_param(&self) -> Option<f32> {
-        match self {
-            Self::Kick(k) => Some(k.params.frequency.get()),
-            Self::Tom(t) => Some(t.tune()),
-            Self::Bass(b) => Some(b.params.frequency.get()),
-            _ => None,
         }
     }
 
@@ -623,135 +622,110 @@ impl ChannelInstrument {
         }
     }
 
-    /// Apply LFO modulation to a parameter. Uses bipolar modulation for smoothed params.
-    fn apply_modulation(&mut self, param: u32, value: f32) {
-        match self {
-            Self::Kick(k) => match param {
-                KICK_PARAM_FREQUENCY => k.params.frequency.set_bipolar(value),
-                KICK_PARAM_PUNCH => k.params.punch.set_bipolar(value),
-                KICK_PARAM_SUB => k.params.sub.set_bipolar(value),
-                KICK_PARAM_CLICK => k.params.click.set_bipolar(value),
-                KICK_PARAM_DECAY => k.params.oscillator_decay.set_bipolar(value),
-                // KICK_PARAM_PITCH_ENVELOPE is no longer modulatable: it was
-                // baked at trigger time and never re-read. Use KICK_PARAM_TUNING
-                // for live pitch modulation instead.
-                KICK_PARAM_VOLUME => k.params.volume.set_bipolar(value),
-                KICK_PARAM_TUNING => k.params.tuning.set_bipolar(value),
-                // Curve, start ratio and amp decay are latched at trigger, so
-                // modulating them shapes the next hit rather than the current one.
-                KICK_PARAM_PITCH_ENVELOPE_CURVE => k.params.pitch_envelope_curve.set_bipolar(value),
-                KICK_PARAM_PITCH_START_RATIO => k.params.pitch_start_ratio.set_bipolar(value),
-                KICK_PARAM_PHASE_MOD_AMOUNT => k.params.phase_mod_amount.set_bipolar(value),
-                KICK_PARAM_NOISE_AMOUNT => k.params.noise_amount.set_bipolar(value),
-                KICK_PARAM_NOISE_CUTOFF => k.params.noise_cutoff.set_bipolar(value),
-                KICK_PARAM_NOISE_RESONANCE => k.params.noise_resonance.set_bipolar(value),
-                KICK_PARAM_OVERDRIVE => k.params.overdrive.set_bipolar(value),
-                KICK_PARAM_FEEDBACK_AMOUNT => k.params.feedback.set_bipolar(value),
-                KICK_PARAM_FEEDBACK_CUTOFF => k.params.feedback_cutoff.set_bipolar(value),
-                KICK_PARAM_AMP_DECAY => k.params.amp_decay.set_bipolar(value),
-                KICK_PARAM_AMP_DECAY_CURVE => k.params.amp_decay_curve.set_bipolar(value),
-                _ => {}
-            },
-            Self::Snare(s) => match param {
-                SNARE_PARAM_FREQUENCY => s.params.frequency.set_bipolar(value),
-                SNARE_PARAM_DECAY => s.params.decay.set_bipolar(value),
-                SNARE_PARAM_BRIGHTNESS => s.params.brightness.set_bipolar(value),
-                SNARE_PARAM_VOLUME => s.params.volume.set_bipolar(value),
-                SNARE_PARAM_TONAL => s.params.tonal.set_bipolar(value),
-                SNARE_PARAM_NOISE => s.params.noise.set_bipolar(value),
-                SNARE_PARAM_PITCH_DROP => s.params.pitch_drop.set_bipolar(value),
-                SNARE_PARAM_TONAL_DECAY => s.params.tonal_decay.set_bipolar(value),
-                SNARE_PARAM_NOISE_DECAY => s.params.noise_decay.set_bipolar(value),
-                SNARE_PARAM_NOISE_TAIL_DECAY => s.params.noise_tail_decay.set_bipolar(value),
-                SNARE_PARAM_FILTER_CUTOFF => s.params.filter_cutoff.set_bipolar(value),
-                SNARE_PARAM_FILTER_RESONANCE => s.params.filter_resonance.set_bipolar(value),
-                SNARE_PARAM_XFADE => s.params.xfade.set_bipolar(value),
-                SNARE_PARAM_PHASE_MOD_AMOUNT => s.params.phase_mod_amount.set_bipolar(value),
-                SNARE_PARAM_OVERDRIVE => s.params.overdrive.set_bipolar(value),
-                SNARE_PARAM_AMP_DECAY => s.params.amp_decay.set_bipolar(value),
-                SNARE_PARAM_AMP_DECAY_CURVE => s.params.amp_decay_curve.set_bipolar(value),
-                SNARE_PARAM_TONAL_DECAY_CURVE => s.params.tonal_decay_curve.set_bipolar(value),
-                SNARE_PARAM_TUNING => s.params.tuning.set_bipolar(value),
-                _ => {}
-            },
-            Self::HiHat(h) => match param {
-                HIHAT_PARAM_PITCH => h.params.pitch.set_bipolar(value),
-                HIHAT_PARAM_DECAY => h.params.decay.set_bipolar(value),
-                HIHAT_PARAM_ATTACK => h.params.attack.set_bipolar(value),
-                HIHAT_PARAM_TONE => h.params.tone.set_bipolar(value),
-                HIHAT_PARAM_VOLUME => h.params.volume.set_bipolar(value),
-                HIHAT_PARAM_TUNING => h.params.tuning.set_bipolar(value),
-                _ => {}
-            },
-            Self::Tom(t) => {
-                // Tom2 uses 0-100 range, scale modulation accordingly
-                let scaled = value * 100.0;
-                match param {
-                    TOM_PARAM_TUNE => t.set_tune(scaled),
-                    TOM_PARAM_BEND => t.set_bend(scaled),
-                    TOM_PARAM_TONE => t.set_tone(scaled),
-                    TOM_PARAM_COLOR => t.set_color(scaled),
-                    TOM_PARAM_DECAY => t.set_decay(scaled),
-                    TOM_PARAM_MEMBRANE => t.set_membrane(scaled),
-                    TOM_PARAM_MEMBRANE_Q => t.set_membrane_q(scaled),
-                    TOM_PARAM_VOLUME => t.set_volume(scaled),
-                    // Tuning uses 0-1 directly (not 0-100)
-                    TOM_PARAM_TUNING => t.set_tuning(value.clamp(0.0, 1.0)),
-                    _ => {}
+    /// How a routed LFO drives `param`. Only parameters the voice re-reads
+    /// while playing are destinations; routes to anything else are ignored.
+    fn lfo_target(&self, param: u32) -> LfoTarget {
+        let centered = match self {
+            // KICK_PARAM_PITCH_ENVELOPE is not modulatable: it is baked at
+            // trigger time and never re-read. Use KICK_PARAM_TUNING for live
+            // pitch modulation instead. Curve, start ratio and amp decay are
+            // latched at trigger, so modulating them shapes the next hit.
+            Self::Kick(_) => matches!(
+                param,
+                KICK_PARAM_FREQUENCY
+                    | KICK_PARAM_PUNCH
+                    | KICK_PARAM_SUB
+                    | KICK_PARAM_CLICK
+                    | KICK_PARAM_DECAY
+                    | KICK_PARAM_VOLUME
+                    | KICK_PARAM_TUNING
+                    | KICK_PARAM_PITCH_ENVELOPE_CURVE
+                    | KICK_PARAM_PITCH_START_RATIO
+                    | KICK_PARAM_PHASE_MOD_AMOUNT
+                    | KICK_PARAM_NOISE_AMOUNT
+                    | KICK_PARAM_NOISE_CUTOFF
+                    | KICK_PARAM_NOISE_RESONANCE
+                    | KICK_PARAM_OVERDRIVE
+                    | KICK_PARAM_FEEDBACK_AMOUNT
+                    | KICK_PARAM_FEEDBACK_CUTOFF
+                    | KICK_PARAM_AMP_DECAY
+                    | KICK_PARAM_AMP_DECAY_CURVE
+            ),
+            Self::Snare(_) => matches!(
+                param,
+                SNARE_PARAM_FREQUENCY
+                    | SNARE_PARAM_DECAY
+                    | SNARE_PARAM_BRIGHTNESS
+                    | SNARE_PARAM_VOLUME
+                    | SNARE_PARAM_TONAL
+                    | SNARE_PARAM_NOISE
+                    | SNARE_PARAM_PITCH_DROP
+                    | SNARE_PARAM_TONAL_DECAY
+                    | SNARE_PARAM_NOISE_DECAY
+                    | SNARE_PARAM_NOISE_TAIL_DECAY
+                    | SNARE_PARAM_FILTER_CUTOFF
+                    | SNARE_PARAM_FILTER_RESONANCE
+                    | SNARE_PARAM_XFADE
+                    | SNARE_PARAM_PHASE_MOD_AMOUNT
+                    | SNARE_PARAM_OVERDRIVE
+                    | SNARE_PARAM_AMP_DECAY
+                    | SNARE_PARAM_AMP_DECAY_CURVE
+                    | SNARE_PARAM_TONAL_DECAY_CURVE
+                    | SNARE_PARAM_TUNING
+            ),
+            // Noise color and filter slope are mode selectors, not destinations.
+            Self::HiHat(_) => matches!(
+                param,
+                HIHAT_PARAM_PITCH
+                    | HIHAT_PARAM_DECAY
+                    | HIHAT_PARAM_ATTACK
+                    | HIHAT_PARAM_TONE
+                    | HIHAT_PARAM_VOLUME
+                    | HIHAT_PARAM_TUNING
+            ),
+            Self::Tom(_) => matches!(
+                param,
+                TOM_PARAM_TUNE
+                    | TOM_PARAM_BEND
+                    | TOM_PARAM_TONE
+                    | TOM_PARAM_COLOR
+                    | TOM_PARAM_DECAY
+                    | TOM_PARAM_MEMBRANE
+                    | TOM_PARAM_MEMBRANE_Q
+                    | TOM_PARAM_VOLUME
+                    | TOM_PARAM_TUNING
+            ),
+            Self::Bass(_) => matches!(
+                param,
+                BASS_PARAM_FREQUENCY
+                    | BASS_PARAM_SUB_LEVEL
+                    | BASS_PARAM_OSC_LEVEL
+                    | BASS_PARAM_DETUNE_LEVEL
+                    | BASS_PARAM_DETUNE_AMOUNT
+                    | BASS_PARAM_OSC_SHAPE
+                    | BASS_PARAM_FILTER_CUTOFF
+                    | BASS_PARAM_FILTER_RESONANCE
+                    | BASS_PARAM_FILTER_ENV_AMOUNT
+                    | BASS_PARAM_FILTER_ENV_DECAY
+                    | BASS_PARAM_FILTER_ENV_CURVE
+                    | BASS_PARAM_AMP_DECAY
+                    | BASS_PARAM_AMP_DECAY_CURVE
+                    | BASS_PARAM_OVERDRIVE
+                    | BASS_PARAM_VOLUME
+                    | BASS_PARAM_TUNING
+            ),
+            Self::Resonator(p) => p.parameter_name(param as usize).is_some(),
+            Self::TwinCore(_) => {
+                if param == TWIN_CORE_PARAM_BODY_MODE || param == TWIN_CORE_PARAM_NOISE_MODE {
+                    return LfoTarget::Mode;
                 }
+                param < TWIN_CORE_PERC_PARAM_COUNT
             }
-            Self::Bass(b) => match param {
-                BASS_PARAM_FREQUENCY => b.params.frequency.set_bipolar(value),
-                BASS_PARAM_SUB_LEVEL => b.params.sub_level.set_bipolar(value),
-                BASS_PARAM_OSC_LEVEL => b.params.osc_level.set_bipolar(value),
-                BASS_PARAM_DETUNE_LEVEL => b.params.detune_level.set_bipolar(value),
-                BASS_PARAM_DETUNE_AMOUNT => b.params.detune_amount.set_bipolar(value),
-                BASS_PARAM_OSC_SHAPE => b.params.osc_shape.set_bipolar(value),
-                BASS_PARAM_FILTER_CUTOFF => b.params.filter_cutoff.set_bipolar(value),
-                BASS_PARAM_FILTER_RESONANCE => b.params.filter_resonance.set_bipolar(value),
-                BASS_PARAM_FILTER_ENV_AMOUNT => b.params.filter_env_amount.set_bipolar(value),
-                BASS_PARAM_FILTER_ENV_DECAY => b.params.filter_env_decay.set_bipolar(value),
-                BASS_PARAM_FILTER_ENV_CURVE => b.params.filter_env_curve.set_bipolar(value),
-                BASS_PARAM_AMP_DECAY => b.params.amp_decay.set_bipolar(value),
-                BASS_PARAM_AMP_DECAY_CURVE => b.params.amp_decay_curve.set_bipolar(value),
-                BASS_PARAM_OVERDRIVE => b.params.overdrive.set_bipolar(value),
-                BASS_PARAM_VOLUME => b.params.volume.set_bipolar(value),
-                BASS_PARAM_TUNING => b.params.tuning.set_bipolar(value),
-                _ => {}
-            },
-            Self::Resonator(p) => {
-                if let Some(name) = p.parameter_name(param as usize) {
-                    if let Some(voice) = p.routing_matrix_mut() {
-                        let _ = voice.apply_modulation(name, value);
-                    }
-                }
-            }
-            Self::TwinCore(p) => {
-                if param < TWIN_CORE_PERC_PARAM_COUNT {
-                    p.set_parameter_normalized(
-                        param as usize,
-                        (value.clamp(-1.0, 1.0) + 1.0) * 0.5,
-                    );
-                } else if param == TWIN_CORE_PARAM_BODY_MODE || param == TWIN_CORE_PARAM_NOISE_MODE
-                {
-                    let mode = (value.clamp(-1.0, 1.0) + 1.0).round();
-                    if let Some(voice) = p.twin_core_mut() {
-                        if param == TWIN_CORE_PARAM_BODY_MODE {
-                            voice.set_body_mode(match mode as u32 {
-                                0 => TwinCorePercBodyMode::Low,
-                                1 => TwinCorePercBodyMode::Mid,
-                                _ => TwinCorePercBodyMode::High,
-                            });
-                        } else {
-                            voice.set_noise_mode(match mode as u32 {
-                                0 => TwinCorePercNoiseMode::Lowpass,
-                                1 => TwinCorePercNoiseMode::Highpass,
-                                _ => TwinCorePercNoiseMode::Body,
-                            });
-                        }
-                    }
-                }
-            }
+        };
+        if centered {
+            LfoTarget::Centered
+        } else {
+            LfoTarget::None
         }
     }
 }
@@ -938,6 +912,28 @@ impl ChannelBlender {
 const KIT_VOICE_COUNT: usize = 4;
 /// Parameter-lock slots per channel; covers the largest instrument param set.
 const CHANNEL_PARAM_LOCK_CAPACITY: usize = 32;
+// LFO modulation tracks parameters in a `u32` bitmask.
+const _: () = assert!(CHANNEL_PARAM_LOCK_CAPACITY <= u32::BITS as usize);
+/// A parameter that moved further than this since the LFOs last wrote it was
+/// set by something else, which becomes the new LFO center.
+const LFO_WRITE_EPSILON: f32 = 1e-6;
+
+/// Iterates the set bit indices of a mask, lowest first.
+struct BitIter(u32);
+
+impl Iterator for BitIter {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        if self.0 == 0 {
+            return None;
+        }
+        let bit = self.0.trailing_zeros();
+        self.0 &= self.0 - 1;
+        Some(bit)
+    }
+}
+
 /// Maximum independently routable sampler racks in one FFI engine.
 pub const SAMPLER_RACK_MAX: u32 = 4;
 /// PCM pads in each sampler rack and steps in its sequencer.
@@ -979,6 +975,18 @@ struct VoiceStrip {
     /// A locked value is re-applied after every preset blend so the XY pad
     /// and per-step blends cannot overwrite it. LFOs still modulate on top.
     param_locks: [Option<f32>; CHANNEL_PARAM_LOCK_CAPACITY],
+    /// LFO center per parameter: the normalized value the host, a lock, a
+    /// blend or a macro last set. Routed LFOs swing around it.
+    lfo_base: [f32; CHANNEL_PARAM_LOCK_CAPACITY],
+    /// Value the LFOs last wrote, so writes from anywhere else are seen as a
+    /// new center.
+    lfo_written: [f32; CHANNEL_PARAM_LOCK_CAPACITY],
+    /// Sum of every enabled route's output for the current sample.
+    lfo_sum: [f32; CHANNEL_PARAM_LOCK_CAPACITY],
+    /// One bit per parameter currently modulated around `lfo_base`.
+    lfo_active: u32,
+    /// One bit per parameter an enabled route touched this sample.
+    lfo_touched: u32,
 }
 
 impl VoiceStrip {
@@ -1008,7 +1016,89 @@ impl VoiceStrip {
             trigger_velocity: AtomicU32::new(1.0_f32.to_bits()),
             saved_global_freq: None,
             param_locks: [None; CHANNEL_PARAM_LOCK_CAPACITY],
+            lfo_base: [0.0; CHANNEL_PARAM_LOCK_CAPACITY],
+            lfo_written: [0.0; CHANNEL_PARAM_LOCK_CAPACITY],
+            lfo_sum: [0.0; CHANNEL_PARAM_LOCK_CAPACITY],
+            lfo_active: 0,
+            lfo_touched: 0,
         }
+    }
+
+    /// Add one route's output to this sample's modulation of `param`.
+    fn add_lfo_modulation(&mut self, param: u32, modulation: f32) {
+        let Some(sum) = self.lfo_sum.get_mut(param as usize) else {
+            return;
+        };
+        let bit = 1 << param;
+        if self.lfo_touched & bit == 0 {
+            self.lfo_touched |= bit;
+            *sum = 0.0;
+        }
+        *sum += modulation;
+    }
+
+    /// Write this sample's LFO modulation around each parameter's center, and
+    /// return parameters no route touched to their center.
+    ///
+    /// The center is whatever was last written by anything other than the LFOs
+    /// (host, lock, blend, macro), so moving the knob moves the sweep. A write
+    /// of exactly the value the LFOs last wrote can't be told apart and leaves
+    /// the center where it was.
+    fn apply_lfo_modulation(&mut self) {
+        let stale = self.lfo_active & !self.lfo_touched;
+        for param in BitIter(stale) {
+            // Keep a value written since the last LFO tick; otherwise restore.
+            let current = self.instrument.get_param(param);
+            if (current - self.lfo_written[param as usize]).abs() <= LFO_WRITE_EPSILON {
+                self.instrument
+                    .set_param(param, self.lfo_base[param as usize]);
+            }
+        }
+        self.lfo_active &= !stale;
+
+        for param in BitIter(self.lfo_touched) {
+            let i = param as usize;
+            let sum = self.lfo_sum[i];
+            match self.instrument.lfo_target(param) {
+                LfoTarget::Centered => {}
+                LfoTarget::Mode => {
+                    // Modes have no meaningful center: -1..1 picks mode 0..2.
+                    self.instrument.set_param(param, sum.clamp(-1.0, 1.0) + 1.0);
+                    continue;
+                }
+                LfoTarget::None => continue,
+            }
+            let current = self.instrument.get_param(param);
+            if !current.is_finite() {
+                continue;
+            }
+            let bit = 1 << param;
+            if self.lfo_active & bit == 0
+                || (current - self.lfo_written[i]).abs() > LFO_WRITE_EPSILON
+            {
+                self.lfo_base[i] = current;
+            }
+            self.instrument
+                .set_param(param, (self.lfo_base[i] + 0.5 * sum).clamp(0.0, 1.0));
+            self.lfo_written[i] = self.instrument.get_param(param);
+            self.lfo_active |= bit;
+        }
+        self.lfo_touched = 0;
+    }
+
+    /// The parameter's un-modulated value: its LFO center while modulated.
+    fn param_center(&self, param: u32) -> f32 {
+        if param < u32::BITS && self.lfo_active & (1 << param) != 0 {
+            self.lfo_base[param as usize]
+        } else {
+            self.instrument.get_param(param)
+        }
+    }
+
+    /// Forget LFO centers, e.g. when param indices change meaning.
+    fn reset_lfo_modulation(&mut self) {
+        self.lfo_active = 0;
+        self.lfo_touched = 0;
     }
 
     /// Blend the corner presets at (x,y) into the instrument, then re-apply
@@ -1966,7 +2056,9 @@ impl GooeyEngine {
                                     Self::freq_range_for_instrument(instr_type)
                                 {
                                     if voice.saved_global_freq.is_none() {
-                                        voice.saved_global_freq = voice.instrument.get_freq_param();
+                                        // Save the knob value, not an LFO-modulated one,
+                                        // in the same normalized form `set_param` takes.
+                                        voice.saved_global_freq = Some(voice.param_center(0));
                                     }
                                     let normalized = Self::midi_note_to_normalized_freq(
                                         midi_note, freq_min, freq_max,
@@ -2032,8 +2124,8 @@ impl GooeyEngine {
                 self.performance.clear_pending_sampler_hits();
             }
 
-            // Macros and motions run at control rate, before the LFOs so an
-            // LFO routed to the same parameter still wins.
+            // Macros and motions run at control rate, before the LFOs, so an
+            // LFO routed to the same parameter swings around the macro value.
             self.automation_frames += 1;
             if self.automation_frames >= AUTOMATION_CONTROL_INTERVAL {
                 self.tick_automation(transport_running, transport_beat);
@@ -2046,12 +2138,17 @@ impl GooeyEngine {
                     let route_count = self.lfo_routes[lfo_idx].len();
 
                     for route_idx in 0..route_count {
-                        let channel = self.lfo_routes[lfo_idx][route_idx].instrument;
-                        let param = self.lfo_routes[lfo_idx][route_idx].param;
-                        let depth = self.lfo_routes[lfo_idx][route_idx].depth;
-                        let modulation = lfo_value * depth;
-                        self.apply_modulation_by_index(channel, param, modulation);
+                        let route = self.lfo_routes[lfo_idx][route_idx];
+                        if let Some(voice) = self.voice_mut(route.instrument as usize) {
+                            voice.add_lfo_modulation(route.param, lfo_value * route.depth);
+                        }
                     }
+                }
+            }
+            // Routes to the same parameter add up, centered on its knob value.
+            for ch in 0..NUM_INSTRUMENTS {
+                if let Some(voice) = self.voice_mut(ch) {
+                    voice.apply_lfo_modulation();
                 }
             }
 
@@ -2695,13 +2792,6 @@ impl GooeyEngine {
         self.plate_reverb.reset();
     }
 
-    /// Apply LFO modulation to a channel's instrument parameter by index
-    fn apply_modulation_by_index(&mut self, channel: u32, param: u32, value: f32) {
-        if let Some(voice) = self.voice_mut(channel as usize) {
-            voice.instrument.apply_modulation(param, value);
-        }
-    }
-
     /// Calculate the target gain for an instrument based on mute/solo state
     /// Returns 1.0 (full volume) or 0.0 (silent)
     #[inline]
@@ -2725,14 +2815,13 @@ impl GooeyEngine {
         1.0
     }
 
-    /// Borrow the first voice's instrument matching the given type.
-    fn instrument_by_type(&self, instrument_type: u32) -> Option<&ChannelInstrument> {
+    /// Borrow the first voice whose instrument matches the given type.
+    fn voice_by_type(&self, instrument_type: u32) -> Option<&VoiceStrip> {
         self.voices_iter()
-            .map(|v| &v.instrument)
-            .find(|i| i.instrument_type() == instrument_type)
+            .find(|v| v.instrument.instrument_type() == instrument_type)
     }
 
-    /// Mutable counterpart to [`instrument_by_type`](Self::instrument_by_type).
+    /// Borrow the first voice's instrument matching the given type, mutably.
     fn instrument_by_type_mut(&mut self, instrument_type: u32) -> Option<&mut ChannelInstrument> {
         self.voices_iter_mut()
             .map(|v| &mut v.instrument)
@@ -3812,6 +3901,7 @@ pub unsafe extern "C" fn gooey_engine_set_channel_instrument_type(
     voice.blend_corner_presets = ChannelBlender::default_corner_preset_ids(instrument_type);
     // Param indices mean different things per instrument type.
     voice.param_locks = [None; CHANNEL_PARAM_LOCK_CAPACITY];
+    voice.reset_lfo_modulation();
     voice.saved_global_freq = None;
     if matches!(instrument_type, INSTRUMENT_RESONATOR | INSTRUMENT_TWIN_CORE) {
         voice.blend_enabled = false;
@@ -3935,8 +4025,11 @@ pub unsafe extern "C" fn gooey_engine_set_channel_param(
 /// used by `gooey_engine_set_channel_param`.
 ///
 /// Returns the locked value if the parameter is locked, otherwise the current
-/// target (e.g. the blended value). Unlike `gooey_engine_get_kick_param` and
-/// friends, this reaches any channel, not just the first of a type.
+/// target (e.g. the blended value). While an LFO modulates the parameter this
+/// is the sweep's center, not the modulated value (see
+/// `gooey_engine_get_channel_param_modulated`). Unlike
+/// `gooey_engine_get_kick_param` and friends, this reaches any channel, not
+/// just the first of a type.
 ///
 /// # Returns
 /// The parameter value, or `NaN` if `engine` is null, `channel` is out of
@@ -3958,7 +4051,28 @@ pub unsafe extern "C" fn gooey_engine_get_channel_param(
         .get(param as usize)
         .copied()
         .flatten()
-        .unwrap_or_else(|| voice.instrument.get_param(param))
+        .unwrap_or_else(|| voice.param_center(param))
+}
+
+/// Read the value a channel parameter is actually targeting, including LFO
+/// modulation, in the same normalized form as `gooey_engine_get_channel_param`.
+///
+/// # Returns
+/// The parameter value, or `NaN` if `engine` is null, `channel` is out of
+/// range, or `param` is not valid for the channel's instrument type.
+///
+/// # Safety
+/// `engine` must be a valid pointer returned by `gooey_engine_new`
+#[no_mangle]
+pub unsafe extern "C" fn gooey_engine_get_channel_param_modulated(
+    engine: *const GooeyEngine,
+    channel: u32,
+    param: u32,
+) -> f32 {
+    engine
+        .as_ref()
+        .and_then(|e| e.voice(channel as usize))
+        .map_or(f32::NAN, |voice| voice.instrument.get_param(param))
 }
 
 /// Lock a channel parameter to `value` so preset blending cannot overwrite it.
@@ -4326,10 +4440,9 @@ pub unsafe extern "C" fn gooey_engine_get_kick_param(
         return f32::NAN;
     }
     let engine = &*engine;
-    match engine.instrument_by_type(INSTRUMENT_KICK) {
-        Some(instr) => instr.get_param(param),
-        None => f32::NAN,
-    }
+    engine
+        .voice_by_type(INSTRUMENT_KICK)
+        .map_or(f32::NAN, |v| v.param_center(param))
 }
 
 /// Set a hi-hat parameter
@@ -4393,10 +4506,9 @@ pub unsafe extern "C" fn gooey_engine_get_hihat_param(
         return f32::NAN;
     }
     let engine = &*engine;
-    match engine.instrument_by_type(INSTRUMENT_HIHAT) {
-        Some(instr) => instr.get_param(param),
-        None => f32::NAN,
-    }
+    engine
+        .voice_by_type(INSTRUMENT_HIHAT)
+        .map_or(f32::NAN, |v| v.param_center(param))
 }
 
 /// Set a snare drum parameter
@@ -4472,10 +4584,9 @@ pub unsafe extern "C" fn gooey_engine_get_snare_param(
         return f32::NAN;
     }
     let engine = &*engine;
-    match engine.instrument_by_type(INSTRUMENT_SNARE) {
-        Some(instr) => instr.get_param(param),
-        None => f32::NAN,
-    }
+    engine
+        .voice_by_type(INSTRUMENT_SNARE)
+        .map_or(f32::NAN, |v| v.param_center(param))
 }
 
 /// Set a tom drum parameter
@@ -4537,10 +4648,9 @@ pub unsafe extern "C" fn gooey_engine_get_tom_param(engine: *const GooeyEngine, 
         return f32::NAN;
     }
     let engine = &*engine;
-    match engine.instrument_by_type(INSTRUMENT_TOM) {
-        Some(instr) => instr.get_param(param),
-        None => f32::NAN,
-    }
+    engine
+        .voice_by_type(INSTRUMENT_TOM)
+        .map_or(f32::NAN, |v| v.param_center(param))
 }
 
 /// Set a bass synth parameter
@@ -6761,7 +6871,9 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_timing(
 /// Set the global modulation amount for an LFO
 ///
 /// This scales the LFO's waveform amplitude before it's distributed to routes.
-/// Final modulation = (offset + waveform * amount) * route_depth
+/// Each routed parameter becomes
+/// `clamp(center + 0.5 * (offset + waveform * amount) * route_depth, 0, 1)`,
+/// where `center` is the parameter's own (knob) value.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -6808,10 +6920,10 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_amount(
 
 /// Set the center offset (DC bias) for an LFO
 ///
-/// This adds a constant value to the LFO output before distribution to routes.
-/// Final modulation = (offset + waveform * amount) * route_depth
-///
-/// Use offset to bias the modulation (e.g., offset=0.5 with amount=0.5 gives 0.0-1.0 range)
+/// This adds a constant value to the LFO output before distribution to routes,
+/// shifting the sweep away from each parameter's own value.
+/// Each routed parameter becomes
+/// `clamp(center + 0.5 * (offset + waveform * amount) * route_depth, 0, 1)`.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
@@ -6858,15 +6970,22 @@ pub unsafe extern "C" fn gooey_engine_get_lfo_offset(
 
 /// Add a route from an LFO to a channel parameter
 ///
-/// Each LFO can have multiple routes to different parameters.
-/// Final modulation applied to target = (offset + sine * amount) * depth
+/// Each LFO can have multiple routes to different parameters. The LFO swings
+/// the parameter around its own value (the center), so setting the parameter
+/// while it is routed (`gooey_engine_set_channel_param`, a param lock, a blend,
+/// a macro) moves the center of the sweep:
+/// `clamp(center + 0.5 * (offset + waveform * amount) * depth, 0, 1)`.
+/// Several routes to one parameter add together. Parameter getters return the
+/// center, not the modulated value. When the last route to a parameter is
+/// removed or its LFO disabled, the parameter returns to its center.
 ///
 /// # Arguments
 /// * `engine` - Pointer to a GooeyEngine
 /// * `lfo_index` - LFO index (0-7)
 /// * `instrument` - Target channel slot index (0–4), independent of its type
 /// * `param` - Target parameter index (KICK_PARAM_FREQUENCY, etc.)
-/// * `depth` - Per-route depth (0.0 to 1.0) - scales the LFO output for this target
+/// * `depth` - Per-route depth (0.0 to 1.0). At 1.0 a full-amount LFO sweeps
+///   ±0.5 of the parameter's normalized range.
 ///
 /// # Returns
 /// A route ID that can be used to remove this specific route, or LFO_INVALID on error
