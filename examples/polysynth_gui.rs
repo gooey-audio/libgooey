@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use glfw::{Action, Context, GlfwReceiver, Key, Modifiers, WindowEvent};
 
+use gooey::effects::{TranceGate, TranceGateConfig, TranceGatePattern, TRANCE_GATE_PATTERN_COUNT};
 use gooey::engine::{Engine, EngineOutput, Instrument};
 use gooey::instruments::{
     PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, POLY_MOD_ROUTE_COUNT,
@@ -27,8 +28,11 @@ use gooey::instruments::{
 use gooey::StereoFrame;
 
 const SAMPLE_RATE: f32 = 44_100.0;
+const AUDITION_BPM: f32 = 120.0;
 const SCOPE_CAPACITY: usize = 2_048;
-const PAGE_COUNT: usize = 6;
+const PAGE_COUNT: usize = 7;
+const GATE_PAGE: usize = 5;
+const MOD_PAGE: usize = 6;
 
 const PARAM_NAMES: [&str; POLY_PARAM_COUNT as usize] = [
     "Osc A waveform",
@@ -106,6 +110,7 @@ const PAGE_NAMES: [&str; PAGE_COUNT] = [
     "Pitch envelope",
     "Filter",
     "Expression",
+    "Trance gate",
     "Mod matrix",
 ];
 const PRESET_NAMES: [&str; 5] = ["Default", "Pad", "Pluck", "Keys", "Strings"];
@@ -121,17 +126,32 @@ fn page_params(page: usize) -> &'static [u32] {
     }
 }
 
-fn factory_presets() -> [PolySynthConfig; 5] {
+#[derive(Clone, Copy)]
+struct LabPreset {
+    synth: PolySynthConfig,
+    gate: TranceGateConfig,
+}
+
+impl LabPreset {
+    const fn new(synth: PolySynthConfig) -> Self {
+        Self {
+            synth,
+            gate: TranceGateConfig::off(),
+        }
+    }
+}
+
+fn factory_presets() -> [LabPreset; 5] {
     [
-        PolySynthConfig::default(),
-        PolySynthConfig::pad(),
-        PolySynthConfig::pluck(),
-        PolySynthConfig::keys(),
-        PolySynthConfig::strings(),
+        LabPreset::new(PolySynthConfig::default()),
+        LabPreset::new(PolySynthConfig::pad()),
+        LabPreset::new(PolySynthConfig::pluck()),
+        LabPreset::new(PolySynthConfig::keys()),
+        LabPreset::new(PolySynthConfig::strings()),
     ]
 }
 
-fn factory_preset(index: usize) -> PolySynthConfig {
+fn factory_preset(index: usize) -> LabPreset {
     factory_presets()[index.min(PRESET_NAMES.len() - 1)]
 }
 
@@ -184,6 +204,7 @@ impl StereoScope {
 
 struct SharedLabSynth {
     synth: Arc<Mutex<PolySynth>>,
+    gate: Arc<Mutex<TranceGate>>,
     scope: Arc<StereoScope>,
 }
 
@@ -197,12 +218,24 @@ impl Instrument for SharedLabSynth {
 
     fn tick(&mut self, current_time: f64) -> f32 {
         let sample = self.synth.lock().unwrap().tick(current_time);
+        let sample = self.gate.lock().unwrap().process(
+            sample,
+            current_time * AUDITION_BPM as f64 / 60.0,
+            AUDITION_BPM,
+            true,
+        );
         self.scope.push(StereoFrame::mono(sample));
         sample
     }
 
     fn tick_stereo(&mut self, current_time: f64) -> Option<StereoFrame> {
         let frame = self.synth.lock().unwrap().tick_frame(current_time);
+        let frame = self.gate.lock().unwrap().process_stereo(
+            frame,
+            current_time * AUDITION_BPM as f64 / 60.0,
+            AUDITION_BPM,
+            true,
+        );
         self.scope.push(frame);
         Some(frame)
     }
@@ -259,7 +292,7 @@ struct LabState {
     velocity: f32,
     octave: i32,
     preset: usize,
-    presets: [PolySynthConfig; 5],
+    presets: [LabPreset; 5],
     held_keys: Vec<(Key, Vec<u8>)>,
 }
 
@@ -278,8 +311,10 @@ impl LabState {
     }
 
     fn item_count(&self) -> usize {
-        if self.page == PAGE_COUNT - 1 {
+        if self.page == MOD_PAGE {
             POLY_MOD_ROUTE_COUNT
+        } else if self.page == GATE_PAGE {
+            3
         } else {
             page_params(self.page).len()
         }
@@ -301,12 +336,42 @@ impl LabState {
 }
 
 impl LabState {
-    fn edit_selected(&mut self, synth: &mut PolySynth, direction: f32, coarse: bool) {
+    fn edit_selected(
+        &mut self,
+        synth: &mut PolySynth,
+        gate: &mut TranceGate,
+        direction: f32,
+        coarse: bool,
+    ) {
         if let Some(param) = self.selected_param() {
             let step = if coarse { 0.05 } else { 0.01 };
             let value = synth.param(param).unwrap_or(0.5) + direction * step;
             synth.set_param(param, value);
-            self.presets[self.preset].set_param(param, value);
+            self.presets[self.preset].synth.set_param(param, value);
+            return;
+        }
+
+        if self.page == GATE_PAGE {
+            let mut config = self.presets[self.preset].gate;
+            match self.selected {
+                0 => {
+                    let id = (config.pattern.id() as i32 + direction.signum() as i32)
+                        .rem_euclid(TRANCE_GATE_PATTERN_COUNT as i32)
+                        as u32;
+                    config.pattern = TranceGatePattern::from_id(id).unwrap();
+                }
+                1 => {
+                    let step = if coarse { 0.1 } else { 0.02 };
+                    config.depth = (config.depth + direction * step).clamp(0.0, 1.0);
+                }
+                2 => {
+                    let step = if coarse { 0.1 } else { 0.02 };
+                    config.smoothing = (config.smoothing + direction * step).clamp(0.0, 1.0);
+                }
+                _ => return,
+            }
+            self.presets[self.preset].gate = config;
+            gate.set_config(config);
             return;
         }
 
@@ -339,13 +404,37 @@ impl LabState {
             }
         }
         synth.set_mod_route(self.selected, route);
-        self.presets[self.preset].set_mod_route(self.selected, route);
+        self.presets[self.preset]
+            .synth
+            .set_mod_route(self.selected, route);
     }
 
-    fn set_selected_absolute(&mut self, synth: &mut PolySynth, normalized: f32) {
+    fn set_selected_absolute(
+        &mut self,
+        synth: &mut PolySynth,
+        gate: &mut TranceGate,
+        normalized: f32,
+    ) {
         if let Some(param) = self.selected_param() {
             synth.set_param(param, normalized);
-            self.presets[self.preset].set_param(param, normalized);
+            self.presets[self.preset].synth.set_param(param, normalized);
+            return;
+        }
+
+        if self.page == GATE_PAGE {
+            let mut config = self.presets[self.preset].gate;
+            match self.selected {
+                0 => {
+                    let id = (normalized.clamp(0.0, 1.0) * (TRANCE_GATE_PATTERN_COUNT - 1) as f32)
+                        .round() as u32;
+                    config.pattern = TranceGatePattern::from_id(id).unwrap();
+                }
+                1 => config.depth = normalized.clamp(0.0, 1.0),
+                2 => config.smoothing = normalized.clamp(0.0, 1.0),
+                _ => return,
+            }
+            self.presets[self.preset].gate = config;
+            gate.set_config(config);
             return;
         }
 
@@ -370,34 +459,50 @@ impl LabState {
             RouteField::KeyScale => route.key_scale = normalized.clamp(0.0, 1.0) * 2.0 - 1.0,
         }
         synth.set_mod_route(self.selected, route);
-        self.presets[self.preset].set_mod_route(self.selected, route);
+        self.presets[self.preset]
+            .synth
+            .set_mod_route(self.selected, route);
     }
 
-    fn reset_selected(&mut self, synth: &mut PolySynth) {
+    fn reset_selected(&mut self, synth: &mut PolySynth, gate: &mut TranceGate) {
         let factory = factory_preset(self.preset);
         if let Some(param) = self.selected_param() {
-            let value = factory.param(param).unwrap();
+            let value = factory.synth.param(param).unwrap();
             synth.set_param(param, value);
-            self.presets[self.preset].set_param(param, value);
+            self.presets[self.preset].synth.set_param(param, value);
+        } else if self.page == GATE_PAGE {
+            let mut config = self.presets[self.preset].gate;
+            match self.selected {
+                0 => config.pattern = factory.gate.pattern,
+                1 => config.depth = factory.gate.depth,
+                2 => config.smoothing = factory.gate.smoothing,
+                _ => return,
+            }
+            self.presets[self.preset].gate = config;
+            gate.set_config(config);
         } else {
-            let route = factory.mod_routes[self.selected];
+            let route = factory.synth.mod_routes[self.selected];
             synth.set_mod_route(self.selected, route);
-            self.presets[self.preset].set_mod_route(self.selected, route);
+            self.presets[self.preset]
+                .synth
+                .set_mod_route(self.selected, route);
         }
     }
 
-    fn reset_preset(&mut self, synth: &mut PolySynth) {
+    fn reset_preset(&mut self, synth: &mut PolySynth, gate: &mut TranceGate) {
         self.panic(synth);
         let factory = factory_preset(self.preset);
         self.presets[self.preset] = factory;
-        synth.set_config(factory);
+        synth.set_config(factory.synth);
+        gate.set_config(factory.gate);
         synth.snap_params();
     }
 
-    fn select_preset(&mut self, synth: &mut PolySynth, preset: usize) {
+    fn select_preset(&mut self, synth: &mut PolySynth, gate: &mut TranceGate, preset: usize) {
         self.panic(synth);
         self.preset = preset.min(PRESET_NAMES.len() - 1);
-        synth.set_config(self.presets[self.preset]);
+        synth.set_config(self.presets[self.preset].synth);
+        gate.set_config(self.presets[self.preset].gate);
         synth.snap_params();
     }
 
@@ -433,6 +538,14 @@ impl LabState {
                 PARAM_NAMES[param as usize],
                 synth.param(param).unwrap_or(f32::NAN)
             )
+        } else if self.page == GATE_PAGE {
+            let config = self.presets[self.preset].gate;
+            match self.selected {
+                0 => format!("Pattern = {:?}", config.pattern),
+                1 => format!("Depth = {:.3}", config.depth),
+                2 => format!("Smoothing = {:.3}", config.smoothing),
+                _ => String::new(),
+            }
         } else {
             let route = synth
                 .mod_route(self.selected)
@@ -498,6 +611,7 @@ fn handle_key(
     window: &mut glfw::PWindow,
     state: &mut LabState,
     synth: &Arc<Mutex<PolySynth>>,
+    gate: &Arc<Mutex<TranceGate>>,
     key: Key,
     action: Action,
     modifiers: Modifiers,
@@ -546,25 +660,47 @@ fn handle_key(
         Key::Tab if press => state.select_page(if coarse { -1 } else { 1 }),
         Key::Up if press || action == Action::Repeat => state.select_item(-1),
         Key::Down if press || action == Action::Repeat => state.select_item(1),
-        Key::Comma if press && state.page == PAGE_COUNT - 1 => {
+        Key::Comma if press && state.page == MOD_PAGE => {
             state.route_field = state.route_field.shifted(-1);
         }
-        Key::Period if press && state.page == PAGE_COUNT - 1 => {
+        Key::Period if press && state.page == MOD_PAGE => {
             state.route_field = state.route_field.shifted(1);
         }
         Key::Left | Key::Right if press || action == Action::Repeat => {
-            let toggled_field = state.page == PAGE_COUNT - 1
+            let toggled_field = state.page == MOD_PAGE
                 && matches!(state.route_field, RouteField::Enabled | RouteField::Source);
             if !toggled_field || press {
                 let direction = if key == Key::Left { -1.0 } else { 1.0 };
-                state.edit_selected(&mut synth.lock().unwrap(), direction, coarse);
+                let mut synth = synth.lock().unwrap();
+                let mut gate = gate.lock().unwrap();
+                state.edit_selected(&mut synth, &mut gate, direction, coarse);
             }
         }
-        Key::Home if press => state.set_selected_absolute(&mut synth.lock().unwrap(), 0.0),
-        Key::Backslash if press => state.set_selected_absolute(&mut synth.lock().unwrap(), 0.5),
-        Key::End if press => state.set_selected_absolute(&mut synth.lock().unwrap(), 1.0),
-        Key::Delete if press => state.reset_selected(&mut synth.lock().unwrap()),
-        Key::Backspace if press => state.reset_preset(&mut synth.lock().unwrap()),
+        Key::Home if press => {
+            let mut synth = synth.lock().unwrap();
+            let mut gate = gate.lock().unwrap();
+            state.set_selected_absolute(&mut synth, &mut gate, 0.0);
+        }
+        Key::Backslash if press => {
+            let mut synth = synth.lock().unwrap();
+            let mut gate = gate.lock().unwrap();
+            state.set_selected_absolute(&mut synth, &mut gate, 0.5);
+        }
+        Key::End if press => {
+            let mut synth = synth.lock().unwrap();
+            let mut gate = gate.lock().unwrap();
+            state.set_selected_absolute(&mut synth, &mut gate, 1.0);
+        }
+        Key::Delete if press => {
+            let mut synth = synth.lock().unwrap();
+            let mut gate = gate.lock().unwrap();
+            state.reset_selected(&mut synth, &mut gate);
+        }
+        Key::Backspace if press => {
+            let mut synth = synth.lock().unwrap();
+            let mut gate = gate.lock().unwrap();
+            state.reset_preset(&mut synth, &mut gate);
+        }
         Key::Minus if press || action == Action::Repeat => {
             state.velocity = (state.velocity - if coarse { 0.1 } else { 0.02 }).max(0.0);
         }
@@ -573,11 +709,19 @@ fn handle_key(
         }
         Key::LeftBracket if press => state.octave = (state.octave - 1).max(0),
         Key::RightBracket if press => state.octave = (state.octave + 1).min(8),
-        Key::F1 if press => state.select_preset(&mut synth.lock().unwrap(), 0),
-        Key::F2 if press => state.select_preset(&mut synth.lock().unwrap(), 1),
-        Key::F3 if press => state.select_preset(&mut synth.lock().unwrap(), 2),
-        Key::F4 if press => state.select_preset(&mut synth.lock().unwrap(), 3),
-        Key::F5 if press => state.select_preset(&mut synth.lock().unwrap(), 4),
+        Key::F1 | Key::F2 | Key::F3 | Key::F4 | Key::F5 if press => {
+            let preset = match key {
+                Key::F1 => 0,
+                Key::F2 => 1,
+                Key::F3 => 2,
+                Key::F4 => 3,
+                Key::F5 => 4,
+                _ => unreachable!(),
+            };
+            let mut synth = synth.lock().unwrap();
+            let mut gate = gate.lock().unwrap();
+            state.select_preset(&mut synth, &mut gate, preset);
+        }
         _ => {}
     }
 }
@@ -834,11 +978,20 @@ impl LabWindow {
     fn render(&mut self, state: &LabState, synth: &Arc<Mutex<PolySynth>>, scope: &StereoScope) {
         let (title, values, routes) = {
             let synth = synth.lock().unwrap();
-            let values = page_params(state.page)
-                .iter()
-                .map(|param| synth.param(*param).unwrap_or(0.0))
-                .collect::<Vec<_>>();
-            let routes = if state.page == PAGE_COUNT - 1 {
+            let values = if state.page == GATE_PAGE {
+                let gate = state.presets[state.preset].gate;
+                vec![
+                    gate.pattern.id() as f32 / (TRANCE_GATE_PATTERN_COUNT - 1) as f32,
+                    gate.depth,
+                    gate.smoothing,
+                ]
+            } else {
+                page_params(state.page)
+                    .iter()
+                    .map(|param| synth.param(*param).unwrap_or(0.0))
+                    .collect::<Vec<_>>()
+            };
+            let routes = if state.page == MOD_PAGE {
                 (0..POLY_MOD_ROUTE_COUNT)
                     .filter_map(|slot| synth.mod_route(slot))
                     .collect::<Vec<_>>()
@@ -857,7 +1010,7 @@ impl LabWindow {
             gl::UseProgram(self.shader);
         }
         self.render_scope(&left, &right);
-        if state.page == PAGE_COUNT - 1 {
+        if state.page == MOD_PAGE {
             self.render_routes(state, &routes);
         } else {
             self.render_parameter_bars(state, &values);
@@ -984,18 +1137,21 @@ fn print_help() {
     println!("Cyan/magenta are left/right scope traces; the orange meter is side energy.");
     println!("On the matrix page, green/red is depth, blue is key scale, and the thin");
     println!("orange/purple strip is curve plus velocity/key source.");
+    println!("The gate page auditions its per-preset pattern at {AUDITION_BPM:.0} BPM.");
 }
 
 fn main() -> anyhow::Result<()> {
     print_help();
 
     let synth = Arc::new(Mutex::new(PolySynth::new(SAMPLE_RATE)));
+    let gate = Arc::new(Mutex::new(TranceGate::new(SAMPLE_RATE)));
     let scope = Arc::new(StereoScope::new(SCOPE_CAPACITY));
     let mut engine = Engine::new(SAMPLE_RATE);
     engine.add_instrument(
         "polysynth",
         Box::new(SharedLabSynth {
             synth: Arc::clone(&synth),
+            gate: Arc::clone(&gate),
             scope: Arc::clone(&scope),
         }),
     );
@@ -1013,7 +1169,15 @@ fn main() -> anyhow::Result<()> {
         for event in ui.poll_events() {
             match event {
                 WindowEvent::Key(key, _, action, modifiers) => {
-                    handle_key(&mut ui.window, &mut state, &synth, key, action, modifiers);
+                    handle_key(
+                        &mut ui.window,
+                        &mut state,
+                        &synth,
+                        &gate,
+                        key,
+                        action,
+                        modifiers,
+                    );
                 }
                 WindowEvent::FramebufferSize(width, height) => {
                     ui.width = width.max(1);
@@ -1038,7 +1202,7 @@ mod tests {
 
     #[test]
     fn parameter_pages_cover_every_public_parameter_once() {
-        let mut params = (0..PAGE_COUNT - 1)
+        let mut params = (0..GATE_PAGE)
             .flat_map(page_params)
             .copied()
             .collect::<Vec<_>>();
@@ -1085,10 +1249,31 @@ mod tests {
     fn page_and_matrix_navigation_wraps() {
         let mut state = LabState::new();
         state.select_page(-1);
-        assert_eq!(state.page, PAGE_COUNT - 1);
+        assert_eq!(state.page, MOD_PAGE);
         state.select_item(-1);
         assert_eq!(state.selected, POLY_MOD_ROUTE_COUNT - 1);
         assert_eq!(RouteField::Enabled.shifted(-1), RouteField::KeyScale);
         assert_eq!(RouteField::KeyScale.shifted(1), RouteField::Enabled);
+    }
+
+    #[test]
+    fn gate_edits_follow_local_presets() {
+        let mut state = LabState::new();
+        let mut synth = PolySynth::new(SAMPLE_RATE);
+        let mut gate = TranceGate::new(SAMPLE_RATE);
+        state.page = GATE_PAGE;
+        state.selected = 0;
+
+        state.edit_selected(&mut synth, &mut gate, 1.0, false);
+        assert_eq!(
+            state.presets[0].gate.pattern,
+            TranceGatePattern::StraightEighths
+        );
+        assert_eq!(gate.config().pattern, TranceGatePattern::StraightEighths);
+
+        state.select_preset(&mut synth, &mut gate, 1);
+        assert_eq!(gate.config().pattern, TranceGatePattern::Off);
+        state.select_preset(&mut synth, &mut gate, 0);
+        assert_eq!(gate.config().pattern, TranceGatePattern::StraightEighths);
     }
 }

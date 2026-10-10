@@ -8,6 +8,7 @@ pub mod plate_reverb;
 pub mod reverb;
 pub mod saturation;
 pub mod tilt_filter;
+pub mod trance_gate;
 pub mod waveshaper;
 
 pub use self::compressor::*;
@@ -20,6 +21,7 @@ pub use self::plate_reverb::*;
 pub use self::reverb::*;
 pub use self::saturation::*;
 pub use self::tilt_filter::*;
+pub use self::trance_gate::*;
 pub use self::waveshaper::*;
 
 use crate::frame::StereoFrame;
