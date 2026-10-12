@@ -12736,9 +12736,10 @@ impl GooeyEngine {
 
         // Install accepted controls before resetting offline DSP history.
         self.apply_live_control_commands();
-        for voice in self.voices_iter() {
+        for voice in self.voices_iter_mut() {
             voice.effects.reset();
         }
+        self.retire_live_control_racks();
         // Reset engine to a clean state
         self.current_time = 0.0;
 

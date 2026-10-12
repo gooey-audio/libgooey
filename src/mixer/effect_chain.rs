@@ -448,11 +448,11 @@ impl LiveEffectRack {
         }
     }
 
-    pub(crate) fn reset(&self) {
+    /// Offline rendering starts directly on the requested rack, independent of
+    /// any live crossfade progress. Keep old storage for normal off-thread retirement.
+    pub(crate) fn reset(&mut self) {
+        self.remaining = 0;
         self.chain.reset();
-        if let Some(old) = &self.old {
-            old.reset();
-        }
     }
 }
 

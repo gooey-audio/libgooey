@@ -14,6 +14,9 @@ Ripple users can distort one kick or delay only a hi-hat without processing the 
 - [x] (2026-10-06) Add tempo, offline bounce, history-preserving parameter, concurrent rendering, and complete-transition allocation coverage; 978 Rust tests pass, two existing tests are ignored.
 - [x] (2026-10-06) Complete library/build validation and open linked libgooey #275 and Ripple #130 PRs. Ripple remains draft pending a library release and manual AUv3 host checks.
 
+- [x] (2026-10-12) Merge upstream LFO APIs and implement review fixes: settle rack transitions before bounce; smooth feedback drive and bypass activation. Focused tests pass (649 passed, two ignored).
+- [x] (2026-10-12) Full updated Rust regression: 1,027 passed, two existing ignored tests; C consumer and device/universal simulator/universal Mac archive builds pass. Review fixes prepared for push.
+
 ## Surprises & Discoveries
 
 The engine already provides a lock-free live-control endpoint, but its rack descriptor validator originally accepts only low-pass, delay, and spring reverb. The reusable `ChannelEffect` DSP already handles saturation, feedback waveshaping, and plate reverb. The extension can reuse that DSP and broaden the producer's validator without implementing new synthesis.
@@ -21,6 +24,8 @@ The engine already provides a lock-free live-control endpoint, but its rack desc
 The existing graph routes the complete drum kit as one source. Giving each drum a graph track would change the source-routing contract. A rack on `VoiceStrip` isolates the voices while preserving the existing drum-kit submix and legacy APIs.
 
 The generated `include/gooey.h` is intentionally gitignored by this repository. It is regenerated during Cargo builds and included in the XCFramework/release artifact; the C consumer test verifies its new declarations against the compiled library.
+
+Review found that resetting delay/filter history alone left the voice rack crossfade active at export start. Offline reset now sets the transition count to zero while keeping obsolete storage in the existing retirement path. The regression compares queued, partially rendered, and fully settled racks using identical saturation defaults, isolating rack crossfading from saturation's own parameter ramp.
 
 ## Decision Log
 
@@ -31,6 +36,8 @@ Decision: Add commands to the existing live-control endpoint instead of exposing
 Decision: Keep empty-rack rendering's original arithmetic. Rationale: multiplying a panned stereo frame can slightly change floating-point rounding; an empty rack should preserve the previous output exactly. Date/Author: 2026-10-06, Codex.
 
 Decision: Put insert effects before channel gain and mute/solo. Rationale: gain should control the wet signal and mute must silence tails. Muted voices still tick their racks, so DSP histories decay naturally. Date/Author: 2026-10-06, Codex.
+
+Decision: Smooth feedback drive and its bypass activation at the engine sample rate using existing 15 ms smoothers; parameter getters still report the accepted target. Reset snaps these smoothers for repeatable offline initialization, and bypassed processing advances them. Rationale: ramping the drive alone still changes abruptly at the drive=1 bypass boundary. Date/Author: 2026-10-12, Codex.
 
 ## Outcomes & Retrospective
 
@@ -107,3 +114,5 @@ Revision note: Initial implementation and passing targeted tests recorded on 202
 Revision note: Full regression suite (978 passed, two ignored), complete-transition allocation coverage, and the C consumer have been verified. Generated headers follow the repository's existing artifact policy.
 
 Revision note: Linked PRs and downstream validation recorded on 2026-10-06. The dependency source pin identifies the tested code commit before this documentation-only revision.
+
+Revision note: Review fixes on 2026-10-12 remove offline rack crossfades while retaining off-thread retirement and introduce sample-rate-aware feedback-drive and bypass ramps. The full suite initially exposed the existing 10 ms thread-start assumption in `engine_free_waits_for_the_control_handle_to_detach` during concurrent compilation; the focused run and subsequent complete run both pass without modifying that unrelated test.

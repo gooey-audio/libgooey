@@ -345,3 +345,47 @@ fn offline_bounce_includes_voice_effects_and_resets_preexisting_echoes() {
         gooey_engine_free(engine);
     }
 }
+
+#[test]
+fn offline_bounce_starts_with_current_rack_regardless_of_live_crossfade_progress() {
+    unsafe {
+        // Use the rack's native parameter defaults to isolate rack crossfading
+        // from saturation's separate parameter smoothers.
+        let mut bounces = Vec::new();
+        for live_frames in [0, 128, 1024] {
+            let engine = gooey_engine_new(SR);
+            let control = gooey_engine_live_control_new(engine);
+            assert_ne!(
+                install(
+                    control,
+                    0,
+                    EFFECT_SATURATION,
+                    &[(SATURATION_PARAM_DRIVE, 0.3), (SATURATION_PARAM_MIX, 0.5)]
+                ),
+                0
+            );
+            if live_frames > 0 {
+                render(engine, live_frames);
+            }
+            gooey_engine_sequencer_set_instrument_step(engine, 0, 0, true);
+            let mut count = 0;
+            let buffer = gooey_engine_bounce_to_buffer(engine, 1, &mut count);
+            assert!(!buffer.is_null());
+            bounces.push(std::slice::from_raw_parts(buffer, count as usize).to_vec());
+            gooey_engine_free_buffer(buffer, count);
+            // Offline settlement still permits producer retirement and replacement.
+            assert_ne!(install(control, 0, EFFECT_DELAY, &[]), 0);
+            render(engine, 1024);
+            gooey_live_control_free(control);
+            gooey_engine_free(engine);
+        }
+        assert!(
+            bounces[0] == bounces[2],
+            "queued replacement must be fully wet from the first sample"
+        );
+        assert!(
+            bounces[1] == bounces[2],
+            "offline output must not depend on live transition progress"
+        );
+    }
+}
