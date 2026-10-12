@@ -17,6 +17,7 @@ visualization = ["glfw", "gl", "rustfft", "eframe"]
 midi = ["midir"]  # MIDI input support for examples
 bounce = ["hound"]  # Offline audio bounce/export to WAV
 plots = ["rustfft", "plotters", "hound"]  # Offline aliasing spectrum/spectrogram PNGs
+plate-hq = []  # Plate voice with 64 modes instead of 32
 
 [profile.release]
 panic = "unwind"
@@ -44,6 +45,10 @@ required-features = ["native", "crossterm"]
 
 [[example]]
 name = "reso_kick"
+required-features = ["native", "crossterm"]
+
+[[example]]
+name = "plate"
 required-features = ["native", "crossterm"]
 
 [[example]]

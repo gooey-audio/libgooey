@@ -12,6 +12,7 @@ pub mod multisample_pack;
 #[cfg(feature = "bounce")]
 pub mod multisample_prep;
 pub mod percussion_engine;
+pub mod plate;
 pub mod poly_synth;
 pub(crate) mod poly_synth_control;
 pub mod reso_kick;
@@ -36,6 +37,7 @@ pub use self::multisample_pack::*;
 #[cfg(feature = "bounce")]
 pub use self::multisample_prep::*;
 pub use self::percussion_engine::*;
+pub use self::plate::*;
 pub use self::poly_synth::*;
 pub use self::reso_kick::*;
 pub use self::resonator_voice::*;
