@@ -146,6 +146,13 @@ impl Resonator {
         self.prev_band = 0.0;
     }
 
+    /// Approximate ringing amplitude. Near resonance the two integrator
+    /// states carry the band-pass and low-pass taps in quadrature, so their
+    /// magnitude tracks the envelope without a follower.
+    pub fn amplitude(&self) -> f32 {
+        self.s1.hypot(self.s2) as f32
+    }
+
     /// Return true once both integrator states are below the audible floor.
     pub fn is_quiet(&self) -> bool {
         self.s1.abs() + self.s2.abs() < QUIET_THRESHOLD

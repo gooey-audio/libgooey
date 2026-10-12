@@ -310,16 +310,22 @@ impl PlateConfig {
     }
 }
 
-/// Weight of each mode at a 0 (centre) to 1 (edge) position, using the 1-D
-/// stand-in `sin(pi * p * (k + 1))`, normalised to unit RMS over the bank.
+/// Un-normalised shape of mode `mode` at a 0 (centre) to 1 (edge) position,
+/// using the 1-D stand-in `sin(pi * p * (k + 1))`. Exposed so visualisations
+/// draw the same shapes the voice strikes and picks up.
 ///
 /// Centre maps to p = 0.5, which silences every even-numbered shape for a
 /// hollow centre hit. The edge maps to p = 0.03 rather than 0, which would
 /// silence every mode.
+pub fn plate_mode_shape(mode: usize, position: f32) -> f32 {
+    let p = 0.5 - 0.47 * position.clamp(0.0, 1.0);
+    (PI * p * (mode + 1) as f32).sin()
+}
+
+/// Weight of each mode at a 0 (centre) to 1 (edge) position, normalised to
+/// unit RMS over the bank.
 fn position_weights(pos: f32) -> [f32; PLATE_MAX_MODES] {
-    let p = 0.5 - 0.47 * pos.clamp(0.0, 1.0);
-    let mut weights: [f32; PLATE_MAX_MODES] =
-        std::array::from_fn(|k| (PI * p * (k + 1) as f32).sin());
+    let mut weights: [f32; PLATE_MAX_MODES] = std::array::from_fn(|k| plate_mode_shape(k, pos));
     let mean_square = weights.iter().map(|w| w * w).sum::<f32>() / PLATE_MAX_MODES as f32;
     let norm = 1.0 / mean_square.sqrt().max(1.0e-3);
     for w in &mut weights {
@@ -337,9 +343,30 @@ fn cascade_cubic(x: f32) -> f32 {
     y * y * y
 }
 
+/// Read-only view of one mode, for visualisation and metering.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlateModeState {
+    /// Current frequency in Hz, including the tension glide.
+    pub frequency_hz: f32,
+    /// Ratio to the fundamental after the geometry stretch.
+    pub ratio: f32,
+    /// Approximate ringing amplitude (magnitude of the resonator state).
+    pub amplitude: f32,
+    /// Strike weight latched at the last trigger.
+    pub strike_weight: f32,
+    /// Current pickup weight.
+    pub pickup_weight: f32,
+    /// Output gain: roll-off times the Nyquist fade. 0 for disabled modes.
+    pub gain: f32,
+    /// Cascade band, 0 (lowest) to 3.
+    pub band: u8,
+}
+
 pub struct PlateVoice {
     sample_rate: f32,
     modes: [Resonator; PLATE_MAX_MODES],
+    /// Mode frequencies from the last control update, for metering.
+    mode_freq: [f32; PLATE_MAX_MODES],
     /// Material table, latched on trigger.
     ratios: [f32; PLATE_MAX_MODES],
     /// Strike weights, latched on trigger.
@@ -397,6 +424,7 @@ impl PlateVoice {
         let mut voice = Self {
             sample_rate: sr,
             modes: std::array::from_fn(|_| Resonator::new(sr)),
+            mode_freq: [0.0; PLATE_MAX_MODES],
             ratios: config.material.ratios(config.seed),
             w_strike: position_weights(config.strike_pos),
             w_pickup: position_weights(config.pickup_pos),
@@ -563,6 +591,25 @@ impl PlateVoice {
         self.cascade_env.iter().fold(0.0, |max, env| max.max(*env))
     }
 
+    /// Snapshot of every mode's frequency, amplitude and weights. Intended
+    /// for UI threads; it copies a few hundred bytes and never allocates.
+    pub fn mode_states(&self) -> [PlateModeState; PLATE_MAX_MODES] {
+        let stretch = 1.0 + self.params[1].get();
+        std::array::from_fn(|k| PlateModeState {
+            frequency_hz: self.mode_freq[k],
+            ratio: self.ratios[k].powf(stretch),
+            amplitude: if self.mode_enabled[k] {
+                self.modes[k].amplitude()
+            } else {
+                0.0
+            },
+            strike_weight: self.w_strike[k],
+            pickup_weight: self.w_pickup[k],
+            gain: self.mode_gain[k],
+            band: self.mode_band[k],
+        })
+    }
+
     pub fn reset(&mut self) {
         for mode in &mut self.modes {
             mode.reset();
@@ -609,6 +656,7 @@ impl PlateVoice {
         for k in 0..PLATE_MAX_MODES {
             let ratio = self.ratios[k].powf(stretch);
             let freq = f0 * ratio * glide;
+            self.mode_freq[k] = freq;
             let fade = ((fade_end - freq) / (fade_end - fade_start)).clamp(0.0, 1.0);
             if fade <= 0.0 {
                 if self.mode_enabled[k] {

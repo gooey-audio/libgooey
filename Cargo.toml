@@ -120,6 +120,10 @@ name = "resonator_voice_gui"
 required-features = ["native", "visualization"]
 
 [[example]]
+name = "plate_explorer"
+required-features = ["native", "visualization"]
+
+[[example]]
 name = "bounce"
 required-features = ["bounce"]
 
