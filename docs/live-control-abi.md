@@ -70,8 +70,11 @@ A live rack has at most eight ordered effects and supports:
 
 - `EFFECT_LOWPASS_FILTER`: cutoff `20...20000` Hz and resonance `0...0.95`;
 - `EFFECT_DELAY`: an exact `DELAY_TIMING_*` value, feedback `0...0.95`, and mix
-  `0...1`;
-- `EFFECT_REVERB`: spring decay, mix, and damping in `0...1`.
+  `0...1`, filter cutoff `20...20000` Hz, and ping-pong `0...1`;
+- `EFFECT_REVERB`: spring decay, mix, and damping in `0...1`;
+- `EFFECT_PLATE_REVERB`: decay, mix, damping, predelay, width, and size in `0...1`;
+- `EFFECT_SATURATION`: drive, warmth, and mix in `0...1`;
+- `EFFECT_FEEDBACK_WAVESHAPER`: drive `1...100`, feedback `0...0.98`, filter cutoff `200...20000` Hz, and mix `0...1`.
 
 Omitted parameters use the existing track-effect defaults: open low-pass;
 quarter-note delay with feedback/mix `0.3` and internal cutoff 8 kHz; spring
@@ -102,3 +105,20 @@ Legacy `gooey_engine_mixer_*`, `gooey_engine_track_effect_*`, layout/routing
 getters, and other direct engine APIs retain their historical host-serialized
 contract. Do not call them concurrently with render merely because a live
 control handle also exists.
+
+## Per-voice inserts
+
+`gooey_live_control_replace_channel_rack` and
+`gooey_live_control_set_channel_effect_param` use the same descriptors, limits,
+validation, generations, and retry contract as track racks. Channel indices
+address stable voice slots (0 through 3 for drums, 4 for bass), regardless of the
+synth type assigned to a slot. Only one producer may submit through the handle.
+
+Voice inserts process the panned dry signal before channel gain and mute/solo,
+then join the existing drum-kit or bass submix and master effects. Consequently
+mute silences delay/reverb tails; silent inputs still advance the rack. Empty
+racks preserve the historical output. Rack changes crossfade for 10 ms and
+retire old DSP storage off the audio thread. Scalar edits preserve effect
+history. Instrument changes and factory preset loads do not reset the rack.
+BPM updates retime voice delays, and offline bounce resets voice-rack history
+before using the same processing path.

@@ -59,6 +59,24 @@ fn applying_prepared_commands_allocates_and_deallocates_nothing_in_render() {
             ),
             0
         );
+        let channel_generation = gooey_live_control_replace_channel_rack(
+            control,
+            2,
+            effects.as_ptr(),
+            effects.len() as u32,
+        );
+        assert_ne!(channel_generation, 0);
+        assert_ne!(
+            gooey_live_control_set_channel_effect_param(
+                control,
+                2,
+                1,
+                channel_generation,
+                DELAY_PARAM_MIX,
+                0.5
+            ),
+            0
+        );
         assert_ne!(gooey_live_control_set_track_gain(control, 0, 0.7), 0);
         assert_ne!(
             gooey_live_control_set_source_trim(control, SOURCE_DRUMKIT, 1.2),
@@ -73,7 +91,10 @@ fn applying_prepared_commands_allocates_and_deallocates_nothing_in_render() {
         ALLOCATIONS.store(0, Ordering::Relaxed);
         DEALLOCATIONS.store(0, Ordering::Relaxed);
         TRACK.store(true, Ordering::SeqCst);
-        gooey_engine_render(engine, output.as_mut_ptr(), 1);
+        // Include installation, the entire crossfade, and retirement publication.
+        for _ in 0..1024 {
+            gooey_engine_render(engine, output.as_mut_ptr(), 1);
+        }
         TRACK.store(false, Ordering::SeqCst);
 
         assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);

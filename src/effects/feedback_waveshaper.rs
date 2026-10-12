@@ -7,6 +7,7 @@
 //! moderate feedback on snares adds a gritty, self-exciting tail.
 
 use crate::utils::oversampler::{Oversampler, OversamplingMode};
+use crate::utils::smoother::{SmoothedParam, DEFAULT_SMOOTH_TIME_MS};
 
 /// Threshold for flushing denormal numbers to zero
 const DENORMAL_THRESHOLD: f32 = 1e-15;
@@ -41,7 +42,8 @@ const MAX_COMPENSATION_GAIN: f32 = 3.0;
 /// 4x oversampling to reduce audible foldback.
 pub struct FeedbackWaveshaper {
     // Parameters
-    drive: f32,
+    drive: SmoothedParam,
+    drive_active: SmoothedParam,
     mix: f32,
     feedback: f32,
     sample_rate: f32,
@@ -74,7 +76,11 @@ impl FeedbackWaveshaper {
         let filter_cutoff = filter_cutoff.clamp(200.0, 20000.0);
         let mix = mix.clamp(0.0, 1.0);
         Self {
-            drive,
+            drive: SmoothedParam::new(drive, 1.0, 100.0, sample_rate, DEFAULT_SMOOTH_TIME_MS),
+            drive_active: SmoothedParam::new_normalized(
+                if drive > 1.0 { 1.0 } else { 0.0 },
+                sample_rate,
+            ),
             mix,
             feedback,
             sample_rate,
@@ -113,13 +119,16 @@ impl FeedbackWaveshaper {
             return 0.0;
         }
 
-        // Bypass if no effect
-        if self.mix <= 0.0001 || self.drive <= 1.0 {
+        // Advance even while bypassed. Ramp wet activation as well as drive,
+        // so crossing the drive=1 bypass boundary does not switch DSP abruptly.
+        let drive = self.drive.tick();
+        let mix = self.mix * self.drive_active.tick();
+        if mix <= 0.0001 {
             return input;
         }
 
         // Sum input with filtered feedback
-        let fb_input = self.drive * input + self.feedback * self.last_out;
+        let fb_input = drive * input + self.feedback * self.last_out;
 
         // Oversample only the memoryless nonlinearity. Feedback state and
         // filtering remain at the engine rate to preserve loop timing.
@@ -141,7 +150,7 @@ impl FeedbackWaveshaper {
             self.env = 0.0;
         }
 
-        let compensation = Self::gain_compensation(self.env, self.drive, self.feedback);
+        let compensation = Self::gain_compensation(self.env, drive, self.feedback);
         let compensated = shaped * compensation;
 
         // DC block the output
@@ -165,7 +174,7 @@ impl FeedbackWaveshaper {
         }
 
         // Mix dry/wet (wet signal is full-bandwidth dc_blocked, not the filtered feedback)
-        input * (1.0 - self.mix) + dc_blocked * self.mix
+        input * (1.0 - mix) + dc_blocked * mix
     }
 
     /// Reset all internal state
@@ -175,17 +184,21 @@ impl FeedbackWaveshaper {
         self.dc_x1 = 0.0;
         self.dc_y1 = 0.0;
         self.env = 0.0;
+        self.drive.snap();
+        self.drive_active.snap();
         self.oversampler.reset();
     }
 
     /// Set the drive amount (1.0-100.0)
     pub fn set_drive(&mut self, drive: f32) {
-        self.drive = drive.clamp(1.0, 100.0);
+        self.drive.set_target(drive);
+        self.drive_active
+            .set_target(if self.drive.target() > 1.0 { 1.0 } else { 0.0 });
     }
 
-    /// Get the current drive amount
+    /// Get the accepted drive target (processing ramps toward it).
     pub fn drive(&self) -> f32 {
-        self.drive
+        self.drive.target()
     }
 
     /// Set the feedback gain (0.0-0.98)
@@ -274,6 +287,39 @@ impl FeedbackWaveshaper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_drive_edits_ramp_even_while_bypassed_and_reset_snaps_to_target() {
+        for sample_rate in [44_100.0, 96_000.0] {
+            let mut ws = FeedbackWaveshaper::new(sample_rate, 1.0, 0.0, 2000.0, 1.0);
+            ws.set_drive(100.0);
+            assert_eq!(ws.drive(), 100.0, "getter reports the accepted target");
+            let first = ws.process(0.2);
+            assert!(
+                (first - 0.2).abs() < 0.01,
+                "bypass activation must also ramp: {first}"
+            );
+            assert!(ws.drive.get() > 1.0 && ws.drive.get() < 2.0);
+            let previous = ws.drive.get();
+            ws.set_mix(0.0);
+            assert_eq!(ws.process(0.2), 0.2);
+            assert!(
+                ws.drive.get() > previous,
+                "bypass must not stall the smoother"
+            );
+            ws.set_mix(1.0);
+            for _ in 0..(sample_rate as usize / 4) {
+                ws.process(0.2);
+            }
+            assert!((ws.drive.get() - 100.0).abs() < 0.01);
+            ws.set_drive(1.0);
+            ws.process(0.2);
+            assert!(ws.drive.get() > 99.0, "downward edits also ramp");
+            ws.reset();
+            assert_eq!(ws.drive.get(), 1.0);
+            assert_eq!(ws.process(0.2), 0.2);
+        }
+    }
 
     #[test]
     fn test_bypass_when_mix_zero() {

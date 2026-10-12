@@ -48,6 +48,20 @@ int main(void) {
     return fail("kick step zero has the wrong velocity");
   }
 
+  const GooeyEffectParamDescriptor params[] = {
+      {SATURATION_PARAM_DRIVE, 0.8f}, {SATURATION_PARAM_MIX, 1.0f}};
+  const GooeyEffectDescriptor effect = {EFFECT_SATURATION, params, 2};
+  const uint64_t rack = gooey_live_control_replace_channel_rack(control, 0, &effect, 1);
+  if (rack == 0) {
+    return fail("voice rack was rejected");
+  }
+  const uint64_t edit = gooey_live_control_set_channel_effect_param(
+      control, 0, 0, rack, SATURATION_PARAM_DRIVE, 0.9f);
+  if (edit == 0 || gooey_live_control_set_channel_effect_param(
+      control, 0, 0, rack + 1, SATURATION_PARAM_DRIVE, 0.9f) != 0) {
+    return fail("voice rack generation validation failed");
+  }
+
   gooey_engine_sequencer_start(engine);
   float output[4096 * GOOEY_OUTPUT_CHANNELS] = {0.0f};
   gooey_engine_render(engine, output, 4096);
