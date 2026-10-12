@@ -193,7 +193,12 @@ fn locks_lfos_presets_and_blends_follow_channel_rules() {
         engine.render(64);
         approx(engine.param(param), 0.1); // the getter exposes the locked base
         unsafe { gooey_engine_clear_channel_param_lock(engine.0, CHANNEL, param) };
-        approx(engine.param(param), 0.9); // the LFO changed the live target
+        approx(engine.param(param), 0.1); // the getter exposes the LFO center
+                                          // The LFO swings the live target around that center.
+        approx(
+            unsafe { gooey_engine_get_channel_param_modulated(engine.0, CHANNEL, param) },
+            0.5,
+        );
 
         unsafe {
             gooey_engine_set_channel_param_lock(engine.0, CHANNEL, param, 0.2);

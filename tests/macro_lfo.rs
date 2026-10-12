@@ -586,14 +586,15 @@ fn poly_projection_follows_lfo_ownership() {
 }
 
 #[test]
-fn routed_drum_lfo_still_wins_over_a_macro_lfo() {
+fn routed_drum_lfo_swings_around_a_macro_lfo() {
     let engine = Engine::new();
     engine.map_hihat_tone(0, 0.0, 0.2);
     engine.start(0, MACRO_LFO_SHAPE_SAW, LFO_TIMING_QUARTER);
     unsafe {
-        // A flat routed LFO (amount 0, offset 0) holds the tone at mid-range.
+        // A flat routed LFO (amount 0, offset 0.4) lifts the tone by 0.2
+        // above wherever the macro puts it.
         gooey_engine_set_lfo_amount(engine.0, 0, 0.0);
-        gooey_engine_set_lfo_offset(engine.0, 0, 0.0);
+        gooey_engine_set_lfo_offset(engine.0, 0, 0.4);
         assert_ne!(
             gooey_engine_add_lfo_route(engine.0, 0, INSTRUMENT_HIHAT, HIHAT_PARAM_TONE, 1.0),
             LFO_INVALID
@@ -602,7 +603,15 @@ fn routed_drum_lfo_still_wins_over_a_macro_lfo() {
     }
     for _ in 0..10 {
         engine.render_seconds(0.043);
-        close(engine.hihat_tone(), 0.5, 1e-6);
+        let center = engine.hihat_tone();
+        assert!(
+            (0.0..=0.2).contains(&center),
+            "macro sets the center: {center}"
+        );
+        let modulated = unsafe {
+            gooey_engine_get_channel_param_modulated(engine.0, INSTRUMENT_HIHAT, HIHAT_PARAM_TONE)
+        };
+        close(modulated, center + 0.2, 1e-6);
     }
     assert!(engine.value(0) > 0.0, "the macro itself keeps cycling");
 }

@@ -138,6 +138,24 @@ pub struct LoopChannel {
     /// is externally moved (`set_buffer`/`restart`/`set_position`) so it
     /// re-seeds at the new position instead of playing stale state.
     stretcher: Option<WsolaStretcher>,
+    /// Session-only musical position supplied by ClipGrid on each render sample.
+    transport_beat: Option<f64>,
+    clip_phase: f64,
+    clip_previous_beat: f64,
+    clip_speed: SmoothedParam,
+    clip_preserve_mix: SmoothedParam,
+    /// Transpose as a frequency ratio. Applied only to the WSOLA grain read
+    /// step, so it changes pitch without moving the beat-derived cursor. Not
+    /// smoothed: it lands on the next hop, and a ratio gliding within one hop
+    /// would make adjacent grains disagree in pitch and beat in the overlap.
+    clip_transpose: f64,
+    /// Direct read (0) vs WSOLA path (1). Engaging is instant because a fresh
+    /// stretcher's first hop starts on the direct sample; bypassing fades out,
+    /// since the stretcher's correlated position can sit off the cursor.
+    clip_stretch_mix: SmoothedParam,
+    /// Consecutive hops synthesized at the direct path's pitch. Bypass waits
+    /// for two (the overlapped tail and head) so its fade joins equal pitches.
+    clip_matched_hops: u8,
     /// A buffer staged (from the main thread) to atomically replace `buffer` at
     /// the next bar-grid boundary. Taken by the audio thread in `advance()`.
     /// `has_pending` gates the audio thread so the common (nothing-queued) path
@@ -184,6 +202,14 @@ impl LoopChannel {
             pitch_mode: PitchMode::default(),
             engine_bpm: DEFAULT_ENGINE_BPM,
             stretcher: None,
+            transport_beat: None,
+            clip_phase: 0.0,
+            clip_previous_beat: 0.0,
+            clip_speed: SmoothedParam::new(1.0, 0.25, 4.0, sample_rate, FADER_SMOOTH_MS),
+            clip_preserve_mix: SmoothedParam::new(1.0, 0.0, 1.0, sample_rate, FADER_SMOOTH_MS),
+            clip_transpose: 1.0,
+            clip_stretch_mix: SmoothedParam::new(0.0, 0.0, 1.0, sample_rate, FADER_SMOOTH_MS),
+            clip_matched_hops: 2,
             pending: Mutex::new(None),
             pending_divisions: AtomicU32::new(1),
             has_pending: AtomicBool::new(false),
@@ -198,7 +224,9 @@ impl LoopChannel {
     /// effect tails — rather than chopping the dry input.
     pub fn tick(&mut self, engine_sample_rate: f32) -> StereoFrame {
         let dry = if self.playing && self.has_buffer() {
-            if self.pitch_mode == PitchMode::PreservePitch && self.speed >= 0.0 {
+            if let Some(beat) = self.transport_beat {
+                self.tick_transport_aligned(engine_sample_rate, beat)
+            } else if self.pitch_mode == PitchMode::PreservePitch && self.speed >= 0.0 {
                 self.tick_preserve_pitch(engine_sample_rate)
             } else {
                 let buffer = self.buffer.as_ref().unwrap();
@@ -223,6 +251,118 @@ impl LoopChannel {
         let gained = dry.scaled(self.gain.tick());
         let wet = self.effects.process(gained);
         wet.scaled(self.active_gain.tick())
+    }
+
+    /// Grid-only playback. The ideal source position follows musical time,
+    /// independently of WSOLA's correlation adjustments, so they cannot accrue
+    /// drift or shorten a phrase at the loop seam.
+    fn tick_transport_aligned(&mut self, engine_sample_rate: f32, beat: f64) -> StereoFrame {
+        let buffer = self.buffer.as_ref().unwrap();
+        let window = self.window(buffer.len() as f64);
+        let bpm = buffer.source_bpm().unwrap_or(self.engine_bpm) as f64;
+        let frames_per_beat = buffer.sample_rate() as f64 * 60.0 / bpm;
+        let length = window.span / frames_per_beat;
+        let speed = self.clip_speed.tick() as f64;
+        // Integrate beat deltas: live rate edits retain position. At 1x this
+        // telescopes to the shared transport clock without correlation drift.
+        self.clip_phase += (beat - self.clip_previous_beat) * speed;
+        self.clip_previous_beat = beat;
+        let mut offset = self.clip_phase.rem_euclid(length);
+        let tolerance = self.engine_bpm as f64 / (60.0 * engine_sample_rate as f64) * 0.5 + 1e-12;
+        if offset < tolerance || length - offset < tolerance {
+            offset = 0.0;
+        }
+        self.cursor = window.to_physical(offset * frames_per_beat);
+        // Snap seams within the transport's half-sample boundary tolerance.
+        // Accumulated floating-point beat error must not report frame N as
+        // normalized position 1 when the intended sample is frame zero.
+        let frame_tolerance = frames_per_beat * tolerance;
+        if self.cursor < frame_tolerance || buffer.len() as f64 - self.cursor < frame_tolerance {
+            self.cursor = 0.0;
+        }
+        let direct = buffer.read_wrapped(self.cursor);
+        let mix = self.clip_preserve_mix.tick();
+        let transpose = self.clip_transpose;
+        let transposing = (transpose - 1.0).abs() >= 1e-6;
+        let tape = self.warp_ratio() * speed;
+        let pitch_in_flight = self.clip_stretch_mix.get() > 0.0 && self.clip_matched_hops < 2;
+        let needs_stretch = transposing
+            || pitch_in_flight
+            || (mix > 0.0 && !((tape - 1.0).abs() < 1e-6 && self.clip_speed.is_settled()));
+        if needs_stretch {
+            self.clip_stretch_mix.set_immediate(1.0);
+        } else {
+            self.clip_stretch_mix.set_target(0.0);
+        }
+        let engage = self.clip_stretch_mix.tick();
+        // Retain the allocated stretcher when bypassed and invalidate its tail,
+        // so toggling preservation never drains stale audio from an old position.
+        if engage == 0.0 {
+            if let Some(stretcher) = self.stretcher.as_mut() {
+                stretcher.reset(self.cursor);
+            }
+            self.clip_matched_hops = 2;
+            return direct;
+        }
+        let sr_ratio = buffer.sample_rate() as f64 / engine_sample_rate.max(1.0) as f64;
+        let stretcher = self
+            .stretcher
+            .get_or_insert_with(|| WsolaStretcher::new(engine_sample_rate, self.cursor));
+        // Grain pitch: transpose alone when preserving, stacked on the tape
+        // ratio when not. Interpolating in the log domain glides the pitch
+        // through a preservation toggle rather than blending two pitches, and
+        // with no transpose and no preservation it equals the direct read's.
+        let grain = transpose * tape.powf(1.0 - mix as f64);
+        if stretcher.needs_refill() {
+            stretcher.synthesize_aligned_hop(buffer, &window, sr_ratio * grain, self.cursor);
+            self.clip_matched_hops = if (grain - tape).abs() < 1e-6 {
+                self.clip_matched_hops.saturating_add(1)
+            } else {
+                0
+            };
+        }
+        let stretched = stretcher.drain();
+        StereoFrame {
+            l: direct.l * (1.0 - engage) + stretched.l * engage,
+            r: direct.r * (1.0 - engage) + stretched.r * engage,
+        }
+    }
+
+    pub(crate) fn set_clip_playback(&mut self, speed: f32, preserve: bool, immediate: bool) {
+        let mix = if preserve { 1.0 } else { 0.0 };
+        if immediate {
+            self.clip_speed.set_immediate(speed);
+            self.clip_preserve_mix.set_immediate(mix);
+        } else {
+            self.clip_speed.set_target(speed);
+            self.clip_preserve_mix.set_target(mix);
+        }
+    }
+
+    pub(crate) fn set_clip_transpose(&mut self, ratio: f32) {
+        self.clip_transpose = ratio.clamp(0.25, 4.0) as f64;
+    }
+
+    pub(crate) fn seed_clip_phase(&mut self, beat: f64, speed: f32) {
+        // The playhead jumps here anyway; do not fade out a stale position.
+        self.clip_stretch_mix.set_immediate(0.0);
+        self.clip_speed.set_immediate(speed);
+        self.clip_previous_beat = beat;
+        self.clip_phase = beat * speed as f64;
+    }
+
+    pub(crate) fn seed_clip_phase_from_cursor(&mut self, beat: f64) {
+        if let Some(buffer) = self.buffer.as_ref() {
+            let window = self.window(buffer.len() as f64);
+            let bpm = buffer.source_bpm().unwrap_or(self.engine_bpm) as f64;
+            self.clip_phase =
+                window.to_virtual(self.cursor) / (buffer.sample_rate() as f64 * 60.0 / bpm);
+        }
+        self.clip_previous_beat = beat;
+    }
+
+    pub(crate) fn set_transport_beat(&mut self, beat: Option<f64>) {
+        self.transport_beat = beat;
     }
 
     /// WSOLA time-stretch playback path (see [`crate::mixer::wsola`]). Drains

@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{
-    loop_channel::RetiredLoopState, ChannelEffect, LaunchQuantization, PitchMode, RetrimTiming,
-    StereoSampleBuffer, CLIP_COLUMN_COUNT, CLIP_ROW_COUNT, LOOP_CHANNEL_COUNT,
+    clip_grid::valid_transpose, loop_channel::RetiredLoopState, ChannelEffect, LaunchQuantization,
+    PitchMode, RetrimTiming, StereoSampleBuffer, CLIP_COLUMN_COUNT, CLIP_ROW_COUNT,
+    LOOP_CHANNEL_COUNT,
 };
 
 /// Maximum number of control operations the audio thread applies in one sample.
@@ -84,6 +85,18 @@ pub(crate) enum MixerCommand {
         row: usize,
         buffer: StereoSampleBuffer,
         source_bpm: f32,
+        playback: Option<(f32, bool)>,
+    },
+    ClipSetPlayback {
+        column: usize,
+        row: usize,
+        speed: f32,
+        preserve_pitch: bool,
+    },
+    ClipSetTranspose {
+        column: usize,
+        row: usize,
+        semitones: f32,
     },
     ClipUnload {
         column: usize,
@@ -122,6 +135,9 @@ pub(crate) enum MixerCommand {
     ClipCancelAll,
     ClipSetDefaultQuantization {
         quantization: LaunchQuantization,
+    },
+    ClipSetPhaseAlignedLaunches {
+        enabled: bool,
     },
     ClipSetTrim {
         column: usize,
@@ -521,6 +537,38 @@ impl MixerControl {
         buffer: StereoSampleBuffer,
         source_bpm: f32,
     ) -> bool {
+        self.enqueue_clip_load(column, row, buffer, source_bpm, None)
+    }
+
+    pub fn clip_load_with_playback(
+        &self,
+        column: usize,
+        row: usize,
+        buffer: StereoSampleBuffer,
+        source_bpm: f32,
+        speed: f32,
+        preserve_pitch: bool,
+    ) -> bool {
+        if !speed.is_finite() || !(0.25..=4.0).contains(&speed) {
+            return false;
+        }
+        self.enqueue_clip_load(
+            column,
+            row,
+            buffer,
+            source_bpm,
+            Some((speed, preserve_pitch)),
+        )
+    }
+
+    fn enqueue_clip_load(
+        &self,
+        column: usize,
+        row: usize,
+        buffer: StereoSampleBuffer,
+        source_bpm: f32,
+        playback: Option<(f32, bool)>,
+    ) -> bool {
         if column >= CLIP_COLUMN_COUNT
             || row >= CLIP_ROW_COUNT
             || buffer.is_empty()
@@ -535,6 +583,7 @@ impl MixerControl {
                 row,
                 buffer,
                 source_bpm,
+                playback,
             },
             move |slots| {
                 slots[column][row] = true;
@@ -542,6 +591,45 @@ impl MixerControl {
             },
         )
     }
+    pub fn clip_set_playback(
+        &self,
+        column: usize,
+        row: usize,
+        speed: f32,
+        preserve_pitch: bool,
+    ) -> bool {
+        if column >= CLIP_COLUMN_COUNT
+            || row >= CLIP_ROW_COUNT
+            || !speed.is_finite()
+            || !(0.25..=4.0).contains(&speed)
+        {
+            return false;
+        }
+        self.enqueue_clip(
+            MixerCommand::ClipSetPlayback {
+                column,
+                row,
+                speed,
+                preserve_pitch,
+            },
+            move |slots| slots[column][row],
+        )
+    }
+
+    pub fn clip_set_transpose(&self, column: usize, row: usize, semitones: f32) -> bool {
+        if column >= CLIP_COLUMN_COUNT || row >= CLIP_ROW_COUNT || !valid_transpose(semitones) {
+            return false;
+        }
+        self.enqueue_clip(
+            MixerCommand::ClipSetTranspose {
+                column,
+                row,
+                semitones,
+            },
+            move |slots| slots[column][row],
+        )
+    }
+
     pub fn clip_unload(&self, column: usize, row: usize) -> bool {
         if column >= CLIP_COLUMN_COUNT || row >= CLIP_ROW_COUNT {
             return false;
@@ -611,6 +699,9 @@ impl MixerControl {
     }
     pub fn clip_cancel_all(&self) -> bool {
         self.enqueue(MixerCommand::ClipCancelAll)
+    }
+    pub fn clip_set_phase_aligned_launches(&self, enabled: bool) -> bool {
+        self.enqueue(MixerCommand::ClipSetPhaseAlignedLaunches { enabled })
     }
     pub fn clip_set_default_quantization(&self, quantization: LaunchQuantization) -> bool {
         self.enqueue(MixerCommand::ClipSetDefaultQuantization { quantization })
