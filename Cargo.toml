@@ -47,6 +47,10 @@ name = "reso_kick"
 required-features = ["native", "crossterm"]
 
 [[example]]
+name = "plate"
+required-features = ["native", "crossterm"]
+
+[[example]]
 name = "snare"
 required-features = ["native", "crossterm"]
 
