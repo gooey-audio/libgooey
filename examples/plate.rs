@@ -6,9 +6,11 @@
 //! Controls:
 //! - SPACE = hit at the current velocity
 //! - ↑/↓ = select parameter, ←/→ = adjust (coarse), [ / ] = adjust (fine)
-//! - 1-5 = Ride, Crash, Bell, Timbale, Gong presets
+//! - 1-5 = Ride, Crash, Bell, Timbale, Gong presets (32 modes)
+//! - 6-8 = China (128 modes), Tam-tam (128), Gamelan (64)
 //! - V = cycle velocity (hard hits glide and shimmer, soft hits don't)
 //! - M = cycle material (latched on the next hit)
+//! - N = cycle mode count 8 → 128 (latched on the next hit)
 //! - P = play / stop a 16-step pattern for the current preset
 //! - Q = quit
 
@@ -20,14 +22,17 @@ use crossterm::{
 };
 use gooey::effects::SoftLimiter;
 use gooey::engine::{Engine, EngineOutput, Instrument, Sequencer, SequencerStep};
-use gooey::instruments::{PlateConfig, PlateMaterial, PlateVoice};
+use gooey::instruments::{
+    PlateConfig, PlateMaterial, PlateVoice, PLATE_MODE_COUNTS, PLATE_PARAM_MATERIAL_INDEX,
+    PLATE_PARAM_MODES_INDEX,
+};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 const INSTRUMENT: &str = "plate";
 const BPM: f32 = 120.0;
 
-const PARAM_NAMES: [&str; 12] = [
+const PARAM_NAMES: [&str; 13] = [
     "pitch",
     "geometry",
     "strike pos",
@@ -40,6 +45,7 @@ const PARAM_NAMES: [&str; 12] = [
     "deplete",
     "brightness",
     "material",
+    "modes",
 ];
 
 struct SharedPlateVoice(Arc<Mutex<PlateVoice>>);
@@ -66,7 +72,7 @@ struct Preset {
     pattern: [f32; 16],
 }
 
-const PRESETS: [Preset; 5] = [
+const PRESETS: [Preset; 8] = [
     Preset {
         name: "Ride",
         config: PlateConfig::ride,
@@ -102,6 +108,27 @@ const PRESETS: [Preset; 5] = [
             1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
         ],
     },
+    Preset {
+        name: "China",
+        config: PlateConfig::china,
+        pattern: [
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.7, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ],
+    },
+    Preset {
+        name: "Tam-tam",
+        config: PlateConfig::tam_tam,
+        pattern: [
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ],
+    },
+    Preset {
+        name: "Gamelan",
+        config: PlateConfig::gamelan,
+        pattern: [
+            1.0, 0.0, 0.0, 0.6, 0.0, 0.0, 0.8, 0.0, 0.0, 0.0, 0.7, 0.0, 0.0, 0.5, 0.0, 0.0,
+        ],
+    },
 ];
 
 fn make_bar(value: f32, width: usize) -> String {
@@ -134,6 +161,7 @@ fn detail(config: &PlateConfig, index: usize) -> String {
         ),
         10 => format!("{:>8.0} Hz", config.brightness_hz),
         11 => format!("{:>8}", config.material.name()),
+        12 => format!("{:>8} modes", config.mode_count),
         _ => String::new(),
     }
 }
@@ -149,7 +177,7 @@ fn render_display(
     print!("\x1b[2J\x1b[H\x1b[?7l");
     print!("=== Plate Lab / MODAL PLATE ENGINE ===\r\n");
     print!("SPACE=hit  V=velocity  M=material  P=pattern  Q=quit  arrows/[]=adjust\r\n");
-    print!("1=ride 2=crash 3=bell 4=timbale 5=gong\r\n");
+    print!("1=ride 2=crash 3=bell 4=timbale 5=gong 6=china 7=tam-tam 8=gamelan  N=modes\r\n");
     print!(
         "Preset: {preset_name} | Velocity: {:.0}% | Pattern: {} @ {BPM:.0} BPM\r\n\r\n",
         velocity * 100.0,
@@ -168,7 +196,7 @@ fn render_display(
         );
     }
     print!(
-        "\r\nSignal: exciter × strike weights → 32 modes × pickup weights → Σ → LP → soft clip\r\n"
+        "\r\nSignal: exciter × strike weights → N modes × pickup weights → Σ → LP → soft clip\r\n"
     );
     print!(
         "        modal energy → tension glide;  band k → cubic → excites band k+1 (cascade)\r\n"
@@ -256,11 +284,14 @@ fn main() -> anyhow::Result<()> {
                         needs_redraw = true;
                     }
                     KeyCode::Left | KeyCode::Right | KeyCode::Char('[') | KeyCode::Char(']') => {
-                        // Material has five discrete positions, a quarter apart.
-                        let (coarse, fine) = if selected == 11 {
-                            (0.25, 0.25)
-                        } else {
-                            (0.05, 0.01)
+                        // Material and modes step through their discrete positions.
+                        let (coarse, fine) = match selected {
+                            PLATE_PARAM_MATERIAL_INDEX => (0.25, 0.25),
+                            PLATE_PARAM_MODES_INDEX => {
+                                let step = 1.0 / (PLATE_MODE_COUNTS.len() - 1) as f32;
+                                (step, step)
+                            }
+                            _ => (0.05, 0.01),
                         };
                         let delta = match code {
                             KeyCode::Left => -coarse,
@@ -296,7 +327,18 @@ fn main() -> anyhow::Result<()> {
                         preset_name = "Custom";
                         needs_redraw = true;
                     }
-                    KeyCode::Char(number @ '1'..='5') => {
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        let mut voice = voice.lock().unwrap();
+                        let current = PLATE_MODE_COUNTS
+                            .iter()
+                            .position(|count| *count == voice.mode_count())
+                            .unwrap_or(0);
+                        let next = PLATE_MODE_COUNTS[(current + 1) % PLATE_MODE_COUNTS.len()];
+                        voice.set_mode_count(next);
+                        preset_name = "Custom";
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char(number @ '1'..='8') => {
                         preset = PRESETS[number as usize - '1' as usize];
                         voice.lock().unwrap().set_config((preset.config)());
                         load_pattern(&audio_engine, &preset, velocities[velocity_index]);

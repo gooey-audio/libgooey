@@ -24,12 +24,24 @@ use crate::filters::Resonator;
 use crate::gen::{Exciter, ExciterKind};
 use crate::utils::{tuning_to_multiplier, Oversampler2x, SmoothedParam, XorShift32};
 
-/// Number of modes in the bank. The `plate-hq` feature doubles it.
-pub const PLATE_MAX_MODES: usize = if cfg!(feature = "plate-hq") { 64 } else { 32 };
-/// Number of indexed parameters, matching the future `PLATE_PARAM_*` 0-11.
-pub const PLATE_PARAM_COUNT: usize = 12;
+/// Capacity of the mode bank. The active count is chosen per voice from
+/// [`PLATE_MODE_COUNTS`].
+pub const PLATE_MAX_MODES: usize = 128;
+/// Selectable mode counts, in the order the normalized `modes` parameter
+/// steps through them.
+pub const PLATE_MODE_COUNTS: [usize; 8] = [8, 16, 24, 32, 48, 64, 96, 128];
+/// Number of indexed parameters, matching the future `PLATE_PARAM_*` 0-12.
+pub const PLATE_PARAM_COUNT: usize = 13;
 /// Index of the discrete material parameter.
 pub const PLATE_PARAM_MATERIAL_INDEX: usize = 11;
+/// Index of the discrete mode-count parameter.
+pub const PLATE_PARAM_MODES_INDEX: usize = 12;
+
+/// Continuous parameters (indices 0-10) held as smoothers.
+const SMOOTHED_PARAMS: usize = 11;
+/// Mode count the tables and levels were tuned at. Denser banks keep the
+/// same frequency span and total energy as this.
+const REFERENCE_MODES: usize = 32;
 
 const SMOOTH_MS: f32 = 15.0;
 /// Samples between mode frequency and decay updates.
@@ -142,18 +154,31 @@ impl PlateMaterial {
 
     /// Mode frequency ratios relative to f0, strictly increasing. `seed`
     /// jitters the statistical tails of Plate and Sheet.
-    pub fn ratios(self, seed: u32) -> [f32; PLATE_MAX_MODES] {
+    ///
+    /// `mode_count` sets the density of the statistical tails (Plate, Bell,
+    /// Sheet): they always span the range the 32-mode tables reach, so more
+    /// modes fill it more densely, and 32 modes reproduces the original
+    /// tables exactly. Membrane and Bar are physical series, so extra modes
+    /// continue them upward (Membrane with higher Bessel zeros; Bar mostly
+    /// lands above Nyquist and is muted).
+    pub fn ratios(self, seed: u32, mode_count: usize) -> [f32; PLATE_MAX_MODES] {
         let mut rng = XorShift32::new(seed ^ 0x5EED_0D35);
         let mut out = [1.0; PLATE_MAX_MODES];
+        if self == Self::Membrane {
+            membrane_ratios(&mut out);
+        }
+        let count = mode_count.clamp(1, PLATE_MAX_MODES) as f32;
+        // Index compression for the tails: 1 at 32 modes, below 1 when denser.
+        let plate_step = 20.0 / (count - 12.0).max(1.0);
+        let bell_step = 12.0 / (count - 20.0).max(1.0);
+        let sheet_step = 31.0 / (count - 1.0).max(1.0);
         for (k, ratio) in out.iter_mut().enumerate() {
             let n = (k + 1) as f32;
             *ratio = match self {
-                Self::Membrane => MEMBRANE_RATIOS
-                    .get(k)
-                    .copied()
-                    .unwrap_or_else(|| MEMBRANE_RATIOS[31] + 0.2 * (n - 32.0)),
+                Self::Membrane => *ratio,
                 Self::Plate => PLATE_RATIOS.get(k).copied().unwrap_or_else(|| {
-                    let jitter = 1.0 + 0.03 * rng.next_bipolar();
+                    let jitter = 1.0 + 0.03 * plate_step.min(1.0) * rng.next_bipolar();
+                    let n = 12.0 + (n - 12.0) * plate_step;
                     PLATE_RATIOS[11] * (n / 12.0).powf(1.12) * jitter
                 }),
                 Self::Bar => BAR_RATIOS
@@ -163,12 +188,13 @@ impl PlateMaterial {
                 Self::Bell => BELL_RATIOS
                     .get(k)
                     .copied()
-                    .unwrap_or_else(|| BELL_RATIOS[19] * 1.06_f32.powf(n - 20.0)),
+                    .unwrap_or_else(|| BELL_RATIOS[19] * 1.06_f32.powf((n - 20.0) * bell_step)),
                 Self::Sheet => {
                     if k == 0 {
                         1.0
                     } else {
-                        n.powf(0.9) * (1.0 + 0.04 * rng.next_bipolar())
+                        let jitter = 1.0 + 0.04 * sheet_step.min(1.0) * rng.next_bipolar();
+                        (1.0 + (n - 1.0) * sheet_step).powf(0.9) * jitter
                     }
                 }
             };
@@ -181,6 +207,52 @@ impl PlateMaterial {
         }
         out
     }
+}
+
+/// First twelve zeros of the Airy function Ai, for the uniform Bessel-zero
+/// expansion.
+const AIRY_ZEROS: [f32; 12] = [
+    2.338, 4.088, 5.521, 6.787, 7.944, 9.023, 10.040, 11.009, 11.936, 12.829, 13.692, 14.528,
+];
+const BESSEL_J01: f32 = 2.404_826;
+const MEMBRANE_ORDERS: usize = 32;
+const MEMBRANE_CANDIDATES: usize = MEMBRANE_ORDERS * AIRY_ZEROS.len();
+
+/// Approximate n-th zero of the Bessel function J_m. McMahon's expansion is
+/// accurate when n is large relative to m; the Airy-zero (Olver) expansion
+/// covers high orders. Both are within about 1 % over the range used here.
+fn bessel_zero(m: usize, n: usize) -> f32 {
+    let m_f = m as f32;
+    if 2 * n <= m {
+        let a = AIRY_ZEROS[n - 1];
+        let h = (m_f / 2.0).cbrt();
+        m_f + a * h + 0.15 * a * a / h
+    } else {
+        let beta = (n as f32 + m_f / 2.0 - 0.25) * PI;
+        let mu = 4.0 * m_f * m_f;
+        let eight_beta = 8.0 * beta;
+        beta - (mu - 1.0) / eight_beta
+            - 4.0 * (mu - 1.0) * (7.0 * mu - 31.0) / (3.0 * eight_beta.powi(3))
+    }
+}
+
+/// Fill `out` with the exact membrane table, then continue with higher
+/// approximate Bessel zeros in ascending order. Allocation-free.
+fn membrane_ratios(out: &mut [f32; PLATE_MAX_MODES]) {
+    out[..MEMBRANE_RATIOS.len()].copy_from_slice(&MEMBRANE_RATIOS);
+    let floor = MEMBRANE_RATIOS[MEMBRANE_RATIOS.len() - 1] * 1.001;
+    let mut candidates = [f32::INFINITY; MEMBRANE_CANDIDATES];
+    for m in 0..MEMBRANE_ORDERS {
+        for n in 1..=AIRY_ZEROS.len() {
+            let ratio = bessel_zero(m, n) / BESSEL_J01;
+            if ratio > floor {
+                candidates[m * AIRY_ZEROS.len() + n - 1] = ratio;
+            }
+        }
+    }
+    candidates.sort_unstable_by(f32::total_cmp);
+    let tail = PLATE_MAX_MODES - MEMBRANE_RATIOS.len();
+    out[MEMBRANE_RATIOS.len()..].copy_from_slice(&candidates[..tail]);
 }
 
 /// Static settings for a [`PlateVoice`]. Units are physical, not normalized.
@@ -209,6 +281,8 @@ pub struct PlateConfig {
     /// Output low-pass cutoff in Hz (500-20000).
     pub brightness_hz: f32,
     pub material: PlateMaterial,
+    /// Active modes, one of [`PLATE_MODE_COUNTS`]. Latched on trigger.
+    pub mode_count: usize,
     pub seed: u32,
 }
 
@@ -233,6 +307,7 @@ impl PlateConfig {
             deplete: 0.2,
             brightness_hz: 12_000.0,
             material: PlateMaterial::Plate,
+            mode_count: 32,
             seed: 0x0052_1DE0,
         }
     }
@@ -251,6 +326,7 @@ impl PlateConfig {
             deplete: 0.5,
             brightness_hz: 16_000.0,
             material: PlateMaterial::Plate,
+            mode_count: 32,
             seed: 0x00C2_A54E,
         }
     }
@@ -269,6 +345,7 @@ impl PlateConfig {
             deplete: 0.0,
             brightness_hz: 14_000.0,
             material: PlateMaterial::Bell,
+            mode_count: 32,
             seed: 0x00BE_11ED,
         }
     }
@@ -287,6 +364,7 @@ impl PlateConfig {
             deplete: 0.1,
             brightness_hz: 9_000.0,
             material: PlateMaterial::Membrane,
+            mode_count: 32,
             seed: 0x0071_BA1E,
         }
     }
@@ -305,9 +383,79 @@ impl PlateConfig {
             deplete: 0.4,
             brightness_hz: 8_000.0,
             material: PlateMaterial::Sheet,
+            mode_count: 32,
             seed: 0x0060_0606,
         }
     }
+
+    /// Dense, trashy China cymbal: 128 plate modes and heavy cascade.
+    pub fn china() -> Self {
+        Self {
+            pitch_hz: 340.0,
+            geometry: 0.3,
+            strike_pos: 0.85,
+            pickup_pos: 0.75,
+            hardness: 0.9,
+            decay_seconds: 2.8,
+            hf_damping: 0.25,
+            tension: 0.2,
+            cascade: 1.0,
+            deplete: 0.6,
+            brightness_hz: 18_000.0,
+            material: PlateMaterial::Plate,
+            mode_count: 128,
+            seed: 0x00C4_1A00,
+        }
+    }
+
+    /// Orchestral tam-tam: 128 sheet modes, soft mallet, slow bloom.
+    pub fn tam_tam() -> Self {
+        Self {
+            pitch_hz: 55.0,
+            geometry: 0.35,
+            strike_pos: 0.3,
+            pickup_pos: 0.55,
+            hardness: 0.05,
+            decay_seconds: 18.0,
+            hf_damping: 0.4,
+            tension: 0.25,
+            cascade: 0.8,
+            deplete: 0.3,
+            brightness_hz: 12_000.0,
+            material: PlateMaterial::Sheet,
+            mode_count: 128,
+            seed: 0x0074_A474,
+        }
+    }
+
+    /// Shimmering gamelan-like bell: 64 bell modes with dense upper partials.
+    pub fn gamelan() -> Self {
+        Self {
+            pitch_hz: 440.0,
+            geometry: -0.05,
+            strike_pos: 0.15,
+            pickup_pos: 0.35,
+            hardness: 0.45,
+            decay_seconds: 6.0,
+            hf_damping: 0.6,
+            tension: 0.0,
+            cascade: 0.25,
+            deplete: 0.0,
+            brightness_hz: 10_000.0,
+            material: PlateMaterial::Bell,
+            mode_count: 64,
+            seed: 0x0064_7E1A,
+        }
+    }
+}
+
+/// Snap a requested count to the nearest entry of [`PLATE_MODE_COUNTS`].
+fn nearest_mode_count(count: usize) -> usize {
+    PLATE_MODE_COUNTS
+        .iter()
+        .copied()
+        .min_by_key(|candidate| candidate.abs_diff(count))
+        .unwrap_or(REFERENCE_MODES)
 }
 
 /// Un-normalised shape of mode `mode` at a 0 (centre) to 1 (edge) position,
@@ -323,10 +471,11 @@ pub fn plate_mode_shape(mode: usize, position: f32) -> f32 {
 }
 
 /// Weight of each mode at a 0 (centre) to 1 (edge) position, normalised to
-/// unit RMS over the bank.
-fn position_weights(pos: f32) -> [f32; PLATE_MAX_MODES] {
+/// unit RMS over the first `count` modes.
+fn position_weights(pos: f32, count: usize) -> [f32; PLATE_MAX_MODES] {
+    let count = count.clamp(1, PLATE_MAX_MODES);
     let mut weights: [f32; PLATE_MAX_MODES] = std::array::from_fn(|k| plate_mode_shape(k, pos));
-    let mean_square = weights.iter().map(|w| w * w).sum::<f32>() / PLATE_MAX_MODES as f32;
+    let mean_square = weights[..count].iter().map(|w| w * w).sum::<f32>() / count as f32;
     let norm = 1.0 / mean_square.sqrt().max(1.0e-3);
     for w in &mut weights {
         *w *= norm;
@@ -385,11 +534,15 @@ pub struct PlateVoice {
     exciter: Exciter,
     /// Scales the exciter so its area is close to its amplitude.
     exciter_norm: f32,
-    params: [SmoothedParam; PLATE_PARAM_COUNT - 1],
+    params: [SmoothedParam; SMOOTHED_PARAMS],
     /// Channel pitch offset (+-12 st); independent of the pitch parameter.
     channel_tuning: SmoothedParam,
     pending_material: PlateMaterial,
     active_material: PlateMaterial,
+    pending_mode_count: usize,
+    active_mode_count: usize,
+    /// Keeps total strike energy constant as the bank gets denser.
+    density_norm: f32,
     latched_seed: u32,
     energy: f32,
     energy_coeff: f32,
@@ -421,13 +574,14 @@ impl PlateVoice {
 
     pub fn with_config(sample_rate: f32, config: PlateConfig) -> Self {
         let sr = sample_rate.max(1.0);
+        let mode_count = nearest_mode_count(config.mode_count);
         let mut voice = Self {
             sample_rate: sr,
             modes: std::array::from_fn(|_| Resonator::new(sr)),
             mode_freq: [0.0; PLATE_MAX_MODES],
-            ratios: config.material.ratios(config.seed),
-            w_strike: position_weights(config.strike_pos),
-            w_pickup: position_weights(config.pickup_pos),
+            ratios: config.material.ratios(config.seed, mode_count),
+            w_strike: position_weights(config.strike_pos, mode_count),
+            w_pickup: position_weights(config.pickup_pos, mode_count),
             mode_gain: [0.0; PLATE_MAX_MODES],
             input_norm: [0.0; PLATE_MAX_MODES],
             noise_norm: [0.0; PLATE_MAX_MODES],
@@ -451,6 +605,9 @@ impl PlateVoice {
             channel_tuning: SmoothedParam::new_normalized(0.5, sr),
             pending_material: config.material,
             active_material: config.material,
+            pending_mode_count: mode_count,
+            active_mode_count: mode_count,
+            density_norm: 1.0,
             latched_seed: config.seed,
             energy: 0.0,
             energy_coeff: 1.0 - (-1.0 / (ENERGY_MS * 0.001 * sr)).exp(),
@@ -490,6 +647,7 @@ impl PlateVoice {
             deplete: self.params[9].target(),
             brightness_hz: self.params[10].target(),
             material: self.pending_material,
+            mode_count: self.pending_mode_count,
             seed: self.seed,
         }
     }
@@ -512,12 +670,20 @@ impl PlateVoice {
             param.set_target(finite(value, param.target()));
         }
         self.pending_material = config.material;
+        self.pending_mode_count = nearest_mode_count(config.mode_count);
         self.seed = config.seed;
     }
 
     pub fn parameter_normalized(&self, index: usize) -> Option<f32> {
         if index == PLATE_PARAM_MATERIAL_INDEX {
             return Some(self.pending_material.index() as f32 / 4.0);
+        }
+        if index == PLATE_PARAM_MODES_INDEX {
+            let step = PLATE_MODE_COUNTS
+                .iter()
+                .position(|count| *count == self.pending_mode_count)
+                .unwrap_or(0);
+            return Some(step as f32 / (PLATE_MODE_COUNTS.len() - 1) as f32);
         }
         let p = self.params.get(index)?;
         Some(if Self::exponential_parameter(index) {
@@ -536,6 +702,11 @@ impl PlateVoice {
             self.set_material(PlateMaterial::from_index(
                 (normalized * 4.0).round() as usize
             ));
+            return;
+        }
+        if index == PLATE_PARAM_MODES_INDEX {
+            let step = (normalized * (PLATE_MODE_COUNTS.len() - 1) as f32).round() as usize;
+            self.set_mode_count(PLATE_MODE_COUNTS[step]);
             return;
         }
         if let Some(param) = self.params.get_mut(index) {
@@ -572,6 +743,16 @@ impl PlateVoice {
         self.pending_material
     }
 
+    /// Snaps to the nearest of [`PLATE_MODE_COUNTS`]. Takes effect on the
+    /// next trigger, like the material.
+    pub fn set_mode_count(&mut self, count: usize) {
+        self.pending_mode_count = nearest_mode_count(count);
+    }
+
+    pub fn mode_count(&self) -> usize {
+        self.pending_mode_count
+    }
+
     pub fn set_ring_limit_secs(&mut self, limit: Option<f32>) {
         self.ring_limit_secs = limit.map(|v| finite(v, 0.001).max(0.001));
     }
@@ -593,21 +774,32 @@ impl PlateVoice {
 
     /// Snapshot of every mode's frequency, amplitude and weights. Intended
     /// for UI threads; it copies a few hundred bytes and never allocates.
+    /// Modes beyond [`Self::active_mode_count`] report zero gain and
+    /// amplitude.
     pub fn mode_states(&self) -> [PlateModeState; PLATE_MAX_MODES] {
         let stretch = 1.0 + self.params[1].get();
-        std::array::from_fn(|k| PlateModeState {
-            frequency_hz: self.mode_freq[k],
-            ratio: self.ratios[k].powf(stretch),
-            amplitude: if self.mode_enabled[k] {
-                self.modes[k].amplitude()
-            } else {
-                0.0
-            },
-            strike_weight: self.w_strike[k],
-            pickup_weight: self.w_pickup[k],
-            gain: self.mode_gain[k],
-            band: self.mode_band[k],
+        std::array::from_fn(|k| {
+            let active = k < self.active_mode_count;
+            PlateModeState {
+                frequency_hz: self.mode_freq[k],
+                ratio: self.ratios[k].powf(stretch),
+                amplitude: if active && self.mode_enabled[k] {
+                    self.modes[k].amplitude()
+                } else {
+                    0.0
+                },
+                strike_weight: self.w_strike[k],
+                pickup_weight: self.w_pickup[k],
+                gain: if active { self.mode_gain[k] } else { 0.0 },
+                band: self.mode_band[k],
+            }
         })
+    }
+
+    /// Mode count the bank is ringing with, latched at the last trigger.
+    /// [`Self::mode_count`] is the count the next trigger will use.
+    pub fn active_mode_count(&self) -> usize {
+        self.active_mode_count
     }
 
     pub fn reset(&mut self) {
@@ -651,9 +843,10 @@ impl PlateVoice {
         let stretch = 1.0 + geometry;
         let fade_start = NYQUIST_FADE_START * sr;
         let fade_end = NYQUIST_FADE_END * sr;
-        self.w_pickup = position_weights(self.params[3].get());
+        self.w_pickup = position_weights(self.params[3].get(), self.active_mode_count);
 
-        for k in 0..PLATE_MAX_MODES {
+        let mut enabled = 0;
+        for k in 0..self.active_mode_count {
             let ratio = self.ratios[k].powf(stretch);
             let freq = f0 * ratio * glide;
             self.mode_freq[k] = freq;
@@ -667,6 +860,7 @@ impl PlateVoice {
                 continue;
             }
             self.mode_enabled[k] = true;
+            enabled += 1;
             let band = BAND_EDGES.iter().filter(|edge| ratio >= **edge).count();
             self.mode_band[k] = band as u8;
             let mode = &mut self.modes[k];
@@ -681,6 +875,10 @@ impl PlateVoice {
             // 4 zeta omega = 4 * 6.91 / T60 in samples.
             self.noise_norm[k] = (27.6 / (t60.max(0.01) * sr)).sqrt();
         }
+
+        // Only denser banks are scaled, so 32-mode (and sparser) presets keep
+        // their tuned level.
+        self.density_norm = (REFERENCE_MODES as f32 / enabled.max(REFERENCE_MODES) as f32).sqrt();
 
         let brightness = self.params[10].get().min(sr * 0.45);
         self.lp_coeff = 1.0 - (-TAU * brightness / sr).exp();
@@ -701,12 +899,22 @@ impl Instrument for PlateVoice {
             }
             self.channel_tuning.snap();
         }
-        if self.pending_material != self.active_material || self.seed != self.latched_seed {
+        if self.pending_material != self.active_material
+            || self.pending_mode_count != self.active_mode_count
+            || self.seed != self.latched_seed
+        {
+            for k in self.pending_mode_count..self.active_mode_count {
+                self.modes[k].reset();
+                self.mode_enabled[k] = false;
+            }
             self.active_material = self.pending_material;
+            self.active_mode_count = self.pending_mode_count;
             self.latched_seed = self.seed;
-            self.ratios = self.active_material.ratios(self.seed);
+            self.ratios = self
+                .active_material
+                .ratios(self.seed, self.active_mode_count);
         }
-        self.w_strike = position_weights(self.params[2].target());
+        self.w_strike = position_weights(self.params[2].target(), self.active_mode_count);
 
         let hardness = self.params[4].target();
         let kind = if hardness < 1.0 / 3.0 {
@@ -759,13 +967,13 @@ impl Instrument for PlateVoice {
         }
         self.control_counter = (self.control_counter + 1) % CONTROL_BLOCK;
 
-        let excitation = self.exciter.tick() * self.exciter_norm;
-        let inject = self.cascade_drive;
-        let inject_noise = self.cascade_noise;
+        let excitation = self.exciter.tick() * self.exciter_norm * self.density_norm;
+        let inject = self.cascade_drive.map(|x| x * self.density_norm);
+        let inject_noise = self.cascade_noise.map(|x| x * self.density_norm);
         let mut sum = 0.0;
         let mut modal_energy = 0.0;
         let mut bands = [0.0_f32; CASCADE_BANDS];
-        for k in 0..PLATE_MAX_MODES {
+        for k in 0..self.active_mode_count {
             if !self.mode_enabled[k] {
                 continue;
             }
@@ -807,7 +1015,9 @@ impl Instrument for PlateVoice {
             self.quiet_counter = 0;
             if !self.exciter.is_active()
                 && self.lp_state.abs() < 1.0e-5
-                && self.modes.iter().all(Resonator::is_quiet)
+                && self.modes[..self.active_mode_count]
+                    .iter()
+                    .all(Resonator::is_quiet)
             {
                 self.reset();
             }
@@ -849,6 +1059,7 @@ impl Modulatable for PlateVoice {
             "deplete",
             "brightness",
             "material",
+            "modes",
         ]
     }
 
@@ -888,8 +1099,27 @@ mod tests {
     }
 
     #[test]
+    fn mode_count_latches_on_the_next_trigger() {
+        let mut voice = PlateVoice::with_config(48_000.0, PlateConfig::ride());
+        voice.set_mode_count(100);
+        assert_eq!(voice.mode_count(), 96);
+        assert_eq!(voice.active_mode_count, 32);
+        voice.trigger_with_velocity(0.0, 1.0);
+        assert_eq!(voice.active_mode_count, 96);
+    }
+
+    #[test]
+    fn membrane_tail_tracks_known_bessel_zeros() {
+        // j(0,5) = 14.931, j(10,1) = 14.476, j(6,3) = 17.004.
+        for (m, n, exact) in [(0, 5, 14.931), (10, 1, 14.476), (6, 3, 17.004)] {
+            let approx = bessel_zero(m, n);
+            assert!((approx / exact - 1.0).abs() < 0.01, "j({m},{n}) = {approx}");
+        }
+    }
+
+    #[test]
     fn edge_strike_still_excites_modes() {
-        let weights = position_weights(1.0);
+        let weights = position_weights(1.0, REFERENCE_MODES);
         assert!(weights.iter().all(|w| w.is_finite()));
         assert!(weights.iter().any(|w| w.abs() > 0.5));
     }
