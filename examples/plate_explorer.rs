@@ -21,6 +21,9 @@
 //! coordinate, so only a point's distance from the centre (or from the middle
 //! of the bar) changes the sound; its angle is free.
 //!
+//! The mode count (8 to 128) sets how dense the bank is; like the material
+//! it latches on the next hit, and CPU cost grows with it.
+//!
 //! The timbre map plots any two parameters as a plane. Drag the cursor to
 //! morph the live sound, store snapshots as pins, drag pins to reshape them
 //! and let the tour step through them bar by bar.
@@ -31,12 +34,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align2, Color32, ColorImage, FontId, Pos2, Rect, RichText, Sense, Stroke, TextureHandle,
-    TextureOptions, Vec2,
+    self, Align2, Color32, ColorImage, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect,
+    RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
 use gooey::engine::{Engine, EngineOutput, Instrument};
 use gooey::instruments::{
     plate_mode_shape, PlateConfig, PlateMaterial, PlateModeState, PlateVoice, PLATE_MAX_MODES,
+    PLATE_MODE_COUNTS,
 };
 use gooey::StereoFrame;
 
@@ -56,7 +60,7 @@ const DB_RANGE: f32 = 60.0;
 /// Peak surface displacement, in units of the body's radius.
 const DISP_MAX: f32 = 0.14;
 /// Samples of the u (centre-to-edge) axis in the displacement table.
-const PROFILE_RES: usize = 128;
+const PROFILE_RES: usize = 384;
 const SPECTROGRAM_COLS: usize = 300;
 const SPECTROGRAM_ROWS: usize = 112;
 const SPECTROGRAM_HZ: f32 = 30.0;
@@ -274,7 +278,7 @@ struct Preset {
     config: fn() -> PlateConfig,
 }
 
-const PRESETS: [Preset; 5] = [
+const PRESETS: [Preset; 8] = [
     Preset {
         name: "Ride",
         config: PlateConfig::ride,
@@ -295,7 +299,51 @@ const PRESETS: [Preset; 5] = [
         name: "Gong",
         config: PlateConfig::gong,
     },
+    Preset {
+        name: "China",
+        config: PlateConfig::china,
+    },
+    Preset {
+        name: "Tam-tam",
+        config: PlateConfig::tam_tam,
+    },
+    Preset {
+        name: "Gamelan",
+        config: PlateConfig::gamelan,
+    },
 ];
+
+/// Inter for the interface, with egui's defaults behind it for symbols and
+/// emoji. Monospace readouts keep egui's Hack.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "Inter".into(),
+        FontData::from_static(include_bytes!("assets/fonts/Inter-Regular.ttf")),
+    );
+    fonts.font_data.insert(
+        "Inter SemiBold".into(),
+        FontData::from_static(include_bytes!("assets/fonts/Inter-SemiBold.ttf")),
+    );
+    let fallbacks = fonts.families[&FontFamily::Proportional].clone();
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "Inter".into());
+    let mut semibold = vec!["Inter SemiBold".to_string()];
+    semibold.extend(fallbacks);
+    fonts.families.insert(semibold_family(), semibold);
+    ctx.set_fonts(fonts);
+}
+
+fn semibold_family() -> FontFamily {
+    FontFamily::Name("semibold".into())
+}
+
+fn semibold(size: f32) -> FontId {
+    FontId::new(size, semibold_family())
+}
 
 fn material_hint(material: PlateMaterial) -> &'static str {
     match material {
@@ -558,8 +606,8 @@ struct BodyMesh {
 impl BodyMesh {
     fn new(body: Body) -> Self {
         let (rows, cols) = match body {
-            Body::Bar => (73, 9),
-            _ => (37, 73),
+            Body::Bar => (161, 9),
+            _ => (81, 73),
         };
         let mut points = Vec::with_capacity(rows * cols);
         for i in 0..rows {
@@ -961,7 +1009,8 @@ fn config_as_rust(config: &PlateConfig) -> String {
         "PlateConfig {{\n    pitch_hz: {:.1},\n    geometry: {:.3},\n    strike_pos: {:.3},\n    \
          pickup_pos: {:.3},\n    hardness: {:.3},\n    decay_seconds: {:.3},\n    \
          hf_damping: {:.3},\n    tension: {:.3},\n    cascade: {:.3},\n    deplete: {:.3},\n    \
-         brightness_hz: {:.0},\n    material: PlateMaterial::{:?},\n    seed: 0x{:08X},\n}}",
+         brightness_hz: {:.0},\n    material: PlateMaterial::{:?},\n    mode_count: {},\n    \
+         seed: 0x{:08X},\n}}",
         config.pitch_hz,
         config.geometry,
         config.strike_pos,
@@ -974,6 +1023,7 @@ fn config_as_rust(config: &PlateConfig) -> String {
         config.deplete,
         config.brightness_hz,
         config.material,
+        config.mode_count,
         config.seed,
     )
 }
@@ -1018,6 +1068,7 @@ fn random_config(dice: &mut Dice) -> PlateConfig {
         deplete: dice.range(0.0, 0.7),
         brightness_hz: dice.log_range(3_000.0, 20_000.0),
         material: PlateMaterial::from_index((dice.unit() * 5.0) as usize),
+        mode_count: PLATE_MODE_COUNTS[(dice.unit() * PLATE_MODE_COUNTS.len() as f32) as usize],
         seed: dice.next_u32(),
     }
 }
@@ -1091,6 +1142,7 @@ struct Explorer {
     phases: [f32; PLATE_MAX_MODES],
     energy: f32,
     cascade_level: f32,
+    active_modes: usize,
     peaks: [f32; 2],
     current_step: Option<usize>,
     seen_serials: [u32; MAX_STRIKERS],
@@ -1149,6 +1201,7 @@ impl Explorer {
             phases: std::array::from_fn(|k| k as f32 * 2.399),
             energy: 0.0,
             cascade_level: 0.0,
+            active_modes: 0,
             peaks: [0.0; 2],
             current_step: None,
             seen_serials: [0; MAX_STRIKERS],
@@ -1269,6 +1322,7 @@ impl Explorer {
         self.modes = rig.left.mode_states();
         self.energy = rig.left.energy();
         self.cascade_level = rig.left.cascade_level();
+        self.active_modes = rig.left.active_mode_count();
         self.peaks = rig.peaks;
         self.current_step = rig.last_step;
         let serials = rig.hit_serials;
@@ -1398,14 +1452,23 @@ impl Explorer {
             egui::Key::Num5,
             egui::Key::Num6,
         ];
-        let (space, digits) = ctx.input(|input| {
+        let (space, next_count, digits) = ctx.input(|input| {
             (
                 input.key_pressed(egui::Key::Space),
+                input.key_pressed(egui::Key::N),
                 keys.map(|key| input.key_pressed(key)),
             )
         });
         if space {
             self.playing = !self.playing;
+        }
+        if next_count {
+            let step = PLATE_MODE_COUNTS
+                .iter()
+                .position(|count| *count == self.scene.config.mode_count)
+                .map_or(0, |step| (step + 1) % PLATE_MODE_COUNTS.len());
+            self.scene.config.mode_count = PLATE_MODE_COUNTS[step];
+            self.audition();
         }
         for (index, pressed) in digits.iter().enumerate() {
             if *pressed {
@@ -1418,7 +1481,11 @@ impl Explorer {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("PLATE EXPLORER").strong().size(16.0));
+            ui.label(
+                RichText::new("Plate Explorer")
+                    .family(semibold_family())
+                    .size(17.0),
+            );
             ui.separator();
             let label = if self.playing { "⏹ Stop" } else { "▶ Play" };
             if ui
@@ -1484,6 +1551,40 @@ impl Explorer {
                 .color(DIM_TEXT)
                 .small(),
         );
+        ui.add_space(6.0);
+        section_heading(ui, "MODES");
+        let mut count_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for count in PLATE_MODE_COUNTS {
+                let selected = self.scene.config.mode_count == count;
+                if ui
+                    .selectable_label(selected, count.to_string())
+                    .on_hover_text(
+                        "Modes in the bank (N cycles). Denser banks fill the same span more \
+                         finely; CPU cost grows with the count. Applies on the next hit.",
+                    )
+                    .clicked()
+                    && !selected
+                {
+                    self.scene.config.mode_count = count;
+                    count_changed = true;
+                }
+            }
+        });
+        if self.active_modes != self.scene.config.mode_count && self.active_modes > 0 {
+            ui.label(
+                RichText::new(format!(
+                    "ringing with {} until the next hit",
+                    self.active_modes
+                ))
+                .color(DIM_TEXT)
+                .small(),
+            );
+        }
+        if count_changed {
+            self.audition();
+        }
         ui.add_space(4.0);
 
         let mut audition = false;
@@ -1673,8 +1774,9 @@ impl Explorer {
                 let response = ui
                     .add(egui::Button::new(text).fill(SNAPSHOT_COLORS[index]))
                     .on_hover_text(format!(
-                        "{}: click to recall, right-click to delete",
-                        snapshot.config.material.name()
+                        "{} · {} modes: click to recall, right-click to delete",
+                        snapshot.config.material.name(),
+                        snapshot.config.mode_count
                     ));
                 if response.clicked() {
                     recall = Some(index);
@@ -1799,7 +1901,10 @@ impl Explorer {
         painter.text(
             rect.min + Vec2::new(8.0, 3.0),
             Align2::LEFT_TOP,
-            "MODES  ·  height = level, colour = cascade band  ·  hover one to see its shape",
+            format!(
+                "MODES ({})  ·  height = level, colour = cascade band  ·  hover one to see its shape",
+                self.active_modes
+            ),
             FontId::proportional(11.0),
             DIM_TEXT,
         );
@@ -2209,11 +2314,12 @@ impl Explorer {
             rect.min + Vec2::new(14.0, 12.0),
             Align2::LEFT_TOP,
             format!(
-                "{}  ·  {}",
-                material.name().to_uppercase(),
-                material_hint(material)
+                "{}  ·  {}  ·  {} modes",
+                material.name(),
+                material_hint(material),
+                self.active_modes
             ),
-            FontId::proportional(15.0),
+            semibold(16.0),
             Color32::WHITE,
         );
         painter.text(
@@ -2255,7 +2361,7 @@ impl Explorer {
             Pos2::new(rect.min.x + 14.0, rect.max.y - 10.0),
             Align2::LEFT_BOTTOM,
             "click: tap  ·  shift-drag: roll  ·  drag a point: move it  ·  double-click: add \
-             striker  ·  right-click striker: remove  ·  drag: orbit  ·  scroll: zoom  ·  1-6: hit",
+             striker  ·  right-click striker: remove  ·  drag: orbit  ·  scroll: zoom  ·  1-6: hit  ·  N: modes",
             FontId::proportional(11.0),
             DIM_TEXT,
         );
@@ -2654,7 +2760,12 @@ fn brighter(a: Color32, b: Color32) -> Color32 {
 }
 
 fn section_heading(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).small().strong().color(DIM_TEXT));
+    ui.label(
+        RichText::new(text)
+            .family(semibold_family())
+            .size(10.5)
+            .color(DIM_TEXT),
+    );
 }
 
 /// A normalised slider with the value in the parameter's units. Returns true
@@ -2762,6 +2873,7 @@ fn main() -> anyhow::Result<()> {
         options,
         Box::new(move |context| {
             context.egui_ctx.set_visuals(egui::Visuals::dark());
+            install_fonts(&context.egui_ctx);
             Ok(Box::new(Explorer::new(rig, engine, output, audio_status)))
         }),
     )
@@ -2917,5 +3029,6 @@ mod tests {
         let text = config_as_rust(&PlateConfig::gong());
         assert!(text.contains("material: PlateMaterial::Sheet"));
         assert!(text.contains("pitch_hz: 70.0"));
+        assert!(text.contains("mode_count: 32"));
     }
 }
