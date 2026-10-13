@@ -13,9 +13,18 @@ display=${2:-:99}
 size=${3:-1600x1000}
 name=$(basename "$binary")
 
-if ! pgrep -f "Xvfb $display" >/dev/null; then
+display_up() {
+    DISPLAY=$display python3 -c 'from Xlib import display; display.Display()' 2>/dev/null
+}
+
+if ! display_up; then
+    # Xvfb needs this socket directory; it disappears when /tmp is cleaned.
+    if [ ! -d /tmp/.X11-unix ]; then
+        sudo mkdir -p /tmp/.X11-unix && sudo chmod 1777 /tmp/.X11-unix
+    fi
     Xvfb "$display" -screen 0 "${size}x24" >/tmp/xvfb.log 2>&1 &
-    sleep 1
+    for _ in $(seq 20); do display_up && break; sleep 0.25; done
+    display_up || { echo "Xvfb failed to start; see /tmp/xvfb.log" >&2; exit 1; }
 fi
 pkill -x "$name" 2>/dev/null
 sleep 0.5
