@@ -1,7 +1,9 @@
 //! Unit-level tests for the modal plate voice (no FFI).
 
 use gooey::engine::{Instrument, Modulatable};
-use gooey::instruments::{PlateConfig, PlateMaterial, PlateVoice, PLATE_MAX_MODES};
+use gooey::instruments::{
+    PlateConfig, PlateMaterial, PlateVoice, PLATE_MAX_MODES, PLATE_MODE_COUNTS,
+};
 
 const SR: f32 = 48_000.0;
 
@@ -71,12 +73,58 @@ fn glide_ratio(tension: f32, velocity: f32) -> f32 {
 #[test]
 fn material_tables_increase_and_stay_finite() {
     for material in PlateMaterial::ALL {
-        let ratios = material.ratios(1234);
-        assert_eq!(ratios.len(), PLATE_MAX_MODES);
-        assert!(ratios.iter().all(|r| r.is_finite() && *r > 0.0));
+        for count in PLATE_MODE_COUNTS {
+            let ratios = material.ratios(1234, count);
+            assert_eq!(ratios.len(), PLATE_MAX_MODES);
+            assert!(ratios.iter().all(|r| r.is_finite() && *r > 0.0));
+            assert!(
+                ratios.windows(2).all(|w| w[1] > w[0]),
+                "{material:?} x{count} ratios are not strictly increasing"
+            );
+        }
+    }
+}
+
+#[test]
+fn denser_banks_fill_the_same_range() {
+    for material in [
+        PlateMaterial::Plate,
+        PlateMaterial::Bell,
+        PlateMaterial::Sheet,
+    ] {
+        let sparse = material.ratios(7, 32);
+        let dense = material.ratios(7, 128);
+        let top = sparse[31];
+        let dense_top = dense[127];
         assert!(
-            ratios.windows(2).all(|w| w[1] > w[0]),
-            "{material:?} ratios are not strictly increasing"
+            (dense_top / top - 1.0).abs() < 0.1,
+            "{material:?}: 32 modes reach {top}, 128 reach {dense_top}"
+        );
+    }
+    // Membrane is a physical series, so more modes extend it upward.
+    let membrane = PlateMaterial::Membrane.ratios(7, 128);
+    assert!(membrane[127] > membrane[31] * 1.5);
+}
+
+#[test]
+fn mode_count_keeps_level_comparable() {
+    let rms = |count: usize| {
+        let x = render(
+            PlateConfig {
+                mode_count: count,
+                ..PlateConfig::crash()
+            },
+            1.0,
+            1.0,
+        );
+        (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt()
+    };
+    let reference = rms(32);
+    for count in [64, 128] {
+        let ratio = rms(count) / reference;
+        assert!(
+            (0.5..2.0).contains(&ratio),
+            "{count} modes RMS is {ratio}x the 32-mode level"
         );
     }
 }
@@ -160,6 +208,7 @@ fn every_parameter_extreme_stays_finite_and_bounded() {
             voice.set_parameter_normalized(5, 1.0);
             voice.set_parameter_normalized(7, 1.0);
             voice.set_parameter_normalized(8, 1.0);
+            voice.set_mode_count(if low > 0.5 { 128 } else { 8 });
             voice.set_material(material);
             for hit in 0..4 {
                 voice.trigger_with_velocity(hit as f64 * 0.05, 1.0);
@@ -213,7 +262,12 @@ fn normalized_parameters_round_trip() {
         assert!((value - 0.75).abs() < 1.0e-4, "param {index} = {value}");
     }
     assert_eq!(voice.material(), PlateMaterial::Bell);
-    assert!(voice.parameter_normalized(12).is_none());
+    voice.set_parameter_normalized(12, 1.0);
+    assert_eq!(voice.mode_count(), 128);
+    assert_eq!(voice.parameter_normalized(12), Some(1.0));
+    voice.set_parameter_normalized(12, 3.0 / 7.0);
+    assert_eq!(voice.mode_count(), 32);
+    assert!(voice.parameter_normalized(13).is_none());
     assert!(voice.apply_modulation("cascade", 0.2).is_ok());
     assert!(voice.apply_modulation("volume", 0.2).is_err());
 }

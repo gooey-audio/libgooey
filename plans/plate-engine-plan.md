@@ -82,7 +82,8 @@ Copy `examples/reso_kick.rs`. Keys cycle the five presets and nudge Pitch, Strik
 
 ## Progress
 
-- [x] Phase 1: `src/instruments/plate.rs` (`PlateMaterial`, `PlateConfig`, `PlateVoice`), `plate-hq` feature.
+- [x] Phase 1: `src/instruments/plate.rs` (`PlateMaterial`, `PlateConfig`, `PlateVoice`).
+- [x] Runtime mode count (8 to 128) as param 12, replacing the `plate-hq` feature; China, Tam-tam and Gamelan presets.
 - [x] Phase 2: `examples/plate.rs` interactive lab (presets, velocity, material, 16-step pattern).
 - [x] Unit tests: `tests/plate_voice.rs`.
 - [ ] Phase 3: FFI channel instrument.
@@ -97,6 +98,8 @@ Copy `examples/reso_kick.rs`. Keys cycle the five presets and nudge Pitch, Strik
 - **Mode input normalisation.** Inputs are scaled by `1/ω_k` and the exciter by its area, so mode amplitude tracks the exciter spectrum rather than the mode frequency; hardness then behaves like mallet width.
 - **Test thresholds.** The cascade test asserts the crash's above-4 kHz share at least 1.5x the dry share (measured about 0.24 vs 0.11 at full velocity with a two-pole split), not the 20 % / 5 % FFT figures.
 
+- **Mode count is a runtime parameter, not a Cargo feature.** `PLATE_PARAM_MODES 12` (so `PLATE_PARAM_COUNT` becomes 13) steps through 8, 16, 24, 32, 48, 64, 96, 128 and latches on trigger like the material. The bank is a fixed 128-slot array; only the active count is processed, so cost scales with the setting. For Plate, Bell and Sheet a higher count fills the same frequency span more densely (32 modes reproduces the original tables bit for bit). Membrane continues upward with higher Bessel zeros (McMahon and Airy-zero expansions, within about 1 %). Bar is a sparse physical series, so its extra modes mostly land above Nyquist. Strike and cascade drive scale by `sqrt(32 / enabled modes)` above 32 so a denser bank keeps roughly the same level (measured within about 4 dB).
+
 ## Surprises
 
-- **CPU.** Release build at 48 kHz on desktop: the crash preset re-struck every 0.5 s costs about 1.2 % of one core, 4.5x a Twin Core voice. That misses the 2x Twin Core target. The mode loop dominates; options are a cheaper f32 two-pole per mode instead of `Resonator`, or skipping modes whose state is below the quiet floor.
+- **CPU.** Release build at 48 kHz on desktop: the crash preset re-struck every 0.5 s costs about 1.2 % of one core, 4.5x a Twin Core voice. That misses the 2x Twin Core target. Cost is linear in the mode count: 1.3 % at 32 modes, 2.3 % at 64 and 4.6 % at 128. The mode loop dominates; options are a cheaper f32 two-pole per mode instead of `Resonator`, or skipping modes whose state is below the quiet floor.
