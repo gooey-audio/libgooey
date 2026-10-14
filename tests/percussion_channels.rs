@@ -50,7 +50,7 @@ fn selectable_types_keep_five_addressable_channels() {
     assert_eq!(gooey_engine_instrument_count(), 7);
     assert_eq!(gooey_engine_channel_count(), 5);
     assert_eq!(gooey_engine_resonator_param_count(), 9);
-    assert_eq!(gooey_engine_twin_core_param_count(), 14);
+    assert_eq!(gooey_engine_twin_core_param_count(), 18);
     let legacy = gooey_engine_new(SR);
     unsafe {
         assert!(!gooey_engine_set_channel_preset(
@@ -110,15 +110,19 @@ fn sequencer_triggers_both_types_with_velocity() {
 
 #[test]
 fn channel_parameters_and_discrete_modes_round_trip() {
-    for (kind, count) in [(INSTRUMENT_RESONATOR, 9), (INSTRUMENT_TWIN_CORE, 12)] {
+    let twin_core_continuous: Vec<u32> = (0..12)
+        .chain(TWIN_CORE_PARAM_SYMMETRY..=TWIN_CORE_PARAM_CHAOS)
+        .collect();
+    for (kind, indices, end) in [
+        (INSTRUMENT_RESONATOR, (0..9).collect::<Vec<u32>>(), 9),
+        (INSTRUMENT_TWIN_CORE, twin_core_continuous, 18),
+    ] {
         let engine = Engine::new(kind);
-        for index in 0..count {
+        for index in indices {
             unsafe { gooey_engine_set_channel_param(engine.0, CHANNEL, index, 0.37) };
             approx(engine.param(index), 0.37);
         }
-        assert!(engine
-            .param(if kind == INSTRUMENT_RESONATOR { 9 } else { 14 })
-            .is_nan());
+        assert!(engine.param(end).is_nan());
     }
     let engine = Engine::new(INSTRUMENT_TWIN_CORE);
     unsafe {
@@ -133,6 +137,51 @@ fn channel_parameters_and_discrete_modes_round_trip() {
     }
     approx(engine.param(TWIN_CORE_PARAM_BODY_MODE), 0.0);
     approx(engine.param(TWIN_CORE_PARAM_NOISE_MODE), 2.0);
+
+    // Controls after the mode switches are continuous, not rounded like modes.
+    unsafe { gooey_engine_set_channel_param_lock(engine.0, CHANNEL, TWIN_CORE_PARAM_LPG, 0.37) };
+    approx(engine.param(TWIN_CORE_PARAM_LPG), 0.37);
+}
+
+#[test]
+fn twin_core_extensions_reach_the_voice_and_accept_lfos() {
+    let engine = Engine::new(INSTRUMENT_TWIN_CORE);
+    unsafe {
+        gooey_engine_set_channel_param(engine.0, CHANNEL, TWIN_CORE_PARAM_SYMMETRY, 0.9);
+        gooey_engine_set_channel_param(engine.0, CHANNEL, TWIN_CORE_PARAM_CROSS_MOD, 0.4);
+        gooey_engine_set_channel_param(engine.0, CHANNEL, TWIN_CORE_PARAM_LPG, 0.6);
+        gooey_engine_set_channel_param(engine.0, CHANNEL, TWIN_CORE_PARAM_CHAOS, 0.2);
+    }
+    approx(engine.param(TWIN_CORE_PARAM_SYMMETRY), 0.9);
+    approx(engine.param(TWIN_CORE_PARAM_CROSS_MOD), 0.4);
+    approx(engine.param(TWIN_CORE_PARAM_LPG), 0.6);
+    approx(engine.param(TWIN_CORE_PARAM_CHAOS), 0.2);
+    for param in TWIN_CORE_PARAM_SYMMETRY..=TWIN_CORE_PARAM_CHAOS {
+        assert!(unsafe {
+            gooey_engine_macro_add_mapping(engine.0, 0, PARAM_TARGET_DRUM, CHANNEL, param, 0.0, 1.0)
+        });
+    }
+    assert!(!unsafe {
+        gooey_engine_macro_add_mapping(
+            engine.0,
+            0,
+            PARAM_TARGET_DRUM,
+            CHANNEL,
+            TWIN_CORE_PARAM_BODY_MODE,
+            0.0,
+            1.0,
+        )
+    });
+    unsafe {
+        gooey_engine_set_lfo_amount(engine.0, 0, 0.5);
+        assert_ne!(
+            gooey_engine_add_lfo_route(engine.0, 0, CHANNEL, TWIN_CORE_PARAM_CROSS_MOD, 1.0),
+            LFO_INVALID
+        );
+        gooey_engine_set_lfo_enabled(engine.0, 0, true);
+        gooey_engine_trigger_channel(engine.0, CHANNEL);
+    }
+    assert!(energy(&engine.render(8192)) > 1e-6);
 }
 
 #[test]

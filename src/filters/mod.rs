@@ -6,6 +6,7 @@ pub mod resonant_lowpass;
 pub mod resonator;
 pub mod state_variable;
 pub mod state_variable_tpt;
+pub mod vactrol_lpg;
 
 pub use self::biquad_bandpass::BiquadBandpass;
 pub use self::biquad_highpass::BiquadHighpass;
@@ -15,3 +16,4 @@ pub use self::resonant_lowpass::ResonantLowpassFilter;
 pub use self::resonator::Resonator;
 pub use self::state_variable::StateVariableFilter;
 pub use self::state_variable_tpt::StateVariableFilterTpt;
+pub use self::vactrol_lpg::VactrolLpg;

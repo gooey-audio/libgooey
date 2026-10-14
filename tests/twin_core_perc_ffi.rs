@@ -57,6 +57,22 @@ fn ffi_exposes_controls_modes_names_and_noise_trigger() {
             "harmonics"
         );
         assert!(gooey_twin_core_perc_parameter_name(99).is_null());
+        for (index, name) in [
+            (TWIN_CORE_PERC_PARAM_SYMMETRY, "symmetry"),
+            (TWIN_CORE_PERC_PARAM_CROSS_MOD, "cross_mod"),
+            (TWIN_CORE_PERC_PARAM_LPG, "lpg"),
+            (TWIN_CORE_PERC_PARAM_CHAOS, "chaos"),
+        ] {
+            assert_eq!(
+                CStr::from_ptr(gooey_twin_core_perc_parameter_name(index))
+                    .to_str()
+                    .unwrap(),
+                name
+            );
+            assert!(gooey_twin_core_perc_set_parameter(voice, index, 0.4));
+            assert!((gooey_twin_core_perc_get_parameter(voice, index) - 0.4).abs() < 1.0e-6);
+        }
+        assert!(gooey_twin_core_perc_parameter_name(TWIN_CORE_PERC_PARAM_COUNT).is_null());
         assert!(gooey_twin_core_perc_set_body_mode(
             voice,
             TWIN_CORE_PERC_BODY_HIGH,
@@ -150,7 +166,13 @@ fn selectable_engine_ffi_supports_a_dropdown_and_shared_presets() {
             gooey_percussion_engine_get_preset(voice),
             PERCUSSION_PRESET_SNARE
         );
-        assert_eq!(gooey_percussion_engine_parameter_count(voice), 12);
+        assert_eq!(gooey_percussion_engine_parameter_count(voice), 16);
+        assert_eq!(
+            CStr::from_ptr(gooey_percussion_engine_parameter_name(voice, 15))
+                .to_str()
+                .unwrap(),
+            "chaos"
+        );
         assert_eq!(
             CStr::from_ptr(gooey_percussion_engine_parameter_name(voice, 7))
                 .to_str()
