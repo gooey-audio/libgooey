@@ -10,6 +10,73 @@
 //! vactrol low-pass gate after the body VCA, and a chaos control that
 //! stiffens the cores (Duffing-style) and then closes a saturating feedback
 //! loop between them.
+//!
+//! # Signal flow
+//!
+//! ```text
+//!                       TRIG ─────────────────────────────┐
+//!                        │                                │     N-TRIG
+//!                        ▼                                ▼       │
+//!                  [1] trigger delay                [9] noise ◄───┘
+//!                        │                           │        │
+//!                        ▼                    LP / HP│        │BODY
+//!                  [2] exciter                       │        │
+//!                        │                           │        │
+//!                        ▼                           │        │
+//!           ┌──────────► + ◄─────────────────────────┼────────┘
+//!           │            │                           │
+//!           │            ▼                           │
+//!           │      [3] core 1 ─── cross mod ──┐      │
+//!           │            │ low-pass           │      │
+//!           │            ▼                    ▼      │
+//!           │      [4] core 2 ◄────────── (pitch)    │
+//!           │            │                           │
+//!           └── chaos ───┤ band-pass                 │
+//!                        ▼                           │
+//!                  [5] body mode tap                 │
+//!                        │                           │
+//!                        ▼                           │
+//!                  [6] wavefolder                    │
+//!                        │                           │
+//!                        ▼                           │
+//!                  [7] body VCA                      │
+//!                        │                           │
+//!                        ▼                           │
+//!                  [8] vactrol LPG                   │
+//!                        │                           │
+//!                        ▼                           │
+//!                        + ◄─────────────────────────┘
+//!                        │
+//!                        ▼
+//!               × volume × √velocity ──► out
+//! ```
+//!
+//! 1. **Trigger delay** (`trigger_delay`): holds back the body strike by up
+//!    to 75 ms while the noise fires on time, for claps and flams.
+//! 2. **Exciter**: a 0.75 ms pulse, scaled by velocity, that strikes core one.
+//! 3. **Core 1**: a resonator at `tune` swept by `fm_depth` over an envelope
+//!    of length `fm_decay`. `length` and `body_bias` set how long it rings.
+//!    `chaos` up to 0.5 adds Duffing stiffness, so hard hits start sharp and
+//!    glide down.
+//! 4. **Core 2**: fed by core one's low-pass (the cores are in series), tuned
+//!    `detune` octaves below it. `cross_mod` lets core one bend its pitch at
+//!    audio rate (±2 octaves) for inharmonic, bell-like tones. Above 0.5,
+//!    `chaos` feeds its band-pass back into core one through a saturator,
+//!    gated by the body envelope so every hit still ends.
+//! 5. **Body mode tap** (`body_mode`): LOW takes core two's low-pass, MID
+//!    mixes both cores' band-passes, HIGH takes core two's band-pass minus its
+//!    low-pass.
+//! 6. **Wavefolder** (2× oversampled): `harmonics` sets fold depth;
+//!    `symmetry` shifts the fold point for even harmonics, with a DC trap
+//!    after it.
+//! 7. **Body VCA**: an envelope over `length`; `body_bias` raises gain and
+//!    sustain, or attenuates by up to about 30 dB.
+//! 8. **Vactrol LPG** (`lpg`): blends in a low-pass gate driven by the body
+//!    envelope. It opens over about 12 ms and darkens the tail as it fades.
+//! 9. **Noise**: white noise through a filter (`noise_filter`) with its own
+//!    envelope (`noise_decay`, `noise_bias`). `noise_mode` LP/HP mixes it into
+//!    the output; BODY sends low-passed noise into core one instead. It can
+//!    also be triggered alone via `trigger_noise_with_velocity` (N-TRIG).
 
 use crate::engine::{Instrument, Modulatable};
 use crate::filters::{Resonator, StateVariableFilterTpt, VactrolLpg};
