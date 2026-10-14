@@ -13,6 +13,8 @@
 //!
 //! # Signal flow
 //!
+//! A rendered diagram and per-node notes live in `docs/twin-core/`.
+//!
 //! ```text
 //!                       TRIG ─────────────────────────────┐
 //!                        │                                │     N-TRIG
@@ -70,7 +72,7 @@
 //!    `symmetry` shifts the fold point for even harmonics, with a DC trap
 //!    after it.
 //! 7. **Body VCA**: an envelope over `length`; `body_bias` raises gain and
-//!    sustain, or attenuates by up to about 30 dB.
+//!    sustain, or attenuates it down to silence at −1.
 //! 8. **Vactrol LPG** (`lpg`): blends in a low-pass gate driven by the body
 //!    envelope. It opens over about 12 ms and darkens the tail as it fades.
 //! 9. **Noise**: white noise through a filter (`noise_filter`) with its own
