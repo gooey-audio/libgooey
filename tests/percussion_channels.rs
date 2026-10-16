@@ -47,7 +47,7 @@ fn approx(actual: f32, expected: f32) {
 
 #[test]
 fn selectable_types_keep_five_addressable_channels() {
-    assert_eq!(gooey_engine_instrument_count(), 7);
+    assert_eq!(gooey_engine_instrument_count(), 8);
     assert_eq!(gooey_engine_channel_count(), 5);
     assert_eq!(gooey_engine_resonator_param_count(), 9);
     assert_eq!(gooey_engine_twin_core_param_count(), 14);
