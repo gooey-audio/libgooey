@@ -86,6 +86,7 @@ Copy `examples/reso_kick.rs`. Keys cycle the five presets and nudge Pitch, Strik
 - [x] Runtime mode count (8 to 128) as param 12, replacing the `plate-hq` feature; China, Tam-tam and Gamelan presets.
 - [x] Phase 2: `examples/plate.rs` interactive lab (presets, velocity, material, 16-step pattern).
 - [x] Unit tests: `tests/plate_voice.rs`.
+- [x] `examples/plate_explorer.rs`: egui explorer with a 3-D view of the struck body, draggable strikers and L/R pickups, mode spectrum and history, and a two-parameter timbre map with snapshots. Adds the read-only `PlateVoice::mode_states()` and `plate_mode_shape()` it draws from.
 - [ ] Phase 3: FFI channel instrument.
 - [ ] Phase 4: FFI tests, CPU bench.
 - [ ] Phase 5: release and Ripple adoption.

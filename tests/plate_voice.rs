@@ -2,7 +2,7 @@
 
 use gooey::engine::{Instrument, Modulatable};
 use gooey::instruments::{
-    PlateConfig, PlateMaterial, PlateVoice, PLATE_MAX_MODES, PLATE_MODE_COUNTS,
+    plate_mode_shape, PlateConfig, PlateMaterial, PlateVoice, PLATE_MAX_MODES, PLATE_MODE_COUNTS,
 };
 
 const SR: f32 = 48_000.0;
@@ -285,4 +285,60 @@ fn channel_tuning_shifts_pitch_an_octave() {
     };
     let up = measure(1.0) / measure(0.5);
     assert!((up - 2.0).abs() < 0.03, "tuning ratio {up}");
+}
+
+#[test]
+fn mode_states_report_ringing_and_decay() {
+    let mut voice = PlateVoice::with_config(SR, PlateConfig::ride());
+    assert!(voice.mode_states().iter().all(|mode| mode.amplitude == 0.0));
+    voice.trigger_with_velocity(0.0, 1.0);
+    for i in 0..(0.05 * SR) as usize {
+        voice.tick(i as f64 / SR as f64);
+    }
+    let early = voice.mode_states();
+    assert!(early[0].amplitude > 1.0e-3, "fundamental should ring");
+    assert!(early
+        .windows(2)
+        .all(|pair| pair[0].frequency_hz < pair[1].frequency_hz || pair[1].gain == 0.0));
+    assert!(early.iter().all(|mode| mode.band <= 3));
+    for i in (0.05 * SR) as usize..(1.0 * SR) as usize {
+        voice.tick(i as f64 / SR as f64);
+    }
+    let late = voice.mode_states();
+    assert!(late[0].amplitude < early[0].amplitude);
+}
+
+#[test]
+fn mode_states_expose_the_latched_strike_shape() {
+    let mut config = PlateConfig::bell();
+    config.strike_pos = 0.0;
+    let mut voice = PlateVoice::with_config(SR, config);
+    voice.trigger_with_velocity(0.0, 1.0);
+    let states = voice.mode_states();
+    // A centre hit sits on a node of every even-numbered shape.
+    assert!(states[1].strike_weight.abs() < 1.0e-4);
+    assert!(states[0].strike_weight.abs() > 0.5);
+    // The weights are the public mode shapes up to one normalisation.
+    let scale = states[0].strike_weight / plate_mode_shape(0, 0.0);
+    for (k, state) in states.iter().enumerate() {
+        assert!((state.strike_weight - scale * plate_mode_shape(k, 0.0)).abs() < 1.0e-4);
+    }
+}
+
+#[test]
+fn mode_states_hide_modes_beyond_the_active_count() {
+    let mut voice = PlateVoice::with_config(SR, PlateConfig::china());
+    voice.trigger_with_velocity(0.0, 1.0);
+    for i in 0..2_000 {
+        voice.tick(i as f64 / SR as f64);
+    }
+    assert_eq!(voice.active_mode_count(), 128);
+    assert!(voice.mode_states()[40].gain > 0.0);
+    voice.set_mode_count(16);
+    voice.trigger_with_velocity(0.1, 1.0);
+    assert_eq!(voice.active_mode_count(), 16);
+    let states = voice.mode_states();
+    assert!(states[16..]
+        .iter()
+        .all(|mode| mode.gain == 0.0 && mode.amplitude == 0.0));
 }
