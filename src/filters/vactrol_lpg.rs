@@ -56,20 +56,7 @@ impl VactrolLpg {
     /// Process one sample. `control` in 0..=1 drives the vactrol LED linearly.
     #[inline]
     pub fn process(&mut self, input: f32, control: f32) -> f32 {
-        let control = if control.is_finite() {
-            control.clamp(0.0, 1.0) as f64
-        } else {
-            0.0
-        };
-        let base = if control > self.vactrol {
-            RISE_SECONDS
-        } else {
-            self.fall_seconds
-        };
-        let tau = base * (1.0 - BRIGHT_SPEEDUP * self.vactrol);
-        let coeff = (1.0 / (tau * self.sample_rate)).min(1.0);
-        self.vactrol += (control - self.vactrol) * coeff;
-
+        self.advance_vactrol(control);
         let led = (self.vactrol * IF_MAX).max(IF_MIN);
         let rf = RF_A / led.powf(1.4) + RF_B;
 
@@ -96,6 +83,33 @@ impl VactrolLpg {
             self.reset();
             0.0
         }
+    }
+
+    /// Advance only the vactrol while the gate is bypassed, and keep the audio
+    /// path cleared. Re-enabling then starts at the right brightness instead of
+    /// resuming from stale filter and vactrol state.
+    #[inline]
+    pub fn follow(&mut self, control: f32) {
+        self.advance_vactrol(control);
+        self.s_x = 0.0;
+        self.s_out = 0.0;
+    }
+
+    #[inline]
+    fn advance_vactrol(&mut self, control: f32) {
+        let control = if control.is_finite() {
+            control.clamp(0.0, 1.0) as f64
+        } else {
+            0.0
+        };
+        let base = if control > self.vactrol {
+            RISE_SECONDS
+        } else {
+            self.fall_seconds
+        };
+        let tau = base * (1.0 - BRIGHT_SPEEDUP * self.vactrol);
+        let coeff = (1.0 / (tau * self.sample_rate)).min(1.0);
+        self.vactrol += (control - self.vactrol) * coeff;
     }
 
     /// Current vactrol brightness in 0..=1, for metering and tests.

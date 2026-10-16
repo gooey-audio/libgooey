@@ -649,6 +649,11 @@ impl Instrument for TwinCorePercVoice {
             self.dc_x1 = folded;
             self.dc_y1 = blocked;
             folded = blocked;
+        } else {
+            // Start clean when the fold turns asymmetric again: a cleared trap
+            // passes its first sample unchanged instead of replaying old DC.
+            self.dc_x1 = 0.0;
+            self.dc_y1 = 0.0;
         }
         let bias = values[3];
         let body_vca = if self.body_started {
@@ -657,14 +662,19 @@ impl Instrument for TwinCorePercVoice {
             0.0
         };
         let mut body = folded * body_vca;
+        // After the VCA, so Length keeps its meaning. The cubic drive puts the
+        // gate's sweep in the audible part of the envelope.
+        let lpg_control = if self.body_started { body_env } else { 0.0 };
+        let lpg_drive = lpg_control * lpg_control * lpg_control;
+        self.lpg
+            .set_fall_seconds((values[2] * LPG_FALL_PER_LENGTH).min(0.25));
         if lpg_amount > 0.0 {
-            let control = if self.body_started { body_env } else { 0.0 };
-            self.lpg
-                .set_fall_seconds((values[2] * LPG_FALL_PER_LENGTH).min(0.25));
-            // After the VCA, so Length keeps its meaning. The cubic drive puts
-            // the gate's sweep in the audible part of the envelope.
-            let gated = self.lpg.process(body, control * control * control);
+            let gated = self.lpg.process(body, lpg_drive);
             body += (gated - body) * lpg_amount;
+        } else {
+            // Keep the vactrol tracking while bypassed so re-enabling the gate
+            // lands at the current brightness.
+            self.lpg.follow(lpg_drive);
         }
         let direct_noise = if self.active_noise_mode == TwinCorePercNoiseMode::Body {
             0.0
@@ -746,6 +756,61 @@ impl Modulatable for TwinCorePercVoice {
 #[cfg(test)]
 mod channel_mode_tests {
     use super::*;
+
+    fn run(voice: &mut TwinCorePercVoice, from: f64, seconds: f64) -> f64 {
+        let sr = voice.sample_rate as f64;
+        let frames = (seconds * sr) as usize;
+        for n in 0..frames {
+            voice.tick(from + n as f64 / sr);
+        }
+        from + seconds
+    }
+
+    #[test]
+    fn bypassed_symmetry_clears_the_dc_trap() {
+        let mut voice = TwinCorePercVoice::with_config(
+            44_100.0,
+            TwinCorePercConfig {
+                harmonics: 0.6,
+                symmetry: 0.8,
+                ..TwinCorePercConfig::kick()
+            },
+        );
+        voice.trigger_with_velocity(0.0, 1.0);
+        let t = run(&mut voice, 0.0, 0.1);
+        assert!(voice.dc_x1 != 0.0);
+        voice.set_parameter_normalized(12, 0.5);
+        // Long enough for the 15 ms smoother to settle exactly on zero.
+        run(&mut voice, t, 0.3);
+        assert!(voice.active);
+        assert_eq!((voice.dc_x1, voice.dc_y1), (0.0, 0.0));
+    }
+
+    #[test]
+    fn bypassed_lpg_keeps_its_vactrol_tracking() {
+        let mut voice = TwinCorePercVoice::with_config(
+            44_100.0,
+            TwinCorePercConfig {
+                lpg: 1.0,
+                ..TwinCorePercConfig::kick()
+            },
+        );
+        voice.trigger_with_velocity(0.0, 1.0);
+        let t = run(&mut voice, 0.0, 0.05);
+        let bright = voice.lpg.vactrol();
+        assert!(bright > 0.3, "{bright}");
+
+        // Bypass the gate and let the hit die away: the vactrol must keep
+        // following the envelope rather than freezing at its bright value.
+        voice.set_parameter_normalized(14, 0.0);
+        let t = run(&mut voice, t, 2.0);
+        assert!(voice.lpg.vactrol() < 0.01, "{}", voice.lpg.vactrol());
+
+        // A new hit while bypassed opens it again.
+        voice.trigger_with_velocity(t, 1.0);
+        run(&mut voice, t, 0.05);
+        assert!(voice.lpg.vactrol() > 0.3, "{}", voice.lpg.vactrol());
+    }
 
     #[test]
     fn selected_modes_latch_on_the_next_trigger() {
