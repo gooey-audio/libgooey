@@ -30,9 +30,10 @@ use crate::instruments::sampler_control::{SamplerCommand, SamplerControl};
 use crate::instruments::{
     BassConfig, BassSynth, FilterSlope, Granulator, HiHat2, HiHat2Config, KickConfig, KickDrum,
     MelodyNotePool, MelodyVoice, NoiseColor, PercussionEngine, PercussionEngineKind,
-    PercussionPreset, PolyModRoute, PolyModSource, PolySynth, PolySynthConfig, SampleBuffer,
-    SamplerBuffer, SamplerRack, SnareConfig, SnareDrum, Tom2, Tom2Config, TwinCorePercBodyMode,
-    TwinCorePercConfig, TwinCorePercNoiseMode, TwinCorePercVoice,
+    PercussionPreset, PlateConfig, PlateMaterial, PlateVoice, PolyModRoute, PolyModSource,
+    PolySynth, PolySynthConfig, SampleBuffer, SamplerBuffer, SamplerRack, SnareConfig, SnareDrum,
+    Tom2, Tom2Config, TwinCorePercBodyMode, TwinCorePercConfig, TwinCorePercNoiseMode,
+    TwinCorePercVoice, PLATE_MODE_COUNTS,
 };
 use crate::live_control::{
     DrumCell, EngineLifecycle, LiveCommand, LiveControlShared, DRUM_LANE_COUNT, DRUM_STEP_COUNT,
@@ -135,8 +136,8 @@ pub const PERCUSSION_PRESET_METALLIC: u32 = 4;
 enum LfoTarget {
     /// Swings around the parameter's own value.
     Centered,
-    /// Mode selector set from the LFO's absolute output.
-    Mode,
+    /// Mode selector 0..=max set from the LFO's absolute output.
+    Mode(u32),
     /// Not a live LFO destination; routes to it are ignored.
     None,
 }
@@ -254,6 +255,23 @@ enum ChannelInstrument {
     Bass(BassSynth),
     Resonator(PercussionEngine),
     TwinCore(PercussionEngine),
+    /// Boxed: the 128-mode bank would otherwise size every channel.
+    Plate(Box<PlateChannel>),
+}
+
+/// A plate voice and the factory preset it was last loaded from.
+struct PlateChannel {
+    voice: PlateVoice,
+    preset: u32,
+}
+
+impl PlateChannel {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            voice: PlateVoice::new(sample_rate),
+            preset: PLATE_VOICE_PRESET_RIDE,
+        }
+    }
 }
 
 impl ChannelInstrument {
@@ -267,6 +285,7 @@ impl ChannelInstrument {
             Self::Bass(_) => INSTRUMENT_BASS,
             Self::Resonator(_) => INSTRUMENT_RESONATOR,
             Self::TwinCore(_) => INSTRUMENT_TWIN_CORE,
+            Self::Plate(_) => INSTRUMENT_PLATE,
         }
     }
 
@@ -279,6 +298,7 @@ impl ChannelInstrument {
             Self::Tom(t) => t.trigger_with_velocity(time, velocity),
             Self::Bass(b) => b.trigger_with_velocity(time, velocity),
             Self::Resonator(p) | Self::TwinCore(p) => p.trigger_with_velocity(time, velocity),
+            Self::Plate(p) => p.voice.trigger_with_velocity(time, velocity),
         }
     }
 
@@ -291,7 +311,7 @@ impl ChannelInstrument {
             Self::HiHat(h) => h.snap_params(),
             Self::Tom(_) => {} // Tom2 uses plain f32, already immediate
             Self::Bass(b) => b.snap_params(),
-            Self::Resonator(_) | Self::TwinCore(_) => {}
+            Self::Resonator(_) | Self::TwinCore(_) | Self::Plate(_) => {}
         }
     }
 
@@ -304,6 +324,7 @@ impl ChannelInstrument {
             Self::Tom(t) => t.tick(current_time),
             Self::Bass(b) => b.tick(current_time),
             Self::Resonator(p) | Self::TwinCore(p) => p.tick(current_time),
+            Self::Plate(p) => p.voice.tick(current_time),
         }
     }
 
@@ -317,6 +338,7 @@ impl ChannelInstrument {
             Self::Bass(b) => b.params.tuning.get(),
             Self::Resonator(p) => p.routing_matrix().map_or(0.5, |v| v.channel_tuning()),
             Self::TwinCore(p) => p.twin_core().map_or(0.5, |v| v.channel_tuning()),
+            Self::Plate(p) => p.voice.channel_tuning(),
         }
     }
 
@@ -331,6 +353,7 @@ impl ChannelInstrument {
             Self::Bass(b) => b.params.tuning.target(),
             Self::Resonator(p) => p.routing_matrix().map_or(0.5, |v| v.channel_tuning()),
             Self::TwinCore(p) => p.twin_core().map_or(0.5, |v| v.channel_tuning()),
+            Self::Plate(p) => p.voice.channel_tuning(),
         }
     }
 
@@ -349,6 +372,7 @@ impl ChannelInstrument {
                     v.set_channel_tuning(value);
                 }
             }
+            Self::Plate(p) => p.voice.set_channel_tuning(value),
             _ => {
                 let param = match self.instrument_type() {
                     INSTRUMENT_KICK => KICK_PARAM_TUNING,
@@ -495,6 +519,24 @@ impl ChannelInstrument {
                     }
                 }
             }
+            Self::Plate(p) => {
+                if !value.is_finite() {
+                    return;
+                }
+                match param {
+                    PLATE_VOICE_PARAM_MATERIAL => p.voice.set_material(PlateMaterial::from_index(
+                        value.round().clamp(0.0, PLATE_VOICE_MATERIAL_MAX as f32) as usize,
+                    )),
+                    PLATE_VOICE_PARAM_MODES => p.voice.set_mode_count(
+                        PLATE_MODE_COUNTS
+                            [value.round().clamp(0.0, PLATE_VOICE_MODES_MAX as f32) as usize],
+                    ),
+                    _ if param < PLATE_VOICE_PARAM_MATERIAL => p
+                        .voice
+                        .set_parameter_normalized(param as usize, value.clamp(0.0, 1.0)),
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -621,6 +663,18 @@ impl ChannelInstrument {
                 }
                 _ => p.parameter_normalized(param as usize).unwrap_or(f32::NAN),
             },
+            Self::Plate(p) => match param {
+                PLATE_VOICE_PARAM_MATERIAL => p.voice.material().index() as f32,
+                PLATE_VOICE_PARAM_MODES => PLATE_MODE_COUNTS
+                    .iter()
+                    .position(|count| *count == p.voice.mode_count())
+                    .map_or(f32::NAN, |step| step as f32),
+                _ if param < PLATE_VOICE_PARAM_MATERIAL => p
+                    .voice
+                    .parameter_normalized(param as usize)
+                    .unwrap_or(f32::NAN),
+                _ => f32::NAN,
+            },
         }
     }
 
@@ -719,10 +773,16 @@ impl ChannelInstrument {
             Self::Resonator(p) => p.parameter_name(param as usize).is_some(),
             Self::TwinCore(_) => {
                 if param == TWIN_CORE_PARAM_BODY_MODE || param == TWIN_CORE_PARAM_NOISE_MODE {
-                    return LfoTarget::Mode;
+                    return LfoTarget::Mode(2);
                 }
                 param < TWIN_CORE_PERC_PARAM_COUNT
             }
+            // Strike position latches on trigger, so it shapes the next hit.
+            Self::Plate(_) => match param {
+                PLATE_VOICE_PARAM_MATERIAL => return LfoTarget::Mode(PLATE_VOICE_MATERIAL_MAX),
+                PLATE_VOICE_PARAM_MODES => return LfoTarget::Mode(PLATE_VOICE_MODES_MAX),
+                _ => param < PLATE_VOICE_PARAM_MATERIAL,
+            },
         };
         if centered {
             LfoTarget::Centered
@@ -820,7 +880,7 @@ impl ChannelBlender {
     /// Create a default blender with standard corner presets for the given instrument type.
     fn default_for_type(instrument_type: u32) -> Self {
         match instrument_type {
-            INSTRUMENT_RESONATOR | INSTRUMENT_TWIN_CORE => Self::None,
+            INSTRUMENT_RESONATOR | INSTRUMENT_TWIN_CORE | INSTRUMENT_PLATE => Self::None,
             INSTRUMENT_KICK => Self::Kick(PresetBlender::new(
                 KickConfig::tight(),
                 KickConfig::punch(),
@@ -863,7 +923,7 @@ impl ChannelBlender {
     /// Returns the default corner preset IDs for a given instrument type.
     fn default_corner_preset_ids(instrument_type: u32) -> [u32; 4] {
         match instrument_type {
-            INSTRUMENT_RESONATOR | INSTRUMENT_TWIN_CORE => [u32::MAX; 4],
+            INSTRUMENT_RESONATOR | INSTRUMENT_TWIN_CORE | INSTRUMENT_PLATE => [u32::MAX; 4],
             INSTRUMENT_KICK => [
                 KICK_PRESET_TIGHT,
                 KICK_PRESET_PUNCH,
@@ -1065,9 +1125,10 @@ impl VoiceStrip {
             let sum = self.lfo_sum[i];
             match self.instrument.lfo_target(param) {
                 LfoTarget::Centered => {}
-                LfoTarget::Mode => {
-                    // Modes have no meaningful center: -1..1 picks mode 0..2.
-                    self.instrument.set_param(param, sum.clamp(-1.0, 1.0) + 1.0);
+                LfoTarget::Mode(max) => {
+                    // Modes have no meaningful center: -1..1 picks mode 0..max.
+                    self.instrument
+                        .set_param(param, (sum.clamp(-1.0, 1.0) + 1.0) * 0.5 * max as f32);
                     continue;
                 }
                 LfoTarget::None => continue,
@@ -2654,6 +2715,7 @@ impl GooeyEngine {
                     ChannelInstrument::Tom(_) => param <= TOM_PARAM_TUNING,
                     ChannelInstrument::Resonator(_) => param < RESONATOR_PARAM_COUNT,
                     ChannelInstrument::TwinCore(_) => param < TWIN_CORE_PARAM_BODY_MODE,
+                    ChannelInstrument::Plate(_) => param < PLATE_VOICE_PARAM_MATERIAL,
                     // Bass is not exposed as a macro target.
                     ChannelInstrument::Bass(_) => false,
                 };
@@ -3281,8 +3343,10 @@ pub const INSTRUMENT_BASS: u32 = 4;
 pub const INSTRUMENT_RESONATOR: u32 = 5;
 /// Instrument ID: twin-core percussion.
 pub const INSTRUMENT_TWIN_CORE: u32 = 6;
+/// Instrument ID: modal plate (ride, crash, bell, timbale, gong).
+pub const INSTRUMENT_PLATE: u32 = 7;
 /// Number of selectable instrument types, not the number of channel slots.
-pub const INSTRUMENT_COUNT: u32 = 7;
+pub const INSTRUMENT_COUNT: u32 = 8;
 /// The engine retains four drum strips and one bass strip.
 const NUM_INSTRUMENTS: usize = 5;
 
@@ -3342,6 +3406,80 @@ pub const TWIN_CORE_PARAM_BODY_MODE: u32 = 12;
 /// Twin Core noise mode (float 0–2 rounded: lowpass, highpass, body; next trigger).
 pub const TWIN_CORE_PARAM_NOISE_MODE: u32 = 13;
 const TWIN_CORE_PARAM_COUNT: u32 = 14;
+
+/// Plate fundamental (0–1, exponential 30–2000 Hz).
+pub const PLATE_VOICE_PARAM_PITCH: u32 = 0;
+/// Plate mode-ratio stretch (0–1, linear −0.5–0.5; ratios become r^(1 + geometry)).
+pub const PLATE_VOICE_PARAM_GEOMETRY: u32 = 1;
+/// Plate strike position (0–1, centre to edge; latched on trigger).
+pub const PLATE_VOICE_PARAM_STRIKE_POS: u32 = 2;
+/// Plate pickup position (0–1, centre to edge).
+pub const PLATE_VOICE_PARAM_PICKUP_POS: u32 = 3;
+/// Plate mallet hardness (0–1, soft 8 ms pulse to hard 0.25 ms noise burst).
+pub const PLATE_VOICE_PARAM_HARDNESS: u32 = 4;
+/// Plate fundamental T60 (0–1, exponential 0.05–20 s).
+pub const PLATE_VOICE_PARAM_DECAY: u32 = 5;
+/// Plate high-mode damping (0–1, linear 0–8; how much faster high modes die).
+pub const PLATE_VOICE_PARAM_HF_DAMPING: u32 = 6;
+/// Plate tension pitch glide (0–1; 1 is about an octave at full energy).
+pub const PLATE_VOICE_PARAM_TENSION: u32 = 7;
+/// Plate cubic mode cascade (0–1).
+pub const PLATE_VOICE_PARAM_CASCADE: u32 = 8;
+/// Plate low-band loss while the cascade feeds upper bands (0–1).
+pub const PLATE_VOICE_PARAM_DEPLETE: u32 = 9;
+/// Plate output low-pass (0–1, exponential 500–20000 Hz).
+pub const PLATE_VOICE_PARAM_BRIGHTNESS: u32 = 10;
+/// Plate material (float 0–4 rounded, `PLATE_VOICE_MATERIAL_*`; next trigger).
+pub const PLATE_VOICE_PARAM_MATERIAL: u32 = 11;
+/// Plate mode count (float 0–7 rounded: 8, 16, 24, 32, 48, 64, 96, 128 modes;
+/// next trigger). Cost scales with the count.
+pub const PLATE_VOICE_PARAM_MODES: u32 = 12;
+const PLATE_VOICE_PARAM_COUNT: u32 = 13;
+const PLATE_VOICE_MATERIAL_MAX: u32 = PLATE_VOICE_MATERIAL_SHEET;
+const PLATE_VOICE_MODES_MAX: u32 = PLATE_MODE_COUNTS.len() as u32 - 1;
+
+/// Plate material: circular membrane (toms, timbales).
+pub const PLATE_VOICE_MATERIAL_MEMBRANE: u32 = 0;
+/// Plate material: free circular plate (cymbals).
+pub const PLATE_VOICE_MATERIAL_PLATE: u32 = 1;
+/// Plate material: free-free bar (marimba, glockenspiel).
+pub const PLATE_VOICE_MATERIAL_BAR: u32 = 2;
+/// Plate material: church bell partials.
+pub const PLATE_VOICE_MATERIAL_BELL: u32 = 3;
+/// Plate material: dense metal sheet (gongs, thunder sheets).
+pub const PLATE_VOICE_MATERIAL_SHEET: u32 = 4;
+
+/// Plate factory presets for `gooey_engine_set_channel_preset`.
+pub const PLATE_VOICE_PRESET_RIDE: u32 = 0;
+pub const PLATE_VOICE_PRESET_CRASH: u32 = 1;
+pub const PLATE_VOICE_PRESET_BELL: u32 = 2;
+pub const PLATE_VOICE_PRESET_TIMBALE: u32 = 3;
+pub const PLATE_VOICE_PRESET_GONG: u32 = 4;
+pub const PLATE_VOICE_PRESET_CHINA: u32 = 5;
+pub const PLATE_VOICE_PRESET_TAM_TAM: u32 = 6;
+pub const PLATE_VOICE_PRESET_GAMELAN: u32 = 7;
+
+const _: () = assert!(PLATE_VOICE_PARAM_COUNT as usize == crate::instruments::PLATE_PARAM_COUNT);
+const _: () =
+    assert!(PLATE_VOICE_PARAM_MATERIAL as usize == crate::instruments::PLATE_PARAM_MATERIAL_INDEX);
+const _: () =
+    assert!(PLATE_VOICE_PARAM_MODES as usize == crate::instruments::PLATE_PARAM_MODES_INDEX);
+const _: () = assert!(PlateMaterial::ALL.len() as u32 == PLATE_VOICE_MATERIAL_MAX + 1);
+
+fn plate_preset(preset: u32) -> Option<PlateConfig> {
+    match preset {
+        PLATE_VOICE_PRESET_RIDE => Some(PlateConfig::ride()),
+        PLATE_VOICE_PRESET_CRASH => Some(PlateConfig::crash()),
+        PLATE_VOICE_PRESET_BELL => Some(PlateConfig::bell()),
+        PLATE_VOICE_PRESET_TIMBALE => Some(PlateConfig::timbale()),
+        PLATE_VOICE_PRESET_GONG => Some(PlateConfig::gong()),
+        PLATE_VOICE_PRESET_CHINA => Some(PlateConfig::china()),
+        PLATE_VOICE_PRESET_TAM_TAM => Some(PlateConfig::tam_tam()),
+        PLATE_VOICE_PRESET_GAMELAN => Some(PlateConfig::gamelan()),
+        _ => None,
+    }
+}
+
 const DEFAULT_MASTER_GAIN: f32 = 0.25;
 
 /// Number of stereo loop-mixer channels (see `gooey_engine_loop_*`).
@@ -3934,6 +4072,7 @@ pub unsafe extern "C" fn gooey_engine_set_channel_instrument_type(
             PercussionEngineKind::TwinCore,
             PercussionPreset::Kick,
         )),
+        INSTRUMENT_PLATE => ChannelInstrument::Plate(Box::new(PlateChannel::new(sample_rate))),
         _ => return,
     };
 
@@ -3945,7 +4084,10 @@ pub unsafe extern "C" fn gooey_engine_set_channel_instrument_type(
     voice.param_locks = [None; CHANNEL_PARAM_LOCK_CAPACITY];
     voice.reset_lfo_modulation();
     voice.saved_global_freq = None;
-    if matches!(instrument_type, INSTRUMENT_RESONATOR | INSTRUMENT_TWIN_CORE) {
+    if matches!(
+        instrument_type,
+        INSTRUMENT_RESONATOR | INSTRUMENT_TWIN_CORE | INSTRUMENT_PLATE
+    ) {
         voice.blend_enabled = false;
     }
 
@@ -3963,7 +4105,7 @@ pub unsafe extern "C" fn gooey_engine_set_channel_instrument_type(
 /// * `channel` - Channel slot index (0–4)
 ///
 /// # Returns
-/// Instrument type (0–6),
+/// Instrument type (0–7),
 /// or 0xFFFFFFFF if invalid.
 ///
 /// # Safety
@@ -3983,34 +4125,50 @@ pub unsafe extern "C" fn gooey_engine_get_channel_instrument_type(
     }
 }
 
-/// Load one of the five factory percussion presets on a Resonator or Twin Core
-/// channel. Clears parameter locks while preserving the strip and its tuning.
+/// Load a factory preset on a Resonator or Twin Core channel (`PERC_PRESET_*`,
+/// 0–4) or a Plate channel (`PLATE_VOICE_PRESET_*`, 0–7). Clears parameter locks
+/// while preserving the strip and its tuning. Returns false for other types,
+/// invalid channels and preset IDs the channel's type does not define.
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_set_channel_preset(
     engine: *mut GooeyEngine,
     channel: u32,
     preset: u32,
 ) -> bool {
-    let Some(preset) = percussion_preset(preset) else {
-        return false;
-    };
     let Some(voice) = engine.as_mut().and_then(|e| e.voice_mut(channel as usize)) else {
         return false;
     };
     let tuning = voice.instrument.tuning_target();
     match &mut voice.instrument {
         ChannelInstrument::Resonator(p) | ChannelInstrument::TwinCore(p) => {
+            let Some(preset) = percussion_preset(preset) else {
+                return false;
+            };
             p.select_preset(preset);
-            voice.instrument.set_tuning(tuning);
-            voice.param_locks = [None; CHANNEL_PARAM_LOCK_CAPACITY];
-            voice.saved_global_freq = None;
-            true
         }
-        _ => false,
+        ChannelInstrument::Plate(p) => {
+            let Some(config) = plate_preset(preset) else {
+                return false;
+            };
+            p.voice.set_config(config);
+            p.preset = preset;
+        }
+        _ => return false,
     }
+    voice.instrument.set_tuning(tuning);
+    voice.param_locks = [None; CHANNEL_PARAM_LOCK_CAPACITY];
+    voice.saved_global_freq = None;
+    true
 }
 
 /// Current factory preset ID, or `UINT32_MAX` for other types/invalid channels.
+/// Plate channels report the last `PLATE_VOICE_PRESET_*` loaded (ride by default).
+///
+/// # Safety
+/// `engine` must be null or a valid pointer returned by `gooey_engine_new`.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_engine_get_channel_preset(
     engine: *const GooeyEngine,
@@ -4023,6 +4181,7 @@ pub unsafe extern "C" fn gooey_engine_get_channel_preset(
             ChannelInstrument::Resonator(p) | ChannelInstrument::TwinCore(p) => {
                 Some(p.preset() as u32)
             }
+            ChannelInstrument::Plate(p) => Some(p.preset),
             _ => None,
         })
         .unwrap_or(u32::MAX)
@@ -4150,6 +4309,13 @@ pub unsafe extern "C" fn gooey_engine_set_channel_param_lock(
         INSTRUMENT_RESONATOR => value.clamp(0.0, 1.0),
         INSTRUMENT_TWIN_CORE if param >= TWIN_CORE_PARAM_BODY_MODE => value.round().clamp(0.0, 2.0),
         INSTRUMENT_TWIN_CORE => value.clamp(0.0, 1.0),
+        INSTRUMENT_PLATE if param == PLATE_VOICE_PARAM_MATERIAL => {
+            value.round().clamp(0.0, PLATE_VOICE_MATERIAL_MAX as f32)
+        }
+        INSTRUMENT_PLATE if param == PLATE_VOICE_PARAM_MODES => {
+            value.round().clamp(0.0, PLATE_VOICE_MODES_MAX as f32)
+        }
+        INSTRUMENT_PLATE => value.clamp(0.0, 1.0),
         _ => value,
     };
     let Some(lock) = voice.param_locks.get_mut(param as usize) else {
@@ -6606,6 +6772,12 @@ pub extern "C" fn gooey_engine_resonator_param_count() -> u32 {
 #[no_mangle]
 pub extern "C" fn gooey_engine_twin_core_param_count() -> u32 {
     TWIN_CORE_PARAM_COUNT
+}
+
+/// Number of indexed Plate channel controls, including material and mode count.
+#[no_mangle]
+pub extern "C" fn gooey_engine_plate_voice_param_count() -> u32 {
+    PLATE_VOICE_PARAM_COUNT
 }
 
 /// Get the number of available global effects

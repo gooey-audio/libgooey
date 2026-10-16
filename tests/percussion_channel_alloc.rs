@@ -29,13 +29,14 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 #[test]
-fn both_channel_voices_render_with_locks_lfos_and_steps_without_allocation() {
+fn new_channel_voices_render_with_locks_lfos_and_steps_without_allocation() {
     unsafe {
         let engine = gooey_engine_new(44_100.0);
         let mut output = [0.0_f32; 8192];
         for (kind, param) in [
             (INSTRUMENT_RESONATOR, RESONATOR_PARAM_PITCH),
             (INSTRUMENT_TWIN_CORE, TWIN_CORE_PARAM_TUNE),
+            (INSTRUMENT_PLATE, PLATE_VOICE_PARAM_PICKUP_POS),
         ] {
             gooey_engine_set_channel_instrument_type(engine, 1, kind);
             gooey_engine_set_channel_param_lock(engine, 1, param, 0.4);

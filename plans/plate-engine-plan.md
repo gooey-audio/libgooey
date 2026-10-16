@@ -86,8 +86,9 @@ Copy `examples/reso_kick.rs`. Keys cycle the five presets and nudge Pitch, Strik
 - [x] Runtime mode count (8 to 128) as param 12, replacing the `plate-hq` feature; China, Tam-tam and Gamelan presets.
 - [x] Phase 2: `examples/plate.rs` interactive lab (presets, velocity, material, 16-step pattern).
 - [x] Unit tests: `tests/plate_voice.rs`.
-- [ ] Phase 3: FFI channel instrument.
-- [ ] Phase 4: FFI tests, CPU bench.
+- [x] Phase 3: FFI channel instrument (`INSTRUMENT_PLATE = 7`, `PLATE_VOICE_*` constants, eight presets).
+- [x] Phase 4 (FFI half): `tests/plate_channels.rs`, plate added to `tests/percussion_channel_alloc.rs`.
+- [ ] Phase 4: CPU bench.
 - [ ] Phase 5: release and Ripple adoption.
 
 ## Decision log
@@ -99,6 +100,11 @@ Copy `examples/reso_kick.rs`. Keys cycle the five presets and nudge Pitch, Strik
 - **Test thresholds.** The cascade test asserts the crash's above-4 kHz share at least 1.5x the dry share (measured about 0.24 vs 0.11 at full velocity with a two-pole split), not the 20 % / 5 % FFT figures.
 
 - **Mode count is a runtime parameter, not a Cargo feature.** `PLATE_PARAM_MODES 12` (so `PLATE_PARAM_COUNT` becomes 13) steps through 8, 16, 24, 32, 48, 64, 96, 128 and latches on trigger like the material. The bank is a fixed 128-slot array; only the active count is processed, so cost scales with the setting. For Plate, Bell and Sheet a higher count fills the same frequency span more densely (32 modes reproduces the original tables bit for bit). Membrane continues upward with higher Bessel zeros (McMahon and Airy-zero expansions, within about 1 %). Bar is a sparse physical series, so its extra modes mostly land above Nyquist. Strike and cascade drive scale by `sqrt(32 / enabled modes)` above 32 so a denser bank keeps roughly the same level (measured within about 4 dB).
+
+- **FFI names are `PLATE_VOICE_*`, not `PLATE_*`.** `PLATE_PARAM_*` 0-5 already belong to the plate reverb effect (`PLATE_PARAM_DECAY` collides), so the channel instrument uses `PLATE_VOICE_PARAM_*`, `PLATE_VOICE_MATERIAL_*`, `PLATE_VOICE_PRESET_*` and `gooey_engine_plate_voice_param_count()` (13). Ripple's `PlateParam` maps onto these.
+- **Discrete params use raw indices on the channel API**, as Twin Core's body and noise modes do: material 0-4, modes step 0-7 (8, 16, 24, 32, 48, 64, 96, 128). Locks round and clamp them; macros only target params 0-10. Presets are ride, crash, bell, timbale, gong, china, tam-tam, gamelan (0-7).
+- **LFO mode targets carry their range.** `LfoTarget::Mode(max)` maps the LFO's -1..1 to 0..max (Twin Core keeps 2, plate material 4, modes 7). Strike position is a centred target; it is latched on trigger, so modulation shapes the next hit.
+- **The channel variant is boxed** (`ChannelInstrument::Plate(Box<PlateChannel>)`): the 128-mode bank is about 12 KB and would otherwise size every channel. The box is allocated by `gooey_engine_set_channel_instrument_type`, never on the render path.
 
 ## Surprises
 
