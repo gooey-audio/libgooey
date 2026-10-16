@@ -80,7 +80,7 @@ impl PercussionEngine {
         "drive",
         "volume",
     ];
-    const TWIN_CORE_PARAMETERS: [&'static str; 12] = [
+    const TWIN_CORE_PARAMETERS: [&'static str; 16] = [
         "tune",
         "detune",
         "length",
@@ -93,6 +93,10 @@ impl PercussionEngine {
         "noise_decay",
         "noise_bias",
         "volume",
+        "symmetry",
+        "cross_mod",
+        "lpg",
+        "chaos",
     ];
 
     pub fn new(sample_rate: f32) -> Self {

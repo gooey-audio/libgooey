@@ -110,7 +110,17 @@ const _: () = assert!(LfoWaveform::SampleHold as u32 == LFO_WAVEFORM_SAMPLE_HOLD
 // Twin-core percussion standalone voice constants
 // =============================================================================
 
-pub const TWIN_CORE_PERC_PARAM_COUNT: u32 = 12;
+pub const TWIN_CORE_PERC_PARAM_COUNT: u32 = 16;
+// Standalone voice indices 0–11 match TWIN_CORE_PARAM_TUNE..TWIN_CORE_PARAM_VOLUME.
+// With no mode switches in this list, the extensions follow directly.
+/// Standalone Twin Core fold symmetry (0–1, linear −1–1; 0.5 is symmetric).
+pub const TWIN_CORE_PERC_PARAM_SYMMETRY: u32 = 12;
+/// Standalone Twin Core cross modulation of core two by core one (0–1).
+pub const TWIN_CORE_PERC_PARAM_CROSS_MOD: u32 = 13;
+/// Standalone Twin Core vactrol low-pass gate amount (0–1).
+pub const TWIN_CORE_PERC_PARAM_LPG: u32 = 14;
+/// Standalone Twin Core chaos (0–1).
+pub const TWIN_CORE_PERC_PARAM_CHAOS: u32 = 15;
 pub const TWIN_CORE_PERC_PRESET_KICK: u32 = 0;
 pub const TWIN_CORE_PERC_PRESET_TOM: u32 = 1;
 pub const TWIN_CORE_PERC_PRESET_SNARE: u32 = 2;
@@ -476,8 +486,8 @@ impl ChannelInstrument {
                 if !value.is_finite() {
                     return;
                 }
-                if param < TWIN_CORE_PERC_PARAM_COUNT {
-                    p.set_parameter_normalized(param as usize, value.clamp(0.0, 1.0));
+                if let Some(index) = twin_core_voice_index(param) {
+                    p.set_parameter_normalized(index, value.clamp(0.0, 1.0));
                 } else if let Some(voice) = p.twin_core_mut() {
                     let mode = value.round().clamp(0.0, 2.0) as u32;
                     match param {
@@ -619,7 +629,9 @@ impl ChannelInstrument {
                         None => f32::NAN,
                     }
                 }
-                _ => p.parameter_normalized(param as usize).unwrap_or(f32::NAN),
+                _ => twin_core_voice_index(param)
+                    .and_then(|index| p.parameter_normalized(index))
+                    .unwrap_or(f32::NAN),
             },
         }
     }
@@ -721,7 +733,7 @@ impl ChannelInstrument {
                 if param == TWIN_CORE_PARAM_BODY_MODE || param == TWIN_CORE_PARAM_NOISE_MODE {
                     return LfoTarget::Mode;
                 }
-                param < TWIN_CORE_PERC_PARAM_COUNT
+                twin_core_voice_index(param).is_some()
             }
         };
         if centered {
@@ -2653,7 +2665,7 @@ impl GooeyEngine {
                     ChannelInstrument::HiHat(_) => param <= HIHAT_PARAM_TUNING,
                     ChannelInstrument::Tom(_) => param <= TOM_PARAM_TUNING,
                     ChannelInstrument::Resonator(_) => param < RESONATOR_PARAM_COUNT,
-                    ChannelInstrument::TwinCore(_) => param < TWIN_CORE_PARAM_BODY_MODE,
+                    ChannelInstrument::TwinCore(_) => twin_core_voice_index(param).is_some(),
                     // Bass is not exposed as a macro target.
                     ChannelInstrument::Bass(_) => false,
                 };
@@ -3341,7 +3353,27 @@ pub const TWIN_CORE_PARAM_VOLUME: u32 = 11;
 pub const TWIN_CORE_PARAM_BODY_MODE: u32 = 12;
 /// Twin Core noise mode (float 0–2 rounded: lowpass, highpass, body; next trigger).
 pub const TWIN_CORE_PARAM_NOISE_MODE: u32 = 13;
-const TWIN_CORE_PARAM_COUNT: u32 = 14;
+/// Twin Core fold symmetry (0–1, linear −1–1; 0.5 is symmetric). Adds even
+/// harmonics when Harmonics is up.
+pub const TWIN_CORE_PARAM_SYMMETRY: u32 = 14;
+/// Twin Core cross modulation (0–1): core one frequency-modulates core two.
+pub const TWIN_CORE_PARAM_CROSS_MOD: u32 = 15;
+/// Twin Core low-pass gate (0–1): blends in a vactrol LPG after the body VCA,
+/// so the tail darkens as it fades.
+pub const TWIN_CORE_PARAM_LPG: u32 = 16;
+/// Twin Core chaos (0–1): to 0.5 stiffens the cores, above it couples them.
+pub const TWIN_CORE_PARAM_CHAOS: u32 = 17;
+const TWIN_CORE_PARAM_COUNT: u32 = 18;
+
+/// Map a Twin Core channel parameter to its continuous voice index. The two
+/// mode switches sit at 12 and 13, so later controls are shifted down by two.
+fn twin_core_voice_index(param: u32) -> Option<usize> {
+    match param {
+        TWIN_CORE_PARAM_TUNE..=TWIN_CORE_PARAM_VOLUME => Some(param as usize),
+        TWIN_CORE_PARAM_SYMMETRY..=TWIN_CORE_PARAM_CHAOS => Some(param as usize - 2),
+        _ => None,
+    }
+}
 const DEFAULT_MASTER_GAIN: f32 = 0.25;
 
 /// Number of stereo loop-mixer channels (see `gooey_engine_loop_*`).
@@ -4148,7 +4180,11 @@ pub unsafe extern "C" fn gooey_engine_set_channel_param_lock(
     }
     let value = match voice.instrument.instrument_type() {
         INSTRUMENT_RESONATOR => value.clamp(0.0, 1.0),
-        INSTRUMENT_TWIN_CORE if param >= TWIN_CORE_PARAM_BODY_MODE => value.round().clamp(0.0, 2.0),
+        INSTRUMENT_TWIN_CORE
+            if param == TWIN_CORE_PARAM_BODY_MODE || param == TWIN_CORE_PARAM_NOISE_MODE =>
+        {
+            value.round().clamp(0.0, 2.0)
+        }
         INSTRUMENT_TWIN_CORE => value.clamp(0.0, 1.0),
         _ => value,
     };
@@ -13096,7 +13132,7 @@ pub unsafe extern "C" fn gooey_percussion_engine_parameter_name(
         b"drive\0",
         b"volume\0",
     ];
-    const TWIN_NAMES: [&[u8]; 12] = [
+    const TWIN_NAMES: [&[u8]; 16] = [
         b"tune\0",
         b"detune\0",
         b"length\0",
@@ -13109,6 +13145,10 @@ pub unsafe extern "C" fn gooey_percussion_engine_parameter_name(
         b"noise_decay\0",
         b"noise_bias\0",
         b"volume\0",
+        b"symmetry\0",
+        b"cross_mod\0",
+        b"lpg\0",
+        b"chaos\0",
     ];
     let Some(voice) = voice.as_ref() else {
         return std::ptr::null();
@@ -13337,7 +13377,7 @@ pub unsafe extern "C" fn gooey_twin_core_perc_is_active(
     voice.as_ref().is_some_and(|voice| voice.voice.is_active())
 }
 
-/// Set one of the 12 continuous controls using a normalized 0–1 value.
+/// Set one of the 16 continuous controls using a normalized 0–1 value.
 #[no_mangle]
 pub unsafe extern "C" fn gooey_twin_core_perc_set_parameter(
     voice: *mut GooeyTwinCorePercVoice,
@@ -13370,7 +13410,7 @@ pub unsafe extern "C" fn gooey_twin_core_perc_get_parameter(
 /// Return a static, null-terminated parameter name, or null for an invalid ID.
 #[no_mangle]
 pub extern "C" fn gooey_twin_core_perc_parameter_name(parameter: u32) -> *const c_char {
-    const NAMES: [&[u8]; 12] = [
+    const NAMES: [&[u8]; 16] = [
         b"tune\0",
         b"detune\0",
         b"length\0",
@@ -13383,6 +13423,10 @@ pub extern "C" fn gooey_twin_core_perc_parameter_name(parameter: u32) -> *const 
         b"noise_decay\0",
         b"noise_bias\0",
         b"volume\0",
+        b"symmetry\0",
+        b"cross_mod\0",
+        b"lpg\0",
+        b"chaos\0",
     ];
     NAMES
         .get(parameter as usize)

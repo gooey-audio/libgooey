@@ -4,13 +4,108 @@
 //! Its identity is the fixed signal order: delayed body excitation, two serial
 //! resonant cores, selectable spectral emphasis, wavefolding, a body VCA, and
 //! an independently enveloped noise path that can instead excite the body.
+//!
+//! Four extensions widen it beyond the hardware: fold symmetry for even
+//! harmonics, audio-rate cross modulation from core one into core two, a
+//! vactrol low-pass gate after the body VCA, and a chaos control that
+//! stiffens the cores (Duffing-style) and then closes a saturating feedback
+//! loop between them.
+//!
+//! # Signal flow
+//!
+//! A rendered diagram and per-node notes live in `docs/twin-core/`.
+//!
+//! ```text
+//!                       TRIG ─────────────────────────────┐
+//!                        │                                │     N-TRIG
+//!                        ▼                                ▼       │
+//!                  [1] trigger delay                [9] noise ◄───┘
+//!                        │                           │        │
+//!                        ▼                    LP / HP│        │BODY
+//!                  [2] exciter                       │        │
+//!                        │                           │        │
+//!                        ▼                           │        │
+//!           ┌──────────► + ◄─────────────────────────┼────────┘
+//!           │            │                           │
+//!           │            ▼                           │
+//!           │      [3] core 1 ─── cross mod ──┐      │
+//!           │            │ low-pass           │      │
+//!           │            ▼                    ▼      │
+//!           │      [4] core 2 ◄────────── (pitch)    │
+//!           │            │                           │
+//!           └── chaos ───┤ band-pass                 │
+//!                        ▼                           │
+//!                  [5] body mode tap                 │
+//!                        │                           │
+//!                        ▼                           │
+//!                  [6] wavefolder                    │
+//!                        │                           │
+//!                        ▼                           │
+//!                  [7] body VCA                      │
+//!                        │                           │
+//!                        ▼                           │
+//!                  [8] vactrol LPG                   │
+//!                        │                           │
+//!                        ▼                           │
+//!                        + ◄─────────────────────────┘
+//!                        │
+//!                        ▼
+//!               × volume × √velocity ──► out
+//! ```
+//!
+//! 1. **Trigger delay** (`trigger_delay`): holds back the body strike by up
+//!    to 75 ms while the noise fires on time, for claps and flams.
+//! 2. **Exciter**: a 0.75 ms pulse, scaled by velocity, that strikes core one.
+//! 3. **Core 1**: a resonator at `tune` swept by `fm_depth` over an envelope
+//!    of length `fm_decay`. `length` and `body_bias` set how long it rings.
+//!    `chaos` up to 0.5 adds Duffing stiffness, so hard hits start sharp and
+//!    glide down.
+//! 4. **Core 2**: fed by core one's low-pass (the cores are in series), tuned
+//!    `detune` octaves below it. `cross_mod` lets core one bend its pitch at
+//!    audio rate (±2 octaves) for inharmonic, bell-like tones. Above 0.5,
+//!    `chaos` feeds its band-pass back into core one through a saturator,
+//!    gated by the body envelope so every hit still ends.
+//! 5. **Body mode tap** (`body_mode`): LOW takes core two's low-pass, MID
+//!    mixes both cores' band-passes, HIGH takes core two's band-pass minus its
+//!    low-pass.
+//! 6. **Wavefolder** (2× oversampled): `harmonics` sets fold depth;
+//!    `symmetry` shifts the fold point for even harmonics, with a DC trap
+//!    after it.
+//! 7. **Body VCA**: an envelope over `length`; `body_bias` raises gain and
+//!    sustain, or attenuates it down to silence at −1.
+//! 8. **Vactrol LPG** (`lpg`): blends in a low-pass gate driven by the body
+//!    envelope. It opens over about 12 ms and darkens the tail as it fades.
+//! 9. **Noise**: white noise through a filter (`noise_filter`) with its own
+//!    envelope (`noise_decay`, `noise_bias`). `noise_mode` LP/HP mixes it into
+//!    the output; BODY sends low-passed noise into core one instead. It can
+//!    also be triggered alone via `trigger_noise_with_velocity` (N-TRIG).
 
 use crate::engine::{Instrument, Modulatable};
-use crate::filters::{Resonator, StateVariableFilterTpt};
+use crate::filters::{Resonator, StateVariableFilterTpt, VactrolLpg};
 use crate::gen::{Exciter, ExciterKind};
 use crate::utils::{Oversampler, OversamplingMode, SmoothedParam, XorShift32};
 
 const SMOOTH_MS: f32 = 15.0;
+const PARAM_COUNT: usize = 16;
+/// Fold offset at full symmetry, after the harmonics drive gain. One unit is a
+/// quarter of the fold period, the most asymmetric point.
+const SYMMETRY_OFFSET: f32 = 1.0;
+/// Corner of the DC trap that follows an asymmetric fold.
+const SYMMETRY_DC_HZ: f32 = 8.0;
+/// Core two deviation, in octaves, at full cross modulation.
+const CROSS_MOD_OCTAVES: f32 = 2.0;
+/// Core level at a 200 Hz reference reaching about three quarters of the
+/// cross-mod deviation.
+const XMOD_DRIVE: f32 = 6.0;
+/// A struck core's level rises with its pitch; dividing by pitch over this
+/// reference keeps chaos and cross mod consistent from kicks to bells.
+const LEVEL_REFERENCE_HZ: f32 = 200.0;
+/// Cubic stiffness reached at chaos 0.5 and held above it.
+const DUFFING_STIFFNESS: f32 = 12.0;
+/// Core two band-pass to core one feedback gain at full chaos.
+const CHAOS_FEEDBACK: f32 = 1.5;
+/// The vactrol release follows Length so the gate never outlasts the body.
+const LPG_FALL_PER_LENGTH: f32 = 0.03;
 
 fn finite(value: f32, fallback: f32) -> f32 {
     if value.is_finite() {
@@ -52,6 +147,14 @@ pub struct TwinCorePercConfig {
     pub noise_decay_seconds: f32,
     pub noise_bias: f32,
     pub volume: f32,
+    /// -1..=1 fold offset; non-zero values add even harmonics.
+    pub symmetry: f32,
+    /// 0..=1 audio-rate frequency modulation of core two by core one.
+    pub cross_mod: f32,
+    /// 0..=1 blend of a vactrol low-pass gate after the body VCA.
+    pub lpg: f32,
+    /// 0..=0.5 stiffens the cores; 0.5..=1 adds core-to-core feedback.
+    pub chaos: f32,
     pub seed: u32,
 }
 
@@ -78,6 +181,10 @@ impl TwinCorePercConfig {
             noise_decay_seconds: 0.018,
             noise_bias: -0.75,
             volume: 0.72,
+            symmetry: 0.0,
+            cross_mod: 0.0,
+            lpg: 0.0,
+            chaos: 0.0,
             seed: 0xe17_7001,
         }
     }
@@ -164,7 +271,8 @@ pub struct TwinCorePercVoice {
     noise_filter: StateVariableFilterTpt,
     noise_rng: XorShift32,
     folder: Oversampler,
-    params: [SmoothedParam; 12],
+    lpg: VactrolLpg,
+    params: [SmoothedParam; PARAM_COUNT],
     /// Channel pitch offset; independent of the indexed tune parameter.
     channel_tuning: SmoothedParam,
     pending_body_mode: TwinCorePercBodyMode,
@@ -181,6 +289,13 @@ pub struct TwinCorePercVoice {
     active: bool,
     midi_note: Option<u8>,
     ring_limit_secs: Option<f32>,
+    /// Previous low-pass output of each core, for chaos and cross modulation.
+    core_prev: [f32; 2],
+    /// Previous core-two band-pass output; DC-free, so the chaos loop cannot latch.
+    core2_band_prev: f32,
+    dc_coeff: f32,
+    dc_x1: f32,
+    dc_y1: f32,
 }
 
 impl TwinCorePercVoice {
@@ -200,6 +315,7 @@ impl TwinCorePercVoice {
             noise_filter: StateVariableFilterTpt::new(sr, config.noise_filter_hz, 0.707),
             noise_rng: XorShift32::new(config.seed),
             folder: Oversampler::new(OversamplingMode::X2),
+            lpg: VactrolLpg::new(sr),
             params: [
                 SmoothedParam::new(config.master_tune_hz, 20.0, 2_000.0, sr, SMOOTH_MS),
                 SmoothedParam::new(config.detune_octaves, 0.0, 2.5, sr, SMOOTH_MS),
@@ -213,6 +329,10 @@ impl TwinCorePercVoice {
                 SmoothedParam::new(config.noise_decay_seconds, 0.002, 20.0, sr, SMOOTH_MS),
                 SmoothedParam::new(config.noise_bias, -1.0, 1.0, sr, SMOOTH_MS),
                 SmoothedParam::new(config.volume, 0.0, 2.0, sr, SMOOTH_MS),
+                SmoothedParam::new(config.symmetry, -1.0, 1.0, sr, SMOOTH_MS),
+                SmoothedParam::new_normalized(config.cross_mod, sr),
+                SmoothedParam::new_normalized(config.lpg, sr),
+                SmoothedParam::new_normalized(config.chaos, sr),
             ],
             channel_tuning: SmoothedParam::new_normalized(0.5, sr),
             pending_body_mode: config.body_mode,
@@ -229,6 +349,11 @@ impl TwinCorePercVoice {
             active: false,
             midi_note: None,
             ring_limit_secs: None,
+            core_prev: [0.0; 2],
+            core2_band_prev: 0.0,
+            dc_coeff: 1.0 - std::f32::consts::TAU * SYMMETRY_DC_HZ / sr,
+            dc_x1: 0.0,
+            dc_y1: 0.0,
         }
     }
 
@@ -248,6 +373,10 @@ impl TwinCorePercVoice {
             noise_decay_seconds: self.params[9].target(),
             noise_bias: self.params[10].target(),
             volume: self.params[11].target(),
+            symmetry: self.params[12].target(),
+            cross_mod: self.params[13].target(),
+            lpg: self.params[14].target(),
+            chaos: self.params[15].target(),
             seed: self.seed,
         }
     }
@@ -266,6 +395,10 @@ impl TwinCorePercVoice {
             config.noise_decay_seconds,
             config.noise_bias,
             config.volume,
+            config.symmetry,
+            config.cross_mod,
+            config.lpg,
+            config.chaos,
         ];
         for (param, value) in self.params.iter_mut().zip(values) {
             param.set_target(finite(value, param.target()));
@@ -351,6 +484,11 @@ impl TwinCorePercVoice {
         self.exciter.reset();
         self.noise_filter.reset();
         self.folder.reset();
+        self.lpg.reset();
+        self.core_prev = [0.0; 2];
+        self.core2_band_prev = 0.0;
+        self.dc_x1 = 0.0;
+        self.dc_y1 = 0.0;
         self.body_armed = false;
         self.body_started = false;
         self.active = false;
@@ -365,9 +503,15 @@ impl TwinCorePercVoice {
     }
 
     #[inline]
-    fn wavefold(sample: f32, amount: f32) -> f32 {
-        let driven = sample * (1.0 + amount * 7.0);
-        let folded = ((driven + 1.0).rem_euclid(4.0) - 2.0).abs() - 1.0;
+    fn fold(driven: f32) -> f32 {
+        ((driven + 1.0).rem_euclid(4.0) - 2.0).abs() - 1.0
+    }
+
+    /// Triangle fold blended with the dry signal. `offset` shifts the fold
+    /// point for even harmonics; the static part of that shift is subtracted.
+    #[inline]
+    fn wavefold(sample: f32, amount: f32, offset: f32) -> f32 {
+        let folded = Self::fold(sample * (1.0 + amount * 7.0) + offset) - Self::fold(offset);
         sample * (1.0 - amount) + folded * amount
     }
 }
@@ -407,7 +551,9 @@ impl Instrument for TwinCorePercVoice {
             self.reset();
             return 0.0;
         }
-        let values: [f32; 12] = std::array::from_fn(|i| self.params[i].tick());
+        let values: [f32; PARAM_COUNT] = std::array::from_fn(|i| self.params[i].tick());
+        let [symmetry, cross_mod, lpg_amount, chaos] =
+            [values[12], values[13], values[14], values[15]];
         let delay = values[6];
         if self.body_armed && !self.body_started && body_total >= delay {
             self.start_body();
@@ -421,9 +567,33 @@ impl Instrument for TwinCorePercVoice {
         let master = master * 2.0_f32.powf((self.channel_tuning.tick() - 0.5) * 2.0);
         let pitch = (master * 2.0_f32.powf(values[5] * fm_env)).clamp(20.0, self.sample_rate * 0.4);
         let second_pitch = (pitch * 2.0_f32.powf(-values[1])).max(20.0);
-        for (core, hz) in self.cores.iter_mut().zip([pitch, second_pitch]) {
-            core.set_frequency(hz);
-            core.set_decay_time(values[2] * (0.8 + values[3].max(0.0) * 2.2));
+        let core_t60 = values[2] * (0.8 + values[3].max(0.0) * 2.2);
+        let stiffness = (chaos * 2.0).min(1.0) * DUFFING_STIFFNESS;
+        let mut core_hz = [pitch, second_pitch];
+        let level = [
+            self.core_prev[0] * LEVEL_REFERENCE_HZ / pitch,
+            self.core_prev[1] * LEVEL_REFERENCE_HZ / second_pitch,
+        ];
+        if cross_mod > 0.0 {
+            core_hz[1] *=
+                2.0_f32.powf(CROSS_MOD_OCTAVES * cross_mod * (XMOD_DRIVE * level[0]).tanh());
+        }
+        for ((core, hz), base_hz) in self
+            .cores
+            .iter_mut()
+            .zip(core_hz)
+            .zip([pitch, second_pitch])
+        {
+            if cross_mod > 0.0 {
+                // Keep damping on the unmodulated pitch so Length stays put.
+                core.set_frequency(hz.clamp(20.0, self.sample_rate * 0.4));
+                core.set_decay_time_for(core_t60, base_hz);
+            } else {
+                core.set_frequency(hz);
+                core.set_decay_time(core_t60);
+            }
+            // A hardening spring: loud motion rings higher, then glides down.
+            core.set_stiffness(stiffness, LEVEL_REFERENCE_HZ / base_hz);
         }
 
         let noise_env = (-noise_elapsed * 6.91 / values[9]).exp();
@@ -448,8 +618,19 @@ impl Instrument for TwinCorePercVoice {
         } else {
             0.0
         };
-        let core1 = self.cores[0].process(transient + body_noise);
+        let body_env = (-body_elapsed * 6.91 / values[2]).exp();
+        let feedback = ((chaos - 0.5) * 2.0).max(0.0);
+        let chaos_input = if feedback > 0.0 && self.body_started {
+            // Gate the loop with the body envelope so every hit still ends.
+            let band = self.core2_band_prev * LEVEL_REFERENCE_HZ / second_pitch;
+            feedback * body_env * CHAOS_FEEDBACK * (3.0 * band).tanh()
+        } else {
+            0.0
+        };
+        let core1 = self.cores[0].process(transient + body_noise + chaos_input);
         let core2 = self.cores[1].process(core1);
+        self.core_prev = [core1, core2];
+        self.core2_band_prev = self.cores[1].bandpass();
         let spectral = match self.active_body_mode {
             TwinCorePercBodyMode::Low => core2,
             TwinCorePercBodyMode::Mid => {
@@ -458,22 +639,49 @@ impl Instrument for TwinCorePercVoice {
             TwinCorePercBodyMode::High => self.cores[1].bandpass() - 0.45 * core2,
         };
         let harmonics = values[7];
-        let folded = self
+        let offset = symmetry * SYMMETRY_OFFSET;
+        let mut folded = self
             .folder
-            .process(spectral, |sample| Self::wavefold(sample, harmonics));
-        let body_env = (-body_elapsed * 6.91 / values[2]).exp();
+            .process(spectral, |sample| Self::wavefold(sample, harmonics, offset));
+        if offset != 0.0 && harmonics > 0.0 {
+            // An asymmetric fold of a decaying tone leaves a moving DC offset.
+            let blocked = folded - self.dc_x1 + self.dc_coeff * self.dc_y1;
+            self.dc_x1 = folded;
+            self.dc_y1 = blocked;
+            folded = blocked;
+        } else {
+            // Start clean when the fold turns asymmetric again: a cleared trap
+            // passes its first sample unchanged instead of replaying old DC.
+            self.dc_x1 = 0.0;
+            self.dc_y1 = 0.0;
+        }
         let bias = values[3];
         let body_vca = if self.body_started {
             (body_env * (1.0 + bias.max(0.0) * 1.5) + bias.max(0.0) * 0.08) * (1.0 + bias.min(0.0))
         } else {
             0.0
         };
+        let mut body = folded * body_vca;
+        // After the VCA, so Length keeps its meaning. The cubic drive puts the
+        // gate's sweep in the audible part of the envelope.
+        let lpg_control = if self.body_started { body_env } else { 0.0 };
+        let lpg_drive = lpg_control * lpg_control * lpg_control;
+        self.lpg
+            .set_fall_seconds((values[2] * LPG_FALL_PER_LENGTH).min(0.25));
+        if lpg_amount > 0.0 {
+            let gated = self.lpg.process(body, lpg_drive);
+            body += (gated - body) * lpg_amount;
+        } else {
+            // Keep the vactrol tracking while bypassed so re-enabling the gate
+            // lands at the current brightness.
+            self.lpg.follow(lpg_drive);
+        }
         let direct_noise = if self.active_noise_mode == TwinCorePercNoiseMode::Body {
             0.0
         } else {
             noise
         };
-        let output = (folded * body_vca + direct_noise) * values[11] * self.velocity.sqrt();
+        let output = (body + direct_noise) * values[11] * self.velocity.sqrt();
         let body_finished = !self.body_armed || body_total > delay + values[2] * 2.0;
         if body_finished
             && noise_elapsed > values[9] * 2.0
@@ -517,6 +725,10 @@ impl Modulatable for TwinCorePercVoice {
             "noise_decay",
             "noise_bias",
             "volume",
+            "symmetry",
+            "cross_mod",
+            "lpg",
+            "chaos",
         ]
     }
 
@@ -544,6 +756,61 @@ impl Modulatable for TwinCorePercVoice {
 #[cfg(test)]
 mod channel_mode_tests {
     use super::*;
+
+    fn run(voice: &mut TwinCorePercVoice, from: f64, seconds: f64) -> f64 {
+        let sr = voice.sample_rate as f64;
+        let frames = (seconds * sr) as usize;
+        for n in 0..frames {
+            voice.tick(from + n as f64 / sr);
+        }
+        from + seconds
+    }
+
+    #[test]
+    fn bypassed_symmetry_clears_the_dc_trap() {
+        let mut voice = TwinCorePercVoice::with_config(
+            44_100.0,
+            TwinCorePercConfig {
+                harmonics: 0.6,
+                symmetry: 0.8,
+                ..TwinCorePercConfig::kick()
+            },
+        );
+        voice.trigger_with_velocity(0.0, 1.0);
+        let t = run(&mut voice, 0.0, 0.1);
+        assert!(voice.dc_x1 != 0.0);
+        voice.set_parameter_normalized(12, 0.5);
+        // Long enough for the 15 ms smoother to settle exactly on zero.
+        run(&mut voice, t, 0.3);
+        assert!(voice.active);
+        assert_eq!((voice.dc_x1, voice.dc_y1), (0.0, 0.0));
+    }
+
+    #[test]
+    fn bypassed_lpg_keeps_its_vactrol_tracking() {
+        let mut voice = TwinCorePercVoice::with_config(
+            44_100.0,
+            TwinCorePercConfig {
+                lpg: 1.0,
+                ..TwinCorePercConfig::kick()
+            },
+        );
+        voice.trigger_with_velocity(0.0, 1.0);
+        let t = run(&mut voice, 0.0, 0.05);
+        let bright = voice.lpg.vactrol();
+        assert!(bright > 0.3, "{bright}");
+
+        // Bypass the gate and let the hit die away: the vactrol must keep
+        // following the envelope rather than freezing at its bright value.
+        voice.set_parameter_normalized(14, 0.0);
+        let t = run(&mut voice, t, 2.0);
+        assert!(voice.lpg.vactrol() < 0.01, "{}", voice.lpg.vactrol());
+
+        // A new hit while bypassed opens it again.
+        voice.trigger_with_velocity(t, 1.0);
+        run(&mut voice, t, 0.05);
+        assert!(voice.lpg.vactrol() > 0.3, "{}", voice.lpg.vactrol());
+    }
 
     #[test]
     fn selected_modes_latch_on_the_next_trigger() {

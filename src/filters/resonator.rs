@@ -4,7 +4,9 @@
 //! keeps its integrator state in `f64`. That matters for low fundamentals and
 //! long decays, where an 8 Hz mode can otherwise disappear into `f32`
 //! quantization. Energy can be injected directly into the first integrator to
-//! model a trigger pulse charging an analog resonator.
+//! model a trigger pulse charging an analog resonator. An optional cubic
+//! stiffness turns the core into a hardening (Duffing) oscillator whose pitch
+//! rises with amplitude.
 
 use std::f64::consts::PI;
 
@@ -12,6 +14,7 @@ const MIN_FREQUENCY_HZ: f64 = 2.0;
 const MIN_DAMPING: f64 = 1.0e-4;
 const MAX_DAMPING: f64 = 1.0;
 const MAX_FEEDBACK: f64 = 0.8;
+const MAX_STIFFNESS: f64 = 16.0;
 const QUIET_THRESHOLD: f64 = 1.0e-5;
 
 /// A topology-preserving-transform state-variable resonator.
@@ -20,6 +23,8 @@ pub struct Resonator {
     freq_hz: f64,
     zeta: f64,
     feedback: f64,
+    stiffness: f64,
+    stiffness_scale: f64,
     g: f64,
     k: f64,
     s1: f64,
@@ -36,6 +41,8 @@ impl Resonator {
             freq_hz: 60.0,
             zeta: 0.1,
             feedback: 0.0,
+            stiffness: 0.0,
+            stiffness_scale: 1.0,
             g: 0.0,
             k: 0.2,
             s1: 0.0,
@@ -62,12 +69,29 @@ impl Resonator {
 
     /// Set decay as the number of seconds needed to fall by 60 dB.
     pub fn set_decay_time(&mut self, t60_seconds: f32) {
+        self.set_decay_time_at(t60_seconds, self.effective_frequency_hz());
+    }
+
+    /// Set the T60 as if the resonator were tuned to `reference_hz`. Use this
+    /// when the frequency is modulated at audio rate but the decay should not.
+    pub fn set_decay_time_for(&mut self, t60_seconds: f32, reference_hz: f32) {
+        let reference_hz = if reference_hz.is_finite() {
+            (reference_hz as f64).clamp(MIN_FREQUENCY_HZ, self.sample_rate * 0.45)
+        } else {
+            self.freq_hz
+        };
+        let reference_hz =
+            (reference_hz / (1.0 - self.feedback).sqrt()).min(self.sample_rate * 0.45);
+        self.set_decay_time_at(t60_seconds, reference_hz);
+    }
+
+    fn set_decay_time_at(&mut self, t60_seconds: f32, frequency_hz: f64) {
         let t60 = if t60_seconds.is_finite() {
             t60_seconds.max(1.0e-4) as f64
         } else {
             0.5
         };
-        let zeta = 6.91 / (2.0 * PI * self.effective_frequency_hz() * t60);
+        let zeta = 6.91 / (2.0 * PI * frequency_hz * t60);
         self.set_damping(zeta as f32);
     }
 
@@ -91,6 +115,20 @@ impl Resonator {
         }
     }
 
+    /// Add hardening restoring force `-k·y·tanh²(scale·y)` on the low-pass
+    /// state `y`, solved without delay. `level_scale` sets which output level
+    /// counts as "loud"; zero `stiffness` disables the term.
+    pub fn set_stiffness(&mut self, stiffness: f32, level_scale: f32) {
+        self.stiffness = if stiffness.is_finite() {
+            (stiffness as f64).clamp(0.0, MAX_STIFFNESS)
+        } else {
+            0.0
+        };
+        if level_scale.is_finite() && level_scale > 0.0 {
+            self.stiffness_scale = level_scale as f64;
+        }
+    }
+
     /// Inject trigger energy directly into the first integrator.
     pub fn excite(&mut self, energy: f32) {
         if energy.is_finite() {
@@ -109,14 +147,21 @@ impl Resonator {
         // sample here adds unintended damping, so even a nominal 15-second
         // decay dies in a few seconds. Three Newton steps converge rapidly
         // because feedback is capped below unity.
-        if self.feedback > 0.0 {
+        if self.feedback > 0.0 || self.stiffness > 0.0 {
             for _ in 0..3 {
                 let low = self.s2 + self.g * v1;
                 let saturated_low = low.tanh();
-                let residual =
-                    v1 - (self.g * (input + self.feedback * saturated_low - self.s2) + self.s1) * h;
-                let derivative =
+                let mut force = self.feedback * saturated_low;
+                let mut derivative =
                     1.0 - h * self.g * self.g * self.feedback * (1.0 - saturated_low.powi(2));
+                if self.stiffness > 0.0 {
+                    let level = (self.stiffness_scale * low).tanh();
+                    force -= self.stiffness * low * level * level;
+                    let slope = level * level
+                        + 2.0 * low * level * (1.0 - level * level) * self.stiffness_scale;
+                    derivative += h * self.g * self.g * self.stiffness * slope;
+                }
+                let residual = v1 - (self.g * (input + force - self.s2) + self.s1) * h;
                 v1 -= residual / derivative;
             }
         }

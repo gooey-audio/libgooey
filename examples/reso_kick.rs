@@ -169,7 +169,7 @@ const ADVANCED_NAMES: [&str; 8] = [
     "noise level",
 ];
 
-const TWIN_CORE_PERC_NAMES: [&str; 14] = [
+const TWIN_CORE_PERC_NAMES: [&str; 18] = [
     "master tune",
     "detune down",
     "length",
@@ -184,10 +184,24 @@ const TWIN_CORE_PERC_NAMES: [&str; 14] = [
     "volume",
     "body spectral mode",
     "noise routing mode",
+    "fold symmetry",
+    "cross mod 1->2",
+    "low-pass gate",
+    "chaos",
 ];
 
+/// Rows follow the channel FFI: two mode switches at 12 and 13, then the
+/// continuous extensions, which are voice indices 12 to 15.
+fn twin_core_voice_index(index: usize) -> Option<usize> {
+    match index {
+        0..=11 => Some(index),
+        14..=17 => Some(index - 2),
+        _ => None,
+    }
+}
+
 fn twin_core_value(voice: &TwinCorePercVoice, index: usize) -> f32 {
-    if index < 12 {
+    if let Some(index) = twin_core_voice_index(index) {
         voice.parameter_normalized(index).unwrap_or(0.0)
     } else {
         let config = voice.config_targets();
@@ -204,7 +218,7 @@ fn twin_core_value(voice: &TwinCorePercVoice, index: usize) -> f32 {
 }
 
 fn set_twin_core_value(voice: &mut TwinCorePercVoice, index: usize, value: f32) {
-    if index < 12 {
+    if let Some(index) = twin_core_voice_index(index) {
         voice.set_parameter_normalized(index, value);
     } else if index == 12 {
         voice.set_body_mode(if value < 0.25 {
@@ -242,6 +256,10 @@ fn twin_core_detail(voice: &TwinCorePercVoice, index: usize) -> String {
         11 => format!("{:>7.2} x", config.volume),
         12 => format!("{:>10?}", config.body_mode),
         13 => format!("{:>10?}", config.noise_mode),
+        14 => format!("{:>+7.2}", config.symmetry),
+        15 => format!("{:>7.0}%", config.cross_mod * 100.0),
+        16 => format!("{:>7.0}%", config.lpg * 100.0),
+        17 => format!("{:>7.2}", config.chaos),
         _ => String::new(),
     }
 }
@@ -273,9 +291,12 @@ fn render_twin_core_display(
         );
     }
     print!(
-        "\r\nSignal: delayed strike → serial twin cores → LO/MID/HI → wavefolder → body VCA\r\n"
+        "\r\nSignal: delayed strike → serial twin cores → LO/MID/HI → wavefolder → body VCA → LPG\r\n"
     );
     print!("        noise → LP/HP direct mix, or LP → body cores; separate noise envelope\r\n");
+    print!(
+        "        core 1 FMs core 2 (cross mod); chaos stiffens, then cross-couples, the cores\r\n"
+    );
     io::stdout().flush().unwrap();
 }
 
